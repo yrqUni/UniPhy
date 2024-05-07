@@ -1,23 +1,26 @@
 import torch
-from ConvLRU import ConvLRU
+from ConvLRU import IterativeConvLRU
 
 class Args:
     input_size = 100
+    input_ch = 3
+    out_frame = 8
     hidden_ch = 8
     emb_ch = 4 
-    input_ch = 3
     convlru_dropout = 0.1  
     ffn_dropout = 0.1
     convlru_num_blocks = 12
+
 args = Args()
-model = ConvLRU(args).cuda()
+model = IterativeConvLRU(args).cuda()
 loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
 opt.zero_grad()
-input = torch.randn(4, 32, 3, 100, 100).cuda()
-label = torch.randn(4, 32, 3, 100, 100).cuda()
-outputs = model(input)
-loss = loss_fn(outputs, label)
+inputs = torch.randn(2, 8, args.input_ch, args.input_size, args.input_size).cuda()
+labels = torch.randn(2, args.out_frame, args.input_ch, args.input_size, args.input_size).cuda()
+outputs = model(inputs)
+print(outputs.shape)
+loss = loss_fn(outputs, labels)
 loss.backward()
 opt.step()
 print(f"Done! Loss {loss}")
