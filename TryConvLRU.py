@@ -4,7 +4,7 @@ from ConvLRU import IterativeConvLRU
 class Args:
     input_size = 100
     input_ch = 3
-    out_frame = 8
+    out_frames = 8
     hidden_ch = 8
     emb_ch = 4 
     convlru_dropout = 0.1  
@@ -17,7 +17,7 @@ loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
 opt.zero_grad()
 inputs = torch.randn(2, 8, args.input_ch, args.input_size, args.input_size).cuda()
-labels = torch.randn(2, args.out_frame, args.input_ch, args.input_size, args.input_size).cuda()
+labels = torch.randn(2, args.out_frames, args.input_ch, args.input_size, args.input_size).cuda()
 outputs = model(inputs)
 print(outputs.shape)
 loss = loss_fn(outputs, labels)
