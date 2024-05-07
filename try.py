@@ -1,5 +1,5 @@
 import torch
-from lru import ConvLRU
+from ConvLRU import ConvLRU
 
 class Args:
     input_size = 100
