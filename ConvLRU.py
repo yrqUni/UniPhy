@@ -114,8 +114,8 @@ class ConvLRULayer(nn.Module):
         self.params_log = nn.Parameter(torch.vstack((nu_log, theta_log, gamma_log)))
         # define layers
         self.in_proj_B = nn.Conv2d(self.emb_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
-        self.in_proj_P = nn.Conv2d(self.emb_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
-        self.out_proj = nn.Conv2d(self.hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.in_proj_P_ = nn.Conv2d(self.emb_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.out_proj_C = nn.Conv2d(self.hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, self.input_size, self.input_size])
     def lru_parallel(self, i, h, lamb, B, L, C, H, W):
@@ -136,12 +136,12 @@ class ConvLRULayer(nn.Module):
         lamb = torch.exp(torch.complex(-nu, theta))
         h = self.in_proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
         h = torch.fft.fft2(h)
-        h = self.in_proj_P(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
+        h = self.in_proj_P_(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
         h = h * torch.diag_embed(gamma)
         log2_L = int(np.ceil(np.log2(L)))
         for i in range(log2_L):
             h, lamb = self.lru_parallel(i + 1, h, lamb, B, L,  self.hidden_ch, H, W)
-        x_ = self.out_proj(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W).real
+        x_ = self.out_proj_C(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W).real
         x_ = self.dropout(x_)
         x_ = torch.fft.ifft2(x_)
         x_ = x_.real
