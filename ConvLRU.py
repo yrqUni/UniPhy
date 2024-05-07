@@ -15,7 +15,7 @@ class IterativeConvLRU(nn.Module):
         for i in range(self.out_frames):
             out_ = self.model(x)[:, -1:, :, :, :]
             out.append(out_)
-            x = torch.cat((x[:, 1:, :, :, :], out_.detach()), 1)
+            x = torch.cat((x[:, 1:, :, :, :].detach(), out_.detach()), 1)
         return torch.cat(out, 1)
 
 class ConvLRU(nn.Module):

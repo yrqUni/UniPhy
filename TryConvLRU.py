@@ -1,5 +1,5 @@
 import torch
-from ConvLRU import IterativeConvLRU
+from ConvLRU import IterativeConvLRU, ConvLRU
 
 class Args:
     input_size = 100
@@ -12,7 +12,7 @@ class Args:
     convlru_num_blocks = 12
 
 args = Args()
-model = IterativeConvLRU(args).cuda()
+model = ConvLRU(args).cuda()
 loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
 opt.zero_grad()
