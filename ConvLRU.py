@@ -124,9 +124,10 @@ class ConvLRULayer(nn.Module):
         gamma_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda) ** 2))
         self.params_log = nn.Parameter(torch.vstack((nu_log, theta_log, gamma_log)))
         # define layers
-        self.in_proj_B = nn.Conv2d(self.emb_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
-        self.in_proj_P_ = nn.Conv2d(self.emb_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
-        self.out_proj_C = nn.Conv2d(self.hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_B = nn.Conv2d(self.emb_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_P_ = nn.Conv2d(self.hidden_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_P = nn.Conv2d(self.hidden_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_C = nn.Conv2d(self.hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, self.input_size, self.input_size])
     def lru_parallel(self, i, h, lamb, B, L, C, H, W):
@@ -145,19 +146,20 @@ class ConvLRULayer(nn.Module):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.hidden_ch, self.hidden_ch, self.hidden_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
-        h = self.in_proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
+        h = self.proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
         h = torch.fft.fft2(h)
-        h = self.in_proj_P_(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
+        h = self.proj_P_(h.reshape(B*L, self.hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
         h = h * torch.diag_embed(gamma)
         log2_L = int(np.ceil(np.log2(L)))
         for i in range(log2_L):
             h, lamb = self.lru_parallel(i + 1, h, lamb, B, L,  self.hidden_ch, H, W)
-        x_ = self.out_proj_C(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W).real
-        x_ = self.dropout(x_)
-        x_ = torch.fft.ifft2(x_)
-        x_ = x_.real
-        x_ = self.layer_norm(x_.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
-        x = x_ + x
+        h = torch.fft.ifft2(h)
+        h = self.proj_P(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.hidden_ch, H, W)
+        h = self.proj_C(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
+        h = h.real
+        h = self.dropout(h)
+        h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
+        x = h + x
         return x
 
 class PositionwiseFeedForward(nn.Module):
