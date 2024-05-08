@@ -8,13 +8,12 @@ class IterativeConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.out_frames = args.out_frames
         self.model = ConvLRU(self.args)
-    def forward(self, x):
-        for i in range(self.out_frames):
+    def forward(self, x, out_frames=1):
+        for _ in range(out_frames):
             out = self.model(x)[:, -1:, :, :, :]
             x = torch.cat((x[:, 1:, :, :, :], out), 1)
-        return x[:, -self.out_frames:, :, :, :]
+        return x[:, -out_frames:, :, :, :]
 
 class ConvLRU(nn.Module):
     def __init__(self, args):
