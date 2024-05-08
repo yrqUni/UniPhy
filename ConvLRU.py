@@ -4,7 +4,23 @@ import torch.nn.functional as F
 import math
 import numpy as np
 
-class IterativeConvLRU(nn.Module):
+class OnlyIterativeInfer_ConvLRU(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.model = ConvLRU(self.args)
+    def forward(self, x, mode='train', out_frames=1):
+        assert mode in ['train', 'infer']
+        if mode == 'train':
+            out = self.model(x)
+            return out
+        elif mode == 'infer':
+            for _ in range(out_frames):
+                out = self.model(x)[:, -1:, :, :, :]
+                x = torch.cat((x[:, 1:, :, :, :], out), 1)
+            return x[:, -out_frames:, :, :, :]
+
+class Iterative_ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
