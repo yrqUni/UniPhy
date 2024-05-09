@@ -100,7 +100,12 @@ class ResNetEmbedding(nn.Module):
         trainable = args.IO_resnet_trainable
         input_size = [args.input_size, args.input_size]
         output_ch = args.emb_ch
-        resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+        if pretrained:
+            try:
+                resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+            except:
+                weight_path = f'./pre_train/{resnet_type}_pretrained.pth'
+                resnet.load_state_dict(torch.load(weight_path))
         self.features = nn.Sequential(*list(resnet.children())[:-2])
         if not trainable:
             for param in self.features.parameters():
@@ -132,7 +137,12 @@ class ResNetDecoder(nn.Module):
         trainable = args.IO_resnet_trainable
         input_size = [args.input_size, args.input_size]
         output_ch = args.input_ch
-        resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+        if pretrained:
+            try:
+                resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+            except:
+                weight_path = f'./pre_train/{resnet_type}_pretrained.pth'
+                resnet.load_state_dict(torch.load(weight_path))
         self.features = nn.Sequential(*list(resnet.children())[:-2])
         if not trainable:
             for param in self.features.parameters():
@@ -279,7 +289,12 @@ class ResNetFeedForward(nn.Module):
         trainable = args.FFN_resnet_trainable
         input_size = [args.input_size, args.input_size]
         output_ch = args.emb_ch
-        resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+        if pretrained:
+            try:
+                resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+            except:
+                weight_path = f'./pre_train/{resnet_type}_pretrained.pth'
+                resnet.load_state_dict(torch.load(weight_path))
         self.features = nn.Sequential(*list(resnet.children())[:-2])
         if not trainable:
             for param in self.features.parameters():
