@@ -4,7 +4,8 @@ from ConvLRU import OnlyIterativeInfer_ConvLRU
 class Args:
     input_size = 32
     input_ch = 1
-    hidden_ch = 8
+    convlru_hidden_ch = 8
+    ffn_hidden_ch = 32
     emb_ch = 4 
     convlru_dropout = 0.1  
     ffn_dropout = 0.1

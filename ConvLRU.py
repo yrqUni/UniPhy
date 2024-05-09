@@ -104,13 +104,14 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.args = args
         emb_ch = args.emb_ch
-        hidden_ch = args.hidden_ch
+        convlru_hidden_ch = args.convlru_hidden_ch
+        ffn_hidden_ch = args.ffn_hidden_ch
         self.lru_layer = ConvLRULayer(emb_ch = emb_ch, 
-                                      hidden_ch = hidden_ch, 
+                                      convlru_hidden_ch = convlru_hidden_ch, 
                                       input_size = args.input_size,
                                       dropout = args.convlru_dropout)
         self.feed_forward = FeedForward(emb_ch=emb_ch, 
-                                        hidden_ch=hidden_ch, 
+                                        ffn_hidden_ch=ffn_hidden_ch, 
                                         input_size=args.input_size,
                                         dropout=args.ffn_dropout)
     def forward(self, x):
@@ -121,7 +122,7 @@ class ConvLRUBlock(nn.Module):
 class ConvLRULayer(nn.Module):
     def __init__(self,
                  emb_ch, 
-                 hidden_ch, 
+                 convlru_hidden_ch, 
                  input_size,
                  dropout=0.1,
                  use_bias=True,
@@ -129,22 +130,22 @@ class ConvLRULayer(nn.Module):
                  r_max=0.99):
         super().__init__()
         self.emb_ch = emb_ch
-        self.hidden_ch = hidden_ch
+        self.convlru_hidden_ch = convlru_hidden_ch
         self.use_bias = use_bias
         self.input_size = input_size
         # init 
-        u1 = torch.rand(hidden_ch, self.input_size)
-        u2 = torch.rand(hidden_ch, self.input_size)
+        u1 = torch.rand(convlru_hidden_ch, self.input_size)
+        u2 = torch.rand(convlru_hidden_ch, self.input_size)
         nu_log = torch.log(-0.5 * torch.log(u1 * (r_max ** 2 - r_min ** 2) + r_min ** 2))
         theta_log = torch.log(u2 * torch.tensor(np.pi) * 2)
         diag_lambda = torch.exp(torch.complex(-torch.exp(nu_log), torch.exp(theta_log)))
         gamma_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda) ** 2))
         self.params_log = nn.Parameter(torch.vstack((nu_log, theta_log, gamma_log)))
         # define layers
-        self.proj_B = nn.Conv2d(self.emb_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
-        self.proj_P_ = nn.Conv2d(self.hidden_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
-        self.proj_P = nn.Conv2d(self.hidden_ch, self.hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
-        self.proj_C = nn.Conv2d(self.hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_B = nn.Conv2d(self.emb_ch, self.convlru_hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_P_ = nn.Conv2d(self.convlru_hidden_ch, self.convlru_hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_P = nn.Conv2d(self.convlru_hidden_ch, self.convlru_hidden_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
+        self.proj_C = nn.Conv2d(self.convlru_hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, self.input_size, self.input_size])
     def convlru_parallel(self, i, h, lamb, B, L, C, H, W):
@@ -161,18 +162,18 @@ class ConvLRULayer(nn.Module):
         return h, lamb
     def forward(self, x):
         B, L, _, H, W = x.size()
-        nu, theta, gamma = torch.exp(self.params_log).split((self.hidden_ch, self.hidden_ch, self.hidden_ch))
+        nu, theta, gamma = torch.exp(self.params_log).split((self.convlru_hidden_ch, self.convlru_hidden_ch, self.convlru_hidden_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
-        h = self.proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
+        h = self.proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
         h = torch.fft.fft2(h)
-        h = self.proj_P_(h.reshape(B*L, self.hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.hidden_ch, H, W)
+        h = self.proj_P_(h.reshape(B*L, self.convlru_hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
         h = h * torch.diag_embed(gamma)
         log2_L = int(np.ceil(np.log2(L)))
         for i in range(log2_L):
-            h, lamb = self.convlru_parallel(i + 1, h, lamb, B, L,  self.hidden_ch, H, W)
+            h, lamb = self.convlru_parallel(i + 1, h, lamb, B, L,  self.convlru_hidden_ch, H, W)
         h = torch.fft.ifft2(h)
-        h = self.proj_P(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.hidden_ch, H, W)
-        h = self.proj_C(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
+        h = self.proj_P(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.convlru_hidden_ch, H, W)
+        h = self.proj_C(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.dropout(h)
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
@@ -180,21 +181,21 @@ class ConvLRULayer(nn.Module):
         return x
 
 class FeedForward(nn.Module):
-    def __init__(self, emb_ch, hidden_ch, input_size, dropout):
+    def __init__(self, emb_ch, ffn_hidden_ch, input_size, dropout):
         super().__init__()
         self.emb_ch = emb_ch
-        self.hidden_ch = hidden_ch
-        self.w_1 = nn.Conv2d(emb_ch, hidden_ch, kernel_size=3, padding='same')
-        self.w_2 = nn.Conv2d(hidden_ch, emb_ch, kernel_size=3, padding='same')
+        self.ffn_hidden_ch = ffn_hidden_ch
+        self.w_1 = nn.Conv2d(emb_ch, ffn_hidden_ch, kernel_size=3, padding='same')
+        self.w_2 = nn.Conv2d(ffn_hidden_ch, emb_ch, kernel_size=3, padding='same')
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm([emb_ch, input_size, input_size])
     def forward(self, x):
         B, L, _, H, W = x.size()
-        x_ = self.w_1(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.hidden_ch, H, W)
+        x_ = self.w_1(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.ffn_hidden_ch, H, W)
         x_ = self.activation(x_)
         x_ = self.dropout(x_)
-        x_ = self.w_2(x_.reshape(B*L, self.hidden_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
+        x_ = self.w_2(x_.reshape(B*L, self.ffn_hidden_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         x_ = self.dropout(x_)
         x_ = self.layer_norm(x_)
         x = x_ + x
