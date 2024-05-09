@@ -104,6 +104,7 @@ class ResNetEmbedding(nn.Module):
             try:
                 resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
             except:
+                resnet = getattr(models, resnet_type.lower())(pretrained=False)
                 weight_path = f'./pre_train/{resnet_type}_pretrained.pth'
                 resnet.load_state_dict(torch.load(weight_path))
         self.features = nn.Sequential(*list(resnet.children())[:-2])
@@ -141,6 +142,7 @@ class ResNetDecoder(nn.Module):
             try:
                 resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
             except:
+                resnet = getattr(models, resnet_type.lower())(pretrained=False)
                 weight_path = f'./pre_train/{resnet_type}_pretrained.pth'
                 resnet.load_state_dict(torch.load(weight_path))
         self.features = nn.Sequential(*list(resnet.children())[:-2])
@@ -293,6 +295,7 @@ class ResNetFeedForward(nn.Module):
             try:
                 resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
             except:
+                resnet = getattr(models, resnet_type.lower())(pretrained=False)
                 weight_path = f'./pre_train/{resnet_type}_pretrained.pth'
                 resnet.load_state_dict(torch.load(weight_path))
         self.features = nn.Sequential(*list(resnet.children())[:-2])
