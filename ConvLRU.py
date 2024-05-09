@@ -37,7 +37,7 @@ class ConvLRU(nn.Module):
         super().__init__()
         self.args = args
         self.model = ConvLRUModel(self.args)
-        if args.use_resnet:
+        if args.IO_use_resnet:
             self.embedding = ResNetEmbedding(args)
             self.decoder = ResNetDecoder(args)
         else:
@@ -95,9 +95,9 @@ class Decoder(nn.Module):
 class ResNetEmbedding(nn.Module):
     def __init__(self, args):
         super().__init__()
-        resnet_type = args.resnet_type
-        pretrained = args.resnet_pretrained
-        trainable = args.resnet_trainable
+        resnet_type = args.IO_resnet_type
+        pretrained = args.IO_resnet_pretrained
+        trainable = args.IO_resnet_trainable
         input_size = [args.input_size, args.input_size]
         output_ch = args.emb_ch
         resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
@@ -127,9 +127,9 @@ class ResNetEmbedding(nn.Module):
 class ResNetDecoder(nn.Module):
     def __init__(self, args):
         super().__init__()
-        resnet_type = args.resnet_type
-        pretrained = args.resnet_pretrained
-        trainable = args.resnet_trainable
+        resnet_type = args.IO_resnet_type
+        pretrained = args.IO_resnet_pretrained
+        trainable = args.IO_resnet_trainable
         input_size = [args.input_size, args.input_size]
         output_ch = args.input_ch
         resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
@@ -155,7 +155,7 @@ class ResNetDecoder(nn.Module):
         x = self.upsample(x) 
         x = x.view(B, L, self.output_ch, H, W)
         return x
-
+    
 class ConvLRUModel(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -166,7 +166,7 @@ class ConvLRUModel(nn.Module):
         for lru_block in self.convlru_blocks:
             x = lru_block.forward(x)
         return x 
-        
+
 class ConvLRUBlock(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -177,10 +177,13 @@ class ConvLRUBlock(nn.Module):
                                       hidden_ch = hidden_ch, 
                                       input_size = args.input_size,
                                       dropout = args.convlru_dropout)
-        self.feed_forward = PositionwiseFeedForward(emb_ch=emb_ch, 
-                                                    hidden_ch=hidden_ch, 
-                                                    input_size=args.input_size,
-                                                    dropout=args.ffn_dropout)
+        if args.FFN_use_resnet:
+            self.feed_forward = ResNetFeedForward(args)
+        else:
+            self.feed_forward = FeedForward(emb_ch=emb_ch, 
+                                            hidden_ch=hidden_ch, 
+                                            input_size=args.input_size,
+                                            dropout=args.ffn_dropout)
     def forward(self, x):
         x = self.lru_layer(x)
         x = self.feed_forward(x)
@@ -215,7 +218,7 @@ class ConvLRULayer(nn.Module):
         self.proj_C = nn.Conv2d(self.hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, self.input_size, self.input_size])
-    def lru_parallel(self, i, h, lamb, B, L, C, H, W):
+    def convlru_parallel(self, i, h, lamb, B, L, C, H, W):
         if i == 1:
             lamb = lamb.unsqueeze(0)
         l = 2 ** i
@@ -237,7 +240,7 @@ class ConvLRULayer(nn.Module):
         h = h * torch.diag_embed(gamma)
         log2_L = int(np.ceil(np.log2(L)))
         for i in range(log2_L):
-            h, lamb = self.lru_parallel(i + 1, h, lamb, B, L,  self.hidden_ch, H, W)
+            h, lamb = self.convlru_parallel(i + 1, h, lamb, B, L,  self.hidden_ch, H, W)
         h = torch.fft.ifft2(h)
         h = self.proj_P(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.hidden_ch, H, W)
         h = self.proj_C(h.reshape(B*L, self.hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
@@ -247,7 +250,7 @@ class ConvLRULayer(nn.Module):
         x = h + x
         return x
 
-class PositionwiseFeedForward(nn.Module):
+class FeedForward(nn.Module):
     def __init__(self, emb_ch, hidden_ch, input_size, dropout):
         super().__init__()
         self.emb_ch = emb_ch
@@ -268,3 +271,34 @@ class PositionwiseFeedForward(nn.Module):
         x = x_ + x
         return x
     
+class ResNetFeedForward(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        resnet_type = args.FFN_resnet_type
+        pretrained = args.FFN_resnet_pretrained
+        trainable = args.FFN_resnet_trainable
+        input_size = [args.input_size, args.input_size]
+        output_ch = args.emb_ch
+        resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+        self.features = nn.Sequential(*list(resnet.children())[:-2])
+        if not trainable:
+            for param in self.features.parameters():
+                param.requires_grad = False
+        self.pre_conv = nn.Conv2d(args.emb_ch, 3, kernel_size=1)  
+        self.output_ch = output_ch
+        self.adapt_conv = nn.Conv2d(resnet.inplanes, self.output_ch, kernel_size=1)
+        with torch.no_grad():
+            sample_input = torch.zeros(1, args.emb_ch, *input_size)
+            sample_output = self.features(self.pre_conv(sample_input))
+            output_size = (sample_output.size(2), sample_output.size(3))
+        scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+    def forward(self, x):
+        B, L, C, H, W = x.size()
+        x = x.view(B * L, C, H, W)
+        x = self.pre_conv(x) 
+        x = self.features(x)
+        x = self.adapt_conv(x) 
+        x = self.upsample(x) 
+        x = x.view(B, L, self.output_ch, H, W)
+        return x
