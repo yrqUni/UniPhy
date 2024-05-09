@@ -99,7 +99,7 @@ class ResNetEmbedding(nn.Module):
         pretrained = args.IO_resnet_pretrained
         trainable = args.IO_resnet_trainable
         input_size = [args.input_size, args.input_size]
-        output_ch = args.emb_ch
+        self.output_ch = args.emb_ch
         if pretrained:
             try:
                 resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
@@ -112,21 +112,23 @@ class ResNetEmbedding(nn.Module):
             for param in self.features.parameters():
                 param.requires_grad = False
         self.pre_conv = nn.Conv2d(args.input_ch, 3, kernel_size=1) 
-        self.output_ch = output_ch
+        self.upsample_in = nn.Upsample(scale_factor=args.IO_scale_factor, mode='bilinear', align_corners=True)
         self.adapt_conv = nn.Conv2d(resnet.inplanes, self.output_ch, kernel_size=1)
         with torch.no_grad():
             sample_input = torch.zeros(1, args.input_ch, *input_size)
+            sample_input = self.upsample_in(sample_input)
             sample_output = self.features(self.pre_conv(sample_input))
             output_size = (sample_output.size(2), sample_output.size(3))
         scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
-        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+        self.upsample_out = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
     def forward(self, x):
         B, L, C, H, W = x.size()
         x = x.view(B * L, C, H, W)
         x = self.pre_conv(x)  
+        x = self.upsample_in(x)
         x = self.features(x)
         x = self.adapt_conv(x)  
-        x = self.upsample(x) 
+        x = self.upsample_out(x)
         x = x.view(B, L, self.output_ch, H, W)
         return x
 
@@ -137,7 +139,7 @@ class ResNetDecoder(nn.Module):
         pretrained = args.IO_resnet_pretrained
         trainable = args.IO_resnet_trainable
         input_size = [args.input_size, args.input_size]
-        output_ch = args.input_ch
+        self.output_ch = args.input_ch
         if pretrained:
             try:
                 resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
@@ -150,21 +152,23 @@ class ResNetDecoder(nn.Module):
             for param in self.features.parameters():
                 param.requires_grad = False
         self.pre_conv = nn.Conv2d(args.emb_ch, 3, kernel_size=1)  
-        self.output_ch = output_ch
+        self.upsample_in = nn.Upsample(scale_factor=args.IO_scale_factor, mode='bilinear', align_corners=True)
         self.adapt_conv = nn.Conv2d(resnet.inplanes, self.output_ch, kernel_size=1)
         with torch.no_grad():
             sample_input = torch.zeros(1, args.emb_ch, *input_size)
+            sample_input = self.upsample_in(sample_input)
             sample_output = self.features(self.pre_conv(sample_input))
             output_size = (sample_output.size(2), sample_output.size(3))
         scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
-        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+        self.upsample_out = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
     def forward(self, x):
         B, L, C, H, W = x.size()
         x = x.view(B * L, C, H, W)
         x = self.pre_conv(x) 
+        x = self.upsample_in(x)
         x = self.features(x)
         x = self.adapt_conv(x) 
-        x = self.upsample(x) 
+        x = self.upsample_out(x)
         x = x.view(B, L, self.output_ch, H, W)
         return x
     
@@ -290,7 +294,7 @@ class ResNetFeedForward(nn.Module):
         pretrained = args.FFN_resnet_pretrained
         trainable = args.FFN_resnet_trainable
         input_size = [args.input_size, args.input_size]
-        output_ch = args.emb_ch
+        self.output_ch = args.emb_ch
         if pretrained:
             try:
                 resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
@@ -303,20 +307,23 @@ class ResNetFeedForward(nn.Module):
             for param in self.features.parameters():
                 param.requires_grad = False
         self.pre_conv = nn.Conv2d(args.emb_ch, 3, kernel_size=1)  
-        self.output_ch = output_ch
         self.adapt_conv = nn.Conv2d(resnet.inplanes, self.output_ch, kernel_size=1)
+        self.upsample_in = nn.Upsample(scale_factor=args.FFN_scale_factor, mode='bilinear', align_corners=True)
         with torch.no_grad():
             sample_input = torch.zeros(1, args.emb_ch, *input_size)
+            sample_input = self.upsample_in(sample_input)
             sample_output = self.features(self.pre_conv(sample_input))
             output_size = (sample_output.size(2), sample_output.size(3))
-        scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
-        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+        scale_factor_out = (input_size[0] / output_size[0], input_size[1] / output_size[1])
+        self.upsample_out = nn.Upsample(scale_factor=scale_factor_out, mode='bilinear', align_corners=True)
     def forward(self, x):
         B, L, C, H, W = x.size()
         x = x.view(B * L, C, H, W)
         x = self.pre_conv(x) 
+        x = self.upsample_in(x)
         x = self.features(x)
         x = self.adapt_conv(x) 
-        x = self.upsample(x) 
+        x = self.upsample_out(x)
         x = x.view(B, L, self.output_ch, H, W)
         return x
+    

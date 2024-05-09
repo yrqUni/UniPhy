@@ -2,8 +2,8 @@ import torch
 from ConvLRU import OnlyIterativeInfer_ConvLRU
 
 class Args:
-    input_size = 100
-    input_ch = 3
+    input_size = 32
+    input_ch = 1
     hidden_ch = 8
     emb_ch = 4 
     convlru_dropout = 0.1  
@@ -11,10 +11,12 @@ class Args:
     convlru_num_blocks = 12
     IO_use_resnet = True
     IO_resnet_type = 'resnet34' # resnet18, resnet34, resnet50, resnet101, resnet152
+    IO_scale_factor = 2
     IO_resnet_pretrained = True
     IO_resnet_trainable = True
     FFN_use_resnet = True
     FFN_resnet_type = 'resnet18' # resnet18, resnet34, resnet50, resnet101, resnet152
+    FFN_scale_factor = 2
     FFN_resnet_pretrained = True
     FFN_resnet_trainable = True
 args = Args()
