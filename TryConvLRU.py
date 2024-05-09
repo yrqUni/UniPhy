@@ -9,6 +9,10 @@ class Args:
     convlru_dropout = 0.1  
     ffn_dropout = 0.1
     convlru_num_blocks = 12
+    use_resnet = True
+    resnet_type = 'resnet34' # resnet18, resnet34, resnet50, resnet101, resnet152
+    resnet_pretrained = True
+    resnet_trainable = True
 args = Args()
 model = OnlyIterativeInfer_ConvLRU(args).cuda()
 loss_fn = torch.nn.MSELoss()

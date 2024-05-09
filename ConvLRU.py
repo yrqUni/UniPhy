@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 import math
 import numpy as np
 
@@ -35,9 +36,13 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.embedding = Embedding(self.args)
         self.model = ConvLRUModel(self.args)
-        self.decoder = Decoder(self.args)
+        if args.use_resnet:
+            self.embedding = ResNetEmbedding(args)
+            self.decoder = ResNetDecoder(args)
+        else:
+            self.embedding = Embedding(self.args)
+            self.decoder = Decoder(self.args)
         self.truncated_normal_init()
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
         with torch.no_grad():
@@ -85,6 +90,70 @@ class Decoder(nn.Module):
     def forward(self, x):
         B, L, C, H, W = x.size()
         x = self.embedding(x.reshape(B*L, C, H, W)).reshape(B, L, -1, H, W)
+        return x
+
+class ResNetEmbedding(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        resnet_type = args.resnet_type
+        pretrained = args.resnet_pretrained
+        trainable = args.resnet_trainable
+        input_size = [args.input_size, args.input_size]
+        output_ch = args.emb_ch
+        resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+        self.features = nn.Sequential(*list(resnet.children())[:-2])
+        if not trainable:
+            for param in self.features.parameters():
+                param.requires_grad = False
+        self.pre_conv = nn.Conv2d(args.input_ch, 3, kernel_size=1) 
+        self.output_ch = output_ch
+        self.adapt_conv = nn.Conv2d(resnet.inplanes, self.output_ch, kernel_size=1)
+        with torch.no_grad():
+            sample_input = torch.zeros(1, args.input_ch, *input_size)
+            sample_output = self.features(self.pre_conv(sample_input))
+            output_size = (sample_output.size(2), sample_output.size(3))
+        scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+    def forward(self, x):
+        B, L, C, H, W = x.size()
+        x = x.view(B * L, C, H, W)
+        x = self.pre_conv(x)  
+        x = self.features(x)
+        x = self.adapt_conv(x)  
+        x = self.upsample(x) 
+        x = x.view(B, L, self.output_ch, H, W)
+        return x
+
+class ResNetDecoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        resnet_type = args.resnet_type
+        pretrained = args.resnet_pretrained
+        trainable = args.resnet_trainable
+        input_size = [args.input_size, args.input_size]
+        output_ch = args.input_ch
+        resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+        self.features = nn.Sequential(*list(resnet.children())[:-2])
+        if not trainable:
+            for param in self.features.parameters():
+                param.requires_grad = False
+        self.pre_conv = nn.Conv2d(args.emb_ch, 3, kernel_size=1)  
+        self.output_ch = output_ch
+        self.adapt_conv = nn.Conv2d(resnet.inplanes, self.output_ch, kernel_size=1)
+        with torch.no_grad():
+            sample_input = torch.zeros(1, args.emb_ch, *input_size)
+            sample_output = self.features(self.pre_conv(sample_input))
+            output_size = (sample_output.size(2), sample_output.size(3))
+        scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+    def forward(self, x):
+        B, L, C, H, W = x.size()
+        x = x.view(B * L, C, H, W)
+        x = self.pre_conv(x) 
+        x = self.features(x)
+        x = self.adapt_conv(x) 
+        x = self.upsample(x) 
+        x = x.view(B, L, self.output_ch, H, W)
         return x
 
 class ConvLRUModel(nn.Module):
