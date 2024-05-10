@@ -2,14 +2,26 @@ import torch
 from ConvLRU import OnlyIterativeInfer_ConvLRU
 
 class Args:
+    # input info
     input_size = 32
     input_ch = 1
+    # convlru info
     convlru_hidden_ch = 8
-    ffn_hidden_ch = 32
-    emb_ch = 4 
     convlru_dropout = 0.1  
-    ffn_dropout = 0.1
     convlru_num_blocks = 12
+    # emb info
+    emb_ch = 4 
+    emb_hidden_ch = 8
+    emb_dropout = 0.0
+    emb_hidden_layers_num = 1
+    # ffn info
+    ffn_hidden_ch = 32
+    ffn_dropout = 0.1
+    ffn_hidden_layers_num = 4
+    # dec info
+    dec_hidden_ch = 32
+    dec_dropout = 0.1
+    dec_hidden_layers_num = 8
 args = Args()
 model = OnlyIterativeInfer_ConvLRU(args).cuda()
 loss_fn = torch.nn.MSELoss()
