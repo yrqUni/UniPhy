@@ -31,9 +31,9 @@ class ConvLRU(nn.Module):
                         p.erfinv_()
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
-    def forward(self, x, mode='train', out_frames=None):
+    def forward(self, x, mask=None, mode='train', out_frames=None):
         x = self.embedding(x)
-        x = self.model(x, mode=mode, out_frames=out_frames)
+        x = self.model(x, mask, mode=mode, out_frames=out_frames)
         x = self.decoder(x)
         return x
 
@@ -130,9 +130,9 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = args.convlru_num_blocks
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_pixelunshuffled_shape) for _ in range(layers)])
-    def forward(self, x, mode='train', out_frames=None):
+    def forward(self, x, mask, mode='train', out_frames=None):
         for lru_block in self.convlru_blocks:
-            x = lru_block.forward(x, mode=mode, out_frames=out_frames)
+            x = lru_block.forward(x, mask, mode=mode, out_frames=out_frames)
         return x 
 
 class ConvLRUBlock(nn.Module):
@@ -140,8 +140,8 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_pixelunshuffled_shape)
         self.feed_forward = FeedForward(args, input_pixelunshuffled_shape)
-    def forward(self, x, mode='train', out_frames=None):
-        x = self.lru_layer(x, mode=mode, out_frames=out_frames)
+    def forward(self, x, mask, mode='train', out_frames=None):
+        x = self.lru_layer(x, mask, mode=mode, out_frames=out_frames)
         x = self.feed_forward(x)
         return x
     
@@ -170,19 +170,20 @@ class ConvLRULayer(nn.Module):
         self.proj_C = nn.Conv2d(self.convlru_hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
-    def convlru_parallel(self, i, h, lamb, B, L, C, H, W):
+    def convlru_parallel(self, i, h, mask, lamb, B, L, C, H, W):
         if i == 1:
             lamb = lamb.unsqueeze(0)
         l = 2 ** i
-        h = h.reshape(B * L // l, l, C, H, W)  
-        h1, h2 = h[:, :l // 2, :, :, :], h[:, l // 2:, :, :, :]  
-        if i > 1: lamb = torch.cat((lamb, lamb * lamb[-1]), 0)
-        lamb = torch.diag_embed(lamb)
-        h2 = h2 + lamb.unsqueeze(0) * h1[:, -1:, :, :, :]
-        h = torch.cat([h1, h2], axis=1)
-        lamb = torch.diagonal(lamb, dim1=-2, dim2=-1)
-        return h, lamb
-    def convlru_parallel_mode(self, x):
+        h = h.reshape(B * L // l, l, C, H, W) 
+        mask = mask.reshape(B * L // l, l, C, H, W) 
+        h1, h2 = h[:, :l // 2, :, :, :], h[:, l // 2:, :, :, :] 
+        if i > 1: lamb = torch.cat((lamb, lamb * lamb[-1]), 0) 
+        lamb = torch.diag_embed(lamb) 
+        h2 = h2 + lamb.unsqueeze(0) * h1[:, -1:, :, :, :] * mask[:, l // 2 - 1:l // 2, :, :, :] 
+        h = torch.cat([h1, h2], axis=1) 
+        lamb = torch.diagonal(lamb, dim1=-2, dim2=-1) 
+        return h, lamb 
+    def convlru_parallel_mode(self, x, mask):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.convlru_hidden_ch, self.convlru_hidden_ch, self.convlru_hidden_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
@@ -191,8 +192,13 @@ class ConvLRULayer(nn.Module):
         h = self.proj_P_(h.reshape(B*L, self.convlru_hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
         h = h * torch.diag_embed(gamma)
         log2_L = int(np.ceil(np.log2(L)))
+        if mask is None:
+            mask = torch.ones_like(h)
+        else:
+            hB, hL, hC, hH, hW = h.size()
+            mask = mask.reshape(hB, hL, 1, 1, 1).expand(hB, hL, hC, hH, hW)
         for i in range(log2_L):
-            h, lamb = self.convlru_parallel(i + 1, h, lamb, B, L,  self.convlru_hidden_ch, H, W)
+            h, lamb = self.convlru_parallel(i + 1, h, mask, lamb, B, L,  self.convlru_hidden_ch, H, W)
         h = torch.fft.ifft2(h)
         h = self.proj_P(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.convlru_hidden_ch, H, W)
         h = self.proj_C(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
@@ -211,8 +217,9 @@ class ConvLRULayer(nn.Module):
         h = self.proj_P_(h.reshape(B*L, self.convlru_hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
         h = h * torch.diag_embed(gamma)
         log2_L = int(np.ceil(np.log2(L)))
+        mask = torch.ones_like(h)
         for i in range(log2_L):
-            h, lamb = self.convlru_parallel(i + 1, h, lamb, B, L,  self.convlru_hidden_ch, H, W)
+            h, lamb = self.convlru_parallel(i + 1, h, mask, lamb, B, L,  self.convlru_hidden_ch, H, W)
         h = torch.fft.ifft2(h)
         h = self.proj_P(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.convlru_hidden_ch, H, W)
         h = self.proj_C(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
@@ -221,12 +228,12 @@ class ConvLRULayer(nn.Module):
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
         x = h + x
         return x
-    def forward(self, x, mode='train', out_frames=None):
+    def forward(self, x, mask, mode='train', out_frames=None):
         assert mode in ['train', 'infer']
         if mode == 'train':
-            x = self.convlru_parallel_mode(x)
+            x = self.convlru_parallel_mode(x, mask)
         elif mode == 'infer':
-            x = self.convlru_parallel_mode(x)
+            x = self.convlru_parallel_mode(x, mask)
             for _ in range(out_frames):
                 _out = self.convlru_iter_mode(x)[:, -1:, :, :, :]
                 x = torch.cat((x[:, 1:, :, :, :], _out), 1)
