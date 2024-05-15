@@ -1,5 +1,5 @@
 import torch
-from ConvLRU import OnlyIterativeInfer_ConvLRU
+from ConvLRU import ConvLRU
 
 class Args:
     # input info
@@ -9,8 +9,10 @@ class Args:
     convlru_hidden_ch = 8
     convlru_dropout = 0.1  
     convlru_num_blocks = 12
+    #
+    hidden_factor = 2
     # emb info
-    emb_ch = 4 
+    emb_ch = 4
     emb_hidden_ch = 8
     emb_dropout = 0.0
     emb_hidden_layers_num = 1
@@ -23,13 +25,13 @@ class Args:
     dec_dropout = 0.1
     dec_hidden_layers_num = 8
 args = Args()
-model = OnlyIterativeInfer_ConvLRU(args).cuda()
+model = ConvLRU(args).cuda()
 loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
 opt.zero_grad()
 inputs_train = torch.randn(2, 8, args.input_ch, args.input_size, args.input_size).cuda()
 labels_train = torch.randn(2, 8, args.input_ch, args.input_size, args.input_size).cuda()
-outputs = model(inputs_train, mode='train', out_frames=None)
+outputs = model(inputs_train, mode='raw', out_frames=None)
 loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
@@ -37,5 +39,5 @@ print(f"Loss {loss}")
 out_frames = 4
 inputs_train = torch.randn(2, 8, args.input_ch, args.input_size, args.input_size).cuda()
 labels_train = torch.randn(2, 8, args.input_ch, args.input_size, args.input_size).cuda()
-outputs = model(inputs_train, mode='infer', out_frames=out_frames)
+outputs = model(inputs_train, mode='iter', out_frames=out_frames)
 print(f"Done! Inference {outputs.shape}")
