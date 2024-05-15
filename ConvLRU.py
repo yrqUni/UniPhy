@@ -7,22 +7,6 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.model = _ConvLRU(self.args)
-    def forward(self, x, mode='raw', out_frames=1):
-        assert mode in ['raw', 'iter']
-        if mode == 'raw':
-            out = self.model(x)
-            return out
-        elif mode == 'iter':
-            for _ in range(out_frames):
-                out = self.model(x)[:, -1:, :, :, :]
-                x = torch.cat((x[:, 1:, :, :, :], out), 1)
-            return x[:, -out_frames:, :, :, :]
-
-class _ConvLRU(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
         self.embedding = Embedding(self.args)
         self.model = ConvLRUModel(self.args, self.embedding.input_pixelunshuffled_shape)
         self.decoder = Decoder(self.args, self.embedding.input_pixelunshuffled_shape)
@@ -47,9 +31,9 @@ class _ConvLRU(nn.Module):
                         p.erfinv_()
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
-    def forward(self, x):
+    def forward(self, x, mode='train', out_frames=None):
         x = self.embedding(x)
-        x = self.model(x)
+        x = self.model(x, mode=mode, out_frames=out_frames)
         x = self.decoder(x)
         return x
 
@@ -146,9 +130,9 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = args.convlru_num_blocks
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_pixelunshuffled_shape) for _ in range(layers)])
-    def forward(self, x):
+    def forward(self, x, mode='train', out_frames=None):
         for lru_block in self.convlru_blocks:
-            x = lru_block.forward(x)
+            x = lru_block.forward(x, mode=mode, out_frames=out_frames)
         return x 
 
 class ConvLRUBlock(nn.Module):
@@ -156,8 +140,8 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_pixelunshuffled_shape)
         self.feed_forward = FeedForward(args, input_pixelunshuffled_shape)
-    def forward(self, x):
-        x = self.lru_layer(x)
+    def forward(self, x, mode='train', out_frames=None):
+        x = self.lru_layer(x, mode=mode, out_frames=out_frames)
         x = self.feed_forward(x)
         return x
     
@@ -198,7 +182,7 @@ class ConvLRULayer(nn.Module):
         h = torch.cat([h1, h2], axis=1)
         lamb = torch.diagonal(lamb, dim1=-2, dim2=-1)
         return h, lamb
-    def forward(self, x):
+    def convlru_parallel_mode(self, x):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.convlru_hidden_ch, self.convlru_hidden_ch, self.convlru_hidden_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
@@ -217,7 +201,38 @@ class ConvLRULayer(nn.Module):
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
         x = h + x
         return x
-
+    def convlru_iter_mode(self, x):
+        x = x[:, -2:, :, :, :]
+        B, L, _, H, W = x.size()
+        nu, theta, gamma = torch.exp(self.params_log).split((self.convlru_hidden_ch, self.convlru_hidden_ch, self.convlru_hidden_ch))
+        lamb = torch.exp(torch.complex(-nu, theta))
+        h = self.proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
+        h = torch.fft.fft2(h)
+        h = self.proj_P_(h.reshape(B*L, self.convlru_hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
+        h = h * torch.diag_embed(gamma)
+        log2_L = int(np.ceil(np.log2(L)))
+        for i in range(log2_L):
+            h, lamb = self.convlru_parallel(i + 1, h, lamb, B, L,  self.convlru_hidden_ch, H, W)
+        h = torch.fft.ifft2(h)
+        h = self.proj_P(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.convlru_hidden_ch, H, W)
+        h = self.proj_C(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
+        h = h.real
+        h = self.dropout(h)
+        h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
+        x = h + x
+        return x
+    def forward(self, x, mode='train', out_frames=None):
+        assert mode in ['train', 'infer']
+        if mode == 'train':
+            x = self.convlru_parallel_mode(x)
+        elif mode == 'infer':
+            x = self.convlru_parallel_mode(x)
+            for _ in range(out_frames):
+                _out = self.convlru_iter_mode(x)[:, -1:, :, :, :]
+                x = torch.cat((x[:, 1:, :, :, :], _out), 1)
+            x = x[:, -out_frames:, :, :, :]
+        return x
+    
 class FeedForward(nn.Module):
     def __init__(self, args, input_pixelunshuffled_shape):
         super().__init__()
