@@ -238,7 +238,10 @@ class ConvLRULayer(nn.Module):
         elif mode == 'infer':
             x = self.convlru_parallel_mode(x, mask)
             for _ in range(out_frames):
-                _out = self.convlru_iter_mode(x)[:, -1:, :, :, :]
+                if _ == 0:
+                    _out = x[:, -1:, :, :, :]
+                else:
+                    _out = self.convlru_iter_mode(x)[:, -1:, :, :, :]
                 x = torch.cat((x[:, 1:, :, :, :], _out), 1)
             x = x[:, -out_frames:, :, :, :]
         return x
