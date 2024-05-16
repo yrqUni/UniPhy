@@ -5,7 +5,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from model.ConvLSTM import ConvLSTM
+from Model.ConvLSTM import ConvLSTM
 
 batch_size = 10
 seq_length = 5
