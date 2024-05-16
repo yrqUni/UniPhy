@@ -10,13 +10,12 @@ class Args:
     input_size = (300, 200)
     input_ch = 1
     # convlru info
-    convlru_hidden_ch = 8
+    emb_ch = 4
     convlru_dropout = 0.1  
     convlru_num_blocks = 12
     #
     hidden_factor = (3, 2)
     # emb info
-    emb_ch = 4
     emb_hidden_ch = 8
     emb_dropout = 0.0
     emb_hidden_layers_num = 1
@@ -36,19 +35,19 @@ loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
 inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
 labels_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
+mask = (torch.randn(B, L).cuda() > 0).float() 
 opt.zero_grad()
-outputs = model(inputs_train, mask=None, mode='train', out_frames=None)
+outputs = model(x = inputs_train, mask = mask, out_frames = None, mode = 'p')
 loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
-print(f"Train mode Loss {loss}")
+print(f"p mode Loss {loss}")
 out_frames = 4
 inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
-mask = (torch.randn(B, L).cuda() > 0).float() 
 labels_train = torch.randn(B, out_frames, args.input_ch, *args.input_size).cuda()
 opt.zero_grad()
-outputs = model(inputs_train, mode='infer', out_frames=out_frames)
+outputs = model(x = inputs_train, mask = None, out_frames = out_frames, mode = 'i')
 loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
-print(f"Infer mode Loss {loss}")
+print(f"i mode Loss {loss}")

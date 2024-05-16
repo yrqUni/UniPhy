@@ -31,10 +31,22 @@ class ConvLRU(nn.Module):
                         p.erfinv_()
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
-    def forward(self, x, mask=None, mode='train', out_frames=None):
-        x = self.embedding(x)
-        x = self.model(x, mask, mode=mode, out_frames=out_frames)
-        x = self.decoder(x)
+    def forward(self, x = None, mask = None, out_frames = None, mode = None):
+        if mode == 'p':
+            x = self.embedding(x)
+            x = self.model(x = x, mask = mask, x_t = None, hidden = None, mode = 'p')
+            x = self.decoder(x)
+        elif mode == 'i':
+            x = self.embedding(x)
+            x_hidden = self.model(x = x, mask = mask, x_t = None, hidden = None, mode = 'p')[:, -1:, :, :, :]
+            x_out = self.decoder(x_hidden)[:, -1:, :, :, :]
+            out = []
+            for _ in range(out_frames):
+                x_out = self.embedding(x_out)
+                x_hidden = self.model(x = None, mask = None, x_t = x_out, hidden = x_hidden, mode = 'i')
+                x_out = self.decoder(x_hidden)
+                out.append(x_out)
+            x = torch.cat(out, 1)
         return x
 
 class Conv_hidden(nn.Module):
@@ -133,9 +145,9 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = args.convlru_num_blocks
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
-    def forward(self, x, mask, mode='train', out_frames=None):
+    def forward(self, x = None, mask = None, x_t = None, hidden = None, mode = None):
         for lru_block in self.convlru_blocks:
-            x = lru_block.forward(x, mask, mode=mode, out_frames=out_frames)
+            x = lru_block.forward(x = x, mask = mask, x_t = x_t, hidden = hidden, mode = mode)
         return x 
 
 class ConvLRUBlock(nn.Module):
@@ -143,8 +155,8 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-    def forward(self, x, mask, mode='train', out_frames=None):
-        x = self.lru_layer(x, mask, mode=mode, out_frames=out_frames)
+    def forward(self, x = None, mask = None, x_t = None, hidden = None, mode = None):
+        x = self.lru_layer(x = x, mask = mask, x_t = x_t, hidden = hidden, mode = mode)
         x = self.feed_forward(x)
         return x
     
@@ -155,22 +167,20 @@ class ConvLRULayer(nn.Module):
         self.r_min = 0.8
         self.r_max = 0.99
         self.emb_ch = args.emb_ch 
-        self.convlru_hidden_ch = args.convlru_hidden_ch
+        self.emb_ch = args.emb_ch
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.dropout = args.convlru_dropout
         # init 
-        u1 = torch.rand(self.convlru_hidden_ch, self.hidden_size[0])
-        u2 = torch.rand(self.convlru_hidden_ch, self.hidden_size[0])
+        u1 = torch.rand(self.emb_ch, self.hidden_size[0])
+        u2 = torch.rand(self.emb_ch, self.hidden_size[0])
         nu_log = torch.log(-0.5 * torch.log(u1 * (self.r_max ** 2 - self.r_min ** 2) + self.r_min ** 2))
         theta_log = torch.log(u2 * torch.tensor(np.pi) * 2)
         diag_lambda = torch.exp(torch.complex(-torch.exp(nu_log), torch.exp(theta_log)))
         gamma_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda) ** 2))
         self.params_log = nn.Parameter(torch.vstack((nu_log, theta_log, gamma_log)))
         # define layers
-        self.proj_B = nn.Conv2d(self.emb_ch, self.convlru_hidden_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
-        self.proj_P_ = nn.Conv2d(self.convlru_hidden_ch, self.convlru_hidden_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
-        self.proj_P = nn.Conv2d(self.convlru_hidden_ch, self.convlru_hidden_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
-        self.proj_C = nn.Conv2d(self.convlru_hidden_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
+        self.proj_B = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
+        self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def convlru_parallel(self, i, h, mask, lamb, B, L, C, H, W):
@@ -188,12 +198,11 @@ class ConvLRULayer(nn.Module):
         return h, lamb 
     def convlru_parallel_mode(self, x, mask):
         B, L, _, H, W = x.size()
-        nu, theta, gamma = torch.exp(self.params_log).split((self.convlru_hidden_ch, self.convlru_hidden_ch, self.convlru_hidden_ch))
+        nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
-        h = self.proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
-        h = torch.fft.fft2(h)
-        h = self.proj_P_(h.reshape(B*L, self.convlru_hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
-        h = h * torch.diag_embed(gamma)
+        h = torch.fft.fft2(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
+        h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
+        h = h * torch.diag_embed(gamma) 
         log2_L = int(np.ceil(np.log2(L)))
         if mask is None:
             mask = torch.ones_like(h)
@@ -201,49 +210,42 @@ class ConvLRULayer(nn.Module):
             hB, hL, hC, hH, hW = h.size()
             mask = mask.reshape(hB, hL, 1, 1, 1).expand(hB, hL, hC, hH, hW)
         for i in range(log2_L):
-            h, lamb = self.convlru_parallel(i + 1, h, mask, lamb, B, L,  self.convlru_hidden_ch, H, W)
+            h, lamb = self.convlru_parallel(i + 1, h, mask, lamb, B, L,  self.emb_ch, H, W)
         h = torch.fft.ifft2(h)
-        h = self.proj_P(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.convlru_hidden_ch, H, W)
-        h = self.proj_C(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
+        h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.dropout(h)
-        h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
+        h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         x = h + x
         return x
-    def convlru_iter_mode(self, x):
-        x = x[:, -2:, :, :, :]
-        B, L, _, H, W = x.size()
-        nu, theta, gamma = torch.exp(self.params_log).split((self.convlru_hidden_ch, self.convlru_hidden_ch, self.convlru_hidden_ch))
+    def convlru_iter_mode(self, x_t, hidden):
+        hB, hL, _, hH, hW = hidden.size()
+        xB, xL, _, xH, xW = x_t.size()
+        nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
-        h = self.proj_B(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
-        h = torch.fft.fft2(h)
-        h = self.proj_P_(h.reshape(B*L, self.convlru_hidden_ch, H, W).to(torch.cfloat)).reshape(B, L, self.convlru_hidden_ch, H, W)
-        h = h * torch.diag_embed(gamma)
-        log2_L = int(np.ceil(np.log2(L)))
-        mask = torch.ones_like(h)
-        for i in range(log2_L):
-            h, lamb = self.convlru_parallel(i + 1, h, mask, lamb, B, L,  self.convlru_hidden_ch, H, W)
-        h = torch.fft.ifft2(h)
-        h = self.proj_P(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.convlru_hidden_ch, H, W)
-        h = self.proj_C(h.reshape(B*L, self.convlru_hidden_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
-        h = h.real
-        h = self.dropout(h)
-        h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W )).reshape(B, L, self.emb_ch, H, W)
-        x = h + x
-        return x
-    def forward(self, x, mask, mode='train', out_frames=None):
-        assert mode in ['train', 'infer']
-        if mode == 'train':
+        hidden = torch.fft.fft2(hidden.reshape(hB*hL, self.emb_ch, hH, hW).to(torch.cfloat)).reshape(hB, hL, self.emb_ch, hH, hW)
+        lamb = torch.diag_embed(lamb)
+        laC, laH, laW = lamb.size()
+        lamb = lamb.reshape(1, 1, laC, laH, laW).expand(hB, hL, laC, laH, laW)
+        hidden = lamb * hidden
+        hidden = torch.fft.ifft2(hidden)
+        _x_t = torch.fft.fft2(x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
+        _x_t = self.proj_B(_x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
+        _x_t = _x_t * torch.diag_embed(gamma)
+        _x_t = torch.fft.ifft2(_x_t)
+        out = hidden + _x_t
+        outB, outL, _, outH, outW = out.size()
+        out = self.proj_C(out.reshape(outB*outL, self.emb_ch, outH, outW)).reshape(outB, outL, self.emb_ch, outH, outW)
+        out = out.real
+        out = self.dropout(out)
+        out = self.layer_norm(out.reshape(outB*outL, self.emb_ch, outH, outW)).reshape(outB, outL, self.emb_ch, outH, outW)
+        out = out + x_t
+        return out
+    def forward(self, x = None, mask = None, x_t = None, hidden = None, mode = None):
+        if mode == 'p':
             x = self.convlru_parallel_mode(x, mask)
-        elif mode == 'infer':
-            x = self.convlru_parallel_mode(x, mask)
-            for _ in range(out_frames):
-                if _ == 0:
-                    _out = x[:, -1:, :, :, :]
-                else:
-                    _out = self.convlru_iter_mode(x)[:, -1:, :, :, :]
-                x = torch.cat((x[:, 1:, :, :, :], _out), 1)
-            x = x[:, -out_frames:, :, :, :]
+        elif mode == 'i':
+            x = self.convlru_iter_mode(x_t, hidden)
         return x
     
 class FeedForward(nn.Module):
@@ -272,5 +274,4 @@ class FeedForward(nn.Module):
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
-    
     
