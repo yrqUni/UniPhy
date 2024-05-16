@@ -1,5 +1,9 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
-from ConvLRU import ConvLRU
+from model.ConvLRU import ConvLRU
 
 class Args:
     # input info
@@ -10,7 +14,7 @@ class Args:
     convlru_dropout = 0.1  
     convlru_num_blocks = 12
     #
-    hidden_factor = 1
+    hidden_factor = 2
     # emb info
     emb_ch = 4
     emb_hidden_ch = 8
@@ -40,7 +44,7 @@ opt.step()
 print(f"Train mode Loss {loss}")
 out_frames = 4
 inputs_train = torch.randn(B, L, args.input_ch, args.input_size, args.input_size).cuda()
-mask = (torch.randn(B, L).cuda() > 0).float()
+mask = (torch.randn(B, L).cuda() > 0).float() 
 labels_train = torch.randn(B, out_frames, args.input_ch, args.input_size, args.input_size).cuda()
 opt.zero_grad()
 outputs = model(inputs_train, mode='infer', out_frames=out_frames)
