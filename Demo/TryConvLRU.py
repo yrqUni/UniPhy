@@ -3,7 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from Model.ConvLRU import ConvLRU, ConvLRULayer
+from Model.ConvLRU import ConvLRU
 
 class Args:
     # input info
@@ -13,6 +13,7 @@ class Args:
     emb_ch = 4
     convlru_dropout = 0.1  
     convlru_num_blocks = 12
+    convlru_return_hidden = False
     #
     hidden_factor = (3, 2)
     # emb info
@@ -37,17 +38,8 @@ opt = torch.optim.Adam(model.parameters(), lr=0.001)
 inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
 labels_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
 opt.zero_grad()
-outputs = model(x = inputs_train.detach().clone(), out_frames = None, mode = 'p')
+outputs, hiddens = model(inputs_train)
 loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
 print(f"p mode Loss {loss}")
-out_frames = 4
-inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
-labels_train = torch.randn(B, out_frames, args.input_ch, *args.input_size).cuda()
-opt.zero_grad()
-outputs = model(x = inputs_train.detach().clone(), out_frames = out_frames, mode = 'i')
-loss = loss_fn(outputs, labels_train)
-loss.backward()
-opt.step()
-print(f"i mode Loss {loss}")

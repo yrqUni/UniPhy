@@ -9,7 +9,7 @@ class ConvLRU(nn.Module):
         super().__init__()
         self.args = args
         self.embedding = Embedding(self.args)
-        self.model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
+        self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.truncated_normal_init()
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
@@ -32,23 +32,11 @@ class ConvLRU(nn.Module):
                         p.erfinv_()
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
-    def forward(self, x = None, out_frames = None, mode = None):
-        if mode == 'p':
-            x = self.embedding(x)
-            x = self.model(x)
-            x = self.decoder(x)
-        elif mode == 'i':
-            x = self.embedding(x)
-            x = self.model(x)
-            x = self.decoder(x)
-            for _ in range(out_frames):
-                _x = x[:, -1:, :, :, :]
-                _x = self.embedding(_x)
-                _x = self.model(_x)
-                _x = self.decoder(_x)
-                x = torch.cat((x, _x), dim=1)
-            x = x[:, -out_frames:, :, :, :]
-        return x
+    def forward(self, x):
+        x = self.embedding(x)
+        x, hiddens = self.convlru_model(x)
+        x = self.decoder(x)
+        return x, hiddens
 
 class Conv_hidden(nn.Module):
     def __init__(self, ch, dropout, hidden_size):
@@ -145,21 +133,31 @@ class ConvLRUModel(nn.Module):
         super().__init__()
         self.args = args
         layers = args.convlru_num_blocks
+        self.return_hidden = args.convlru_return_hidden
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
     def forward(self, x):
+        if self.return_hidden: hiddens = []
+        else: hiddens = None
         for lru_block in self.convlru_blocks:
-            x = lru_block.forward(x)
-        return x 
+            x, hidden = lru_block.forward(x)
+            if self.return_hidden: hiddens.append(hidden)
+        return x, hiddens
 
 class ConvLRUBlock(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
+        self.return_hidden = args.convlru_return_hidden
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
     def forward(self, x):
-        x = self.lru_layer(x)
-        x = self.feed_forward(x)
-        return x
+        if self.return_hidden: 
+            hidden = self.lru_layer(x)
+            x = self.feed_forward(hidden)
+            return x, hidden.detach().clone()
+        else:
+            x = self.lru_layer(x)
+            x = self.feed_forward(x)
+            return x, None
     
 class ConvLRULayer(nn.Module):
     def __init__(self, args, input_downsp_shape):
