@@ -206,11 +206,11 @@ class ConvLRULayer(nn.Module):
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
         hidden = torch.fft.fft2(hidden.reshape(hB*hL, self.emb_ch, hH, hW).to(torch.cfloat)).reshape(hB, hL, self.emb_ch, hH, hW)
-        hidden = lamb.reshape(1, 1, *lamb.shape, 1).expand(hB, hL, *gamma.shape, hW) * hidden
+        hidden = lamb.reshape(1, 1, *lamb.shape, 1).expand(hB, hL, *lamb.shape, hW) * hidden
         hidden = torch.fft.ifft2(hidden)
         _x_t = torch.fft.fft2(x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
         _x_t = self.proj_B(_x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
-        _x_t = _x_t * torch.diag_embed(gamma)
+        _x_t = _x_t * gamma.reshape(1, 1, *gamma.shape, 1).expand(xB, xL, *gamma.shape, xW)
         _x_t = torch.fft.ifft2(_x_t)
         out = hidden + _x_t
         outB, outL, _, outH, outW = out.size()
