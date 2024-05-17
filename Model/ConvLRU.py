@@ -190,7 +190,7 @@ class ConvLRULayer(nn.Module):
         lamb = torch.exp(torch.complex(-nu, theta))
         h = torch.fft.fft2(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
         h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
-        h = h * torch.diag_embed(gamma)  # TODO
+        h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1), h)
         h = torch.fft.ifft2(h)
@@ -206,10 +206,7 @@ class ConvLRULayer(nn.Module):
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
         hidden = torch.fft.fft2(hidden.reshape(hB*hL, self.emb_ch, hH, hW).to(torch.cfloat)).reshape(hB, hL, self.emb_ch, hH, hW)
-        lamb = torch.diag_embed(lamb)
-        laC, laH, laW = lamb.size()
-        lamb = lamb.reshape(1, 1, laC, laH, laW)
-        hidden = lamb * hidden
+        hidden = lamb.reshape(1, 1, *lamb.shape, 1).expand(hB, hL, *gamma.shape, hW) * hidden
         hidden = torch.fft.ifft2(hidden)
         _x_t = torch.fft.fft2(x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
         _x_t = self.proj_B(_x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
