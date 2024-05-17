@@ -35,23 +35,19 @@ class ConvLRU(nn.Module):
     def forward(self, x = None, out_frames = None, mode = None):
         if mode == 'p':
             x = self.embedding(x)
-            x = self.model(x = x, x_t = None, hidden = None, mode = 'p')
+            x = self.model(x)
             x = self.decoder(x)
-            self.aaa = x[:, -1:, :, :, :]
         elif mode == 'i':
             x = self.embedding(x)
-            x_hidden = self.model(x = x, x_t = None, hidden = None, mode = 'p')[:, -2:-1, :, :, :]
-            x_out = self.decoder(x_hidden)
-            out = []
+            x = self.model(x)
+            x = self.decoder(x)
             for _ in range(out_frames):
-                x_out = self.embedding(x_out)
-                x_hidden = self.model(x = None, x_t = x_out, hidden = x_hidden, mode = 'i')
-                x_out = self.decoder(x_hidden)
-                self.bbb = x_out
-                print(f"\n{torch.allclose(self.aaa, self.bbb)}, {(self.aaa - self.bbb).abs().max()}\n")
-                BUG
-                out.append(x_out)
-            x = torch.cat(out, 1)
+                _x = x[:, -1:, :, :, :]
+                _x = self.embedding(_x)
+                _x = self.model(_x)
+                _x = self.decoder(_x)
+                x = torch.cat((x, _x), dim=1)
+            x = x[:, -out_frames:, :, :, :]
         return x
 
 class Conv_hidden(nn.Module):
@@ -150,9 +146,9 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = args.convlru_num_blocks
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
-    def forward(self, x = None, x_t = None, hidden = None, mode = None):
+    def forward(self, x):
         for lru_block in self.convlru_blocks:
-            x = lru_block.forward(x = x, x_t = x_t, hidden = hidden, mode = mode)
+            x = lru_block.forward(x)
         return x 
 
 class ConvLRUBlock(nn.Module):
@@ -160,8 +156,8 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-    def forward(self, x = None, x_t = None, hidden = None, mode = None):
-        x = self.lru_layer(x = x, x_t = x_t, hidden = hidden, mode = mode)
+    def forward(self, x):
+        x = self.lru_layer(x)
         x = self.feed_forward(x)
         return x
     
@@ -188,7 +184,7 @@ class ConvLRULayer(nn.Module):
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
-    def convlru_parallel_mode(self, x):
+    def convlru(self, x):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
@@ -204,31 +200,8 @@ class ConvLRULayer(nn.Module):
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         x = h + x
         return x
-    def convlru_iter_mode(self, x_t, hidden):
-        hB, hL, _, hH, hW = hidden.size()
-        xB, xL, _, xH, xW = x_t.size()
-        nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
-        lamb = torch.exp(torch.complex(-nu, theta))
-        hidden = torch.fft.fft2(hidden.reshape(hB*hL, self.emb_ch, hH, hW).to(torch.cfloat)).reshape(hB, hL, self.emb_ch, hH, hW)
-        hidden = lamb.reshape(1, 1, *lamb.shape, 1).expand(hB, hL, *lamb.shape, hW) * hidden
-        hidden = torch.fft.ifft2(hidden)
-        _x_t = torch.fft.fft2(x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
-        _x_t = self.proj_B(_x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
-        _x_t = _x_t * gamma.reshape(1, 1, *gamma.shape, 1).expand(xB, xL, *gamma.shape, xW)
-        _x_t = torch.fft.ifft2(_x_t)
-        out = hidden + _x_t
-        outB, outL, _, outH, outW = out.size()
-        out = self.proj_C(out.reshape(outB*outL, self.emb_ch, outH, outW)).reshape(outB, outL, self.emb_ch, outH, outW)
-        out = out.real
-        out = self.dropout(out)
-        out = self.layer_norm(out.reshape(outB*outL, self.emb_ch, outH, outW)).reshape(outB, outL, self.emb_ch, outH, outW)
-        out = out + x_t
-        return out
-    def forward(self, x = None, x_t = None, hidden = None, mode = None):
-        if mode == 'p':
-            x = self.convlru_parallel_mode(x)
-        elif mode == 'i':
-            x = self.convlru_iter_mode(x_t, hidden)
+    def forward(self, x):
+        x = self.convlru(x)
         return x
     
 class FeedForward(nn.Module):
