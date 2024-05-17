@@ -50,18 +50,3 @@ loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
 print(f"i mode Loss {loss}")
-
-# with torch.no_grad():
-#     class Args:
-#         emb_ch = 8
-#         convlru_dropout = 0.1
-#     args = Args()
-#     convlru_layer = ConvLRULayer(args, input_downsp_shape=(args.emb_ch, 16, 16))
-#     torch.manual_seed(0)
-#     convlru_layer.eval()
-#     B, L, C, H, W = 2, 4, args.emb_ch, 16, 16
-#     x = torch.randn(B, L, C, H, W)
-#     mask = torch.ones(B, L)
-#     x_parallel_hidden = convlru_layer.convlru_parallel_mode(x, mask)
-#     x_hidden = convlru_layer.convlru_iter_mode(x[:, -1, :, :, :].unsqueeze(1) , x_parallel_hidden[:, -2, :, :, :].unsqueeze(1))
-#     # print((x_hidden - x_parallel_hidden[:, -1, :, :, :].unsqueeze(1)).abs().max())
