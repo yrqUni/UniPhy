@@ -37,15 +37,19 @@ class ConvLRU(nn.Module):
             x = self.embedding(x)
             x = self.model(x = x, x_t = None, hidden = None, mode = 'p')
             x = self.decoder(x)
+            self.aaa = x[:, -1:, :, :, :]
         elif mode == 'i':
             x = self.embedding(x)
-            x_hidden = self.model(x = x, x_t = None, hidden = None, mode = 'p')[:, -1:, :, :, :]
-            x_out = self.decoder(x_hidden)[:, -1:, :, :, :]
+            x_hidden = self.model(x = x, x_t = None, hidden = None, mode = 'p')[:, -2:-1, :, :, :]
+            x_out = self.decoder(x_hidden)
             out = []
             for _ in range(out_frames):
                 x_out = self.embedding(x_out)
                 x_hidden = self.model(x = None, x_t = x_out, hidden = x_hidden, mode = 'i')
                 x_out = self.decoder(x_hidden)
+                self.bbb = x_out
+                print(f"\n{torch.allclose(self.aaa, self.bbb)}, {(self.aaa - self.bbb).abs().max()}\n")
+                BUG
                 out.append(x_out)
             x = torch.cat(out, 1)
         return x
