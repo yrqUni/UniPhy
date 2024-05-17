@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
+from .pscan import pscan
 
 class ConvLRU(nn.Module):
     def __init__(self, args):
@@ -31,19 +32,19 @@ class ConvLRU(nn.Module):
                         p.erfinv_()
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
-    def forward(self, x = None, mask = None, out_frames = None, mode = None):
+    def forward(self, x = None, out_frames = None, mode = None):
         if mode == 'p':
             x = self.embedding(x)
-            x = self.model(x = x, mask = mask, x_t = None, hidden = None, mode = 'p')
+            x = self.model(x = x, x_t = None, hidden = None, mode = 'p')
             x = self.decoder(x)
         elif mode == 'i':
             x = self.embedding(x)
-            x_hidden = self.model(x = x, mask = mask, x_t = None, hidden = None, mode = 'p')[:, -1:, :, :, :]
+            x_hidden = self.model(x = x, x_t = None, hidden = None, mode = 'p')[:, -1:, :, :, :]
             x_out = self.decoder(x_hidden)[:, -1:, :, :, :]
             out = []
             for _ in range(out_frames):
                 x_out = self.embedding(x_out)
-                x_hidden = self.model(x = None, mask = None, x_t = x_out, hidden = x_hidden, mode = 'i')
+                x_hidden = self.model(x = None, x_t = x_out, hidden = x_hidden, mode = 'i')
                 x_out = self.decoder(x_hidden)
                 out.append(x_out)
             x = torch.cat(out, 1)
@@ -145,9 +146,9 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = args.convlru_num_blocks
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
-    def forward(self, x = None, mask = None, x_t = None, hidden = None, mode = None):
+    def forward(self, x = None, x_t = None, hidden = None, mode = None):
         for lru_block in self.convlru_blocks:
-            x = lru_block.forward(x = x, mask = mask, x_t = x_t, hidden = hidden, mode = mode)
+            x = lru_block.forward(x = x, x_t = x_t, hidden = hidden, mode = mode)
         return x 
 
 class ConvLRUBlock(nn.Module):
@@ -155,8 +156,8 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-    def forward(self, x = None, mask = None, x_t = None, hidden = None, mode = None):
-        x = self.lru_layer(x = x, mask = mask, x_t = x_t, hidden = hidden, mode = mode)
+    def forward(self, x = None, x_t = None, hidden = None, mode = None):
+        x = self.lru_layer(x = x, x_t = x_t, hidden = hidden, mode = mode)
         x = self.feed_forward(x)
         return x
     
@@ -183,34 +184,15 @@ class ConvLRULayer(nn.Module):
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
-    def convlru_parallel(self, i, h, mask, lamb, B, L, C, H, W):
-        if i == 1:
-            lamb = lamb.unsqueeze(0)
-        l = 2 ** i
-        h = h.reshape(B * L // l, l, C, H, W) 
-        mask = mask.reshape(B * L // l, l, C, H, W) 
-        h1, h2 = h[:, :l // 2, :, :, :], h[:, l // 2:, :, :, :] 
-        if i > 1: lamb = torch.cat((lamb, lamb * lamb[-1]), 0) 
-        lamb = torch.diag_embed(lamb) 
-        h2 = h2 + lamb.unsqueeze(0) * h1[:, -1:, :, :, :] * mask[:, l // 2 - 1:l // 2, :, :, :] 
-        h = torch.cat([h1, h2], axis=1) 
-        lamb = torch.diagonal(lamb, dim1=-2, dim2=-1) 
-        return h, lamb 
-    def convlru_parallel_mode(self, x, mask):
+    def convlru_parallel_mode(self, x):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
         h = torch.fft.fft2(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
         h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
-        h = h * torch.diag_embed(gamma) 
-        log2_L = int(np.ceil(np.log2(L)))
-        if mask is None:
-            mask = torch.ones_like(h)
-        else:
-            hB, hL, hC, hH, hW = h.size()
-            mask = mask.reshape(hB, hL, 1, 1, 1).expand(hB, hL, hC, hH, hW)
-        for i in range(log2_L):
-            h, lamb = self.convlru_parallel(i + 1, h, mask, lamb, B, L,  self.emb_ch, H, W)
+        h = h * torch.diag_embed(gamma)  # TODO
+        C, S = lamb.size()
+        h = pscan(lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1), h)
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
@@ -226,7 +208,7 @@ class ConvLRULayer(nn.Module):
         hidden = torch.fft.fft2(hidden.reshape(hB*hL, self.emb_ch, hH, hW).to(torch.cfloat)).reshape(hB, hL, self.emb_ch, hH, hW)
         lamb = torch.diag_embed(lamb)
         laC, laH, laW = lamb.size()
-        lamb = lamb.reshape(1, 1, laC, laH, laW).expand(hB, hL, laC, laH, laW)
+        lamb = lamb.reshape(1, 1, laC, laH, laW)
         hidden = lamb * hidden
         hidden = torch.fft.ifft2(hidden)
         _x_t = torch.fft.fft2(x_t.reshape(xB*xL, self.emb_ch, xH, xW).to(torch.cfloat)).reshape(xB, xL, self.emb_ch, xH, xW)
@@ -241,9 +223,9 @@ class ConvLRULayer(nn.Module):
         out = self.layer_norm(out.reshape(outB*outL, self.emb_ch, outH, outW)).reshape(outB, outL, self.emb_ch, outH, outW)
         out = out + x_t
         return out
-    def forward(self, x = None, mask = None, x_t = None, hidden = None, mode = None):
+    def forward(self, x = None, x_t = None, hidden = None, mode = None):
         if mode == 'p':
-            x = self.convlru_parallel_mode(x, mask)
+            x = self.convlru_parallel_mode(x)
         elif mode == 'i':
             x = self.convlru_iter_mode(x_t, hidden)
         return x
