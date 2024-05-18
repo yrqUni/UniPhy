@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 import numpy as np
 from .pscan import pscan
+# torch.autograd.set_detect_anomaly(True)
 
 class ConvLRU(nn.Module):
     def __init__(self, args):
@@ -32,11 +33,26 @@ class ConvLRU(nn.Module):
                         p.erfinv_()
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
-    def forward(self, x):
-        x = self.embedding(x)
-        x, hiddens = self.convlru_model(x)
-        x = self.decoder(x)
-        return x, hiddens
+    def forward(self, x, mode, out_frames_num=None):
+        assert mode in ['p', 'i']
+        if mode == 'p':
+            x = self.embedding(x)
+            x, _ = self.convlru_model(x, last_hiddens_in=None, convlru_return_last_hidden=False)
+            x = self.decoder(x)
+            return x
+        elif mode == 'i':
+            x = self.embedding(x)
+            x, last_hiddens_out = self.convlru_model(x, last_hiddens_in=None, convlru_return_last_hidden=True)
+            x = self.decoder(x)
+            x = x[:, -1:]
+            out = []
+            for _ in range(out_frames_num):
+                x = self.embedding(x)
+                x, last_hiddens_out = self.convlru_model(x, last_hiddens_in=last_hiddens_out, convlru_return_last_hidden=True)
+                x = self.decoder(x)[:, -1:]
+                out.append(x)
+            out = torch.concat(out, dim=1)
+            return out
 
 class Conv_hidden(nn.Module):
     def __init__(self, ch, dropout, hidden_size):
@@ -133,29 +149,35 @@ class ConvLRUModel(nn.Module):
         super().__init__()
         self.args = args
         layers = args.convlru_num_blocks
-        self.return_hidden = args.convlru_return_hidden
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
-    def forward(self, x):
-        if self.return_hidden: hiddens = []
-        else: hiddens = None
-        for lru_block in self.convlru_blocks:
-            x, hidden = lru_block.forward(x)
-            if self.return_hidden: hiddens.append(hidden)
-        return x, hiddens
+    def forward(self, x, last_hiddens_in=None, convlru_return_last_hidden=False):
+        if convlru_return_last_hidden: last_hiddens_out = []
+        else: last_hiddens_out = None
+        convlru_block_num = 0
+        for convlru_block in self.convlru_blocks:
+            if last_hiddens_in is not None: 
+                x, last_hidden_out = convlru_block.forward(x, last_hiddens_in[convlru_block_num])
+            else: 
+                x, last_hidden_out = convlru_block.forward(x, last_hidden_in=None)
+            if convlru_return_last_hidden: 
+                last_hiddens_out.append(last_hidden_out)
+            else:
+                pass
+            convlru_block_num += 1
+        return x, last_hiddens_out
 
 class ConvLRUBlock(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
-        self.return_hidden = args.convlru_return_hidden
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-    def forward(self, x):
-        if self.return_hidden: 
-            hidden = self.lru_layer(x)
-            x = self.feed_forward(hidden)
-            return x, hidden.detach().clone()
+    def forward(self, x, last_hidden_in=None, convlru_return_last_hidden=False):
+        if convlru_return_last_hidden: 
+            hidden_out = self.lru_layer(x, last_hidden_in)
+            x = self.feed_forward(hidden_out)
+            return x, hidden_out[:,-1:].detach().clone()
         else:
-            x = self.lru_layer(x)
+            x = self.lru_layer(x, last_hidden_in)
             x = self.feed_forward(x)
             return x, None
     
@@ -166,7 +188,6 @@ class ConvLRULayer(nn.Module):
         self.r_min = 0.8
         self.r_max = 0.99
         self.emb_ch = args.emb_ch 
-        self.emb_ch = args.emb_ch
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.dropout = args.convlru_dropout
         # init 
@@ -182,7 +203,9 @@ class ConvLRULayer(nn.Module):
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
-    def convlru(self, x):
+    def convlru(self, x, last_hidden_in):
+        if last_hidden_in is not None: x = torch.concat((last_hidden_in, x[:, -1:]), dim=1)
+        else: pass
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
@@ -190,7 +213,8 @@ class ConvLRULayer(nn.Module):
         h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
-        h = pscan(lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1), h)
+        if last_hidden_in is not None: h[:, 1] = h[:, 0] * lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1)
+        else: h = pscan(lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1), h)
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
@@ -198,8 +222,8 @@ class ConvLRULayer(nn.Module):
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         x = h + x
         return x
-    def forward(self, x):
-        x = self.convlru(x)
+    def forward(self, x, last_hiddens_in=None):
+        x = self.convlru(x, last_hiddens_in)
         return x
     
 class FeedForward(nn.Module):
@@ -228,4 +252,3 @@ class FeedForward(nn.Module):
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
-    

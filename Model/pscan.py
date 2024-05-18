@@ -221,7 +221,7 @@ pscan = PScan.apply
 #                 H[b, l] = A[b, l] * H[b, l - 1] + X[b, l]
 #     return H
 
-# B, L, C, S = 2, 8, 768, 32 
+# B, L, C, S = 2, 2, 768, 32 
 # A = torch.nn.Parameter(torch.rand(1, 1, C, S, 1))
 # X = torch.rand(B, L, C, S, S)
 
