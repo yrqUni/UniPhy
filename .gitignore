@@ -6,4 +6,5 @@ __pycache__/
 *.gz
 *.zip
 *log
+log*
 *.log
