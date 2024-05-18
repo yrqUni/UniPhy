@@ -37,12 +37,12 @@ opt = torch.optim.Adam(model.parameters(), lr=0.001)
 inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
 labels_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
 opt.zero_grad()
-outputs, hiddens = model(inputs_train, mode='p')
+outputs = model(inputs_train, mode='p')
 loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
 print(f"\nSuccessful! p mode Loss {loss}\n")
-del model, loss_fn, opt, inputs_train, labels_train, outputs, hiddens
+del model, loss_fn, opt, inputs_train, labels_train, outputs
 torch.cuda.empty_cache()
 gc.collect()
 

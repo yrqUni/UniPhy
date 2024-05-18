@@ -34,7 +34,7 @@ class ConvLRU(nn.Module):
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
     def forward(self, x, mode, out_frames_num=None):
-        assert mode in ['p', 'i']
+        assert mode in ['p', 'i'], f'mode should be either "p" or "i", but got {mode}'
         if mode == 'p':
             x = self.embedding(x)
             x, _ = self.convlru_model(x, last_hiddens_in=None, convlru_return_last_hidden=False)
