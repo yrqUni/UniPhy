@@ -1,7 +1,5 @@
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,7 +17,7 @@ class Args:
     # convlru info
     emb_ch = 4
     convlru_dropout = 0.1  
-    convlru_num_blocks = 3
+    convlru_num_blocks = 6
     #
     hidden_factor = (1, 1)
     # emb info
@@ -46,6 +44,7 @@ class Args:
     num_steps = 400000
     log_file = f'log_{convlru_num_blocks}'
     save_path = f'ckpt_{convlru_num_blocks}/'
+    pretrain_path = './ckpt_6/A.pth'
 args = Args()
 
 if not os.path.exists(args.save_path):
@@ -59,12 +58,23 @@ data_iter = iter(dataloader)
 
 model = ConvLRU(args).cuda()
 
+if os.path.exists(args.pretrain_path):
+    model.load_state_dict(torch.load(args.pretrain_path))
+    logging.info(f'Loaded pretrained model from {args.pretrain_path}')
+else:
+    logging.info('No pretrained model found, starting from scratch.')
+
 loss_fn = nn.CrossEntropyLoss()
 opt = optim.AdamW(model.parameters(), lr=args.lr)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.num_steps)
 
 for step in tqdm(range(args.num_steps)):
-    inputs, _ = next(data_iter)
+    try:
+        inputs, _ = next(data_iter)
+    except StopIteration:
+        data_iter = iter(dataloader)
+        inputs, _ = next(data_iter)
+
     inputs = inputs.cuda()
     opt.zero_grad()
     pred_outputs = model(inputs[:, :-1], mode='p')
