@@ -213,8 +213,8 @@ class ConvLRULayer(nn.Module):
         h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
-        if last_hidden_in is not None: h[:, 1] = h[:, 0] * lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1)
-        else: h = pscan(lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1), h)
+        if last_hidden_in is not None: h[:, 1] = h[:, 0] * lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1)
+        else: h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
