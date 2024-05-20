@@ -79,7 +79,7 @@ if os.path.exists(args.pretrain_path):
 else:
     logging.info('No pretrained model found, starting from scratch.')
 
-loss_fn = nn.MSELoss().cuda()
+loss_fn = nn.BCEWithLogitsLoss().cuda()
 opt = optim.AdamW(model.parameters(), lr=args.lr)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=len(dataloader))
 
@@ -105,7 +105,7 @@ for ep in range(args.EPs):
         inputs, outputs = inputs.cuda(), outputs.cuda()
         opt.zero_grad()
         pred_outputs = model(inputs, mode='i', out_frames_num=args.n_frames_output)
-        pred_outputs = torch.sigmoid(pred_outputs) # sigmoid
+        # pred_outputs = torch.sigmoid(pred_outputs) # sigmoid
         loss = loss_fn(pred_outputs, outputs)
         loss.backward()
         opt.step()
