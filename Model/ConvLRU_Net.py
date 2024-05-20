@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-from .pscan import pscan
+from pscan import pscan
 # torch.autograd.set_detect_anomaly(True)
 
 class ConvLRU(nn.Module):
@@ -59,7 +59,7 @@ class Conv_hidden(nn.Module):
         super().__init__()
         self.ch = ch
         self.conv = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding='same')
-        self.activation = nn.GELU()
+        self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm([self.ch, *hidden_size])
     def forward(self, x):
@@ -90,7 +90,7 @@ class Embedding(nn.Module):
         self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=3, padding='same')
         self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.dropout_rate, self.hidden_size) for _ in range(self.emb_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=3, padding='same')
-        self.activation = nn.GELU()
+        self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
@@ -127,7 +127,7 @@ class Decoder(nn.Module):
         self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=3, padding='same')
         self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, self.dropout_rate, (H, W)) for _ in range(self.dec_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=3, padding='same')
-        self.activation = nn.GELU()
+        self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
     def forward(self, x):
         B, L, _, H, W = x.size()
@@ -237,7 +237,7 @@ class FeedForward(nn.Module):
         self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=3, padding='same')
         self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.dropout_rate, self.hidden_size) for _ in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=3, padding='same')
-        self.activation = nn.GELU()
+        self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
