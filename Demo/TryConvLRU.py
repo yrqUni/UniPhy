@@ -6,33 +6,34 @@ import torch
 from Model.ModelConvLRU import ConvLRU
 
 class Args:
-    # input info
-    input_size = (64, 64)
-    input_ch = 1
-    # convlru info
-    emb_ch = 4
-    convlru_dropout = 0.1  
-    convlru_num_blocks = 12
-    #
-    hidden_factor = (1, 1)
-    use_resnet = True
-    resnet_type = 'resnet18'
-    resnet_path = './resnet_ckpt'
-    resnet_pretrained = True
-    resnet_trainable = True
-    resnet_scale_factor = 8
-    # emb info
-    emb_hidden_ch = 8
-    emb_dropout = 0.0
-    emb_hidden_layers_num = 1
-    # ffn info
-    ffn_hidden_ch = 32
-    ffn_dropout = 0.1
-    ffn_hidden_layers_num = 4
-    # dec info
-    dec_hidden_ch = 32
-    dec_dropout = 0.1
-    dec_hidden_layers_num = 8
+    def __init__(self):
+        # input info
+        self.input_size = (64, 64)
+        self.input_ch = 1
+        # convlru info
+        self.emb_ch = 4
+        self.convlru_dropout = 0.1  
+        self.convlru_num_blocks = 12
+        #
+        self.hidden_factor = (1, 1)
+        self.use_resnet = True
+        self.resnet_type = 'resnet18'
+        self.resnet_path = './resnet_ckpt'
+        self.resnet_pretrained = True
+        self.resnet_trainable = True
+        self.resnet_scale_factor = 8
+        # emb info
+        self.emb_hidden_ch = 8
+        self.emb_dropout = 0.0
+        self.emb_hidden_layers_num = 1
+        # ffn info
+        self.ffn_hidden_ch = 32
+        self.ffn_dropout = 0.1
+        self.ffn_hidden_layers_num = 4
+        # dec info
+        self.dec_hidden_ch = 32
+        self.dec_dropout = 0.1
+        self.dec_hidden_layers_num = 8
 args = Args()
 B = 2
 L = 8

@@ -15,50 +15,51 @@ from ModelConvLRU import ConvLRU
 from DATA.MMNIST import MovingMNIST 
 
 class Args:
-    # input info
-    input_size = (64, 64)
-    input_ch = 1
-    # convlru info
-    emb_ch = 12
-    convlru_dropout = 0.0
-    convlru_num_blocks = 24
-    #
-    hidden_factor = (1, 1)
-    use_resnet = False
-    resnet_type = 'resnet18'
-    resnet_path = './resnet_ckpt'
-    resnet_pretrained = True
-    resnet_trainable = True
-    resnet_scale_factor = 8
-    # emb info
-    emb_hidden_ch = 256
-    emb_dropout = 0.0
-    emb_hidden_layers_num = 4
-    # ffn info
-    ffn_hidden_ch = 32
-    ffn_dropout = 0.0
-    ffn_hidden_layers_num = 2
-    # dec info
-    dec_hidden_ch = 64
-    dec_dropout = 0.0
-    dec_hidden_layers_num = 4
-    # data info
-    root = './DATA/MMNIST/'
-    is_train = True
-    n_frames_input = 17
-    n_frames_output = 1
-    num_objects = [3]
-    num_samples = int(1e4)
-    # training info
-    batch_size = 10
-    lr = 1e-3
-    EPs = 500
-    vis = 50
-    out_path = './exp4/'
-    log_file = os.path.join(out_path, 'log')
-    ckpt_path = os.path.join(out_path, 'ckpt/')
-    vis_path = os.path.join(out_path, 'vis/')
-    pretrain_path = 'None'
+    def __init__(self):
+        # input info
+        self.input_size = (64, 64)
+        self.input_ch = 1
+        # convlru info
+        self.emb_ch = 12
+        self.convlru_dropout = 0.0
+        self.convlru_num_blocks = 12
+        #
+        self.hidden_factor = (1, 1)
+        self.use_resnet = False
+        self.resnet_type = 'resnet18'
+        self.resnet_path = './resnet_ckpt'
+        self.resnet_pretrained = True
+        self.resnet_trainable = True
+        self.resnet_scale_factor = 8
+        # emb info
+        self.emb_hidden_ch = 128
+        self.emb_dropout = 0.0
+        self.emb_hidden_layers_num = 4
+        # ffn info
+        self.ffn_hidden_ch = 32
+        self.ffn_dropout = 0.0
+        self.ffn_hidden_layers_num = 2
+        # dec info
+        self.dec_hidden_ch = 128
+        self.dec_dropout = 0.0
+        self.dec_hidden_layers_num = 4
+        # data info
+        self.root = './DATA/MMNIST/'
+        self.is_train = True
+        self.n_frames_input = 17
+        self.n_frames_output = 1
+        self.num_objects = [3]
+        self.num_samples = int(1e5)
+        # training info
+        self.batch_size = 8
+        self.lr = 1e-3
+        self.EPs = 500
+        self.vis = 50
+        self.out_path = './exp0/'
+        self.log_file = os.path.join(self.out_path, 'log')
+        self.ckpt_path = os.path.join(self.out_path, 'ckpt/')
+        self.vis_path = os.path.join(self.out_path, 'vis/')
+        self.pretrain_path = 'None'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
@@ -72,7 +73,8 @@ if not os.path.exists(args.vis_path):
     os.makedirs(args.vis_path)
 
 logging.basicConfig(filename=args.log_file, level=logging.INFO)
-logging.info(args.__str__())
+logging.info(str(args))
+print(str(args))
 
 dataset = MovingMNIST(root=args.root, is_train=args.is_train, n_frames_input=args.n_frames_input, n_frames_output=args.n_frames_output, num_objects=args.num_objects, num_samples=args.num_samples)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
