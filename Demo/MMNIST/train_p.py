@@ -112,7 +112,7 @@ for ep in range(args.EPs):
         opt.zero_grad()
         # ZERO = torch.zeros_like(inputs[:, :1]).cuda()
         # pred_outputs = model(torch.cat([ZERO, inputs[:, :-1]], dim=1), mode='p')[:, 1:]
-        pred_outputs = model(inputs[:, :-1], dim=1, mode='p')
+        pred_outputs = model(inputs[:, :-1], mode='p')
         # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
         loss = loss_fn(pred_outputs, inputs[:, 1:])
         loss.backward()
