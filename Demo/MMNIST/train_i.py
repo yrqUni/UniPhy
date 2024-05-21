@@ -72,7 +72,7 @@ if not os.path.exists(args.vis_path):
     os.makedirs(args.vis_path)
 
 logging.basicConfig(filename=args.log_file, level=logging.INFO)
-logging.info(logging.info(args.__str__()))
+logging.info(args.__str__())
 
 dataset = MovingMNIST(root=args.root, is_train=args.is_train, n_frames_input=args.n_frames_input, n_frames_output=args.n_frames_output, num_objects=args.num_objects, num_samples=args.num_samples)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
@@ -109,8 +109,9 @@ for ep in range(args.EPs):
     running_loss = 0.0
     for step, (inputs, outputs) in enumerate(tqdm(dataloader)):
         inputs, outputs = inputs.cuda(), outputs.cuda()
+        ZERO = torch.zeros_like(inputs[:, :1]).cuda()
         opt.zero_grad()
-        pred_outputs = model(inputs, mode='i', out_frames_num=args.n_frames_output)
+        pred_outputs = model(torch.cat([ZERO, inputs], dim=1), mode='i', out_frames_num=args.n_frames_output)
         # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
         loss = loss_fn(pred_outputs, outputs)
         loss.backward()

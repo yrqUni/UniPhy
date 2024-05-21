@@ -21,17 +21,17 @@ class Args:
     # convlru info
     emb_ch = 12
     convlru_dropout = 0.0
-    convlru_num_blocks = 6
+    convlru_num_blocks = 12
     #
     hidden_factor = (1, 1)
-    use_resnet = True
+    use_resnet = False
     resnet_type = 'resnet18'
     resnet_path = './resnet_ckpt'
     resnet_pretrained = True
     resnet_trainable = True
     resnet_scale_factor = 8
     # emb info
-    emb_hidden_ch = 64
+    emb_hidden_ch = 128
     emb_dropout = 0.0
     emb_hidden_layers_num = 4
     # ffn info
@@ -48,13 +48,13 @@ class Args:
     n_frames_input = 17
     n_frames_output = 1
     num_objects = [3]
-    num_samples = int(5e3)
+    num_samples = int(1e4)
     # training info
-    batch_size = 4
+    batch_size = 10
     lr = 1e-3
     EPs = 500
     vis = 50
-    out_path = './exp3/'
+    out_path = './exp4/'
     log_file = os.path.join(out_path, 'log')
     ckpt_path = os.path.join(out_path, 'ckpt/')
     vis_path = os.path.join(out_path, 'vis/')
@@ -72,7 +72,7 @@ if not os.path.exists(args.vis_path):
     os.makedirs(args.vis_path)
 
 logging.basicConfig(filename=args.log_file, level=logging.INFO)
-logging.info(logging.info(args.__str__()))
+logging.info(args.__str__())
 
 dataset = MovingMNIST(root=args.root, is_train=args.is_train, n_frames_input=args.n_frames_input, n_frames_output=args.n_frames_output, num_objects=args.num_objects, num_samples=args.num_samples)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
@@ -110,7 +110,8 @@ for ep in range(args.EPs):
     for step, (inputs, _) in enumerate(tqdm(dataloader)):
         inputs = inputs.cuda()
         opt.zero_grad()
-        pred_outputs = model(inputs[:, :-1], mode='p')
+        ZERO = torch.zeros_like(inputs[:, :1]).cuda()
+        pred_outputs = model(torch.cat([ZERO, inputs[:, :-1]], dim=1), mode='p')[:, 1:]
         # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
         loss = loss_fn(pred_outputs, inputs[:, 1:])
         loss.backward()
