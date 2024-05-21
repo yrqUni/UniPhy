@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-from pscan import pscan
+try:
+    from .pscan import pscan
+except:
+    from pscan import pscan
 # torch.autograd.set_detect_anomaly(True)
 
 class ConvLRU(nn.Module):
@@ -173,11 +176,11 @@ class ConvLRUBlock(nn.Module):
         self.feed_forward = FeedForward(args, input_downsp_shape)
     def forward(self, x, last_hidden_in=None, convlru_return_last_hidden=False):
         if convlru_return_last_hidden: 
-            hidden_out = self.lru_layer(x, last_hidden_in)
-            x = self.feed_forward(hidden_out)
-            return x, hidden_out[:,-1:].detach().clone()
+            x, last_hidden = self.lru_layer(x, last_hidden_in, convlru_return_last_hidden)
+            x = self.feed_forward(x)
+            return x, last_hidden
         else:
-            x = self.lru_layer(x, last_hidden_in)
+            x, last_hidden = self.lru_layer(x, last_hidden_in, convlru_return_last_hidden)
             x = self.feed_forward(x)
             return x, None
     
@@ -203,9 +206,7 @@ class ConvLRULayer(nn.Module):
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
-    def convlru(self, x, last_hidden_in):
-        if last_hidden_in is not None: x = torch.concat((last_hidden_in, x[:, -1:]), dim=1)
-        else: pass
+    def convlru(self, x, last_hidden_in, convlru_return_last_hidden):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
@@ -213,18 +214,22 @@ class ConvLRULayer(nn.Module):
         h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
+        if last_hidden_in is not None: x = torch.concat((last_hidden_in, x[:, -1:]), dim=1)
+        else: pass
         if last_hidden_in is not None: h[:, 1] = h[:, 0] * lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1)
         else: h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
+        if convlru_return_last_hidden: _h = h[:, -1:].detach().clone()
+        else: _h = None
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.dropout(h)
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         x = h + x
-        return x
-    def forward(self, x, last_hiddens_in=None):
-        x = self.convlru(x, last_hiddens_in)
-        return x
+        return x, _h
+    def forward(self, x, last_hiddens_in=None, convlru_return_last_hidden=False):
+        x, _h = self.convlru(x, last_hiddens_in, convlru_return_last_hidden)
+        return x, _h
     
 class FeedForward(nn.Module):
     def __init__(self, args, input_downsp_shape):

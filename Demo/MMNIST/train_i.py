@@ -11,7 +11,7 @@ from tqdm import tqdm
 import logging
 import matplotlib.pyplot as plt
 
-from ConvLRU_Net import ConvLRU 
+from ModelConvLRU import ConvLRU 
 from DATA.MMNIST import MovingMNIST 
 
 class Args:
@@ -41,18 +41,18 @@ class Args:
     is_train = True
     n_frames_input = 8
     n_frames_output = 8
-    num_objects = [3]
+    num_objects = [2]
     num_samples = int(5e3)
     # training info
     batch_size = 20
     lr = 1e-3
     EPs = 500
     vis = 50
-    out_path = './exp3/'
+    out_path = './exp0/'
     log_file = os.path.join(out_path, 'log')
     ckpt_path = os.path.join(out_path, 'ckpt/')
     vis_path = os.path.join(out_path, 'vis/')
-    pretrain_path = 'None'
+    pretrain_path = './230_250.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
@@ -66,7 +66,7 @@ if not os.path.exists(args.vis_path):
     os.makedirs(args.vis_path)
 
 logging.basicConfig(filename=args.log_file, level=logging.INFO)
-logging.info(args)
+logging.info(logging.info(args.__str__()))
 
 dataset = MovingMNIST(root=args.root, is_train=args.is_train, n_frames_input=args.n_frames_input, n_frames_output=args.n_frames_output, num_objects=args.num_objects, num_samples=args.num_samples)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
@@ -105,7 +105,7 @@ for ep in range(args.EPs):
         inputs, outputs = inputs.cuda(), outputs.cuda()
         opt.zero_grad()
         pred_outputs = model(inputs, mode='i', out_frames_num=args.n_frames_output)
-        # pred_outputs = torch.sigmoid(pred_outputs) # sigmoid
+        # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
         loss = loss_fn(pred_outputs, outputs)
         loss.backward()
         opt.step()

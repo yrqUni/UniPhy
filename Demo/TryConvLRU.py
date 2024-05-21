@@ -3,7 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gc
 import torch
-from Model.ConvLRU_Net import ConvLRU
+from Model.ModelConvLRU import ConvLRU
 
 class Args:
     # input info
