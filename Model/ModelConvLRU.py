@@ -1,5 +1,7 @@
+import os
 import torch
 import torch.nn as nn
+from torchvision import models
 import math
 import numpy as np
 try:
@@ -12,9 +14,13 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.embedding = Embedding(self.args)
+        if args.use_resnet:
+            self.embedding = ResNetEmbedding(self.args)
+            self.decoder = ResNetDecoder(self.args, self.embedding.input_downsp_shape)
+        else:
+            self.embedding = Embedding(self.args)
+            self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
-        self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.truncated_normal_init()
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
         with torch.no_grad():
@@ -56,6 +62,96 @@ class ConvLRU(nn.Module):
                 out.append(x)
             out = torch.concat(out, dim=1)
             return out
+
+class ResNetEmbedding(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        resnet_type = args.resnet_type
+        resnet_path = args.resnet_path
+        pretrained = args.resnet_pretrained
+        trainable = args.resnet_trainable
+        input_size = args.input_size
+        self.output_ch = args.emb_ch
+        if pretrained:
+            try:
+                resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+            except:
+                resnet = getattr(models, resnet_type.lower())(pretrained=False)
+                weight_path = os.path.join(resnet_path, f'{resnet_type}_pretrained.pth')
+                resnet.load_state_dict(torch.load(weight_path))
+        self.features = nn.Sequential(*list(resnet.children())[:-2])
+        if not trainable:
+            for param in self.features.parameters():
+                param.requires_grad = False
+        self.upsample_in = nn.Upsample(scale_factor=args.resnet_scale_factor, mode='bilinear', align_corners=True)
+        self.pre_conv = nn.Conv2d(args.input_ch, 3, kernel_size=3, padding='same')
+        with torch.no_grad():
+            sample_input = torch.zeros(1, args.input_ch, *input_size)
+            sample_input = self.upsample_in(sample_input)
+            sample_output = self.features(self.pre_conv(sample_input))
+            output_size = (sample_output.size(2), sample_output.size(3))
+        scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
+        self.upsample_out = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+        self.downsp = nn.Conv2d(in_channels=resnet.inplanes, out_channels=self.output_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
+        with torch.no_grad():
+            x = torch.zeros(1, resnet.inplanes, *input_size)
+            x = self.downsp(x)
+            _, C, H, W = x.size()
+            self.input_downsp_shape = (C, H, W)
+    def forward(self, x):
+        B, L, C, H, W = x.size()
+        x = x.view(B * L, C, H, W)
+        x = self.upsample_in(x)
+        x = self.pre_conv(x)  
+        x = self.features(x)
+        x = self.upsample_out(x)
+        x = self.downsp(x)
+        _, C, H, W = x.size()
+        x = x.view(B, L, C, H, W)
+        return x
+
+class ResNetDecoder(nn.Module):
+    def __init__(self, args, input_downsp_shape):
+        super().__init__()
+        resnet_type = args.resnet_type
+        resnet_path = args.resnet_path
+        pretrained = args.resnet_pretrained
+        trainable = args.resnet_trainable
+        output_ch = args.input_ch
+        if pretrained:
+            try:
+                resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
+            except:
+                resnet = getattr(models, resnet_type.lower())(pretrained=False)
+                weight_path = os.path.join(resnet_path, f'{resnet_type}_pretrained.pth')
+                resnet.load_state_dict(torch.load(weight_path))
+        self.features = nn.Sequential(*list(resnet.children())[:-2])
+        if not trainable:
+            for param in self.features.parameters():
+                param.requires_grad = False
+        self.upsample_in = nn.Upsample(scale_factor=args.resnet_scale_factor, mode='bilinear', align_corners=True)
+        self.pre_conv = nn.Conv2d(args.emb_ch, 3, kernel_size=3, padding='same')  
+        with torch.no_grad():
+            sample_input = torch.zeros(1, args.emb_ch, *input_downsp_shape[1:])
+            sample_input = self.upsample_in(sample_input)
+            sample_output = self.features(self.pre_conv(sample_input))
+            output_size = (sample_output.size(2), sample_output.size(3))
+        scale_factor = (input_downsp_shape[1] / output_size[0], input_downsp_shape[2] / output_size[1])
+        self.upsample_out = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+        self.upsp = nn.ConvTranspose2d(in_channels=resnet.inplanes, out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
+        self.out_conv = nn.Conv2d(in_channels=input_downsp_shape[0], out_channels=output_ch, kernel_size=1, padding='same')
+    def forward(self, x):
+        B, L, C, H, W = x.size()
+        x = x.view(B * L, C, H, W)
+        x = self.upsample_in(x)
+        x = self.pre_conv(x) 
+        x = self.features(x)
+        x = self.upsample_out(x)
+        x = self.upsp(x)
+        x = self.out_conv(x)
+        _, C, H, W = x.size()
+        x = x.view(B, L, C, H, W)
+        return x
 
 class Conv_hidden(nn.Module):
     def __init__(self, ch, dropout, hidden_size):

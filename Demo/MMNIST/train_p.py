@@ -24,6 +24,12 @@ class Args:
     convlru_num_blocks = 6
     #
     hidden_factor = (1, 1)
+    use_resnet = True
+    resnet_type = 'resnet18'
+    resnet_path = './resnet_ckpt'
+    resnet_pretrained = True
+    resnet_trainable = True
+    resnet_scale_factor = 8
     # emb info
     emb_hidden_ch = 64
     emb_dropout = 0.0

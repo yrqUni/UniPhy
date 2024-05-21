@@ -7,14 +7,20 @@ from Model.ModelConvLRU import ConvLRU
 
 class Args:
     # input info
-    input_size = (300, 200)
+    input_size = (64, 64)
     input_ch = 1
     # convlru info
     emb_ch = 4
     convlru_dropout = 0.1  
     convlru_num_blocks = 12
     #
-    hidden_factor = (3, 2)
+    hidden_factor = (1, 1)
+    use_resnet = True
+    resnet_type = 'resnet18'
+    resnet_path = './resnet_ckpt'
+    resnet_pretrained = True
+    resnet_trainable = True
+    resnet_scale_factor = 8
     # emb info
     emb_hidden_ch = 8
     emb_dropout = 0.0
