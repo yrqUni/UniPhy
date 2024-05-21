@@ -314,7 +314,7 @@ class ConvLRULayer(nn.Module):
         else: pass
         if last_hidden_in is not None: h[:, 1] = h[:, 0] * lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1)
         else: h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
-        if convlru_return_last_hidden: _h = h[:, -1:].detach().clone()
+        if convlru_return_last_hidden: _h = h[:, -1:] # Maybe .detach().clone() is needed
         else: _h = None
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)

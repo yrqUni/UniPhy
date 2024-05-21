@@ -24,7 +24,7 @@ class Args:
     convlru_num_blocks = 6
     #
     hidden_factor = (1, 1)
-    use_resnet = True
+    use_resnet = False
     resnet_type = 'resnet18'
     resnet_path = './resnet_ckpt'
     resnet_pretrained = True
@@ -50,15 +50,15 @@ class Args:
     num_objects = [2]
     num_samples = int(5e3)
     # training info
-    batch_size = 4
+    batch_size = 16
     lr = 1e-3
     EPs = 500
     vis = 50
-    out_path = './exp1/'
+    out_path = './exp2/'
     log_file = os.path.join(out_path, 'log')
     ckpt_path = os.path.join(out_path, 'ckpt/')
     vis_path = os.path.join(out_path, 'vis/')
-    pretrain_path = 'None'
+    pretrain_path = '230_250.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
