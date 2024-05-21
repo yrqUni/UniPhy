@@ -54,7 +54,7 @@ class ConvLRULayer(nn.Module):
         h = self.proj_B(h.reshape(B*L, self.d_model, H, W).to(torch.cfloat)).reshape(B, L, self.d_model, H, W)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
-        h = pscan(lamb.reshape(1, 1, C, S, 1).expand(1, 1, C, S, 1), h)
+        h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.d_model, H, W)).reshape(B, L, self.d_model, H, W)
         h = h.real
