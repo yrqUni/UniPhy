@@ -100,14 +100,14 @@ class ResNetEmbedding(nn.Module):
             self.input_downsp_shape = (C, H, W)
     def forward(self, x):
         B, L, C, H, W = x.size()
-        x = x.view(B * L, C, H, W)
+        x = x.reshape(B * L, C, H, W)
         x = self.upsample_in(x)
         x = self.pre_conv(x)  
         x = self.features(x)
         x = self.upsample_out(x)
         x = self.downsp(x)
         _, C, H, W = x.size()
-        x = x.view(B, L, C, H, W)
+        x = x.reshape(B, L, C, H, W)
         return x
 
 class ResNetDecoder(nn.Module):
@@ -142,7 +142,7 @@ class ResNetDecoder(nn.Module):
         self.out_conv = nn.Conv2d(in_channels=input_downsp_shape[0], out_channels=output_ch, kernel_size=1, padding='same')
     def forward(self, x):
         B, L, C, H, W = x.size()
-        x = x.view(B * L, C, H, W)
+        x = x.reshape(B * L, C, H, W)
         x = self.upsample_in(x)
         x = self.pre_conv(x) 
         x = self.features(x)
@@ -150,7 +150,7 @@ class ResNetDecoder(nn.Module):
         x = self.upsp(x)
         x = self.out_conv(x)
         _, C, H, W = x.size()
-        x = x.view(B, L, C, H, W)
+        x = x.reshape(B, L, C, H, W)
         return x
 
 class Conv_hidden(nn.Module):
