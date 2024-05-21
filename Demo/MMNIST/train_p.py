@@ -21,7 +21,7 @@ class Args:
     # convlru info
     emb_ch = 12
     convlru_dropout = 0.0
-    convlru_num_blocks = 12
+    convlru_num_blocks = 24
     #
     hidden_factor = (1, 1)
     use_resnet = False
@@ -31,7 +31,7 @@ class Args:
     resnet_trainable = True
     resnet_scale_factor = 8
     # emb info
-    emb_hidden_ch = 128
+    emb_hidden_ch = 256
     emb_dropout = 0.0
     emb_hidden_layers_num = 4
     # ffn info
