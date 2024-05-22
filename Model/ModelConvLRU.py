@@ -14,12 +14,8 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        if args.use_resnet:
-            self.embedding = ResNetEmbedding(self.args)
-            self.decoder = ResNetDecoder(self.args, self.embedding.input_downsp_shape)
-        else:
-            self.embedding = Embedding(self.args)
-            self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
+        self.embedding = Embedding(self.args)
+        self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.truncated_normal_init()
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
@@ -46,118 +42,23 @@ class ConvLRU(nn.Module):
         assert mode in ['p', 'i'], f'mode should be either "p" or "i", but got {mode}'
         if mode == 'p':
             x = self.embedding(x)
-            x, _ = self.convlru_model(x, last_hiddens_in=None, convlru_return_last_hidden=False)
+            x, _ = self.convlru_model(x, last_hidden_in=None)
             x = self.decoder(x)
             return x
         elif mode == 'i':
+            out = []
             x = self.embedding(x)
-            x, last_hiddens_out = self.convlru_model(x, last_hiddens_in=None, convlru_return_last_hidden=True)
+            x, last_hiddens_out = self.convlru_model(x, last_hidden_in=None)
             x = self.decoder(x)
             x = x[:, -1:]
-            out = []
-            for _ in range(out_frames_num):
-                x = self.embedding(x)
-                x, last_hiddens_out = self.convlru_model(x, last_hiddens_in=last_hiddens_out, convlru_return_last_hidden=True)
+            out.append(torch.sigmoid(x))
+            for i in range(out_frames_num-1):
+                x = self.embedding(out[i])
+                x, last_hiddens_out = self.convlru_model(x, last_hidden_in=last_hiddens_out)
                 x = self.decoder(x)[:, -1:]
-                out.append(x)
+                out.append(torch.sigmoid(x))
             out = torch.concat(out, dim=1)
             return out
-
-############################################################################################################
-# TODO: ResNetEmbedding and ResNetDecoder maybe wrong, need to be checked.
-############################################################################################################
-class ResNetEmbedding(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        resnet_type = args.resnet_type
-        resnet_path = args.resnet_path
-        pretrained = args.resnet_pretrained
-        trainable = args.resnet_trainable
-        input_size = args.input_size
-        self.output_ch = args.emb_ch
-        if pretrained:
-            try:
-                resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
-            except:
-                resnet = getattr(models, resnet_type.lower())(pretrained=False)
-                weight_path = os.path.join(resnet_path, f'{resnet_type}_pretrained.pth')
-                resnet.load_state_dict(torch.load(weight_path))
-        self.features = nn.Sequential(*list(resnet.children())[:-2])
-        if not trainable:
-            for param in self.features.parameters():
-                param.requires_grad = False
-        self.upsample_in = nn.Upsample(scale_factor=args.resnet_scale_factor, mode='bilinear', align_corners=True)
-        self.pre_conv = nn.Conv2d(args.input_ch, 3, kernel_size=3, padding='same')
-        with torch.no_grad():
-            sample_input = torch.zeros(1, args.input_ch, *input_size)
-            sample_input = self.upsample_in(sample_input)
-            sample_output = self.features(self.pre_conv(sample_input))
-            output_size = (sample_output.size(2), sample_output.size(3))
-        scale_factor = (input_size[0] / output_size[0], input_size[1] / output_size[1])
-        self.upsample_out = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
-        self.downsp = nn.Conv2d(in_channels=resnet.inplanes, out_channels=self.output_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
-        with torch.no_grad():
-            x = torch.zeros(1, resnet.inplanes, *input_size)
-            x = self.downsp(x)
-            _, C, H, W = x.size()
-            self.input_downsp_shape = (C, H, W)
-    def forward(self, x):
-        B, L, C, H, W = x.size()
-        x = x.reshape(B * L, C, H, W)
-        x = self.upsample_in(x)
-        x = self.pre_conv(x)  
-        x = self.features(x)
-        x = self.upsample_out(x)
-        x = self.downsp(x)
-        _, C, H, W = x.size()
-        x = x.reshape(B, L, C, H, W)
-        return x
-
-class ResNetDecoder(nn.Module):
-    def __init__(self, args, input_downsp_shape):
-        super().__init__()
-        resnet_type = args.resnet_type
-        resnet_path = args.resnet_path
-        pretrained = args.resnet_pretrained
-        trainable = args.resnet_trainable
-        output_ch = args.input_ch
-        if pretrained:
-            try:
-                resnet = getattr(models, resnet_type.lower())(pretrained=pretrained)
-            except:
-                resnet = getattr(models, resnet_type.lower())(pretrained=False)
-                weight_path = os.path.join(resnet_path, f'{resnet_type}_pretrained.pth')
-                resnet.load_state_dict(torch.load(weight_path))
-        self.features = nn.Sequential(*list(resnet.children())[:-2])
-        if not trainable:
-            for param in self.features.parameters():
-                param.requires_grad = False
-        self.upsample_in = nn.Upsample(scale_factor=args.resnet_scale_factor, mode='bilinear', align_corners=True)
-        self.pre_conv = nn.Conv2d(args.emb_ch, 3, kernel_size=3, padding='same')  
-        with torch.no_grad():
-            sample_input = torch.zeros(1, args.emb_ch, *input_downsp_shape[1:])
-            sample_input = self.upsample_in(sample_input)
-            sample_output = self.features(self.pre_conv(sample_input))
-            output_size = (sample_output.size(2), sample_output.size(3))
-        scale_factor = (input_downsp_shape[1] / output_size[0], input_downsp_shape[2] / output_size[1])
-        self.upsample_out = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
-        self.upsp = nn.ConvTranspose2d(in_channels=resnet.inplanes, out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
-        self.out_conv = nn.Conv2d(in_channels=input_downsp_shape[0], out_channels=output_ch, kernel_size=1, padding='same')
-    def forward(self, x):
-        B, L, C, H, W = x.size()
-        x = x.reshape(B * L, C, H, W)
-        x = self.upsample_in(x)
-        x = self.pre_conv(x) 
-        x = self.features(x)
-        x = self.upsample_out(x)
-        x = self.upsp(x)
-        x = self.out_conv(x)
-        _, C, H, W = x.size()
-        x = x.reshape(B, L, C, H, W)
-        return x
-############################################################################################################
-# ResNetEmbedding and ResNetDecoder END.
-############################################################################################################
 
 class Conv_hidden(nn.Module):
     def __init__(self, ch, dropout, hidden_size):
@@ -255,19 +156,13 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = args.convlru_num_blocks
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
-    def forward(self, x, last_hiddens_in=None, convlru_return_last_hidden=False):
-        if convlru_return_last_hidden: last_hiddens_out = []
-        else: last_hiddens_out = None
+    def forward(self, x, last_hidden_in=None):
+        last_hiddens_out = []
         convlru_block_num = 0
         for convlru_block in self.convlru_blocks:
-            if last_hiddens_in is not None: 
-                x, last_hidden_out = convlru_block.forward(x, last_hiddens_in[convlru_block_num])
-            else: 
-                x, last_hidden_out = convlru_block.forward(x, last_hidden_in=None)
-            if convlru_return_last_hidden: 
-                last_hiddens_out.append(last_hidden_out)
-            else:
-                pass
+            if last_hidden_in is not None: x = convlru_block.forward(x, last_hidden_in[convlru_block_num])
+            else: x = convlru_block.forward(x, None)
+            last_hiddens_out.append(x[:, -1:])
             convlru_block_num += 1
         return x, last_hiddens_out
 
@@ -276,16 +171,15 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-    def forward(self, x, last_hidden_in=None, convlru_return_last_hidden=False):
-        if convlru_return_last_hidden: 
-            x, last_hidden = self.lru_layer(x, last_hidden_in, convlru_return_last_hidden)
-            x = self.feed_forward(x)
-            return x, last_hidden
-        else:
-            x, last_hidden = self.lru_layer(x, last_hidden_in, convlru_return_last_hidden)
-            x = self.feed_forward(x)
-            return x, None
-    
+    def forward(self, x, last_hidden_in=None):
+        if last_hidden_in is not None: 
+            assert torch.allclose(last_hidden_in, x[:, -2].unsqueeze(1)), 'The stored output of the previous layer at moment t-1 (hidden, h) is not equal to the \
+                output of the previous layer at moment t-1 (hidden, h) computed in real time!!!!'
+            x = torch.concat([last_hidden_in, x[:, -1:]], dim=1)
+        x = self.lru_layer(x)
+        x = self.feed_forward(x)
+        return x
+        
 class ConvLRULayer(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
@@ -308,7 +202,7 @@ class ConvLRULayer(nn.Module):
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
-    def convlru(self, x, last_hidden_in, convlru_return_last_hidden):
+    def convlru(self, x):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
@@ -316,22 +210,17 @@ class ConvLRULayer(nn.Module):
         h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
-        if last_hidden_in is not None: x = torch.concat((last_hidden_in, x[:, -1:]), dim=1)
-        else: pass
-        if last_hidden_in is not None: h[:, 1] = h[:, 0] * lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1)
-        else: h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
-        if convlru_return_last_hidden: _h = h[:, -1:] # Maybe .detach().clone() is needed
-        else: _h = None
+        h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.dropout(h)
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         x = h + x
-        return x, _h
-    def forward(self, x, last_hiddens_in=None, convlru_return_last_hidden=False):
-        x, _h = self.convlru(x, last_hiddens_in, convlru_return_last_hidden)
-        return x, _h
+        return x
+    def forward(self, x):
+        x = self.convlru(x)
+        return x
     
 class FeedForward(nn.Module):
     def __init__(self, args, input_downsp_shape):

@@ -20,23 +20,17 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 12
+        self.emb_ch = 256
         self.convlru_dropout = 0.0
-        self.convlru_num_blocks = 12
+        self.convlru_num_blocks = 24
         #
-        self.hidden_factor = (1, 1)
-        self.use_resnet = False
-        self.resnet_type = 'resnet18'
-        self.resnet_path = './resnet_ckpt'
-        self.resnet_pretrained = True
-        self.resnet_trainable = True
-        self.resnet_scale_factor = 8
+        self.hidden_factor = (2, 2)
         # emb info
         self.emb_hidden_ch = 128
         self.emb_dropout = 0.0
         self.emb_hidden_layers_num = 4
         # ffn info
-        self.ffn_hidden_ch = 32
+        self.ffn_hidden_ch = 128
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
@@ -51,11 +45,11 @@ class Args:
         self.num_objects = [2]
         self.num_samples = int(5e3)
         # training info
-        self.batch_size = 8
-        self.lr = 1e-3
+        self.batch_size = 2
+        self.lr = 1e-1
         self.EPs = 500
         self.vis = 50
-        self.out_path = './exp1/'
+        self.out_path = './exp3/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.ckpt_path = os.path.join(self.out_path, 'ckpt/')
         self.vis_path = os.path.join(self.out_path, 'vis/')
@@ -125,7 +119,8 @@ for ep in range(args.EPs):
             avg_loss = running_loss / args.vis
             current_lr = scheduler.get_last_lr()[0]
             logging.info(f'Step {step+1}, Epoch {ep}, Average Loss: {avg_loss}, LR: {current_lr}')
-            torch.save(model.state_dict(), os.path.join(args.ckpt_path, f'{ep}_{step+1}.pth'))
+            # torch.save(model.state_dict(), os.path.join(args.ckpt_path, f'{ep}_{step+1}.pth'))
+            torch.save(model.state_dict(), os.path.join(args.ckpt_path, f'A.pth'))
             tqdm.write(f'Step {step+1}, Epoch {ep}, Average Loss: {avg_loss}, LR: {current_lr}')
             running_loss = 0.0
             visualize(outputs, pred_outputs, ep, step + 1)

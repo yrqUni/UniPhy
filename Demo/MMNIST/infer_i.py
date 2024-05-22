@@ -20,45 +20,39 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 12
+        self.emb_ch = 256
         self.convlru_dropout = 0.0
-        self.convlru_num_blocks = 6
+        self.convlru_num_blocks = 24
         #
-        self.hidden_factor = (1, 1)
-        self.use_resnet = True
-        self.resnet_type = 'resnet18'
-        self.resnet_path = './resnet_ckpt'
-        self.resnet_pretrained = False
-        self.resnet_trainable = True
-        self.resnet_scale_factor = 8
+        self.hidden_factor = (2, 2)
         # emb info
-        self.emb_hidden_ch = 64
+        self.emb_hidden_ch = 128
         self.emb_dropout = 0.0
         self.emb_hidden_layers_num = 4
         # ffn info
-        self.ffn_hidden_ch = 32
+        self.ffn_hidden_ch = 128
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_hidden_ch = 64
+        self.dec_hidden_ch = 128
         self.dec_dropout = 0.0
         self.dec_hidden_layers_num = 4
         # data info
         self.root = './DATA/MMNIST/'
         self.is_train = True
-        self.n_frames_input = 8
-        self.n_frames_output = 8
-        self.num_objects = [2]
+        self.n_frames_input = 16
+        self.n_frames_output = 32
+        self.num_objects = [3]
         self.num_samples = int(5e3)
         # training info
-        self.batch_size = 20
+        self.batch_size = 8
         self.lr = 1e-3
         self.EPs = 500
-        self.vis = 50
-        self.out_path = './exp1/'
+        self.vis = 1
+        self.out_path = './exp5/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = './230_250.pth'
+        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp2/ckpt/A.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())

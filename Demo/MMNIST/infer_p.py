@@ -5,7 +5,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model'))
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
@@ -20,23 +19,17 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 12
+        self.emb_ch = 256
         self.convlru_dropout = 0.0
-        self.convlru_num_blocks = 12
+        self.convlru_num_blocks = 24
         #
-        self.hidden_factor = (1, 1)
-        self.use_resnet = False
-        self.resnet_type = 'resnet18'
-        self.resnet_path = './resnet_ckpt'
-        self.resnet_pretrained = True
-        self.resnet_trainable = True
-        self.resnet_scale_factor = 8
+        self.hidden_factor = (2, 2)
         # emb info
         self.emb_hidden_ch = 128
         self.emb_dropout = 0.0
         self.emb_hidden_layers_num = 4
         # ffn info
-        self.ffn_hidden_ch = 32
+        self.ffn_hidden_ch = 128
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
@@ -46,19 +39,19 @@ class Args:
         # data info
         self.root = './DATA/MMNIST/'
         self.is_train = True
-        self.n_frames_input = 8
-        self.n_frames_output = 8
-        self.num_objects = [2]
+        self.n_frames_input = 16
+        self.n_frames_output = 32
+        self.num_objects = [3]
         self.num_samples = int(5e3)
         # training info
         self.batch_size = 20
         self.lr = 1e-3
         self.EPs = 500
-        self.vis = 50
-        self.out_path = './exp2/'
+        self.vis = 1
+        self.out_path = './exp5/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp0/ckpt/5_3600.pth'
+        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp2/ckpt/A.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
@@ -106,11 +99,14 @@ running_loss = 0.0
 with torch.no_grad():
     for step, (inputs, outputs) in enumerate(tqdm(dataloader)):
         inputs, outputs = inputs.cuda(), outputs.cuda()
-        for i in range(args.n_frames_output):
-            pred_outputs = model(inputs[:, i:], mode='p')[:, -1:]
-            inputs = torch.cat([inputs, pred_outputs], dim=1)
-        pred_outputs = inputs[:, -args.n_frames_input:]
-        # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
+        out = []
+        pred_outputs = model(inputs, mode='p')[:, -1:]
+        out.append(pred_outputs)
+        for i in range(args.n_frames_output-1):
+            inputs = torch.cat([inputs[:, 1:], torch.sigmoid(out[i])], dim=1)
+            pred_outputs = model(inputs, mode='p')[:, -1:]
+            out.append(pred_outputs)
+        pred_outputs = torch.cat(out, dim=1)
         loss = loss_fn(pred_outputs, outputs)
         running_loss += loss.item()
         if (step + 1) % args.vis == 0:
@@ -118,6 +114,6 @@ with torch.no_grad():
             logging.info(f'Step {step+1}, Average Loss: {avg_loss}')
             tqdm.write(f'Step {step+1}, Average Loss: {avg_loss}')
             running_loss = 0.0
-            visualize(outputs, pred_outputs, step + 1, )
+            visualize(outputs, pred_outputs, step + 1)
 
 logging.shutdown()
