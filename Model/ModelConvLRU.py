@@ -63,6 +63,9 @@ class ConvLRU(nn.Module):
             out = torch.concat(out, dim=1)
             return out
 
+############################################################################################################
+# TODO: ResNetEmbedding and ResNetDecoder maybe wrong, need to be checked.
+############################################################################################################
 class ResNetEmbedding(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -152,6 +155,9 @@ class ResNetDecoder(nn.Module):
         _, C, H, W = x.size()
         x = x.reshape(B, L, C, H, W)
         return x
+############################################################################################################
+# ResNetEmbedding and ResNetDecoder END.
+############################################################################################################
 
 class Conv_hidden(nn.Module):
     def __init__(self, ch, dropout, hidden_size):
