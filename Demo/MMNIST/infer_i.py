@@ -45,7 +45,7 @@ class Args:
         self.num_objects = [3]
         self.num_samples = int(5e3)
         # training info
-        self.batch_size = 8
+        self.batch_size = 16
         self.lr = 1e-3
         self.EPs = 500
         self.vis = 1
