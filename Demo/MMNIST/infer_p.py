@@ -40,7 +40,7 @@ class Args:
         self.root = './DATA/MMNIST/'
         self.is_train = True
         self.n_frames_input = 16
-        self.n_frames_output = 32
+        self.n_frames_output = 16
         self.num_objects = [3]
         self.num_samples = int(5e3)
         # training info
@@ -77,7 +77,7 @@ if os.path.exists(args.pretrain_path):
 else:
     logging.info('No pretrained model found, starting from scratch.')
 
-loss_fn = nn.BCEWithLogitsLoss().cuda()
+loss_fn = nn.BCELoss().cuda()
 
 def visualize(GTs, PREDs, step):
     L = GTs.size(1)
@@ -87,7 +87,7 @@ def visualize(GTs, PREDs, step):
         axes[0, i].imshow(GTs[0, i].cpu().numpy(), cmap='gray')
         axes[0, i].set_title(f"GT {i}")
         axes[0, i].axis('off')
-        axes[1, i].imshow(torch.sigmoid(PREDs[0, i]).cpu().detach().numpy(), cmap='gray')
+        axes[1, i].imshow(PREDs[0, i].cpu().detach().numpy(), cmap='gray')
         axes[1, i].set_title(f"Pred {i}")
         axes[1, i].axis('off')
     plt.tight_layout()
@@ -100,11 +100,11 @@ with torch.no_grad():
     for step, (inputs, outputs) in enumerate(tqdm(dataloader)):
         inputs, outputs = inputs.cuda(), outputs.cuda()
         out = []
-        pred_outputs = model(inputs, mode='p')[:, -1:]
+        pred_outputs = model(inputs, mode='p_sigmoid')[:, -1:]
         out.append(pred_outputs)
         for i in range(args.n_frames_output-1):
-            inputs = torch.cat([inputs[:, 1:], torch.sigmoid(out[i])], dim=1)
-            pred_outputs = model(inputs, mode='p')[:, -1:]
+            inputs = torch.cat([inputs[:, 1:], out[i]], dim=1)
+            pred_outputs = model(inputs, mode='p_sigmoid')[:, -1:]
             out.append(pred_outputs)
         pred_outputs = torch.cat(out, dim=1)
         loss = loss_fn(pred_outputs, outputs)

@@ -1214,7 +1214,7 @@ A = torch.nn.Parameter(torch.rand(1, 1, C, S, 1))
 X = torch.rand(B, L, C, S, S)
 
 pscan_result_p = pscan(A.expand(B, L, C, S, 1), X)
-# pscan_result_i = A.expand(B, 2, C, S, 1) * pscan_result_p[:,-2].unsqueeze(1) + X[:, -1:]
+# pscan_result_i = A.expand(B, 1, C, S, 1) * pscan_result_p[:,-2].unsqueeze(1) + X[:, -1:]
 pscan_result_i = pscan(A.expand(B, 2, C, S, 1), torch.concat([pscan_result_p[:,-2].unsqueeze(1).clone(),X[:, -1:].clone()], dim=1))
 serial_scan_result = serial_scan(A.expand(B, L, C, S, 1), X)
 

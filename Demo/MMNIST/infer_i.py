@@ -41,7 +41,7 @@ class Args:
         self.root = './DATA/MMNIST/'
         self.is_train = True
         self.n_frames_input = 16
-        self.n_frames_output = 32
+        self.n_frames_output = 16
         self.num_objects = [3]
         self.num_samples = int(5e3)
         # training info
@@ -49,7 +49,7 @@ class Args:
         self.lr = 1e-3
         self.EPs = 500
         self.vis = 1
-        self.out_path = './exp5/'
+        self.out_path = './exp6/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.vis_path = os.path.join(self.out_path, 'vis/')
         self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp2/ckpt/A.pth'
@@ -78,7 +78,7 @@ if os.path.exists(args.pretrain_path):
 else:
     logging.info('No pretrained model found, starting from scratch.')
 
-loss_fn = nn.BCEWithLogitsLoss().cuda()
+loss_fn = nn.BCELoss().cuda()
 
 def visualize(GTs, PREDs, step):
     L = GTs.size(1)
@@ -88,7 +88,7 @@ def visualize(GTs, PREDs, step):
         axes[0, i].imshow(GTs[0, i].cpu().numpy(), cmap='gray')
         axes[0, i].set_title(f"GT {i}")
         axes[0, i].axis('off')
-        axes[1, i].imshow(torch.sigmoid(PREDs[0, i]).cpu().detach().numpy(), cmap='gray')
+        axes[1, i].imshow(PREDs[0, i].cpu().detach().numpy(), cmap='gray')
         axes[1, i].set_title(f"Pred {i}")
         axes[1, i].axis('off')
     plt.tight_layout()
@@ -100,8 +100,7 @@ running_loss = 0.0
 with torch.no_grad():
     for step, (inputs, outputs) in enumerate(tqdm(dataloader)):
         inputs, outputs = inputs.cuda(), outputs.cuda()
-        pred_outputs = model(inputs, mode='i', out_frames_num=args.n_frames_output)
-        # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
+        pred_outputs = model(inputs, mode='i_sigmoid', out_frames_num=args.n_frames_output)
         loss = loss_fn(pred_outputs, outputs)
         running_loss += loss.item()
         if (step + 1) % args.vis == 0:
@@ -109,6 +108,6 @@ with torch.no_grad():
             logging.info(f'Step {step+1}, Average Loss: {avg_loss}')
             tqdm.write(f'Step {step+1}, Average Loss: {avg_loss}')
             running_loss = 0.0
-            visualize(outputs, pred_outputs, step + 1, )
+            visualize(outputs, pred_outputs, step + 1)
 
 logging.shutdown()
