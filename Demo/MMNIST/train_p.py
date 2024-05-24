@@ -1,5 +1,6 @@
 import sys
 import os
+import random
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model'))
 
@@ -48,7 +49,8 @@ class Args:
         self.batch_size = 2
         self.lr = 1e-3
         self.EPs = 500
-        self.vis = 50
+        self.vis_step = 50
+        self.vis_num = 16
         self.out_path = './exp3/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.ckpt_path = os.path.join(self.out_path, 'ckpt/')
@@ -85,44 +87,44 @@ loss_fn = nn.BCEWithLogitsLoss().cuda()
 opt = optim.AdamW(model.parameters(), lr=args.lr)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=len(dataloader))
 
-def visualize(GTs, PREDs, epoch, step):
+def visualize(GTs, PREDs, epoch, step, vis_num):
     L = GTs.size(1)
     GTs, PREDs = GTs.squeeze(2), PREDs.squeeze(2)
-    _, axes = plt.subplots(2, L, figsize=(20, 5))
-    for i in range(L):
-        axes[0, i].imshow(GTs[0, i].cpu().numpy(), cmap='gray')
-        axes[0, i].set_title(f"GT {i}")
+    indices = random.sample(range(L), min(vis_num, L))
+    _, axes = plt.subplots(2, vis_num, figsize=(20, 5))
+    for i, idx in enumerate(indices):
+        axes[0, i].imshow(GTs[0, idx].cpu().numpy(), cmap='gray')
+        axes[0, i].set_title(f"GT {idx}")
         axes[0, i].axis('off')
-        axes[1, i].imshow(torch.sigmoid(PREDs[0, i]).cpu().detach().numpy(), cmap='gray')
-        axes[1, i].set_title(f"Pred {i}")
+        axes[1, i].imshow(torch.sigmoid(PREDs[0, idx]).cpu().detach().numpy(), cmap='gray')
+        axes[1, i].set_title(f"Pred {idx}")
         axes[1, i].axis('off')
     plt.tight_layout()
     plt.savefig(os.path.join(args.vis_path, f'visualization_epoch{epoch}_step{step}.png'))
     plt.close()
 
+_save_name_flag = True
 for ep in range(args.EPs):
     model.train()
     running_loss = 0.0
     for step, (inputs, _) in enumerate(tqdm(dataloader)):
         inputs = inputs.cuda()
         opt.zero_grad()
-        # ZERO = torch.zeros_like(inputs[:, :1]).cuda()
-        # pred_outputs = model(torch.cat([ZERO, inputs[:, :-1]], dim=1), mode='p')[:, 1:]
         pred_outputs = model(inputs[:, :-1], mode='p_logits')
-        # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
         loss = loss_fn(pred_outputs[:, 1:], inputs[:, 2:])
         loss.backward()
         opt.step()
         scheduler.step()
         running_loss += loss.item()
-        if (step + 1) % args.vis == 0:
-            avg_loss = running_loss / args.vis
+        if (step + 1) % args.vis_step == 0:
+            avg_loss = running_loss / args.vis_step
             current_lr = scheduler.get_last_lr()[0]
             logging.info(f'Step {step+1}, Epoch {ep}, Average Loss: {avg_loss}, LR: {current_lr}')
-            # torch.save(model.state_dict(), os.path.join(args.ckpt_path, f'{ep}_{step+1}.pth'))
-            torch.save(model.state_dict(), os.path.join(args.ckpt_path, f'A.pth'))
+            if _save_name_flag: torch.save(model.state_dict(), os.path.join(args.ckpt_path, f'A.pth'))
+            else: torch.save(model.state_dict(), os.path.join(args.ckpt_path, f'B.pth'))
+            _save_name_flag = not _save_name_flag
             tqdm.write(f'Step {step+1}, Epoch {ep}, Average Loss: {avg_loss}, LR: {current_lr}')
             running_loss = 0.0
-            visualize(inputs[:, 1:], pred_outputs, ep, step + 1)
+            visualize(inputs[:, 1:], pred_outputs, ep, step + 1, args.vis_num)
 
 logging.shutdown()
