@@ -5,11 +5,16 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model'))
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
 import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+import lpips
+import numpy as np
+from scipy.linalg import sqrtm
+from torchvision.models.video import r3d_18
 
 from ModelConvLRU import ConvLRU 
 from DATA.MMNIST import MovingMNIST 
@@ -40,8 +45,8 @@ class Args:
         # data info
         self.root = './DATA/MMNIST/'
         self.is_train = True
-        self.n_frames_input = 128
-        self.n_frames_output = 128
+        self.n_frames_input = 8
+        self.n_frames_output = 32
         self.num_objects = [2]
         self.num_samples = int(5e3)
         # training info
@@ -80,6 +85,52 @@ else:
 
 loss_fn = nn.BCELoss().cuda()
 
+lpips_fn = lpips.LPIPS(net='alex').cuda()
+
+def load_i3d_model():
+    model = r3d_18(pretrained=True)
+    model.fc = nn.Identity() 
+    return model.cuda().eval()
+
+i3d_model = load_i3d_model()
+
+def calculate_fvd(preds, targets):
+    B, L, C, H, W = preds.shape
+    preds_rgb = preds.repeat(1, 1, 3, 1, 1).view(B, L, 3, H, W).permute(0, 2, 1, 3, 4).cuda()
+    targets_rgb = targets.repeat(1, 1, 3, 1, 1).view(B, L, 3, H, W).permute(0, 2, 1, 3, 4).cuda()
+    with torch.no_grad():
+        pred_features = i3d_model(preds_rgb).view(B, -1)
+        target_features = i3d_model(targets_rgb).view(B, -1)
+    mu1, sigma1 = pred_features.mean(dim=0), torch.cov(pred_features.T)
+    mu2, sigma2 = target_features.mean(dim=0), torch.cov(target_features.T)
+    diff = mu1 - mu2
+    covmean, _ = sqrtm(sigma1.cpu().numpy() @ sigma2.cpu().numpy(), disp=False)
+    if not np.isfinite(covmean).all():
+        covmean = sqrtm((sigma1 + 1e-6 * torch.eye(sigma1.shape[0])).cpu().numpy() @ (sigma2 + 1e-6 * torch.eye(sigma2.shape[0])).cpu().numpy())
+    covmean = torch.tensor(covmean).float().cuda()
+    fvd = diff @ diff + torch.trace(sigma1) + torch.trace(sigma2) - 2 * torch.trace(covmean)
+    return fvd.item()
+
+def compute_metrics(preds, targets):
+    preds = preds.cpu()
+    targets = targets.cpu()
+    ssim_vals = []
+    psnr_vals = []
+    lpips_vals = []
+    for b in range(preds.shape[0]):
+        pred = preds[b]
+        target = targets[b]
+        for frame in range(pred.shape[0]):
+            pred_frame_np = pred[frame].squeeze().numpy()
+            target_frame_np = target[frame].squeeze().numpy()
+            ssim_vals.append(ssim(target_frame_np, pred_frame_np, data_range=1.0))
+            psnr_vals.append(psnr(target_frame_np, pred_frame_np, data_range=1.0))
+            lpips_val = lpips_fn(torch.tensor(target[frame]).expand(1, 3, pred.shape[2], pred.shape[3]).squeeze().cuda(), torch.tensor(pred[frame]).expand(1, 3, pred.shape[2], pred.shape[3]).squeeze().cuda())
+            lpips_vals.append(lpips_val.item())
+    
+    fvd_val = calculate_fvd(preds, targets)
+    return np.mean(ssim_vals), np.mean(psnr_vals), np.mean(lpips_vals), fvd_val
+
 def visualize(GTs, PREDs, step, vis_num, sample_idx):
     L = GTs.size(1)
     indices = torch.linspace(0, L - 1, steps=vis_num).long()
@@ -98,6 +149,7 @@ def visualize(GTs, PREDs, step, vis_num, sample_idx):
 
 model.eval()
 running_loss = 0.0
+ssim_vals, psnr_vals, lpips_vals, fvd_vals = [], [], [], []
 with torch.no_grad():
     for step, (inputs, outputs) in enumerate(tqdm(dataloader)):
         inputs, outputs = inputs.cuda(), outputs.cuda()
@@ -106,6 +158,16 @@ with torch.no_grad():
         running_loss += loss.item()
         logging.info(f'Step {step+1}, Average Loss: {running_loss}')
         tqdm.write(f'Step {step+1}, Average Loss: {running_loss}')
+        
+        ssim_val, psnr_val, lpips_val, fvd_val = compute_metrics(pred_outputs, outputs)
+        ssim_vals.append(ssim_val)
+        psnr_vals.append(psnr_val)
+        lpips_vals.append(lpips_val)
+        fvd_vals.append(fvd_val)
+        
+        logging.info(f'Mean SSIM: {np.mean(ssim_vals)}, Mean PSNR: {np.mean(psnr_vals)}, Mean LPIPS: {np.mean(lpips_vals)}, Mean FVD: {np.mean(fvd_vals)}')
+        tqdm.write(f'Mean SSIM: {np.mean(ssim_vals)}, Mean PSNR: {np.mean(psnr_vals)}, Mean LPIPS: {np.mean(lpips_vals)}, Mean FVD: {np.mean(fvd_vals)}')
+        
         running_loss = 0.0
         for sample_idx in range(outputs.size(0)):
             visualize(outputs[sample_idx:sample_idx+1], pred_outputs[sample_idx:sample_idx+1], step + 1, args.vis_num, sample_idx)

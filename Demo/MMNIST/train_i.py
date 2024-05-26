@@ -2,6 +2,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model'))
+import random
 
 import torch
 import torch.nn as nn
@@ -26,22 +27,22 @@ class Args:
         #
         self.hidden_factor = (2, 2)
         # emb info
-        self.emb_hidden_ch = 128
+        self.emb_hidden_ch = 64
         self.emb_dropout = 0.0
         self.emb_hidden_layers_num = 4
         # ffn info
-        self.ffn_hidden_ch = 128
+        self.ffn_hidden_ch = 32
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_hidden_ch = 128
+        self.dec_hidden_ch = 64
         self.dec_dropout = 0.0
         self.dec_hidden_layers_num = 4
         # data info
         self.root = './DATA/MMNIST/'
         self.is_train = True
-        self.n_frames_input = 8
-        self.n_frames_output = 8
+        self.n_frames_input = 32
+        self.n_frames_output = 128
         self.num_objects = [2]
         self.num_samples = int(5e3)
         # training info
@@ -54,7 +55,7 @@ class Args:
         self.log_file = os.path.join(self.out_path, 'log')
         self.ckpt_path = os.path.join(self.out_path, 'ckpt/')
         self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp0/ckpt/5_3600.pth'
+        self.pretrain_path = '/data/lzh/jshasyh/yrqUni/ConvLRU/Demo/MMNIST/exp1/ckpt/A.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
