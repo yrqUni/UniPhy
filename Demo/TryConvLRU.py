@@ -11,23 +11,27 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 512
-        self.convlru_dropout = 0.1  
-        self.convlru_num_blocks = 24
+        self.emb_ch = 12
+        self.convlru_dropout = 0.0
+        self.convlru_num_blocks = 12
         #
         self.hidden_factor = (4, 4)
         # emb info
-        self.emb_hidden_ch = 128
+        self.emb_hidden_ch = 32
         self.emb_dropout = 0.0
-        self.emb_hidden_layers_num = 4
+        self.emb_hidden_layers_num = 2
         # ffn info
         self.ffn_hidden_ch = 32
-        self.ffn_dropout = 0.1
+        self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_hidden_ch = 128
-        self.dec_dropout = 0.1
-        self.dec_hidden_layers_num = 4
+        self.dec_attn_layers_num = 3
+        self.dec_attn_num_heads = 8
+        self.dec_attn_ffn_dim_factor = 1
+        self.dec_attn_dropout = 0.0
+        self.dec_hidden_ch = 32
+        self.dec_dropout = 0.0
+        self.dec_hidden_layers_num = 2
 args = Args()
 B = 2
 L = 8
