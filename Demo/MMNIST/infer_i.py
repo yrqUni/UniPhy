@@ -95,7 +95,7 @@ def load_i3d_model():
 i3d_model = load_i3d_model()
 
 def calculate_fvd(preds, targets):
-    B, L, C, H, W = preds.shape
+    B, L, _, H, W = preds.shape
     preds_rgb = preds.repeat(1, 1, 3, 1, 1).view(B, L, 3, H, W).permute(0, 2, 1, 3, 4).cuda()
     targets_rgb = targets.repeat(1, 1, 3, 1, 1).view(B, L, 3, H, W).permute(0, 2, 1, 3, 4).cuda()
     with torch.no_grad():
