@@ -26,6 +26,7 @@ class Args:
         self.ffn_hidden_layers_num = 2
         # dec info
         self.dec_attn_layers_num = 3
+        self.dec_attn_dim = 768
         self.dec_attn_num_heads = 8
         self.dec_attn_ffn_dim_factor = 1
         self.dec_attn_dropout = 0.0

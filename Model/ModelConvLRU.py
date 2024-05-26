@@ -254,9 +254,9 @@ class ConvLRULayer(nn.Module):
 #         x = x + pe.unsqueeze(0)
 #         return x
 
-class MultiHeadSelfAttention(nn.Module):
+class CausalMultiHeadSelfAttention(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.0):
-        super(MultiHeadSelfAttention, self).__init__()
+        super(CausalMultiHeadSelfAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -270,10 +270,12 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = self.qkv(x)  # B, L, 3 * D
         qkv = qkv.view(B, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)  # 3, B, num_heads, L, head_dim
-        # Scaled dot-product attention
+        # Scaled dot-product attention with causal mask
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # B, num_heads, L, L
+        # causal_mask = torch.tril(torch.ones(L, L, device=x.device)).view(1, 1, L, L)  # 1, 1, L, L
+        # attn_weights = attn_weights.masked_fill(causal_mask == 0, float('-inf'))
         if mask is not None:
-            mask = mask.reshape(B, 1, 1, L)  # B, 1, 1, L
+            mask = mask.view(B, 1, 1, L)  # B, 1, 1, L
             attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
@@ -286,8 +288,7 @@ class MultiHeadSelfAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_dim, dropout=0.0):
         super(TransformerBlock, self).__init__()
-        self.attention = MultiHeadSelfAttention(dim, num_heads, dropout)
-        # self.position_encoding = RoPEPositionEncoding(dim)
+        self.attention = CausalMultiHeadSelfAttention(dim, num_heads, dropout)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -297,7 +298,6 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
     def forward(self, x, mask=None):
-        # x = self.position_encoding(x)
         attn_output = self.attention(x, mask)
         x = self.norm1(x + attn_output)
         ffn_output = self.ffn(x)
@@ -315,7 +315,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             x = layer(x, mask)
         return x
-    
+
 class Decoder(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
@@ -325,11 +325,13 @@ class Decoder(nn.Module):
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
         self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
         self.dropout_rate = args.dec_dropout
+        self.remember_mixer_in_proj = nn.Linear(self.emb_ch*input_downsp_shape[1]*input_downsp_shape[2], args.dec_attn_dim)
         self.remember_mixer = Transformer(args.dec_attn_layers_num, 
-                                          self.emb_ch*input_downsp_shape[1]*input_downsp_shape[2], 
+                                          args.dec_attn_dim, 
                                           args.dec_attn_num_heads, 
-                                          args.dec_attn_ffn_dim_factor*self.emb_ch*input_downsp_shape[1]*input_downsp_shape[2], 
+                                          args.dec_attn_ffn_dim_factor*args.dec_attn_dim, 
                                           args.dec_attn_dropout)
+        self.remember_mixer_out_proj = nn.Linear(args.dec_attn_dim, self.emb_ch*input_downsp_shape[1]*input_downsp_shape[2])
         self.c_in_1 = nn.Conv2d(self.emb_ch, input_downsp_shape[0], kernel_size=3, padding='same')
         self.upsp = nn.ConvTranspose2d(in_channels=input_downsp_shape[0], out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
         with torch.no_grad():
@@ -358,7 +360,10 @@ class Decoder(nn.Module):
             return x
         elif mode == 'i':
             B, L, C, H, W = x.size()
-            x = self.remember_mixer(torch.concat([condition, x], dim=1).reshape(B, -1, C*H*W)).reshape(B, -1, C, H, W)[:, -1:]
+            x = self.remember_mixer_in_proj(x.reshape(B, -1, C*H*W))
+            condition = self.remember_mixer_in_proj(condition.reshape(B, -1, C*H*W))
+            x = self.remember_mixer(torch.concat([condition, x], dim=1))[:, -1:]
+            x = self.remember_mixer_out_proj(x).reshape(B, 1, C, H, W)
             x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
             x = self.upsp(x)
             _, _, H, W = x.size()
