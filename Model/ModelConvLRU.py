@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torchvision import models
 import math
 import numpy as np
 try:
@@ -43,43 +43,39 @@ class ConvLRU(nn.Module):
         if mode == 'p_logits':
             x = self.embedding(x)
             x, _ = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x)
             return x
         elif mode == 'p_sigmoid':
             x = self.embedding(x)
             x, _ = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x)
             x = torch.sigmoid(x)
             return x
         elif mode == 'i_logits':
             out = []
             x = self.embedding(x)
-            condition = x.detach().clone()
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
+            x = self.decoder(x)
             x = x[:, -1:]
-            x = self.decoder(x, mode='p', condition=None)
             out.append(x)
             for i in range(out_frames_num-1):
                 x = self.embedding(torch.sigmoid(out[i]))
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
-                x = x[:, -1:]
-                x = self.decoder(x, mode='i', condition=condition)
+                x = self.decoder(x)[:, -1:]
                 out.append(x)
             out = torch.concat(out, dim=1)
             return out
         elif mode == 'i_sigmoid':
             out = []
             x = self.embedding(x)
-            condition = x.detach().clone()
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
+            x = self.decoder(x)
             x = x[:, -1:]
-            x = self.decoder(x, mode='p', condition=None)
             out.append(torch.sigmoid(x))
             for i in range(out_frames_num-1):
                 x = self.embedding(out[i])
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
-                x = x[:, -1:]
-                x = self.decoder(x, mode='i', condition=condition)
+                x = self.decoder(x)[:, -1:]
                 out.append(torch.sigmoid(x))
             out = torch.concat(out, dim=1)
             return out
@@ -138,32 +134,40 @@ class Embedding(nn.Module):
         x = self.dropout(x)
         x = self.layer_norm(x).reshape(B, L, -1, H, W)
         return x
-    
-class FeedForward(nn.Module):
+
+class Decoder(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
+        self.input_ch = args.input_ch
         self.emb_ch = args.emb_ch
-        self.ffn_hidden_ch = args.ffn_hidden_ch
-        self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
-        self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
-        self.dropout_rate = args.ffn_dropout
-        self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=3, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.dropout_rate, self.hidden_size) for _ in range(self.ffn_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=3, padding='same')
+        self.dec_hidden_ch = args.dec_hidden_ch
+        self.dec_hidden_layers_num = args.dec_hidden_layers_num
+        self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
+        self.dropout_rate = args.dec_dropout
+        self.c_in_1 = nn.Conv2d(self.emb_ch, input_downsp_shape[0], kernel_size=3, padding='same')
+        self.upsp = nn.ConvTranspose2d(in_channels=input_downsp_shape[0], out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
+        with torch.no_grad():
+            x = torch.zeros(1, input_downsp_shape[0], input_downsp_shape[1], input_downsp_shape[2])
+            x = self.upsp(x)
+            _, C, H, W = x.size()
+        self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=3, padding='same')
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, self.dropout_rate, (H, W)) for _ in range(self.dec_hidden_layers_num)])
+        self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=3, padding='same')
         self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
         B, L, _, H, W = x.size()
-        x_ = self.c_in(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.ffn_hidden_ch, H, W)
-        x_ = self.activation(x_)
-        x_ = self.dropout(x_)
+        x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
+        x = self.upsp(x)
+        _, _, H, W = x.size()
+        x = self.c_in_2(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = x.reshape(B, L, self.dec_hidden_ch, H, W)
         for layer in self.c_hidden:
-            x_ = layer(x_)
-        x_ = self.c_out(x_.reshape(B*L, self.ffn_hidden_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
-        x_ = self.dropout(x_)
-        x_ = self.layer_norm(x_)
-        x = x_ + x
+            x = layer(x)
+        x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W))
+        x = self.dropout(x).reshape(B, L, self.input_ch, H, W)
         return x
 
 class ConvLRUModel(nn.Module):
@@ -239,140 +243,30 @@ class ConvLRULayer(nn.Module):
     def forward(self, x, last_hidden_in):
         x, last_hidden_out = self.convlru(x, last_hidden_in)
         return x, last_hidden_out
-
-# class RoPEPositionEncoding(nn.Module):
-#     def __init__(self, dim):
-#         super(RoPEPositionEncoding, self).__init__()
-#         self.dim = dim
-#     def forward(self, x):
-#         seq_len = x.size(1)
-#         position = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)
-#         div_term = torch.exp(torch.arange(0, self.dim, 2).float() * -(math.log(10000.0) / self.dim))
-#         pe = torch.zeros(seq_len, self.dim, device=x.device)
-#         pe[:, 0::2] = torch.sin(position * div_term)
-#         pe[:, 1::2] = torch.cos(position * div_term)
-#         x = x + pe.unsqueeze(0)
-#         return x
-
-class CausalMultiHeadSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.0):
-        super(CausalMultiHeadSelfAttention, self).__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.out = nn.Linear(dim, dim)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.proj_dropout = nn.Dropout(dropout)
-    def forward(self, x, mask=None):
-        B, L, D = x.shape
-        qkv = self.qkv(x)  # B, L, 3 * D
-        qkv = qkv.view(B, L, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)  # 3, B, num_heads, L, head_dim
-        # Scaled dot-product attention with causal mask
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # B, num_heads, L, L
-        # causal_mask = torch.tril(torch.ones(L, L, device=x.device)).view(1, 1, L, L)  # 1, 1, L, L
-        # attn_weights = attn_weights.masked_fill(causal_mask == 0, float('-inf'))
-        if mask is not None:
-            mask = mask.view(B, 1, 1, L)  # B, 1, 1, L
-            attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-        attn_output = torch.matmul(attn_weights, v)  # B, num_heads, L, head_dim
-        # Concatenate heads
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, D)  # B, L, D
-        attn_output = self.proj_dropout(self.out(attn_output))
-        return attn_output
-
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, ffn_dim, dropout=0.0):
-        super(TransformerBlock, self).__init__()
-        self.attention = CausalMultiHeadSelfAttention(dim, num_heads, dropout)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim),
-            nn.ReLU(),
-            nn.Linear(ffn_dim, dim),
-            nn.Dropout(dropout)
-        )
-    def forward(self, x, mask=None):
-        attn_output = self.attention(x, mask)
-        x = self.norm1(x + attn_output)
-        ffn_output = self.ffn(x)
-        x = self.norm2(x + ffn_output)
-        return x
-
-class Transformer(nn.Module):
-    def __init__(self, attn_layers_num, attn_dim, num_heads, ffn_dim, dropout=0.0):
-        super(Transformer, self).__init__()
-        self.layers = nn.ModuleList([
-            TransformerBlock(attn_dim, num_heads, ffn_dim, dropout)
-            for _ in range(attn_layers_num)
-        ])
-    def forward(self, x, mask=None):
-        for layer in self.layers:
-            x = layer(x, mask)
-        return x
-
-class Decoder(nn.Module):
+    
+class FeedForward(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
-        self.input_ch = args.input_ch
         self.emb_ch = args.emb_ch
-        self.dec_hidden_ch = args.dec_hidden_ch
-        self.dec_hidden_layers_num = args.dec_hidden_layers_num
-        self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
-        self.dropout_rate = args.dec_dropout
-        self.remember_mixer_in_proj = nn.Linear(self.emb_ch*input_downsp_shape[1]*input_downsp_shape[2], args.dec_attn_dim)
-        self.remember_mixer = Transformer(args.dec_attn_layers_num, 
-                                          args.dec_attn_dim, 
-                                          args.dec_attn_num_heads, 
-                                          args.dec_attn_ffn_dim_factor*args.dec_attn_dim, 
-                                          args.dec_attn_dropout)
-        self.remember_mixer_out_proj = nn.Linear(args.dec_attn_dim, self.emb_ch*input_downsp_shape[1]*input_downsp_shape[2])
-        self.c_in_1 = nn.Conv2d(self.emb_ch, input_downsp_shape[0], kernel_size=3, padding='same')
-        self.upsp = nn.ConvTranspose2d(in_channels=input_downsp_shape[0], out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
-        with torch.no_grad():
-            x = torch.zeros(1, input_downsp_shape[0], input_downsp_shape[1], input_downsp_shape[2])
-            x = self.upsp(x)
-            _, C, H, W = x.size()
-        self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=3, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, self.dropout_rate, (H, W)) for _ in range(self.dec_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=3, padding='same')
+        self.ffn_hidden_ch = args.ffn_hidden_ch
+        self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
+        self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
+        self.dropout_rate = args.ffn_dropout
+        self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=3, padding='same')
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.dropout_rate, self.hidden_size) for _ in range(self.ffn_hidden_layers_num)])
+        self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=3, padding='same')
         self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
-    def forward(self, x, mode, condition):
-        if mode == 'p':
-            B, L, C, H, W = x.size()
-            x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
-            x = self.upsp(x)
-            _, _, H, W = x.size()
-            x = self.c_in_2(x)
-            x = self.activation(x)
-            x = self.dropout(x)
-            x = x.reshape(B, L, self.dec_hidden_ch, H, W)
-            for layer in self.c_hidden:
-                x = layer(x)
-            x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W))
-            x = self.dropout(x).reshape(B, L, self.input_ch, H, W)
-            return x
-        elif mode == 'i':
-            B, L, C, H, W = x.size()
-            x = self.remember_mixer_in_proj(x.reshape(B, -1, C*H*W))
-            condition = self.remember_mixer_in_proj(condition.reshape(B, -1, C*H*W))
-            x = self.remember_mixer(torch.concat([condition, x], dim=1))[:, -1:]
-            x = self.remember_mixer_out_proj(x).reshape(B, 1, C, H, W)
-            x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
-            x = self.upsp(x)
-            _, _, H, W = x.size()
-            x = self.c_in_2(x)
-            x = self.activation(x)
-            x = self.dropout(x)
-            x = x.reshape(B, L, self.dec_hidden_ch, H, W)
-            for layer in self.c_hidden:
-                x = layer(x)
-            x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W))
-            x = self.dropout(x).reshape(B, L, self.input_ch, H, W)
-            return x
+        self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
+    def forward(self, x):
+        B, L, _, H, W = x.size()
+        x_ = self.c_in(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.ffn_hidden_ch, H, W)
+        x_ = self.activation(x_)
+        x_ = self.dropout(x_)
+        for layer in self.c_hidden:
+            x_ = layer(x_)
+        x_ = self.c_out(x_.reshape(B*L, self.ffn_hidden_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
+        x_ = self.dropout(x_)
+        x_ = self.layer_norm(x_)
+        x = x_ + x
+        return x

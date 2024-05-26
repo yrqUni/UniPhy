@@ -35,32 +35,27 @@ class Args:
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_attn_layers_num = 3
-        self.dec_attn_dim = 768
-        self.dec_attn_num_heads = 8
-        self.dec_attn_ffn_dim_factor = 1
-        self.dec_attn_dropout = 0.0
         self.dec_hidden_ch = 64
         self.dec_dropout = 0.0
         self.dec_hidden_layers_num = 4
         # data info
         self.root = './DATA/MMNIST/'
         self.is_train = True
-        self.n_frames_input = 129
-        self.n_frames_output = 1
-        self.num_objects = [3]
-        self.num_samples = int(1e5)
+        self.n_frames_input = 32
+        self.n_frames_output = 128
+        self.num_objects = [2]
+        self.num_samples = int(5e3)
         # training info
-        self.only_train_decoder = False
-        self.batch_size = 1
-        self.lr = 1e-3
+        self.batch_size = 2
+        self.lr = 1e-1
         self.EPs = 500
-        self.vis = 200
-        self.out_path = './exp600/'
+        self.vis_step = 50
+        self.vis_num = 16
+        self.out_path = './exp3/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.ckpt_path = os.path.join(self.out_path, 'ckpt/')
         self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = 'None'
+        self.pretrain_path = '/data/lzh/jshasyh/yrqUni/ConvLRU/Demo/MMNIST/exp1/ckpt/A.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
@@ -87,11 +82,6 @@ if os.path.exists(args.pretrain_path):
     logging.info(f'Loaded pretrained model from {args.pretrain_path}')
 else:
     logging.info('No pretrained model found, starting from scratch.')
-
-if args.only_train_decoder:
-    for name, param in model.named_parameters():
-        if "decoder" not in name:
-            param.requires_grad = False
 
 loss_fn = nn.BCEWithLogitsLoss().cuda()
 opt = optim.AdamW(model.parameters(), lr=args.lr)
