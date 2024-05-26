@@ -46,6 +46,7 @@ class Args:
         self.num_objects = [2]
         self.num_samples = int(5e3)
         # training info
+        self.only_train_decoder = False
         self.batch_size = 2
         self.lr = 1e-1
         self.EPs = 500
@@ -82,6 +83,11 @@ if os.path.exists(args.pretrain_path):
     logging.info(f'Loaded pretrained model from {args.pretrain_path}')
 else:
     logging.info('No pretrained model found, starting from scratch.')
+
+if args.only_train_decoder:
+    for name, param in model.named_parameters():
+        if "decoder" not in name:
+            param.requires_grad = False
 
 loss_fn = nn.BCEWithLogitsLoss().cuda()
 opt = optim.AdamW(model.parameters(), lr=args.lr)
