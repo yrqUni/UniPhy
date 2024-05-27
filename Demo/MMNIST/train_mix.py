@@ -12,8 +12,8 @@ from tqdm import tqdm
 import logging
 import matplotlib.pyplot as plt
 
-from ModelConvLRU import ConvLRU 
-from DATA.MMNIST import MovingMNIST 
+from ModelConvLRU import ConvLRU
+from DATA.MMNIST import MovingMNIST
 
 class Args:
     def __init__(self):
@@ -65,6 +65,7 @@ class Args:
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
+
 args = Args()
 
 if not os.path.exists(args.out_path):
@@ -83,8 +84,15 @@ dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_
 
 model = ConvLRU(args).cuda()
 
+def load_model_weights(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)
+    model_dict = model.state_dict()
+    filtered_checkpoint = {k: v for k, v in checkpoint.items() if not k.startswith('decoder')}
+    model_dict.update(filtered_checkpoint)
+    model.load_state_dict(model_dict)
+
 if os.path.exists(args.pretrain_path):
-    model.load_state_dict(torch.load(args.pretrain_path))
+    load_model_weights(model, args.pretrain_path)
     logging.info(f'Loaded pretrained model from {args.pretrain_path}')
 else:
     logging.info('No pretrained model found, starting from scratch.')
