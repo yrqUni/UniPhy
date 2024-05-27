@@ -38,62 +38,64 @@ class ConvLRU(nn.Module):
                         p.erfinv_()
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
-    def forward(self, x, mode, out_frames_num=None):
+    def forward(self, x, condition, mode, out_frames_num=None, ):
         if mode == 'p_logits':
             x = self.embedding(x)
+            condition = self.embedding(condition)
             x, _ = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x, condition=condition)
             return x
         elif mode == 'p_sigmoid':
             x = self.embedding(x)
+            condition = self.embedding(condition)
             x, _ = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x, condition=condition)
             x = torch.sigmoid(x)
             return x
         elif mode == 'i_logits':
             out = []
             x = self.embedding(x)
-            condition = x.detach().clone()
+            condition = self.embedding(condition)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
             x = x[:, -1:]
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x, condition=condition)
             out.append(x)
             for i in range(out_frames_num-1):
                 x = self.embedding(torch.sigmoid(out[i]))
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
                 x = x[:, -1:]
-                x = self.decoder(x, mode='i', condition=condition)
+                x = self.decoder(x, condition=condition)
                 out.append(x)
             out = torch.concat(out, dim=1)
             return out
         elif mode == 'i_sigmoid':
             out = []
             x = self.embedding(x)
-            condition = x.detach().clone()
+            condition = self.embedding(condition)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
             x = x[:, -1:]
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x, condition=condition)
             out.append(torch.sigmoid(x))
             for i in range(out_frames_num-1):
                 x = self.embedding(out[i])
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
                 x = x[:, -1:]
-                x = self.decoder(x, mode='i', condition=condition)
+                x = self.decoder(x, condition=condition)
                 out.append(torch.sigmoid(x))
             out = torch.concat(out, dim=1)
             return out
         elif mode == 'mix_logits':
             out = []
             x = self.embedding(x)
-            condition = x.detach().clone()
+            condition = self.embedding(condition)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x, condition=condition)
             _x = x
             out.append(x[:, -1:])
             for i in range(out_frames_num-1):
                 x = self.embedding(torch.sigmoid(out[i]))
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
-                x = self.decoder(x, mode='i', condition=condition)
+                x = self.decoder(x, condition=condition)
                 out.append(x[:, -1:])
             out = torch.concat(out, dim=1)
             out = torch.concat([_x, out], dim=1)
@@ -101,15 +103,15 @@ class ConvLRU(nn.Module):
         elif mode == 'mix_sigmoid':
             out = []
             x = self.embedding(x)
-            condition = x.detach().clone()
+            condition = self.embedding(condition)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x, mode='p', condition=None)
+            x = self.decoder(x, condition=condition)
             _x = torch.sigmoid(x)
             out.append(torch.sigmoid(x[:, -1:]))
             for i in range(out_frames_num-1):
                 x = self.embedding(out[i])
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
-                x = self.decoder(x, mode='i', condition=condition)
+                x = self.decoder(x, condition=condition)
                 out.append(torch.sigmoid(x[:, -1:]))
             out = torch.concat(out, dim=1)
             out = torch.concat([_x, out], dim=1)
@@ -375,36 +377,28 @@ class Decoder(nn.Module):
         self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=3, padding='same')
         self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
-    def forward(self, x, mode, condition):
-        if mode == 'p':
-            B, L, C, H, W = x.size()
-            x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
-            x = self.upsp(x)
-            _, _, H, W = x.size()
-            x = self.c_in_2(x)
-            x = self.activation(x)
-            x = self.dropout(x)
-            x = x.reshape(B, L, self.dec_hidden_ch, H, W)
-            for layer in self.c_hidden:
-                x = layer(x)
-            x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W))
-            x = self.dropout(x).reshape(B, L, self.input_ch, H, W)
-            return x
-        elif mode == 'i':
-            x = torch.concat([condition, x], dim=1)
-            B, L, C, H, W = x.size()
-            x = self.c_attn_in(x.reshape(B*L, C, H, W)).reshape(B, L, -1, H, W)
-            x = self.remember_mixer(x.reshape(B, L, -1)).reshape(B, L, -1, H, W)[:, -1:]
-            x = self.c_attn_out(x.reshape(B*1, -1, H, W)).reshape(B, 1, -1, H, W)
-            x = self.c_in_1(x.reshape(B*1, self.emb_ch, H, W))
-            x = self.upsp(x)
-            _, _, H, W = x.size()
-            x = self.c_in_2(x)
-            x = self.activation(x)
-            x = self.dropout(x)
-            x = x.reshape(B, 1, self.dec_hidden_ch, H, W)
-            for layer in self.c_hidden:
-                x = layer(x)
-            x = self.c_out(x.reshape(B*1, self.dec_hidden_ch, H, W))
-            x = self.dropout(x).reshape(B, 1, self.input_ch, H, W)
-            return x
+    def forward(self, x, condition):
+        B, L, C, H, W = x.size()
+        condition_L = condition.size(1)
+        x = self.c_attn_in(x.reshape(B*L, C, H, W)).reshape(B, L, -1, H, W)
+        condition = self.c_attn_in(condition.reshape(B*condition_L, C, H, W)).reshape(B, condition_L, -1, H, W)
+        attn_ch = x.size(2)
+        x = x.reshape(B*L, 1, attn_ch*H*W)
+        condition = condition.reshape(B, 1, condition_L, attn_ch, H, W).expand(B, L, condition_L, attn_ch, H, W ).reshape(B*L, condition_L, attn_ch*H*W)
+        x = torch.concat([condition, x], dim=1)
+        x = self.remember_mixer(x)[:, -1:] # B*L, 1, attn_ch*H*W
+        x = x.reshape(B, L, 1, attn_ch, H, W).reshape(B, L, attn_ch, H, W)
+        x = self.c_attn_out(x.reshape(B*L, -1, H, W)).reshape(B, L, C, H, W)
+        x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
+        x = self.upsp(x)
+        _, _, H, W = x.size()
+        x = self.c_in_2(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = x.reshape(B, L, self.dec_hidden_ch, H, W)
+        for layer in self.c_hidden:
+            x = layer(x)
+        x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W))
+        x = self.dropout(x).reshape(B, L, self.input_ch, H, W)
+        return x
+    
