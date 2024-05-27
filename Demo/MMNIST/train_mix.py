@@ -123,9 +123,9 @@ for ep in range(args.EPs):
         # ZERO = torch.zeros_like(inputs[:, :1]).cuda()
         opt.zero_grad()
         # pred_outputs = model(torch.cat([ZERO, inputs], dim=1), mode='i', out_frames_num=args.n_frames_output)
-        pred_outputs = model(inputs, mode='mix_logits', out_frames_num=args.n_frames_output)
+        pred_outputs = model(inputs, mode='mix_logits', out_frames_num=args.n_frames_output-1)
         # pred_outputs = torch.sigmoid(pred_outputs) # if BCEWithLogitsLoss, no need to sigmoid for pred_outputs 
-        outputs = torch.cat([inputs, outputs], dim=1)
+        outputs = torch.cat([inputs[:,1:], outputs], dim=1)
         loss = loss_fn(pred_outputs, outputs)
         loss.backward()
         opt.step()
