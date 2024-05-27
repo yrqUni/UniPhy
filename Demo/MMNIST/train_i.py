@@ -21,7 +21,7 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 128
+        self.emb_ch = 256
         self.convlru_dropout = 0.0
         self.convlru_num_blocks = 24
         #
@@ -35,11 +35,6 @@ class Args:
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_attn_layers_num = 1
-        self.dec_attn_ch = 1
-        self.dec_attn_num_heads = 8
-        self.dec_attn_ffn_dim_factor = 1
-        self.dec_attn_dropout = 0.0
         self.dec_hidden_ch = 64
         self.dec_dropout = 0.0
         self.dec_hidden_layers_num = 4
@@ -51,7 +46,6 @@ class Args:
         self.num_objects = [2]
         self.num_samples = int(5e3)
         # training info
-        self.only_train_decoder = False
         self.batch_size = 2
         self.lr = 1e-1
         self.EPs = 500
@@ -88,11 +82,6 @@ if os.path.exists(args.pretrain_path):
     logging.info(f'Loaded pretrained model from {args.pretrain_path}')
 else:
     logging.info('No pretrained model found, starting from scratch.')
-
-if args.only_train_decoder:
-    for name, param in model.named_parameters():
-        if "decoder" not in name:
-            param.requires_grad = False
 
 loss_fn = nn.BCEWithLogitsLoss().cuda()
 opt = optim.AdamW(model.parameters(), lr=args.lr)

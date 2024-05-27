@@ -25,7 +25,7 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 128
+        self.emb_ch = 256
         self.convlru_dropout = 0.0
         self.convlru_num_blocks = 24
         #
@@ -39,11 +39,6 @@ class Args:
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_attn_layers_num = 1
-        self.dec_attn_ch = 1
-        self.dec_attn_num_heads = 8
-        self.dec_attn_ffn_dim_factor = 1
-        self.dec_attn_dropout = 0.0
         self.dec_hidden_ch = 64
         self.dec_dropout = 0.0
         self.dec_hidden_layers_num = 4
@@ -62,7 +57,7 @@ class Args:
         self.out_path = './exp_b/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp_mix_0/ckpt/A.pth'
+        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp1/ckpt/A.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())

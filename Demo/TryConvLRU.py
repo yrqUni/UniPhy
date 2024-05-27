@@ -11,28 +11,23 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 12
-        self.convlru_dropout = 0.0
-        self.convlru_num_blocks = 12
+        self.emb_ch = 512
+        self.convlru_dropout = 0.1  
+        self.convlru_num_blocks = 24
         #
         self.hidden_factor = (4, 4)
         # emb info
-        self.emb_hidden_ch = 32
+        self.emb_hidden_ch = 128
         self.emb_dropout = 0.0
-        self.emb_hidden_layers_num = 2
+        self.emb_hidden_layers_num = 4
         # ffn info
         self.ffn_hidden_ch = 32
-        self.ffn_dropout = 0.0
+        self.ffn_dropout = 0.1
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_attn_layers_num = 3
-        self.dec_attn_ch = 1
-        self.dec_attn_num_heads = 8
-        self.dec_attn_ffn_dim_factor = 2
-        self.dec_attn_dropout = 0.0
-        self.dec_hidden_ch = 32
-        self.dec_dropout = 0.0
-        self.dec_hidden_layers_num = 2
+        self.dec_hidden_ch = 128
+        self.dec_dropout = 0.1
+        self.dec_hidden_layers_num = 4
 args = Args()
 B = 2
 L = 8
@@ -44,16 +39,15 @@ print(f"GP: {total_params}")
 print(f"TP: {trainable_params}")
 loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
-inputs = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
-condition = torch.randn(B, 3, args.input_ch, *args.input_size).cuda()
-labels = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
+inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
+labels_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
 opt.zero_grad()
-outputs = model(inputs, condition, mode='p_sigmoid')
-loss = loss_fn(outputs, labels)
+outputs = model(inputs_train, mode='p_sigmoid')
+loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
 print(f"\nSuccessful! p mode Loss {loss}\n")
-del model, loss_fn, opt, inputs, labels, outputs
+del model, loss_fn, opt, inputs_train, labels_train, outputs
 torch.cuda.empty_cache()
 gc.collect()
 
@@ -65,31 +59,11 @@ print(f"GP: {total_params}")
 print(f"TP: {trainable_params}")
 loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
-inputs = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
-condition = torch.randn(B, 3, args.input_ch, *args.input_size).cuda()
-labels = torch.randn(B, out_frames_num, args.input_ch, *args.input_size).cuda()
+inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
+labels_train = torch.randn(B, out_frames_num, args.input_ch, *args.input_size).cuda()
 opt.zero_grad()
-outputs = model(inputs, condition, mode='i_sigmoid', out_frames_num=out_frames_num)
-loss = loss_fn(outputs, labels)
+outputs = model(inputs_train, mode='i_sigmoid', out_frames_num=out_frames_num)
+loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
 print(f"\nSuccessful! i mode Loss {loss}\n")
-
-out_frames_num = 8
-model = ConvLRU(args).cuda()
-total_params = sum(p.numel() for p in model.parameters())
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"GP: {total_params}")
-print(f"TP: {trainable_params}")
-loss_fn = torch.nn.MSELoss()
-opt = torch.optim.Adam(model.parameters(), lr=0.001)
-inputs = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
-condition = torch.randn(B, 3, args.input_ch, *args.input_size).cuda()
-labels = torch.randn(B, out_frames_num, args.input_ch, *args.input_size).cuda()
-labels = torch.cat([inputs, labels], dim=1)
-opt.zero_grad()
-outputs = model(inputs, condition, mode='mix_sigmoid', out_frames_num=out_frames_num)
-loss = loss_fn(outputs, labels)
-loss.backward()
-opt.step()
-print(f"\nSuccessful! mix mode Loss {loss}\n")
