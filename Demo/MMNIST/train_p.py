@@ -21,37 +21,42 @@ class Args:
         self.input_size = (64, 64)
         self.input_ch = 1
         # convlru info
-        self.emb_ch = 256
+        self.emb_ch = 128
         self.convlru_dropout = 0.0
         self.convlru_num_blocks = 24
         #
         self.hidden_factor = (2, 2)
         # emb info
-        self.emb_hidden_ch = 128
+        self.emb_hidden_ch = 64
         self.emb_dropout = 0.0
         self.emb_hidden_layers_num = 4
         # ffn info
-        self.ffn_hidden_ch = 128
+        self.ffn_hidden_ch = 32
         self.ffn_dropout = 0.0
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_hidden_ch = 128
+        self.dec_attn_layers_num = 1
+        self.dec_attn_ch = 1
+        self.dec_attn_num_heads = 8
+        self.dec_attn_ffn_dim_factor = 1
+        self.dec_attn_dropout = 0.0
+        self.dec_hidden_ch = 64
         self.dec_dropout = 0.0
         self.dec_hidden_layers_num = 4
         # data info
         self.root = './DATA/MMNIST/'
         self.is_train = True
-        self.n_frames_input = 17
+        self.n_frames_input = 129
         self.n_frames_output = 1
         self.num_objects = [3]
         self.num_samples = int(1e5)
         # training info
-        self.batch_size = 2
+        self.batch_size = 8
         self.lr = 1e-3
         self.EPs = 500
         self.vis_step = 50
         self.vis_num = 16
-        self.out_path = './exp3/'
+        self.out_path = './exp0/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.ckpt_path = os.path.join(self.out_path, 'ckpt/')
         self.vis_path = os.path.join(self.out_path, 'vis/')
