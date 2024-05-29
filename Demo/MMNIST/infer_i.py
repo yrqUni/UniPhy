@@ -42,22 +42,43 @@ class Args:
         self.dec_hidden_ch = 64
         self.dec_dropout = 0.0
         self.dec_hidden_layers_num = 4
+        # # input info
+        # self.input_size = (64, 64)
+        # self.input_ch = 1
+        # # convlru info
+        # self.emb_ch = 128
+        # self.convlru_dropout = 0.0
+        # self.convlru_num_blocks = 12
+        # #
+        # self.hidden_factor = (4, 4)
+        # # emb info
+        # self.emb_hidden_ch = 32
+        # self.emb_dropout = 0.0
+        # self.emb_hidden_layers_num = 8
+        # # ffn info
+        # self.ffn_hidden_ch = 32
+        # self.ffn_dropout = 0.0
+        # self.ffn_hidden_layers_num = 2
+        # # dec info
+        # self.dec_hidden_ch = 32
+        # self.dec_dropout = 0.0
+        # self.dec_hidden_layers_num = 8
         # data info
         self.root = './DATA/MMNIST/'
-        self.is_train = True
-        self.n_frames_input = 8
-        self.n_frames_output = 32
+        self.is_train = False
+        self.n_frames_input = 10
+        self.n_frames_output = 10
         self.num_objects = [2]
-        self.num_samples = int(5e3)
+        self.num_samples = int(1e3)
         # training info
         self.batch_size = 2
         self.lr = 1e-3
-        self.EPs = 500
-        self.vis_num = 16
+        self.EPs = 1
+        self.vis_num = 10
         self.out_path = './exp_b/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp1/ckpt/A.pth'
+        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp19/ckpt/B.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
@@ -81,7 +102,7 @@ if os.path.exists(args.pretrain_path):
     model.load_state_dict(torch.load(args.pretrain_path))
     logging.info(f'Loaded pretrained model from {args.pretrain_path}')
 else:
-    logging.info('No pretrained model found, starting from scratch.')
+    assert False, 'No pretrained model found'
 
 loss_fn = nn.BCELoss().cuda()
 
