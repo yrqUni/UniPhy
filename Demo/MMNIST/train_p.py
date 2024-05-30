@@ -49,6 +49,8 @@ class Args:
         self.n_frames_output = 1
         self.num_objects = [2]
         self.num_samples = int(1e4)
+        #
+        self.out_path_root = './exp0/'
         # training info
         self.batch_size = 2
         self.lr = 1e-3
@@ -56,7 +58,7 @@ class Args:
         self.vis_step = 100
         self.vis_num = 10
         self.val_step = 500
-        self.out_path = './exp0/train/'
+        self.out_path = os.path.join(self.out_path_root, 'train')
         self.log_file = os.path.join(self.out_path, 'log')
         self.ckpt_path = os.path.join(self.out_path, 'ckpt/')
         self.vis_path = os.path.join(self.out_path, 'vis/')
@@ -72,7 +74,7 @@ class Args:
         # evaluation info
         self.eval_batch_size = 2
         self.eval_vis_num = 10
-        self.eval_out_path = './exp0/eval/'
+        self.eval_out_path = os.path.join(self.out_path_root, 'eval')
         self.eval_ckpt_path = os.path.join(self.eval_out_path, 'ckpt/')
         self.eval_pretrain_path = 'None'
         # random seed
@@ -124,7 +126,8 @@ def visualize(GTs, PREDs, epoch, step, vis_num, path):
     plt.savefig(os.path.join(path, f'visualization_epoch{epoch}_step{step}.png'))
     plt.close()
 
-def evaluate_model(model, dataloader, criterion, args, epoch, step):
+def evaluate_model(model, dataloader, args, epoch, step):
+    criterion = nn.BCELoss().cuda()
     model.eval()
     ssim_vals, mse_vals, bce_vals = [], [], []
     with torch.no_grad():
@@ -209,7 +212,7 @@ def train_model(args):
                 visualize(inputs[:, 1:], pred_outputs, ep, step + 1, args.vis_num, args.vis_path)
 
             if (step + 1) % args.val_step == 0:
-                mean_ssim, mean_mse, mean_bce = evaluate_model(model, eval_dataloader, criterion, args, ep, step + 1)
+                mean_ssim, mean_mse, mean_bce = evaluate_model(model, eval_dataloader, args, ep, step + 1)
                 if mean_ssim > best_val_ssim:
                     best_val_ssim = mean_ssim
                     save_checkpoint(args.eval_ckpt_path, model, ep, step + 1, best=True)
