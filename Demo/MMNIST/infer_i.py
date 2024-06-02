@@ -33,15 +33,15 @@ class Args:
         # emb info
         self.emb_hidden_ch = 64
         self.emb_dropout = 0.0
-        self.emb_hidden_layers_num = 4
+        self.emb_hidden_layers_num = 16
         # ffn info
         self.ffn_hidden_ch = 32
         self.ffn_dropout = 0.0
-        self.ffn_hidden_layers_num = 2
+        self.ffn_hidden_layers_num = 4
         # dec info
         self.dec_hidden_ch = 64
         self.dec_dropout = 0.0
-        self.dec_hidden_layers_num = 4
+        self.dec_hidden_layers_num = 16
         # # input info
         # self.input_size = (64, 64)
         # self.input_ch = 1
@@ -65,7 +65,7 @@ class Args:
         # self.dec_hidden_layers_num = 8
         # data info
         self.root = './DATA/MMNIST/'
-        self.is_train = False
+        self.is_train = True
         self.n_frames_input = 10
         self.n_frames_output = 10
         self.num_objects = [2]
@@ -78,7 +78,7 @@ class Args:
         self.out_path = './exp_b/'
         self.log_file = os.path.join(self.out_path, 'log')
         self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp19/ckpt/B.pth'
+        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp1/eval/ckpt/best_checkpoint_epoch7_step5000.pth'
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())

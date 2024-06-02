@@ -1,7 +1,5 @@
-import os
 import torch
 import torch.nn as nn
-from torchvision import models
 import math
 import numpy as np
 try:
@@ -81,10 +79,10 @@ class ConvLRU(nn.Module):
             return out
 
 class Conv_hidden(nn.Module):
-    def __init__(self, ch, dropout, hidden_size):
+    def __init__(self, ch, dropout, hidden_size, kernel_size):
         super().__init__()
         self.ch = ch
-        self.conv = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding='same')
+        self.conv = nn.Conv2d(self.ch, self.ch, kernel_size=kernel_size, padding='same')
         self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm([self.ch, *hidden_size])
@@ -113,9 +111,9 @@ class Embedding(nn.Module):
             _, C, H, W = x.size()
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
-        self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=3, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.dropout_rate, self.hidden_size) for _ in range(self.emb_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=3, padding='same')
+        self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.dropout_rate, self.hidden_size, 3 if i == 0 else 1) for i in range(self.emb_hidden_layers_num)])
+        self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
@@ -144,15 +142,15 @@ class Decoder(nn.Module):
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
         self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
         self.dropout_rate = args.dec_dropout
-        self.c_in_1 = nn.Conv2d(self.emb_ch, input_downsp_shape[0], kernel_size=3, padding='same')
+        self.c_in_1 = nn.Conv2d(self.emb_ch, input_downsp_shape[0], kernel_size=1, padding='same')
         self.upsp = nn.ConvTranspose2d(in_channels=input_downsp_shape[0], out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
         with torch.no_grad():
             x = torch.zeros(1, input_downsp_shape[0], input_downsp_shape[1], input_downsp_shape[2])
             x = self.upsp(x)
             _, C, H, W = x.size()
-        self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=3, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, self.dropout_rate, (H, W)) for _ in range(self.dec_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=3, padding='same')
+        self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=7, padding='same')
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, self.dropout_rate, (H, W), 3 if i == 0 else 1) for i in range(self.dec_hidden_layers_num)])
+        self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=1, padding='same')
         self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
     def forward(self, x):
@@ -252,9 +250,9 @@ class FeedForward(nn.Module):
         self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.dropout_rate = args.ffn_dropout
-        self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=3, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.dropout_rate, self.hidden_size) for _ in range(self.ffn_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=3, padding='same')
+        self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.dropout_rate, self.hidden_size, 3 if i == 0 else 1) for i in range(self.ffn_hidden_layers_num)])
+        self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.LeakyReLU()
         self.dropout = nn.Dropout(self.dropout_rate)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
