@@ -2,8 +2,11 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-from .pscan import pscan
-
+try:
+    from .pscan import pscan
+except:
+    from pscan import pscan
+    
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, use_mup: bool = False):
         super().__init__()
