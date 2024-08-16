@@ -212,7 +212,8 @@ class ConvLRULayer(nn.Module):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
-        h = torch.fft.fft2(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
+        # h = torch.fft.fft2(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W) # Test for No FFT
+        h = x.to(torch.cfloat) # Test for No FFT
         h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
@@ -223,7 +224,7 @@ class ConvLRULayer(nn.Module):
             pass
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
-        h = torch.fft.ifft2(h)
+        # h = torch.fft.ifft2(h) # Test for No FFT
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
