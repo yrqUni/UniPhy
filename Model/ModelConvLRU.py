@@ -2,12 +2,32 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-try:
-    from .pscan import pscan
-except:
-    from pscan import pscan
-# torch.autograd.set_detect_anomaly(True)
+from .pscan import pscan
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, use_mup: bool = False):
+        super().__init__()
+        self.use_mup = use_mup
+        self.eps = eps
+        if not use_mup:
+            self.weight = nn.Parameter(torch.ones(d_model))
+    def forward(self, x):
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        if not self.use_mup:
+            return output * self.weight
+        else:
+            return output
+        
+class ComplexGELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.real_gelu = nn.GELU()
+        self.imag_gelu = nn.GELU()
+    def forward(self, x):
+        real = x.real
+        imag = x.imag
+        return torch.complex(self.real_gelu(real), self.imag_gelu(imag))
+    
 class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -78,6 +98,26 @@ class ConvLRU(nn.Module):
             out = torch.concat(out, dim=1)
             return out
 
+class Conv_hidden_Complex(nn.Module):
+    def __init__(self, ch, hidden_size):
+        super().__init__()
+        self.ch = ch
+        self.conv3 = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding='same').to(torch.cfloat)
+        self.activation3 = ComplexGELU()
+        self.conv1 = nn.Conv2d(self.ch, self.ch, kernel_size=1, padding='same').to(torch.cfloat)
+        self.activation1 = ComplexGELU()
+        self.layer_norm = RMSNorm(torch.prod(torch.tensor([self.ch, *hidden_size])))
+    def forward(self, x):
+        B, L, _, H, W = x.size()
+        x_ = self.conv3(x.reshape(B*L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
+        x_ = self.activation3(x_)
+        x_ = self.conv1(x.reshape(B*L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
+        x_ = self.activation1(x_)
+        B, L, C, H, W = x_.size()
+        x_ = self.layer_norm(x_.reshape(B, L, -1)).reshape(B, L, C, H, W)
+        x = x_ + x
+        return x
+    
 class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size):
         super().__init__()
@@ -105,19 +145,20 @@ class Embedding(nn.Module):
         self.emb_ch = args.emb_ch
         self.emb_hidden_ch = args.emb_hidden_ch
         self.emb_hidden_layers_num = args.emb_hidden_layers_num
-        self.downsp = nn.Conv2d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
+        self.downsp = nn.Conv2d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor).to(torch.cfloat)
         with torch.no_grad():
-            x = torch.zeros(1, self.input_ch, *self.input_size)
+            x = torch.zeros(1, self.input_ch, *self.input_size).to(torch.cfloat)
             x = self.downsp(x)
             _, C, H, W = x.size()
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
-        self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size) for i in range(self.emb_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
-        self.activation = nn.GELU()
-        self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
+        self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same').to(torch.cfloat)
+        self.c_hidden = nn.ModuleList([Conv_hidden_Complex(self.emb_hidden_ch, self.hidden_size).to(torch.cfloat) for i in range(self.emb_hidden_layers_num)])
+        self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same').to(torch.cfloat)
+        self.activation = ComplexGELU()
+        self.layer_norm = RMSNorm(torch.prod(torch.tensor([self.emb_ch, *self.hidden_size])))
     def forward(self, x):
+        x = x.to(torch.cfloat)
         B, L, C, H, W = x.size()
         x = self.downsp(x.reshape(B*L, C, H, W))
         _, C, H, W = x.size()
@@ -128,7 +169,8 @@ class Embedding(nn.Module):
         for layer in self.c_hidden:
             x = layer(x)
         x = self.c_out(x.reshape(B*L, -1, H, W))
-        x = self.layer_norm(x).reshape(B, L, -1, H, W)
+        x = self.layer_norm(x.reshape(B, L, -1)).reshape(B, L, -1, H, W)
+        x = x.reshape(B, L, -1, H, W)
         return x
 
 class Decoder(nn.Module):
@@ -150,7 +192,8 @@ class Decoder(nn.Module):
         self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
     def forward(self, x):
-        B, L, _, H, W = x.size()
+        B, L, _, H, W = x.size() 
+        x = torch.sqrt(x.real ** 2 + x.imag ** 2)
         x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
         x = self.upsp(x)
         _, _, H, W = x.size()
@@ -207,14 +250,13 @@ class ConvLRULayer(nn.Module):
         # define layers
         self.proj_B = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
-        self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
+        self.layer_norm = RMSNorm(torch.prod(torch.tensor([self.emb_ch, *self.hidden_size])))
     def convlru(self, x, last_hidden_in):
         B, L, _, H, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
-        # h = torch.fft.fft2(x.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W) # Test for No FFT
-        h = x.to(torch.cfloat) # Test for No FFT
-        h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W).to(torch.cfloat)).reshape(B, L, self.emb_ch, H, W)
+        h = torch.fft.fft2(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
+        h = self.proj_B(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
         if last_hidden_in is not None: 
@@ -224,10 +266,10 @@ class ConvLRULayer(nn.Module):
             pass
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
-        # h = torch.fft.ifft2(h) # Test for No FFT
+        h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
-        h = h.real
-        h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
+        h = self.layer_norm(h.reshape(B, L, -1)).reshape(B, L, self.emb_ch, H, W)
+        h = h.reshape(B, L, self.emb_ch, H, W)
         x = h + x
         return x, last_hidden_out
     def forward(self, x, last_hidden_in):
@@ -241,11 +283,11 @@ class FeedForward(nn.Module):
         self.ffn_hidden_ch = args.ffn_hidden_ch
         self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
-        self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size) for i in range(self.ffn_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
-        self.activation = nn.GELU()
-        self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
+        self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same').to(torch.cfloat)
+        self.c_hidden = nn.ModuleList([Conv_hidden_Complex(self.ffn_hidden_ch, self.hidden_size).to(torch.cfloat) for _ in range(self.ffn_hidden_layers_num)])
+        self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same').to(torch.cfloat)
+        self.activation = ComplexGELU()
+        self.layer_norm = RMSNorm(torch.prod(torch.tensor([self.emb_ch, *self.hidden_size])))
     def forward(self, x):
         B, L, _, H, W = x.size()
         x_ = self.c_in(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.ffn_hidden_ch, H, W)
@@ -253,7 +295,8 @@ class FeedForward(nn.Module):
         for layer in self.c_hidden:
             x_ = layer(x_)
         x_ = self.c_out(x_.reshape(B*L, self.ffn_hidden_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
-        x_ = self.layer_norm(x_)
+        B, L, C, H, W = x_.size()
+        x_ = self.layer_norm(x_.reshape(B, L, -1)).reshape(B, L, C, H, W)
         x = x_ + x
         return x
     
