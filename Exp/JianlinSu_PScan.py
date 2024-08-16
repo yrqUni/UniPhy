@@ -10,7 +10,6 @@ class LRU:
 
         if i > 1:
             lamb = torch.cat((lamb, lamb * lamb[-1]), 0)
-        print(h2.size(), lamb.size(), h1[:, -1:].size())
         h2 = h2 + lamb * h1[:, -1:] * mask_[:, l // 2 - 1:l // 2].unsqueeze(-1)
         h = torch.cat([h1, h2], axis=1)
         return h, lamb
@@ -25,11 +24,10 @@ class LRU:
     def lru_serial(self, h, lamb, mask):
         B, L, D = h.size()
         for l in range(1, L):
-            print(h[:, l - 1, :].size(), lamb.size())
             h[:, l, :] += h[:, l - 1, :] * lamb * mask[:, l - 1].unsqueeze(-1)
         return h
 
-B, L, D = 2, 8, 3
+B, L, D = 2, 8, 128
 h = torch.randn(B, L, D)
 lamb = torch.randn(1, D)
 mask = torch.ones(B, L)
@@ -37,7 +35,8 @@ mask = torch.ones(B, L)
 lru = LRU()
 h_result_parallel = lru.compute_parallel(h.clone(), lamb.clone(), mask.clone())
 h_result_serial = lru.lru_serial(h.clone(), lamb.clone(), mask.clone())
-print((h_result_parallel-h_result_serial).abs().max())
+out = (h_result_parallel-h_result_serial).abs()
+print(torch.max(out[~torch.isnan(out)]))
 print(torch.allclose(h_result_parallel, h_result_serial))
 
 ##############################################
@@ -55,7 +54,6 @@ class LRU:
         if i > 1:
             lamb = torch.cat((lamb, lamb * lamb[-1]), 0)
         mask_ = mask_[:, l // 2 - 1:l // 2]
-        print(lamb.shape, h1[:, -1:].shape)
         h2 = h2 + lamb * h1[:, -1:] * mask_.reshape(*mask_.shape, 1, 1, 1)
         h = torch.cat([h1, h2], axis=1)
         return h, lamb
@@ -70,12 +68,11 @@ class LRU:
     def lru_serial(self, h, lamb, mask):
         B, L, C, S, S = h.size()
         for l in range(1, L):
-            print(h[:, l - 1].size(), lamb.size())
             mask_ = mask[:, l - 1]
             h[:, l] += h[:, l - 1] * lamb * mask_.reshape(*mask_.shape, 1, 1, 1)
         return h
 
-B, L, C, S = 2, 8, 3, 16
+B, L, C, S = 2, 8, 128, 1
 h = torch.randn(B, L, C, S, S)
 lamb = torch.randn(1, C, S, S)
 mask = torch.ones(B, L)
@@ -83,5 +80,6 @@ mask = torch.ones(B, L)
 lru = LRU()
 h_result_parallel = lru.compute_parallel(h.clone(), lamb.clone(), mask.clone())
 h_result_serial = lru.lru_serial(h.clone(), lamb.clone(), mask.clone())
-print((h_result_parallel-h_result_serial).abs().max())
+out = (h_result_parallel-h_result_serial).abs()
+print(torch.max(out[~torch.isnan(out)]))
 print(torch.allclose(h_result_parallel, h_result_serial))

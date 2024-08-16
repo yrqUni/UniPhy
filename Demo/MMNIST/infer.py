@@ -3,6 +3,8 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model'))
 
+import json
+import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -20,72 +22,49 @@ from ModelConvLRU import ConvLRU
 from DATA.MMNIST import MovingMNIST 
 
 class Args:
-    def __init__(self):
-        # input info
-        self.input_size = (64, 64)
-        self.input_ch = 1
-        # convlru info
-        self.emb_ch = 256
-        self.convlru_dropout = 0.0
-        self.convlru_num_blocks = 24
-        #
-        self.hidden_factor = (2, 2)
-        # emb info
-        self.emb_hidden_ch = 64
-        self.emb_dropout = 0.0
-        self.emb_hidden_layers_num = 16
-        # ffn info
-        self.ffn_hidden_ch = 32
-        self.ffn_dropout = 0.0
-        self.ffn_hidden_layers_num = 4
-        # dec info
-        self.dec_hidden_ch = 64
-        self.dec_dropout = 0.0
-        self.dec_hidden_layers_num = 16
-        # # input info
-        # self.input_size = (64, 64)
-        # self.input_ch = 1
-        # # convlru info
-        # self.emb_ch = 128
-        # self.convlru_dropout = 0.0
-        # self.convlru_num_blocks = 12
-        # #
-        # self.hidden_factor = (4, 4)
-        # # emb info
-        # self.emb_hidden_ch = 32
-        # self.emb_dropout = 0.0
-        # self.emb_hidden_layers_num = 8
-        # # ffn info
-        # self.ffn_hidden_ch = 32
-        # self.ffn_dropout = 0.0
-        # self.ffn_hidden_layers_num = 2
-        # # dec info
-        # self.dec_hidden_ch = 32
-        # self.dec_dropout = 0.0
-        # self.dec_hidden_layers_num = 8
-        # data info
-        self.root = './DATA/MMNIST/'
-        self.is_train = True
-        self.n_frames_input = 10
-        self.n_frames_output = 10
-        self.num_objects = [2]
-        self.num_samples = int(1e3)
-        # training info
-        self.batch_size = 2
-        self.lr = 1e-3
-        self.EPs = 1
-        self.vis_num = 10
-        self.out_path = './exp_b/'
-        self.log_file = os.path.join(self.out_path, 'log')
-        self.vis_path = os.path.join(self.out_path, 'vis/')
-        self.pretrain_path = '/data1/ruiqingy/Workspace/ConvLRU/Demo/MMNIST/exp1/eval/ckpt/best_checkpoint_epoch7_step5000.pth'
+    def __init__(self, config_file):
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        # Model
+        self.input_size = tuple(config.get("input_size", [64, 64]))
+        self.input_ch = config.get("input_ch", 1)
+        self.emb_ch = config.get("emb_ch", 256)
+        self.convlru_dropout = config.get("convlru_dropout", 0.0)
+        self.convlru_num_blocks = config.get("convlru_num_blocks", 24)
+        self.hidden_factor = tuple(config.get("hidden_factor", [2, 2]))
+        self.emb_hidden_ch = config.get("emb_hidden_ch", 128)
+        self.emb_dropout = config.get("emb_dropout", 0.0)
+        self.emb_hidden_layers_num = config.get("emb_hidden_layers_num", 22)
+        self.ffn_hidden_ch = config.get("ffn_hidden_ch", 64)
+        self.ffn_dropout = config.get("ffn_dropout", 0.0)
+        self.ffn_hidden_layers_num = config.get("ffn_hidden_layers_num", 12)
+        self.dec_hidden_ch = config.get("dec_hidden_ch", 128)
+        self.dec_dropout = config.get("dec_dropout", 0.0)
+        self.dec_hidden_layers_num = config.get("dec_hidden_layers_num", 22)
+        # Data
+        self.out_path_root = config.get("out_path_root", './exp1/')
+        self.pretrain_path = config.get("pretrain_path", 'None')
+        self.eval_root = config.get("eval_root", './DATA/MMNIST/')
+        self.eval_is_train = config.get("eval_is_train", False)
+        self.eval_n_frames_input = config.get("eval_n_frames_input", 10)
+        self.eval_n_frames_output = config.get("eval_n_frames_output", 10)
+        self.eval_num_objects = config.get("eval_num_objects", [2])
+        self.eval_num_samples = config.get("eval_num_samples", int(1e2))
+        self.eval_batch_size = config.get("eval_batch_size", 5)
+        self.log_file = config.get("log_file", os.path.join(self.out_path_root, 'log'))
+        self.vis_path = config.get("vis_path", os.path.join(self.out_path_root, 'vis/'))
+        self.eval_vis_num = config.get("eval_vis_num", 10)
+        self.seed = config.get("seed", 1017)
     def __str__(self):
         attrs = vars(self)
         return '\n'.join(f'{k}: {v}' for k, v in attrs.items())
-args = Args()
 
-if not os.path.exists(args.out_path):
-    os.makedirs(args.out_path)
+parser = argparse.ArgumentParser(description="Load config file")
+parser.add_argument('--cfg', type=str, required=True, help="Path to the config file")
+args = parser.parse_args()
+config_file = args.cfg
+args = Args(config_file)
+
 if not os.path.exists(args.vis_path):
     os.makedirs(args.vis_path)
 
@@ -93,8 +72,8 @@ logging.basicConfig(filename=args.log_file, level=logging.INFO)
 logging.info(str(args))
 print(str(args))
 
-dataset = MovingMNIST(root=args.root, is_train=args.is_train, n_frames_input=args.n_frames_input, n_frames_output=args.n_frames_output, num_objects=args.num_objects, num_samples=args.num_samples)
-dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+dataset = MovingMNIST(root=args.eval_root, is_train=args.eval_is_train, n_frames_input=args.eval_n_frames_input, n_frames_output=args.eval_n_frames_output, num_objects=args.eval_num_objects, num_samples=args.eval_num_samples)
+dataloader = DataLoader(dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 
 model = ConvLRU(args).cuda()
 
@@ -104,7 +83,7 @@ if os.path.exists(args.pretrain_path):
 else:
     assert False, 'No pretrained model found'
 
-loss_fn = nn.BCELoss().cuda()
+loss_fn = nn.MSELoss().cuda()
 
 lpips_fn = lpips.LPIPS(net='alex').cuda()
 
@@ -174,7 +153,7 @@ ssim_vals, psnr_vals, lpips_vals, fvd_vals = [], [], [], []
 with torch.no_grad():
     for step, (inputs, outputs) in enumerate(tqdm(dataloader)):
         inputs, outputs = inputs.cuda(), outputs.cuda()
-        pred_outputs = model(inputs, mode='i_sigmoid', out_frames_num=args.n_frames_output)
+        pred_outputs = model(inputs, mode='i_sigmoid', out_frames_num=args.eval_n_frames_output)
         loss = loss_fn(pred_outputs, outputs)
         running_loss += loss.item()
         logging.info(f'Step {step+1}, Average Loss: {running_loss}')
@@ -191,6 +170,6 @@ with torch.no_grad():
         
         running_loss = 0.0
         for sample_idx in range(outputs.size(0)):
-            visualize(outputs[sample_idx:sample_idx+1], pred_outputs[sample_idx:sample_idx+1], step + 1, args.vis_num, sample_idx)
+            visualize(outputs[sample_idx:sample_idx+1], pred_outputs[sample_idx:sample_idx+1], step + 1, args.eval_vis_num, sample_idx)
 
 logging.shutdown()

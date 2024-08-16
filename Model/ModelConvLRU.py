@@ -79,14 +79,13 @@ class ConvLRU(nn.Module):
             return out
 
 class Conv_hidden(nn.Module):
-    def __init__(self, ch, dropout, hidden_size):
+    def __init__(self, ch, hidden_size):
         super().__init__()
         self.ch = ch
         self.conv3 = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding='same')
         self.activation3 = nn.GELU()
         self.conv1 = nn.Conv2d(self.ch, self.ch, kernel_size=1, padding='same')
         self.activation1 = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm([self.ch, *hidden_size])
     def forward(self, x):
         B, L, _, H, W = x.size()
@@ -94,7 +93,6 @@ class Conv_hidden(nn.Module):
         x_ = self.activation3(x_)
         x_ = self.conv1(x.reshape(B*L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
         x_ = self.activation1(x_)
-        x_ = self.dropout(x_)
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
@@ -107,7 +105,6 @@ class Embedding(nn.Module):
         self.emb_ch = args.emb_ch
         self.emb_hidden_ch = args.emb_hidden_ch
         self.emb_hidden_layers_num = args.emb_hidden_layers_num
-        self.dropout_rate = args.emb_dropout
         self.downsp = nn.Conv2d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
         with torch.no_grad():
             x = torch.zeros(1, self.input_ch, *self.input_size)
@@ -116,10 +113,9 @@ class Embedding(nn.Module):
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.dropout_rate, self.hidden_size) for i in range(self.emb_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size) for i in range(self.emb_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
-        self.dropout = nn.Dropout(self.dropout_rate)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
         B, L, C, H, W = x.size()
@@ -128,12 +124,10 @@ class Embedding(nn.Module):
         x = x.reshape(B, L, C, H, W)
         B, L, _, H, W = x.size()
         x = self.c_in(x.reshape(B*L, -1, H, W))
-        x = self.activation(x)
-        x = self.dropout(x).reshape(B, L, -1, H, W)
+        x = self.activation(x).reshape(B, L, -1, H, W)
         for layer in self.c_hidden:
             x = layer(x)
         x = self.c_out(x.reshape(B*L, -1, H, W))
-        x = self.dropout(x)
         x = self.layer_norm(x).reshape(B, L, -1, H, W)
         return x
 
@@ -145,7 +139,6 @@ class Decoder(nn.Module):
         self.dec_hidden_ch = args.dec_hidden_ch
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
         self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
-        self.dropout_rate = args.dec_dropout
         self.c_in_1 = nn.Conv2d(self.emb_ch, input_downsp_shape[0], kernel_size=1, padding='same')
         self.upsp = nn.ConvTranspose2d(in_channels=input_downsp_shape[0], out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
         with torch.no_grad():
@@ -153,10 +146,9 @@ class Decoder(nn.Module):
             x = self.upsp(x)
             _, C, H, W = x.size()
         self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, self.dropout_rate, (H, W)) for i in range(self.dec_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W)) for i in range(self.dec_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
-        self.dropout = nn.Dropout(self.dropout_rate)
     def forward(self, x):
         B, L, _, H, W = x.size()
         x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
@@ -164,12 +156,10 @@ class Decoder(nn.Module):
         _, _, H, W = x.size()
         x = self.c_in_2(x)
         x = self.activation(x)
-        x = self.dropout(x)
         x = x.reshape(B, L, self.dec_hidden_ch, H, W)
         for layer in self.c_hidden:
             x = layer(x)
-        x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W))
-        x = self.dropout(x).reshape(B, L, self.input_ch, H, W)
+        x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W)).reshape(B, L, self.input_ch, H, W)
         return x
 
 class ConvLRUModel(nn.Module):
@@ -206,7 +196,6 @@ class ConvLRULayer(nn.Module):
         self.r_max = 0.99
         self.emb_ch = args.emb_ch 
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
-        self.dropout = args.convlru_dropout
         # init 
         u1 = torch.rand(self.emb_ch, self.hidden_size[0])
         u2 = torch.rand(self.emb_ch, self.hidden_size[0])
@@ -218,7 +207,6 @@ class ConvLRULayer(nn.Module):
         # define layers
         self.proj_B = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
-        self.dropout = nn.Dropout(p=self.dropout)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def convlru(self, x, last_hidden_in):
         B, L, _, H, W = x.size()
@@ -238,7 +226,6 @@ class ConvLRULayer(nn.Module):
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
-        h = self.dropout(h)
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         x = h + x
         return x, last_hidden_out
@@ -253,22 +240,18 @@ class FeedForward(nn.Module):
         self.ffn_hidden_ch = args.ffn_hidden_ch
         self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
-        self.dropout_rate = args.ffn_dropout
         self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.dropout_rate, self.hidden_size) for i in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size) for i in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
-        self.dropout = nn.Dropout(self.dropout_rate)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
         B, L, _, H, W = x.size()
         x_ = self.c_in(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.ffn_hidden_ch, H, W)
         x_ = self.activation(x_)
-        x_ = self.dropout(x_)
         for layer in self.c_hidden:
             x_ = layer(x_)
         x_ = self.c_out(x_.reshape(B*L, self.ffn_hidden_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
-        x_ = self.dropout(x_)
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x

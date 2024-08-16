@@ -18,15 +18,12 @@ class Args:
         self.hidden_factor = (4, 4)
         # emb info
         self.emb_hidden_ch = 128
-        self.emb_dropout = 0.0
         self.emb_hidden_layers_num = 4
         # ffn info
         self.ffn_hidden_ch = 32
-        self.ffn_dropout = 0.1
         self.ffn_hidden_layers_num = 2
         # dec info
         self.dec_hidden_ch = 128
-        self.dec_dropout = 0.1
         self.dec_hidden_layers_num = 4
 args = Args()
 B = 2
