@@ -228,7 +228,10 @@ class ConvLRULayer(nn.Module):
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
-        x = h[:, -self.gen_factor:] + x
+        if last_hidden_in is not None:
+            x = h[:, :-self.gen_factor] + x
+        else:
+            x = h + x
         return x, last_hidden_out
     def forward(self, x, last_hidden_in):
         x, last_hidden_out = self.convlru(x, last_hidden_in)
