@@ -3,7 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gc
 import torch
-from Model.ModelConvLRU import ConvLRU
+from Model.FFT.ModelConvLRU import ConvLRU
 
 class Args:
     def __init__(self):
@@ -25,6 +25,8 @@ class Args:
         # dec info
         self.dec_hidden_ch = 128
         self.dec_hidden_layers_num = 4
+        # output info
+        self.gen_factor = 8
 args = Args()
 B = 2
 L = 8
@@ -59,7 +61,8 @@ opt = torch.optim.Adam(model.parameters(), lr=0.001)
 inputs_train = torch.randn(B, L, args.input_ch, *args.input_size).cuda()
 labels_train = torch.randn(B, out_frames_num, args.input_ch, *args.input_size).cuda()
 opt.zero_grad()
-outputs = model(inputs_train, mode='i_sigmoid', out_frames_num=out_frames_num)
+out_gen_num = out_frames_num // args.gen_factor
+outputs = model(inputs_train, mode='i_sigmoid', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
 loss = loss_fn(outputs, labels_train)
 loss.backward()
 opt.step()
