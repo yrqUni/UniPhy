@@ -1,7 +1,7 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model/FFT/'))
 
 import json
 import argparse
@@ -41,6 +41,8 @@ class Args:
         self.dec_hidden_ch = config.get("dec_hidden_ch", 128)
         self.dec_dropout = config.get("dec_dropout", 0.0)
         self.dec_hidden_layers_num = config.get("dec_hidden_layers_num", 22)
+        # Generation
+        self.gen_factor = config.get("gen_factor", 10)
         # Data
         self.out_path_root = config.get("out_path_root", './exp1/')
         self.pretrain_path = config.get("pretrain_path", 'None')
@@ -153,7 +155,8 @@ ssim_vals, psnr_vals, lpips_vals, fvd_vals = [], [], [], []
 with torch.no_grad():
     for step, (inputs, outputs) in enumerate(tqdm(dataloader)):
         inputs, outputs = inputs.cuda(), outputs.cuda()
-        pred_outputs = model(inputs, mode='i_sigmoid', out_frames_num=args.eval_n_frames_output)
+        out_gen_num = args.eval_n_frames_output // args.gen_factor
+        pred_outputs = model(inputs, mode='i_sigmoid', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
         loss = loss_fn(pred_outputs, outputs)
         running_loss += loss.item()
         logging.info(f'Step {step+1}, Average Loss: {running_loss}')
