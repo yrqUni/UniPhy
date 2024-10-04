@@ -259,4 +259,3 @@ class FeedForward(nn.Module):
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
-
