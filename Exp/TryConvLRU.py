@@ -8,27 +8,26 @@ from Model.FFT.ModelConvLRU import ConvLRU
 class Args:
     def __init__(self):
         # input info
-        self.input_size = (64, 64)
-        self.input_ch = 1
+        self.input_size = (720, 1440) 
+        self.input_ch = 20
         # convlru info
-        self.emb_ch = 512
-        self.convlru_dropout = 0.1  
-        self.convlru_num_blocks = 24
+        self.emb_ch = 32
+        self.convlru_num_blocks = 8
         #
-        self.hidden_factor = (4, 4)
+        self.hidden_factor = (24, 48)
         # emb info
-        self.emb_hidden_ch = 128
+        self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 4
         # ffn info
         self.ffn_hidden_ch = 32
         self.ffn_hidden_layers_num = 2
         # dec info
-        self.dec_hidden_ch = 128
+        self.dec_hidden_ch = 32
         self.dec_hidden_layers_num = 4
         # output info
         self.gen_factor = 8
 args = Args()
-B = 2
+B = 1
 L = 8
 
 model = ConvLRU(args).cuda()
