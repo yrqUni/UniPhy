@@ -8,13 +8,13 @@ from Model.FFT.ModelConvLRU import ConvLRU
 class Args:
     def __init__(self):
         # input info
-        self.input_size = (720, 1440) 
+        self.input_size = (64, 64) 
         self.input_ch = 20
         # convlru info
         self.emb_ch = 32
         self.convlru_num_blocks = 8
         #
-        self.hidden_factor = (24, 48)
+        self.hidden_factor = (8, 8)
         # emb info
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 4

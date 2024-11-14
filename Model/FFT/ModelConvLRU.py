@@ -79,20 +79,29 @@ class ConvLRU(nn.Module):
             return out
 
 class Conv_hidden(nn.Module):
-    def __init__(self, ch, hidden_size):
+    def __init__(self, ch, hidden_size, num_heads=4, use_mhsa=False):
         super().__init__()
         self.ch = ch
+        self.use_mhsa = use_mhsa 
         self.conv3 = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding='same')
         self.activation3 = nn.GELU()
         self.conv1 = nn.Conv2d(self.ch, self.ch, kernel_size=1, padding='same')
         self.activation1 = nn.GELU()
         self.layer_norm = nn.LayerNorm([self.ch, *hidden_size])
+        if self.use_mhsa:
+            embed_dim = ch * hidden_size[0] * hidden_size[1]  
+            self.mhsa = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
     def forward(self, x):
         B, L, _, H, W = x.size()
-        x_ = self.conv3(x.reshape(B*L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
+        x_ = self.conv3(x.reshape(B * L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
         x_ = self.activation3(x_)
-        x_ = self.conv1(x.reshape(B*L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
+        x_ = self.conv1(x.reshape(B * L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
         x_ = self.activation1(x_)
+        if self.use_mhsa:
+            x_mhsa_input = x_.reshape(B, L, -1).permute(1, 0, 2)  
+            x_mhsa_output, _ = self.mhsa(x_mhsa_input, x_mhsa_input, x_mhsa_input)
+            x_mhsa_output = x_mhsa_output.permute(1, 0, 2).reshape(B, L, self.ch, H, W)
+            x_ = x_ + x_mhsa_output  
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
@@ -113,7 +122,7 @@ class Embedding(nn.Module):
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size) for i in range(self.emb_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, num_heads=None, use_mhsa=False) for i in range(self.emb_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
@@ -146,7 +155,7 @@ class Decoder(nn.Module):
             x = self.upsp(x)
             _, C, H, W = x.size()
         self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W)) for i in range(self.dec_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), num_heads=None, use_mhsa=False) for i in range(self.dec_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
     def forward(self, x):
@@ -196,7 +205,6 @@ class ConvLRULayer(nn.Module):
         self.r_max = 0.99
         self.emb_ch = args.emb_ch
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
-        self.gen_factor = args.gen_factor
         # init
         u1 = torch.rand(self.emb_ch, self.hidden_size[0])
         u2 = torch.rand(self.emb_ch, self.hidden_size[0])
@@ -223,13 +231,13 @@ class ConvLRULayer(nn.Module):
         else:
             pass
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
-        last_hidden_out = h[:, -self.gen_factor:]
+        last_hidden_out = h[:, -1:]
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         if last_hidden_in is not None:
-            x = h[:, -self.gen_factor:] + x
+            x = h[:, 1:] + x
         else:
             x = h + x
         return x, last_hidden_out
@@ -245,7 +253,7 @@ class FeedForward(nn.Module):
         self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size) for i in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, num_heads=4, use_mhsa=True) for i in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
