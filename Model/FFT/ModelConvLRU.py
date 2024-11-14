@@ -79,7 +79,7 @@ class ConvLRU(nn.Module):
             return out
 
 class Conv_hidden(nn.Module):
-    def __init__(self, ch, hidden_size, num_heads=4, use_mhsa=False):
+    def __init__(self, ch, hidden_size, use_mhsa=False, sa_dim=128):
         super().__init__()
         self.ch = ch
         self.use_mhsa = use_mhsa 
@@ -89,8 +89,8 @@ class Conv_hidden(nn.Module):
         self.activation1 = nn.GELU()
         self.layer_norm = nn.LayerNorm([self.ch, *hidden_size])
         if self.use_mhsa:
-            embed_dim = ch * hidden_size[0] * hidden_size[1]  
-            self.mhsa = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+            self.sa_dim = sa_dim
+            self.mhsa_qk = nn.Linear(hidden_size[0]*hidden_size[1], sa_dim*2)
     def forward(self, x):
         B, L, _, H, W = x.size()
         x_ = self.conv3(x.reshape(B * L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
@@ -98,10 +98,14 @@ class Conv_hidden(nn.Module):
         x_ = self.conv1(x.reshape(B * L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
         x_ = self.activation1(x_)
         if self.use_mhsa:
-            x_mhsa_input = x_.reshape(B, L, -1).permute(1, 0, 2)  
-            x_mhsa_output, _ = self.mhsa(x_mhsa_input, x_mhsa_input, x_mhsa_input)
-            x_mhsa_output = x_mhsa_output.permute(1, 0, 2).reshape(B, L, self.ch, H, W)
-            x_ = x_ + x_mhsa_output  
+            x_ = x_.reshape(B * L, self.ch, H * W)
+            qk = self.mhsa_qk(x_)
+            q, k = qk.split(self.sa_dim, dim=-1)
+            attn = torch.einsum('bld,bmd->blm', q, k)
+            attn = attn / math.sqrt(self.sa_dim)
+            attn = torch.softmax(attn, dim=-1)
+            x_ = torch.einsum('blm,bmd->bld', attn, x_)
+            x_ = x_.reshape(B, L, self.ch, H, W)
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
@@ -122,7 +126,7 @@ class Embedding(nn.Module):
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, num_heads=None, use_mhsa=False) for i in range(self.emb_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, use_mhsa=False, sa_dim=None) for i in range(self.emb_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
@@ -155,7 +159,7 @@ class Decoder(nn.Module):
             x = self.upsp(x)
             _, C, H, W = x.size()
         self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), num_heads=None, use_mhsa=False) for i in range(self.dec_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
     def forward(self, x):
@@ -253,7 +257,7 @@ class FeedForward(nn.Module):
         self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, num_heads=4, use_mhsa=True) for i in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, use_mhsa=True, sa_dim=128) for i in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
