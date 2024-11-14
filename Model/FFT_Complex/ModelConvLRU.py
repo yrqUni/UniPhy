@@ -268,13 +268,13 @@ class ConvLRULayer(nn.Module):
         else:
             pass
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
-        last_hidden_out = h[:, -self.gen_factor:]
+        last_hidden_out = h[:, -1:]
         h = torch.fft.ifft2(h)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = self.layer_norm(h.reshape(B, L, -1)).reshape(B, L, self.emb_ch, H, W)
         h = h.reshape(B, L, self.emb_ch, H, W)
         if last_hidden_in is not None:
-            x = h[:, -self.gen_factor:] + x
+            x = h[:, 1:] + x
         else:
             x = h + x
         return x, last_hidden_out
