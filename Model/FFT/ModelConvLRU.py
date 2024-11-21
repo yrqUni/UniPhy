@@ -220,6 +220,7 @@ class ConvLRULayer(nn.Module):
         # define layers
         self.proj_B = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
+        self.channel_mixer = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=3, padding=1, bias=self.use_bias).to(torch.cfloat)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def convlru(self, x, last_hidden_in):
         B, L, _, H, W = x.size()
@@ -234,6 +235,7 @@ class ConvLRULayer(nn.Module):
             B, L, _, H, W = h.size()
         else:
             pass
+        h = self.channel_mixer(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
         h = torch.fft.ifft2(h)
