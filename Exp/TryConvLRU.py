@@ -15,6 +15,7 @@ class Args:
         self.convlru_num_blocks = 8
         #
         self.hidden_factor = (8, 8)
+        self.use_mhsa = False
         # emb info
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 4
