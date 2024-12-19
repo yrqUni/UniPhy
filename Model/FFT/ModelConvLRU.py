@@ -91,6 +91,7 @@ class Conv_hidden(nn.Module):
         if self.use_mhsa:
             self.sa_dim = sa_dim
             self.mhsa_qk = nn.Linear(hidden_size[0]*hidden_size[1], sa_dim*2)
+            self.pos_bias = nn.Parameter(torch.randn(1, ch, hidden_size[0]*hidden_size[1]))
     def forward(self, x):
         B, L, _, H, W = x.size()
         x_ = self.conv3(x.reshape(B * L, self.ch, H, W)).reshape(B, L, self.ch, H, W)
@@ -99,6 +100,7 @@ class Conv_hidden(nn.Module):
         x_ = self.activation1(x_)
         if self.use_mhsa:
             x_ = x_.reshape(B * L, self.ch, H * W)
+            x_ = x_ + self.pos_bias
             qk = self.mhsa_qk(x_)
             q, k = qk.split(self.sa_dim, dim=-1)
             attn = torch.einsum('bld,bmd->blm', q, k)
