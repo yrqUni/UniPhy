@@ -243,7 +243,7 @@ class ConvLRULayer(nn.Module):
             h = self.channel_mixer(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
-        h = torch.fft.ifft2(h)
+        h = torch.fft.ifft2(h.reshape(B*L, self.emb_ch, H, W), dim=(-3, -2, -1)).reshape(B, L, self.emb_ch, H, W)
         h = self.proj_C(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = h.real
         h = self.layer_norm(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
