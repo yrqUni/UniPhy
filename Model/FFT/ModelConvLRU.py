@@ -222,9 +222,6 @@ class ConvLRULayer(nn.Module):
         # define layers
         self.proj_B = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
         self.proj_C = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1, padding='same', bias=self.use_bias).to(torch.cfloat)
-        self.use_mhsa = args.use_mhsa
-        if self.use_mhsa == False:
-            self.channel_mixer = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=3, padding=1, bias=self.use_bias).to(torch.cfloat)
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def convlru(self, x, last_hidden_in):
         B, L, _, H, W = x.size()
@@ -239,8 +236,6 @@ class ConvLRULayer(nn.Module):
             B, L, _, H, W = h.size()
         else:
             pass
-        if self.use_mhsa == False:
-            h = self.channel_mixer(h.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.emb_ch, H, W)
         h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
         h = torch.fft.ifft2(h.reshape(B*L, self.emb_ch, H, W), dim=(-3, -2, -1)).reshape(B, L, self.emb_ch, H, W)
@@ -262,9 +257,10 @@ class FeedForward(nn.Module):
         self.emb_ch = args.emb_ch
         self.ffn_hidden_ch = args.ffn_hidden_ch
         self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
+        self.use_mhsa = args.use_mhsa
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, use_mhsa=True, sa_dim=128) for i in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, use_mhsa=self.use_mhsa, sa_dim=128) for i in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = nn.GELU()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
