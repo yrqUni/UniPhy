@@ -24,6 +24,8 @@ class Args:
         self.dec_hidden_ch = 32
         self.dec_hidden_layers_num = 4
         self.gen_factor = 8
+        self.hidden_activation = 'ReLU'
+        self.output_activation = 'Sigmoid'
 
 def setup_ddp(rank, world_size):
     """Initialize the distributed environment."""
@@ -63,7 +65,7 @@ def demo_ddp(rank, world_size, args):
     model.train()
     for inputs, labels in train_loader:
         opt.zero_grad()
-        outputs = model(inputs, mode='p_sigmoid')
+        outputs = model(inputs, mode='p')
         loss = loss_fn(outputs, labels)
         loss.backward()
         opt.step()

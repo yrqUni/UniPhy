@@ -15,6 +15,7 @@ class ConvLRU(nn.Module):
         self.embedding = Embedding(self.args)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
+        self.out_activation = getattr(nn, args.output_activation)()
         self.truncated_normal_init()
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
         with torch.no_grad():
@@ -37,56 +38,38 @@ class ConvLRU(nn.Module):
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
-        assert mode in ['p_sigmoid', 'p_logits', 'i_sigmoid', 'i_logits'], f'mode should be either p_sigmoid, p_logits, i_sigmoid or i_logits, but got {mode}'
-        if mode == 'p_logits':
+        assert mode in ['p', 'i'], f'mode should be either p or i, but got {mode}'
+        if mode == 'p':
             x = self.embedding(x)
             x, _ = self.convlru_model(x, last_hidden_ins=None)
             x = self.decoder(x)
+            x = self.out_activation(x)
             return x
-        elif mode == 'p_sigmoid':
-            x = self.embedding(x)
-            x, _ = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x)
-            x = torch.sigmoid(x)
-            return x
-        elif mode == 'i_logits':
+        elif mode == 'i':
             out = []
             x = self.embedding(x)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
             x = self.decoder(x)
             x = x[:, -gen_factor:]
-            out.append(x)
+            out.append(self.out_activation(x))
             for i in range(out_gen_num-1):
-                x = self.embedding(torch.sigmoid(out[i]))
+                x = self.embedding(self.out_activation(out[i]))
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
                 x = self.decoder(x)[:, -gen_factor:]
-                out.append(x)
+                out.append(self.out_activation(x))
             out = torch.concat(out, dim=1)
             return out
-        elif mode == 'i_sigmoid':
-            out = []
-            x = self.embedding(x)
-            x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x)
-            x = x[:, -gen_factor:]
-            out.append(torch.sigmoid(x))
-            for i in range(out_gen_num-1):
-                x = self.embedding(out[i])
-                x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
-                x = self.decoder(x)[:, -gen_factor:]
-                out.append(torch.sigmoid(x))
-            out = torch.concat(out, dim=1)
-            return out
+        
 
 class Conv_hidden(nn.Module):
-    def __init__(self, ch, hidden_size, use_mhsa=False, sa_dim=128):
+    def __init__(self, ch, hidden_size, activation_func, use_mhsa=False, sa_dim=128):
         super().__init__()
         self.ch = ch
         self.use_mhsa = use_mhsa 
         self.conv3 = nn.Conv2d(self.ch, self.ch, kernel_size=3, padding='same')
-        self.activation3 = nn.GELU()
+        self.activation3 = getattr(nn, activation_func)()
         self.conv1 = nn.Conv2d(self.ch, self.ch, kernel_size=1, padding='same')
-        self.activation1 = nn.GELU()
+        self.activation1 = getattr(nn, activation_func)()
         self.layer_norm = nn.LayerNorm([self.ch, *hidden_size])
         if self.use_mhsa:
             self.sa_dim = sa_dim
@@ -128,9 +111,9 @@ class Embedding(nn.Module):
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, use_mhsa=False, sa_dim=None) for i in range(self.emb_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.emb_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
-        self.activation = nn.GELU()
+        self.activation = getattr(nn, args.hidden_activation)()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
         B, L, C, H, W = x.size()
@@ -161,9 +144,9 @@ class Decoder(nn.Module):
             x = self.upsp(x)
             _, C, H, W = x.size()
         self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=1, padding='same')
-        self.activation = nn.GELU()
+        self.activation = getattr(nn, args.hidden_activation)()
     def forward(self, x):
         B, L, _, H, W = x.size()
         x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
@@ -260,9 +243,9 @@ class FeedForward(nn.Module):
         self.use_mhsa = args.use_mhsa
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, use_mhsa=self.use_mhsa, sa_dim=128) for i in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=self.use_mhsa, sa_dim=128) for i in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
-        self.activation = nn.GELU()
+        self.activation = getattr(nn, args.hidden_activation)()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
         B, L, _, H, W = x.size()

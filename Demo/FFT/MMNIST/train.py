@@ -36,6 +36,8 @@ class Args:
         self.dec_hidden_ch = config.get("dec_hidden_ch", 128)
         self.dec_hidden_layers_num = config.get("dec_hidden_layers_num", 22)
         self.gen_factor = config.get("gen_factor", 16)
+        self.output_activation = config.get("hidden_activation", 'ReLU')
+        self.output_activation = config.get("output_activation", 'Sigmoid')
         self.root = config.get("root", './DATA/MMNIST/')
         self.is_train = config.get("is_train", True)
         self.n_frames_input = config.get("n_frames_input", 21)
