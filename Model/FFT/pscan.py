@@ -4,13 +4,13 @@ import torch.nn.functional as F
 
 def npo2(len):
     """
-    Returns the next power of 2 above len
+    Returns the next power of 2 above len.
     """
     return 2 ** math.ceil(math.log2(len))
 
 def pad_npo2(X):
     """
-    Pads input length dim to the next power of 2
+    Pads input length dim to the next power of 2.
 
     Args:
         X : (B, L, C, S, S)
@@ -122,8 +122,9 @@ class PScan(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A_in, X_in):
         """
-        Applies the parallel scan operation, as defined above. Returns a new tensor.
-        If you can, privilege sequence lengths that are powers of two.
+        Applies the parallel scan operation, as defined above. 
+        Returns a new tensor.
+        Privilege sequence lengths that are powers of two.
 
         Args:
             A_in : (B, L, C, S, 1)
@@ -151,7 +152,8 @@ class PScan(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output_in):
         """
-        Flows the gradient from the output to the input. Returns two new tensors.
+        Flows the gradient from the output to the input. 
+        Returns two new tensors.
 
         Args:
             ctx : A_in : (B, L, C, S, 1), X : (B, L, C, S, S)
