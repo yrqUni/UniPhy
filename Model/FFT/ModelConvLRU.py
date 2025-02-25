@@ -53,7 +53,7 @@ class ConvLRU(nn.Module):
             x = x[:, -gen_factor:]
             out.append(self.out_activation(x))
             for i in range(out_gen_num-1):
-                x = self.embedding(self.out_activation(out[i]))
+                x = self.embedding(out[:, -1, :, :, :])
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
                 x = self.decoder(x)[:, -gen_factor:]
                 out.append(self.out_activation(x))

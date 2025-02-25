@@ -31,7 +31,6 @@ class PScan(torch.autograd.Function):
         B, L, C, S, _ = A.size()
         num_steps = int(math.log2(L))
 
-        # up sweep (last 2 steps unfolded)
         Aa = A
         Xa = X
         for _ in range(num_steps - 2):
@@ -45,7 +44,6 @@ class PScan(torch.autograd.Function):
             Aa = Aa[:, :, 1]
             Xa = Xa[:, :, 1]
 
-        # we have only 4, 2 or 1 nodes left
         if Xa.size(1) == 4:
             Xa[:, 1].add_(Aa[:, 1].mul(Xa[:, 0]))
             Aa[:, 1].mul_(Aa[:, 0])
@@ -57,7 +55,6 @@ class PScan(torch.autograd.Function):
         else:
             return
 
-        # down sweep (first 2 steps unfolded)
         Aa = A[:, 2 ** (num_steps - 2) - 1:L:2 ** (num_steps - 2)]
         Xa = X[:, 2 ** (num_steps - 2) - 1:L:2 ** (num_steps - 2)]
         Xa[:, 2].add_(Aa[:, 2].mul(Xa[:, 1]))
@@ -82,7 +79,6 @@ class PScan(torch.autograd.Function):
         B, L, C, S, _ = A.size()
         num_steps = int(math.log2(L))
 
-        # up sweep (last 2 steps unfolded)
         Aa = A
         Xa = X
         for _ in range(num_steps - 2):
@@ -96,7 +92,6 @@ class PScan(torch.autograd.Function):
             Aa = Aa[:, :, 0]
             Xa = Xa[:, :, 0]
 
-        # we have only 4, 2 or 1 nodes left
         if Xa.size(1) == 4:
             Xa[:, 2].add_(Aa[:, 2].mul(Xa[:, 3]))
             Aa[:, 2].mul_(Aa[:, 3])
@@ -108,7 +103,6 @@ class PScan(torch.autograd.Function):
         else:
             return
 
-        # down sweep (first 2 steps unfolded)
         Aa = A[:, 0:L:2 ** (num_steps - 2)]
         Xa = X[:, 0:L:2 ** (num_steps - 2)]
         Xa[:, 1].add_(Aa[:, 1].mul(Xa[:, 2]))
@@ -141,21 +135,17 @@ class PScan(torch.autograd.Function):
 
         L = X_in.size(1)
 
-        # cloning is required because of the in-place ops
         if L == npo2(L):
             A = A_in.clone()
             X = X_in.clone()
         else:
-            # pad tensors (and clone btw)
             A = pad_npo2(A_in) # (B, npo2(L), C, S, S)
             X = pad_npo2(X_in) # (B, npo2(L), C, S, S)
         
-        # parallel scan (modifies X in-place)
         PScan.pscan(A, X)
 
         ctx.save_for_backward(A_in, X)
         
-        # slice [:, :L] (cut if there was padding)
         return X[:, :L]
     
     @staticmethod
@@ -175,19 +165,15 @@ class PScan(torch.autograd.Function):
 
         L = grad_output_in.size(1)
 
-        # cloning is required because of the in-place ops
         if L == npo2(L):
             grad_output = grad_output_in.clone()
-            # the next padding will clone A_in
         else:
             grad_output = pad_npo2(grad_output_in) # (B, npo2(L), C, S, S)
             A_in = pad_npo2(A_in) # (B, npo2(L), C, S, 1)
 
         A = A_in
-        # shift 1 to the left (see hand derivation)
         A_shifted = torch.nn.functional.pad(A[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
 
-        # reverse parallel scan (modifies grad_output in-place)
         PScan.pscan_rev(A_shifted, grad_output)
 
         Q = torch.zeros_like(X)
