@@ -12,6 +12,8 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
+        self.input_reshape_era5 = nn.Conv2d(in_channels=args.input_ch, out_channels=args.input_ch, kernel_size=(4,3), padding=(1, 1)) # C, 721, 1440 -> C, 720, 1440
+        self.output_reshape_era5 = nn.ConvTranspose2d(in_channels=args.input_ch, out_channels=args.input_ch, kernel_size=(4, 3), padding=(1, 1), stride=1) # C, 720, 1440 -> C, 721, 1440
         self.embedding = Embedding(self.args)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
@@ -38,29 +40,37 @@ class ConvLRU(nn.Module):
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
+        B, L, C, H_raw, W = x.size()
         assert mode in ['p', 'i'], f'mode should be either p or i, but got {mode}'
         if mode == 'p':
+            x = self.input_reshape_era5(x.reshape(B*L, C, H_raw, W)).reshape(B, L, C, H_raw-1, W)
             x = self.embedding(x)
             x, _ = self.convlru_model(x, last_hidden_ins=None)
             x = self.decoder(x)
             x = self.out_activation(x)
+            x = self.output_reshape_era5(x.reshape(B*L, C, H_raw-1, W)).reshape(B, L, C, H_raw, W)
             return x
         elif mode == 'i':
             out = []
+            x = self.input_reshape_era5(x.reshape(B*L, C, H_raw, W)).reshape(B, L, C, H_raw-1, W)
             x = self.embedding(x)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
             x = self.decoder(x)
             x = x[:, -gen_factor:]
-            out.append(self.out_activation(x))
+            x = self.out_activation(x)
+            x = self.output_reshape_era5(x.reshape(B*L, C, H_raw-1, W)).reshape(B, L, C, H_raw, W)
+            out.append(x)
             for i in range(out_gen_num-1):
-                x = self.embedding(out[:, -1, :, :, :])
+                x = self.input_reshape_era5(out[-1].reshape(B*L, C, H_raw, W)).reshape(B, L, C, H_raw-1, W)
+                x = self.embedding(x)
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
                 x = self.decoder(x)[:, -gen_factor:]
-                out.append(self.out_activation(x))
+                x = self.out_activation(x)
+                x = self.output_reshape_era5(x.reshape(B*L, C, H_raw-1, W)).reshape(B, L, C, H_raw, W)
+                out.append(x)
             out = torch.concat(out, dim=1)
             return out
         
-
 class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_mhsa=False, sa_dim=128):
         super().__init__()
@@ -105,9 +115,7 @@ class Embedding(nn.Module):
         self.emb_hidden_layers_num = args.emb_hidden_layers_num
         self.downsp = nn.Conv2d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
         with torch.no_grad():
-            x = torch.zeros(1, self.input_ch, *self.input_size)
-            x = self.downsp(x)
-            _, C, H, W = x.size()
+            _, C, H, W = self.downsp(torch.zeros(1, self.input_ch, *self.input_size)).size()
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
@@ -132,32 +140,26 @@ class Embedding(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
-        self.input_ch = args.input_ch
+        self.output_ch = args.out_ch
         self.emb_ch = args.emb_ch
         self.dec_hidden_ch = args.dec_hidden_ch
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
         self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
-        self.c_in_1 = nn.Conv2d(self.emb_ch, input_downsp_shape[0], kernel_size=1, padding='same')
-        self.upsp = nn.ConvTranspose2d(in_channels=input_downsp_shape[0], out_channels=input_downsp_shape[0], kernel_size=args.hidden_factor, stride=args.hidden_factor)
+        self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
         with torch.no_grad():
-            x = torch.zeros(1, input_downsp_shape[0], input_downsp_shape[1], input_downsp_shape[2])
-            x = self.upsp(x)
-            _, C, H, W = x.size()
-        self.c_in_2 = nn.Conv2d(C, self.dec_hidden_ch, kernel_size=7, padding='same')
+            _, C, H, W = self.upsp(torch.zeros(1, args.emb_ch, input_downsp_shape[1], input_downsp_shape[2])).size()
         self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.dec_hidden_ch, self.input_ch, kernel_size=1, padding='same')
+        self.c_out = nn.Conv2d(self.dec_hidden_ch, self.output_ch, kernel_size=1, padding='same')
         self.activation = getattr(nn, args.hidden_activation)()
     def forward(self, x):
         B, L, _, H, W = x.size()
-        x = self.c_in_1(x.reshape(B*L, self.emb_ch, H, W))
-        x = self.upsp(x)
+        x = self.upsp(x.reshape(B*L, self.emb_ch, H, W))
         _, _, H, W = x.size()
-        x = self.c_in_2(x)
         x = self.activation(x)
         x = x.reshape(B, L, self.dec_hidden_ch, H, W)
         for layer in self.c_hidden:
             x = layer(x)
-        x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W)).reshape(B, L, self.input_ch, H, W)
+        x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W)).reshape(B, L, self.output_ch, H, W)
         return x
 
 class ConvLRUModel(nn.Module):
@@ -257,3 +259,4 @@ class FeedForward(nn.Module):
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
+    
