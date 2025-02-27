@@ -61,7 +61,7 @@ class ConvLRU(nn.Module):
             x = self.output_reshape_era5(x.reshape(-1, C, H_raw-1, W)).reshape(B, -1, C, H_raw, W)
             out.append(x)
             for i in range(out_gen_num-1):
-                x = self.input_reshape_era5(out[-1].reshape(B*L, C, H_raw, W)).reshape(B, L, C, H_raw-1, W)
+                x = self.input_reshape_era5(out[-1].reshape(-1, C, H_raw, W)).reshape(B, -1, C, H_raw-1, W)
                 x = self.embedding(x)
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
                 x = self.decoder(x)[:, -gen_factor:]
@@ -259,3 +259,4 @@ class FeedForward(nn.Module):
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
+        
