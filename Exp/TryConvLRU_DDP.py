@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from Model.FFT.ModelConvLRU import ConvLRU
+from Git.ConvLRU.Model.FFT.ModelConvLRU_ERA5 import ConvLRU
 
 class Args:
     def __init__(self):
