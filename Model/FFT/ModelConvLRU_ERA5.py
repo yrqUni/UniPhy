@@ -58,7 +58,7 @@ class ConvLRU(nn.Module):
             x = self.decoder(x)
             x = x[:, -gen_factor:]
             x = self.out_activation(x)
-            x = self.output_reshape_era5(x.reshape(B*L, C, H_raw-1, W)).reshape(B, L, C, H_raw, W)
+            x = self.output_reshape_era5(x.reshape(-1, C, H_raw-1, W)).reshape(-1, L, C, H_raw, W)
             out.append(x)
             for i in range(out_gen_num-1):
                 x = self.input_reshape_era5(out[-1].reshape(B*L, C, H_raw, W)).reshape(B, L, C, H_raw-1, W)
@@ -259,4 +259,3 @@ class FeedForward(nn.Module):
         x_ = self.layer_norm(x_)
         x = x_ + x
         return x
-    
