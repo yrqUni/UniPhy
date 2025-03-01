@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
+import gc
 try:
     from .pscan import pscan
 except:
@@ -68,8 +69,11 @@ class ConvLRU(nn.Module):
                 x = self.out_activation(x)
                 x = self.output_reshape_era5(x.reshape(-1, C, H_raw-1, W)).reshape(B, -1, C, H_raw, W)
                 out.append(x)
-            out = torch.concat(out, dim=1)
-            return out
+            x = torch.concat(out, dim=1)
+            del out
+            gc.collect()
+            torch.cuda.empty_cache()
+            return x
         
 class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_mhsa=False, sa_dim=128):
