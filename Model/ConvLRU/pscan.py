@@ -11,10 +11,8 @@ def npo2(len):
 def pad_npo2(X):
     """
     Pads input length dim to the next power of 2.
-
     Args:
         X : (B, L, C, S, S)
-
     Returns:
         Y : (B, npo2(L), C, S, S)
     """
@@ -25,9 +23,10 @@ def pad_npo2(X):
 class PScan(torch.autograd.Function):
     @staticmethod
     def pscan(A, X):
-        # A : (B, L, C, S, 1)
-        # X : (B, L, C, S, S)
-
+        """
+        A : (B, L, C, S, 1)
+        X : (B, L, C, S, S)
+        """
         B, L, C, S, _ = A.size()
         num_steps = int(math.log2(L))
 
@@ -73,9 +72,10 @@ class PScan(torch.autograd.Function):
 
     @staticmethod
     def pscan_rev(A, X):
-        # A : (B, L, C, S, 1)
-        # X : (B, L, C, S, S)
-
+        """
+        A : (B, L, C, S, 1)
+        X : (B, L, C, S, S)
+        """
         B, L, C, S, _ = A.size()
         num_steps = int(math.log2(L))
 
@@ -125,15 +125,12 @@ class PScan(torch.autograd.Function):
         Applies the parallel scan operation, as defined above. 
         Returns a new tensor.
         Privilege sequence lengths that are powers of two.
-
         Args:
             A_in : (B, L, C, S, 1)
             X_in : (B, L, C, S, S)
-
         Returns:
             H : (B, L, C, S, S)
         """
-
         L = X_in.size(1)
 
         if L == npo2(L):
@@ -154,15 +151,12 @@ class PScan(torch.autograd.Function):
         """
         Flows the gradient from the output to the input. 
         Returns two new tensors.
-
         Args:
             ctx : A_in : (B, L, C, S, 1), X : (B, L, C, S, S)
             grad_output_in : (B, L, C, S, S)
-
         Returns:
             gradA : (B, L, C, S, S), gradX : (B, L, C, S, S)
         """
-
         A_in, X = ctx.saved_tensors
 
         L = grad_output_in.size(1)
@@ -185,45 +179,42 @@ class PScan(torch.autograd.Function):
     
 pscan = PScan.apply
 
-################################################################################
-# Check correctness
-###############################################################################
-# def serial_scan(A, X):
-#     """
-#     Serial implementation of the scan operation.
-    
-#     Args:
-#         A : (B, L, C, S, 1)
-#         X : (B, L, C, S, S)
-    
-#     Returns:
-#         H : (B, L, C, S, S)
-#     """
-#     B, L, C, S, S = A.size()
-#     H = torch.zeros_like(X)
-#     for b in range(B):
-#         for l in range(L):
-#             if l == 0:
-#                 H[b, l] = X[b, l].clone()
-#             else:
-#                 H[b, l] = A[b, l] * H[b, l - 1].clone() + X[b, l].clone()
-#     return H
+def serial_scan(A, X):
+    """
+    Serial implementation of the scan operation.
+    Args:
+        A : (B, L, C, S, 1)
+        X : (B, L, C, S, S)
+    Returns:
+        H : (B, L, C, S, S)
+    """
+    B, L, C, S, S = A.size()
+    H = torch.zeros_like(X)
+    for b in range(B):
+        for l in range(L):
+            if l == 0:
+                H[b, l] = X[b, l].clone()
+            else:
+                H[b, l] = A[b, l] * H[b, l - 1].clone() + X[b, l].clone()
+    return H
 
-# B, L, C, S = 2, 2, 768, 32 
-# _A = torch.rand(B, L, C, S, 1)
-# A1 = torch.nn.Parameter(_A.clone())
-# A2 = torch.nn.Parameter(_A.clone())
-# X1 = torch.rand(B, L, C, S, S)
-# X2 = X1.clone()
-# H_gt = torch.rand(B, L, C, S, S)
+def pscan_check(B=2, L=13, C=8, S=16):
+    """
+    Checks the parallel scan implementation.
+    """
+    _A = torch.rand(B, L, C, S, 1)
+    A1 = torch.nn.Parameter(_A.clone())
+    A2 = torch.nn.Parameter(_A.clone())
+    X1 = torch.rand(B, L, C, S, S)
+    X2 = X1.clone()
+    H_gt = torch.rand(B, L, C, S, S)
 
-# torch.autograd.set_detect_anomaly(True)
-# loss_fn = torch.nn.MSELoss()
-# H_pscan = pscan(A1.expand(B, L, C, S, 1), X1)
-# loss_pscan = loss_fn(H_pscan, H_gt)
-# loss_pscan.backward()
-# H_serial_scan = serial_scan(A2.expand(B, L, C, S, 1), X2)
-# loss_serial_scan = loss_fn(H_serial_scan, H_gt)
-# loss_serial_scan.backward()
-# print(torch.allclose(H_pscan, H_serial_scan))
-# print(torch.allclose(A1.grad, A2.grad)) 
+    torch.autograd.set_detect_anomaly(True)
+    loss_fn = torch.nn.MSELoss()
+    H_pscan = pscan(A1.expand(B, L, C, S, 1), X1)
+    loss_pscan = loss_fn(H_pscan, H_gt)
+    loss_pscan.backward()
+    H_serial_scan = serial_scan(A2.expand(B, L, C, S, 1), X2)
+    loss_serial_scan = loss_fn(H_serial_scan, H_gt)
+    loss_serial_scan.backward()
+    return torch.allclose(H_pscan, H_serial_scan), torch.allclose(A1.grad, A2.grad)
