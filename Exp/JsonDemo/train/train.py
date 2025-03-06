@@ -1,6 +1,7 @@
 import sys
 import os
-sys.path.append('../../../Model/FFT/')
+sys.path.append('../../../Model')
+sys.path.append('../DATA')
 
 import json
 import argparse

@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-import gc
 try:
     from .pscan import pscan
 except:
@@ -138,11 +137,17 @@ class Decoder(nn.Module):
         self.dec_hidden_ch = args.dec_hidden_ch
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
         self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
-        self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
-        with torch.no_grad():
-            _, C, H, W = self.upsp(torch.zeros(1, args.emb_ch, input_downsp_shape[1], input_downsp_shape[2])).size()
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
-        self.c_out = nn.Conv2d(self.dec_hidden_ch, self.output_ch, kernel_size=1, padding='same')
+        if self.dec_hidden_layers_num != 0:
+            self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
+            with torch.no_grad():
+                _, C, H, W = self.upsp(torch.zeros(1, args.emb_ch, input_downsp_shape[1], input_downsp_shape[2])).size()
+            self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
+            self.c_out = nn.Conv2d(self.dec_hidden_ch, self.output_ch, kernel_size=1, padding='same')
+        else:
+            self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.emb_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)    
+            with torch.no_grad():
+                 _, C, H, W = self.upsp(torch.zeros(1, args.emb_ch, input_downsp_shape[1], input_downsp_shape[2])).size()
+            self.c_out = nn.Conv2d(self.emb_ch, self.output_ch, kernel_size=1, padding='same')
         self.activation = getattr(nn, args.hidden_activation)()
     def forward(self, x):
         B, L, _, H, W = x.size()
@@ -150,9 +155,12 @@ class Decoder(nn.Module):
         _, _, H, W = x.size()
         x = self.activation(x)
         x = x.reshape(B, L, self.dec_hidden_ch, H, W)
-        for layer in self.c_hidden:
-            x = layer(x)
-        x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W)).reshape(B, L, self.output_ch, H, W)
+        if self.dec_hidden_layers_num != 0:
+            for layer in self.c_hidden:
+                x = layer(x)
+            x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W)).reshape(B, L, self.output_ch, H, W)
+        else:
+            x = self.c_out(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.output_ch, H, W)
         return x
 
 class ConvLRUModel(nn.Module):
