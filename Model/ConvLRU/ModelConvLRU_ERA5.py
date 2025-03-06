@@ -162,12 +162,13 @@ class Decoder(nn.Module):
         x = self.upsp(x.reshape(B*L, self.emb_ch, H, W))
         _, _, H, W = x.size()
         x = self.activation(x)
-        x = x.reshape(B, L, self.dec_hidden_ch, H, W)
         if self.dec_hidden_layers_num != 0:
+            x = x.reshape(B, L, self.dec_hidden_ch, H, W)
             for layer in self.c_hidden:
                 x = layer(x)
             x = self.c_out(x.reshape(B*L, self.dec_hidden_ch, H, W)).reshape(B, L, self.output_ch, H, W)
         else:
+            x = x.reshape(B, L, self.emb_ch, H, W)
             x = self.c_out(x.reshape(B*L, self.emb_ch, H, W)).reshape(B, L, self.output_ch, H, W)
         return x
 
