@@ -1,7 +1,6 @@
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../Model'))
+sys.path.append('../../../Model/FFT/')
 
 import json
 import argparse
@@ -18,51 +17,52 @@ import matplotlib.pyplot as plt
 from pytorch_msssim import SSIM
 
 from ModelConvLRU import ConvLRU
-from era5 import ERA5_Dataset
+from DATA.MMNIST import MovingMNIST
 
 class Args:
     def __init__(self, config_file):
         with open(config_file, 'r') as f:
             config = json.load(f)
         self.input_size = tuple(config.get("input_size", [64, 64]))
-        self.input_ch = config.get("input_ch", 32)
+        self.input_ch = config.get("input_ch", 1)
         self.emb_ch = config.get("emb_ch", 256)
         self.convlru_num_blocks = config.get("convlru_num_blocks", 24)
         self.hidden_factor = tuple(config.get("hidden_factor", [2, 2]))
         self.emb_hidden_ch = config.get("emb_hidden_ch", 128)
-        self.emb_hidden_layers_num = config.get("emb_hidden_layers_num", 7)
-        self.ffn_hidden_ch = config.get("ffn_hidden_ch", 128)
-        self.ffn_hidden_layers_num = config.get("ffn_hidden_layers_num", 5)
+        self.emb_hidden_layers_num = config.get("emb_hidden_layers_num", 22)
+        self.ffn_hidden_ch = config.get("ffn_hidden_ch", 64)
+        self.ffn_hidden_layers_num = config.get("ffn_hidden_layers_num", 12)
         self.dec_hidden_ch = config.get("dec_hidden_ch", 128)
-        self.dec_hidden_layers_num = config.get("dec_hidden_layers_num", 7)
+        self.dec_hidden_layers_num = config.get("dec_hidden_layers_num", 22)
         self.gen_factor = config.get("gen_factor", 16)
         self.output_activation = config.get("hidden_activation", 'ReLU')
         self.output_activation = config.get("output_activation", 'Sigmoid')
-        self.root = config.get("root", '/data/lzh/jshasyh/yrqUni/Data/ERA5_norm')
+        self.root = config.get("root", './DATA/MMNIST/')
         self.is_train = config.get("is_train", True)
-        self.n_frames_input = config.get("n_frames_input", 16)
-        self.n_frames_output = config.get("n_frames_output", 16)
-        self.eval_sample = config.get("eval_sample", 400)
-        self.year_range = config.get("year_range", [2000, 2021])
+        self.n_frames_input = config.get("n_frames_input", 21)
+        self.n_frames_output = config.get("n_frames_output", 1)
+        self.num_objects = config.get("num_objects", [2])
+        self.num_samples = config.get("num_samples", int(1e4))
         self.out_path_root = config.get("out_path_root", './exp1/')
-        self.batch_size = config.get("batch_size", 2)
-        self.lr = config.get("lr", 0.001)
+        self.batch_size = config.get("batch_size", 5)
+        self.lr = config.get("lr", 1e-3)
         self.EPs = config.get("EPs", 500)
-        self.vis_step = config.get("vis_step", 250)
+        self.vis_step = config.get("vis_step", 100)
         self.vis_num = config.get("vis_num", 10)
         self.val_step = config.get("val_step", 1000)
         self.out_path = config.get("out_path", os.path.join(self.out_path_root, 'train'))
         self.log_file = config.get("log_file", os.path.join(self.out_path, 'log'))
         self.ckpt_path = config.get("ckpt_path", os.path.join(self.out_path, 'ckpt/'))
         self.vis_path = config.get("vis_path", os.path.join(self.out_path, 'vis/'))
-        self.pretrain_path = config.get("pretrain_path", './1_checkpoint_epoch11_step500.pth')
+        self.pretrain_path = config.get("pretrain_path", 'None')
         self.ckpt_num = config.get("ckpt_num", 5)
-        self.eval_root = config.get("eval_root", '/data/lzh/jshasyh/yrqUni/Data/ERA5_norm')
+        self.eval_root = config.get("eval_root", './DATA/MMNIST/')
         self.eval_is_train = config.get("eval_is_train", False)
-        self.eval_n_frames_input = config.get("eval_n_frames_input", 16)
-        self.eval_n_frames_output = config.get("eval_n_frames_output", 16)
-        self.eval_num_samples = config.get("eval_num_samples", 100)
-        self.eval_batch_size = config.get("eval_batch_size", 2)
+        self.eval_n_frames_input = config.get("eval_n_frames_input", 10)
+        self.eval_n_frames_output = config.get("eval_n_frames_output", 10)
+        self.eval_num_objects = config.get("eval_num_objects", [2])
+        self.eval_num_samples = config.get("eval_num_samples", int(1e2))
+        self.eval_batch_size = config.get("eval_batch_size", 5)
         self.eval_vis_num = config.get("eval_vis_num", 10)
         self.eval_out_path = config.get("eval_out_path", os.path.join(self.out_path_root, 'eval'))
         self.eval_ckpt_path = config.get("eval_ckpt_path", os.path.join(self.eval_out_path, 'ckpt/'))
@@ -124,24 +124,28 @@ def visualize(GTs, PREDs, epoch, step, vis_num, path):
     plt.close()
 
 def evaluate_model(model, dataloader, args, epoch, step):
-    ssim_criterion = SSIM(data_range=1.0, size_average=True, channel=args.input_ch).cuda()
+    criterion = nn.BCELoss().cuda()
+    ssim_criterion = SSIM(data_range=1.0, size_average=True).cuda()
     model.eval()
     ssim_vals, mse_vals, bce_vals = [], [], []
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc="Evaluating"):
             inputs, targets = inputs.cuda(), targets.cuda()
             out_gen_num = args.eval_n_frames_output // args.gen_factor
-            outputs = model(inputs, mode='i_sigmoid', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
+            outputs = model(inputs, mode='i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
             B, L, C, H, W = outputs.size()
-            ssim_val = ssim_criterion(outputs.reshape(B*L, C, H, W), targets.reshape(B*L, C, H, W)).item()
+            bce_loss = criterion(outputs, targets)
+            ssim_val = ssim_criterion(outputs.reshape(B*L, C, H, W).expand(B*L, 3, H, W), targets.reshape(B*L, C, H, W).expand(B*L, 3, H, W)).item()
+            bce_vals.append(bce_loss.item())
             ssim_vals.append(ssim_val)
             mse_fn = nn.MSELoss().cuda()
             mse_vals.append(mse_fn(outputs, targets).item())
     mean_ssim = sum(ssim_vals) / len(ssim_vals)
     mean_mse = sum(mse_vals) / len(mse_vals)
-    logging.info(f'Evaluation at Epoch {epoch}, Step {step}: SSIM={mean_ssim}, MSE={mean_mse}')
-    print(f'Evaluation at Epoch {epoch}, Step {step}: SSIM={mean_ssim}, MSE={mean_mse}')
-    return mean_ssim, mean_mse
+    mean_bce = sum(bce_vals) / len(bce_vals)
+    logging.info(f'Evaluation at Epoch {epoch}, Step {step}: SSIM={mean_ssim}, MSE={mean_mse}, BCE={mean_bce}')
+    print(f'Evaluation at Epoch {epoch}, Step {step}: SSIM={mean_ssim}, MSE={mean_mse}, BCE={mean_bce}')
+    return mean_ssim, mean_mse, mean_bce
 
 def save_checkpoint(ckpt_path, model, epoch, step, best=False):
     if not os.path.exists(ckpt_path):
@@ -163,9 +167,10 @@ def train_model(args):
     create_directories(args)
     initialize_logging(args)
 
-    dataset = ERA5_Dataset(input_dir=args.root, year_range=args.year_range, is_train=args.is_train, sample_len=args.n_frames_input, label_len=args.n_frames_output, eval_sample=args.eval_sample)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=8)
-    eval_dataset = ERA5_Dataset(input_dir=args.eval_root, year_range=args.year_range, is_train=args.eval_is_train, sample_len=args.eval_n_frames_input, label_len=args.eval_n_frames_output, eval_sample=args.eval_num_samples)
+    eval_dataset = MovingMNIST(root=args.eval_root, is_train=args.eval_is_train, n_frames_input=args.eval_n_frames_input, n_frames_output=args.eval_n_frames_output, num_objects=args.eval_num_objects, num_samples=args.eval_num_samples)
+    if len(eval_dataset) > args.eval_num_samples:
+        indices = np.random.choice(len(eval_dataset), args.eval_num_samples, replace=False)
+        eval_dataset = torch.utils.data.Subset(eval_dataset, indices)
     eval_dataloader = DataLoader(eval_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=8)
 
     model = ConvLRU(args).cuda()
@@ -177,11 +182,13 @@ def train_model(args):
         logging.info('No pretrained model found, starting from scratch.')
 
     criterion = nn.MSELoss().cuda()
-    ssim_criterion = SSIM(data_range=1.0, size_average=True, channel=args.input_ch).cuda()
+    ssim_criterion = SSIM(data_range=1.0, size_average=True).cuda()
     opt = optim.AdamW(model.parameters(), lr=args.lr)
 
     best_val_ssim = float('-inf')
     for ep in range(args.EPs):
+        dataset = MovingMNIST(root=args.root, is_train=args.is_train, n_frames_input=args.n_frames_input, n_frames_output=args.n_frames_output, num_objects=args.num_objects, num_samples=args.num_samples)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=8)
         max_lr = args.lr
         scheduler = OneCycleLR(opt, max_lr=max_lr, steps_per_epoch=len(dataloader), epochs=args.EPs)
 
@@ -190,13 +197,14 @@ def train_model(args):
         running_mse = 0.0
         running_ssim = 0.0
         for step, (inputs, targets) in enumerate(tqdm(dataloader)):
-            inputs = torch.cat([inputs, targets], dim=1).cuda()
+            inputs = inputs.cuda()
+            # targets = targets.cuda()
             opt.zero_grad()
-            pred_outputs = model(inputs[:, :-args.gen_factor], mode='p_logits')
+            pred_outputs = model(inputs[:, :-args.gen_factor], mode='p')
             sigmoid_pred_outputs = torch.sigmoid(pred_outputs)
             mse_loss = criterion(sigmoid_pred_outputs, inputs[:, args.gen_factor:])
             B, L, C, H, W = sigmoid_pred_outputs.size()
-            ssim_values = ssim_criterion(sigmoid_pred_outputs.reshape(B*L, C, H, W), inputs[:, args.gen_factor:].reshape(B*L, C, H, W))
+            ssim_values = ssim_criterion(sigmoid_pred_outputs.reshape(B*L, C, H, W).expand(B*L, 3, H, W), inputs[:, args.gen_factor:].reshape(B*L, C, H, W).expand(B*L, 3, H, W))
             total_loss = mse_loss + (1 - ssim_values)
             total_loss.backward()
             opt.step()
@@ -220,12 +228,12 @@ def train_model(args):
                 visualize(inputs[:, args.gen_factor:], pred_outputs, ep, step + 1, args.vis_num, args.vis_path)
 
             if (step + 1) % args.val_step == 0:
-                mean_ssim, mean_mse = evaluate_model(model, eval_dataloader, args, ep, step + 1)
+                mean_ssim, mean_mse, mean_bce = evaluate_model(model, eval_dataloader, args, ep, step + 1)
                 if mean_ssim > best_val_ssim:
                     best_val_ssim = mean_ssim
                     save_checkpoint(args.eval_ckpt_path, model, ep, step + 1, best=True)
-                    logging.info(f'New best model at Epoch {ep}, Step {step+1} with SSIM={mean_ssim}, MSE={mean_mse}')
-                    tqdm.write(f'New best model at Epoch {ep}, Step {step+1} with SSIM={mean_ssim}, MSE={mean_mse}')
+                    logging.info(f'New best model at Epoch {ep}, Step {step+1} with SSIM={mean_ssim}, MSE={mean_mse}, BCE={mean_bce}')
+                    tqdm.write(f'New best model at Epoch {ep}, Step {step+1} with SSIM={mean_ssim}, MSE={mean_mse}, BCE={mean_bce}')
                 manage_checkpoints(args.eval_ckpt_path, args.ckpt_num)
 
     logging.shutdown()
@@ -237,3 +245,4 @@ if __name__ == "__main__":
     config_file = args.cfg
     args = Args(config_file)
     train_model(args)
+
