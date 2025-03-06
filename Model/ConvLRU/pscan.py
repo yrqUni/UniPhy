@@ -120,25 +120,25 @@ class PScan(torch.autograd.Function):
             Aa[:, :-1, 1].mul_(Aa[:, 1:, 0])
 
     @staticmethod
-    def forward(ctx, A_in, X_in):
+    def forward(ctx, A_in, X):
         """
         Applies the parallel scan operation, as defined above. 
         Returns a new tensor.
         Privilege sequence lengths that are powers of two.
         Args:
             A_in : (B, L, C, S, 1)
-            X_in : (B, L, C, S, S)
+            X : (B, L, C, S, S)
         Returns:
             H : (B, L, C, S, S)
         """
-        L = X_in.size(1)
+        L = X.size(1)
 
         if L == npo2(L):
             A = A_in.clone()
-            X = X_in.clone()
+            X = X.clone()
         else:
             A = pad_npo2(A_in) # (B, npo2(L), C, S, S)
-            X = pad_npo2(X_in) # (B, npo2(L), C, S, S)
+            X = pad_npo2(X) # (B, npo2(L), C, S, S)
         
         PScan.pscan(A, X)
 
@@ -152,12 +152,12 @@ class PScan(torch.autograd.Function):
         Flows the gradient from the output to the input. 
         Returns two new tensors.
         Args:
-            ctx : A_in : (B, L, C, S, 1), X : (B, L, C, S, S)
+            ctx : A : (B, L, C, S, 1), X : (B, L, C, S, S)
             grad_output_in : (B, L, C, S, S)
         Returns:
             gradA : (B, L, C, S, S), gradX : (B, L, C, S, S)
         """
-        A_in, X = ctx.saved_tensors
+        A, X = ctx.saved_tensors
 
         L = grad_output_in.size(1)
 
@@ -165,12 +165,11 @@ class PScan(torch.autograd.Function):
             grad_output = grad_output_in.clone()
         else:
             grad_output = pad_npo2(grad_output_in) # (B, npo2(L), C, S, S)
-            A_in = pad_npo2(A_in) # (B, npo2(L), C, S, 1)
+            A = pad_npo2(A) # (B, npo2(L), C, S, 1)
 
-        A = A_in
-        A_shifted = torch.nn.functional.pad(A[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
+        A = torch.nn.functional.pad(A[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
 
-        PScan.pscan_rev(A_shifted, grad_output)
+        PScan.pscan_rev(A, grad_output)
 
         Q = torch.zeros_like(X)
         Q[:, 1:].add_(X[:, :-1] * grad_output[:, 1:])
@@ -218,3 +217,5 @@ def pscan_check(B=2, L=13, C=8, S=16):
     loss_serial_scan = loss_fn(H_serial_scan, H_gt)
     loss_serial_scan.backward()
     return torch.allclose(H_pscan, H_serial_scan), torch.allclose(A1.grad, A2.grad)
+
+# print(pscan_check())
