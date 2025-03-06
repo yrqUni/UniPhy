@@ -69,11 +69,8 @@ class ConvLRU(nn.Module):
                 x = self.out_activation(x)
                 x = self.output_reshape_era5(x.reshape(-1, C, H_raw-1, W)).reshape(B, -1, C, H_raw, W)
                 out.append(x)
-            x = torch.concat(out, dim=1)
-            del out
-            gc.collect()
-            torch.cuda.empty_cache()
-            return x
+            out = torch.concat(out, dim=1)
+            return out
         
 class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_mhsa=False, sa_dim=128):
@@ -176,8 +173,8 @@ class ConvLRUModel(nn.Module):
         last_hidden_outs = []
         convlru_block_num = 0
         for convlru_block in self.convlru_blocks:
-            if last_hidden_ins is not None: x, last_hidden_out = convlru_block.forward(x, last_hidden_ins[convlru_block_num])
-            else: x, last_hidden_out = convlru_block.forward(x, None)
+            if last_hidden_ins is not None: x, last_hidden_out = convlru_block(x, last_hidden_ins[convlru_block_num])
+            else: x, last_hidden_out = convlru_block(x, None)
             last_hidden_outs.append(last_hidden_out)
             convlru_block_num += 1
         return x, last_hidden_outs
