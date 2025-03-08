@@ -1,15 +1,16 @@
 import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append('../../ConvLRU/Model/ConvLRU')
+
 import gc
 import torch
-from Git.ConvLRU.Model.FFT.ModelConvLRU import ConvLRU
+from ModelConvLRU import ConvLRU
 
 class Args:
     def __init__(self):
         # input info
         self.input_size = (64, 64) 
         self.input_ch = 20
+        self.out_ch = 20
         # convlru info
         self.emb_ch = 32
         self.convlru_num_blocks = 8
