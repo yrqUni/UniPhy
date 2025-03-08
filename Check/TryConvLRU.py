@@ -8,14 +8,14 @@ from ModelConvLRU import ConvLRU
 class Args:
     def __init__(self):
         # input info
-        self.input_size = (64, 64) 
+        self.input_size = (720, 1440) 
         self.input_ch = 20
         self.out_ch = 20
         # convlru info
         self.emb_ch = 32
         self.convlru_num_blocks = 8
         #
-        self.hidden_factor = (8, 8)
+        self.hidden_factor = (15, 30)
         self.use_mhsa = False
         # emb info
         self.emb_hidden_ch = 32
@@ -32,7 +32,7 @@ class Args:
         self.hidden_activation = 'ReLU'
         self.output_activation = 'Sigmoid'
 args = Args()
-B = 1
+B = 2
 L = 8
 
 model = ConvLRU(args)# .cuda()
