@@ -16,6 +16,7 @@ class Args:
         self.convlru_num_blocks = 8
         #
         self.hidden_factor = (15, 30)
+        self.io_use_large_kernel = False
         self.use_mhsa = False
         # emb info
         self.emb_hidden_ch = 32

@@ -119,9 +119,12 @@ class Embedding(nn.Module):
         self.emb_ch = args.emb_ch
         self.emb_hidden_ch = args.emb_hidden_ch
         self.emb_hidden_layers_num = args.emb_hidden_layers_num
-        self.kernelsize_factor = CalKernelSizeFactor(args.hidden_factor)
-        self.downsp_padding = tuple(int((k-s)/2) for k, s in zip(tuple(i*self.kernelsize_factor for i in args.hidden_factor), args.hidden_factor))
-        self.downsp = nn.Conv2d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=tuple(i*self.kernelsize_factor for i in args.hidden_factor), stride=args.hidden_factor, padding=self.downsp_padding, padding_mode='zeros')
+        if args.io_use_large_kernel:
+            self.kernelsize_factor = CalKernelSizeFactor(args.hidden_factor)
+            self.downsp_padding = tuple(int((k-s)/2) for k, s in zip(tuple(i*self.kernelsize_factor for i in args.hidden_factor), args.hidden_factor))
+            self.downsp = nn.Conv2d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=tuple(i*self.kernelsize_factor for i in args.hidden_factor), stride=args.hidden_factor, padding=self.downsp_padding, padding_mode='zeros')
+        else:
+            self.downsp = nn.Conv2d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
         with torch.no_grad():
             _, C, H, W = self.downsp(torch.zeros(1, self.input_ch, *self.input_size)).size()
             self.input_downsp_shape = (C, H, W)
@@ -153,16 +156,23 @@ class Decoder(nn.Module):
         self.dec_hidden_ch = args.dec_hidden_ch
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
         self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
-        self.kernelsize_factor = CalKernelSizeFactor(args.hidden_factor)
-        self.upsp_padding = tuple(int((k-s)/2) for k, s in zip(tuple(i*self.kernelsize_factor for i in args.hidden_factor), args.hidden_factor))
+        if args.io_use_large_kernel:
+            self.kernelsize_factor = CalKernelSizeFactor(args.hidden_factor)
+            self.upsp_padding = tuple(int((k-s)/2) for k, s in zip(tuple(i*self.kernelsize_factor for i in args.hidden_factor), args.hidden_factor))
         if self.dec_hidden_layers_num != 0:
-            self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, kernel_size=tuple(i*self.kernelsize_factor for i in args.hidden_factor), stride=args.hidden_factor, padding=self.upsp_padding, padding_mode='zeros')
+            if args.io_use_large_kernel:
+                self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, kernel_size=tuple(i*self.kernelsize_factor for i in args.hidden_factor), stride=args.hidden_factor, padding=self.upsp_padding, padding_mode='zeros')
+            else:
+                self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
             with torch.no_grad():
                 _, C, H, W = self.upsp(torch.zeros(1, args.emb_ch, input_downsp_shape[1], input_downsp_shape[2])).size()
             self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for _ in range(self.dec_hidden_layers_num)])
             self.c_out = nn.Conv2d(self.dec_hidden_ch, self.output_ch, kernel_size=1, padding='same')
         else:
-            self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.emb_ch, kernel_size=tuple(i*self.kernelsize_factor for i in args.hidden_factor), stride=args.hidden_factor, padding=self.upsp_padding, padding_mode='zeros')
+            if args.io_use_large_kernel:
+                self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.emb_ch, kernel_size=tuple(i*self.kernelsize_factor for i in args.hidden_factor), stride=args.hidden_factor, padding=self.upsp_padding, padding_mode='zeros')
+            else:
+                self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.emb_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)    
             with torch.no_grad():
                  _, C, H, W = self.upsp(torch.zeros(1, args.emb_ch, input_downsp_shape[1], input_downsp_shape[2])).size()
             self.c_out = nn.Conv2d(self.emb_ch, self.output_ch, kernel_size=1, padding='same')
