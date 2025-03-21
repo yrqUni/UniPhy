@@ -60,7 +60,7 @@ class ConvLRU(nn.Module):
             x = self.out_activation(x)
             x = self.output_reshape_era5(x.reshape(-1, C, H_raw-1, W)).reshape(B, -1, C, H_raw, W)
             out.append(x)
-            for i in range(out_gen_num-1):
+            for _ in range(out_gen_num-1):
                 x = self.input_reshape_era5(out[-1].reshape(-1, C, H_raw, W)).reshape(B, -1, C, H_raw-1, W)
                 x = self.embedding(x)
                 x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
@@ -119,7 +119,7 @@ class Embedding(nn.Module):
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         self.c_in = nn.Conv2d(C, self.emb_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.emb_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=False, sa_dim=None) for _ in range(self.emb_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = getattr(nn, args.hidden_activation)()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
@@ -149,7 +149,7 @@ class Decoder(nn.Module):
             self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)
             with torch.no_grad():
                 _, C, H, W = self.upsp(torch.zeros(1, args.emb_ch, input_downsp_shape[1], input_downsp_shape[2])).size()
-            self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for _ in range(self.dec_hidden_layers_num)])
             self.c_out = nn.Conv2d(self.dec_hidden_ch, self.output_ch, kernel_size=1, padding='same')
         else:
             self.upsp = nn.ConvTranspose2d(in_channels=args.emb_ch, out_channels=args.emb_ch, kernel_size=args.hidden_factor, stride=args.hidden_factor)    
@@ -182,8 +182,10 @@ class ConvLRUModel(nn.Module):
         last_hidden_outs = []
         convlru_block_num = 0
         for convlru_block in self.convlru_blocks:
-            if last_hidden_ins is not None: x, last_hidden_out = convlru_block(x, last_hidden_ins[convlru_block_num])
-            else: x, last_hidden_out = convlru_block(x, None)
+            if last_hidden_ins is not None: 
+                x, last_hidden_out = convlru_block(x, last_hidden_ins[convlru_block_num])
+            else: 
+                x, last_hidden_out = convlru_block(x, None)
             last_hidden_outs.append(last_hidden_out)
             convlru_block_num += 1
         return x, last_hidden_outs
@@ -255,7 +257,7 @@ class FeedForward(nn.Module):
         self.use_mhsa = args.use_mhsa
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv2d(self.emb_ch, self.ffn_hidden_ch, kernel_size=7, padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=self.use_mhsa, sa_dim=128) for i in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=self.use_mhsa, sa_dim=128) for _ in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv2d(self.ffn_hidden_ch, self.emb_ch, kernel_size=1, padding='same')
         self.activation = getattr(nn, args.hidden_activation)()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
