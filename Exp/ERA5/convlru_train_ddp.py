@@ -115,7 +115,7 @@ def run_ddp(rank, world_size, args):
     if rank == 0:
         setup_logging(args)
     model = load_ckpt(ConvLRU(args), args.ckpt).cuda(rank)
-    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     loss_fn = torch.nn.MSELoss().cuda(rank)
     opt = torch.optim.Adam(model.parameters(), lr=0.001)
 
