@@ -1,21 +1,23 @@
 import sys
-sys.path.append('../../ConvLRU/Model/ConvLRU')
+sys.path.append('../Model/ConvLRU/')
 
 import gc
 import torch
-from ModelConvLRU import ConvLRU
+from ModelConvLRU_ERA5 import ConvLRU
 
 class Args:
     def __init__(self):
+        # sample H, W
+        self.sample_input_size = (721, 1440)
         # input info
-        self.input_size = (720, 1440) 
+        self.input_size = (720, 1440)
         self.input_ch = 20
         self.out_ch = 20
         # convlru info
         self.emb_ch = 32
         self.convlru_num_blocks = 8
         #
-        self.hidden_factor = (15, 30)
+        self.hidden_factor = (72, 144)
         self.use_mhsa = False
         # emb info
         self.emb_hidden_ch = 32
@@ -35,15 +37,15 @@ args = Args()
 B = 2
 L = 8
 
-model = ConvLRU(args)# .cuda()
+model = ConvLRU(args) # .to('mps')
 total_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"GP: {total_params}")
 print(f"TP: {trainable_params}")
 loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
-inputs_train = torch.randn(B, L, args.input_ch, *args.input_size)# .cuda()
-labels_train = torch.randn(B, L, args.input_ch, *args.input_size)# .cuda()
+inputs_train = torch.randn(B, L, args.input_ch, *args.sample_input_size) # .to('mps')
+labels_train = torch.randn(B, L, args.input_ch, *args.sample_input_size) # .to('mps')
 opt.zero_grad()
 outputs = model(inputs_train, mode='p')
 loss = loss_fn(outputs, labels_train)
@@ -55,15 +57,15 @@ torch.cuda.empty_cache()
 gc.collect()
 
 out_frames_num = 8
-model = ConvLRU(args)# .cuda()
+model = ConvLRU(args) # .to('mps')
 total_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"GP: {total_params}")
 print(f"TP: {trainable_params}")
 loss_fn = torch.nn.MSELoss()
 opt = torch.optim.Adam(model.parameters(), lr=0.001)
-inputs_train = torch.randn(B, L, args.input_ch, *args.input_size)# .cuda()
-labels_train = torch.randn(B, out_frames_num, args.input_ch, *args.input_size)# .cuda()
+inputs_train = torch.randn(B, L, args.input_ch, *args.sample_input_size) # .to('mps')
+labels_train = torch.randn(B, out_frames_num, args.input_ch, *args.sample_input_size) # .to('mps')
 opt.zero_grad()
 out_gen_num = out_frames_num // args.gen_factor
 outputs = model(inputs_train, mode='i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
