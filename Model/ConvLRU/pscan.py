@@ -2,13 +2,13 @@ import math
 import torch
 import torch.nn.functional as F
 
-def next_power_of_two(sequence_length):
+def npo2(sequence_length):
     """Returns smallest power of 2 >= sequence_length"""
     return 2 ** math.ceil(math.log2(sequence_length))
 
-def pad_to_power_of_two(input_tensor):
+def pnpo2(input_tensor):
     """Pads tensor's length dim to next power of 2"""
-    target_length = next_power_of_two(input_tensor.size(1))
+    target_length = npo2(input_tensor.size(1))
     pad_tuple = (0, 0, 0, 0, 0, 0, 0, target_length - input_tensor.size(1))
     return F.pad(input_tensor, pad_tuple, "constant", 0)
 
@@ -167,12 +167,12 @@ class PScan(torch.autograd.Function):
         original_length = X.size(1)
         
         # Check if padding is needed
-        if original_length == next_power_of_two(original_length):
+        if original_length == npo2(original_length):
             A = A_in.clone()
             X_work = X.clone()
         else:
-            A = pad_to_power_of_two(A_in)
-            X_work = pad_to_power_of_two(X)
+            A = pnpo2(A_in)
+            X_work = pnpo2(X)
         
         PScan.pscan(A, X_work)
         ctx.save_for_backward(A_in, X_work)
@@ -195,11 +195,11 @@ class PScan(torch.autograd.Function):
         original_length = grad_output_in.size(1)
         
         # Handle padding for gradients
-        if original_length == next_power_of_two(original_length):
+        if original_length == npo2(original_length):
             grad_output = grad_output_in.clone()
         else:
-            grad_output = pad_to_power_of_two(grad_output_in)
-            A = pad_to_power_of_two(A)
+            grad_output = pnpo2(grad_output_in)
+            A = pnpo2(A)
 
         # Prepare for reverse scan
         A_padded = torch.nn.functional.pad(A[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
