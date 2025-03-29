@@ -2,13 +2,13 @@ import math
 import torch
 import torch.nn.functional as F
 
-def npo2(sequence_length):
+def NextPowerOf2(sequence_length):
     """Returns smallest power of 2 >= sequence_length"""
     return 2 ** math.ceil(math.log2(sequence_length))
 
-def pnpo2(input_tensor):
+def PadNextPowerOf2(input_tensor):
     """Pads tensor's length dim to next power of 2"""
-    target_length = npo2(input_tensor.size(1))
+    target_length = NextPowerOf2(input_tensor.size(1))
     pad_tuple = (0, 0, 0, 0, 0, 0, 0, target_length - input_tensor.size(1))
     return F.pad(input_tensor, pad_tuple, "constant", 0)
 
@@ -167,12 +167,12 @@ class PScan(torch.autograd.Function):
         original_length = X.size(1)
         
         # Check if padding is needed
-        if original_length == npo2(original_length):
+        if original_length == NextPowerOf2(original_length):
             A = A_in.clone()
             X_work = X.clone()
         else:
-            A = pnpo2(A_in)
-            X_work = pnpo2(X)
+            A = PadNextPowerOf2(A_in)
+            X_work = PadNextPowerOf2(X)
         
         PScan.pscan(A, X_work)
         ctx.save_for_backward(A_in, X_work)
@@ -195,11 +195,11 @@ class PScan(torch.autograd.Function):
         original_length = grad_output_in.size(1)
         
         # Handle padding for gradients
-        if original_length == npo2(original_length):
+        if original_length == NextPowerOf2(original_length):
             grad_output = grad_output_in.clone()
         else:
-            grad_output = pnpo2(grad_output_in)
-            A = pnpo2(A)
+            grad_output = PadNextPowerOf2(grad_output_in)
+            A = PadNextPowerOf2(A)
 
         # Prepare for reverse scan
         A_padded = torch.nn.functional.pad(A[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
@@ -211,9 +211,6 @@ class PScan(torch.autograd.Function):
             Q[:, i] = X[:, i-1].clone() * grad_output[:, i].clone()
 
         return Q[:, :original_length], grad_output[:, :original_length]
-
-# Create function interface
-pscan = PScan.apply
 
 def serial_scan(A, X):
     """
@@ -242,6 +239,7 @@ def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
     Returns:
         (forward_match, gradient_match) tuple of booleans
     """
+    pscan = PScan.apply
     # Generate random test data
     A_tensor = torch.rand(batch_size, seq_length, channels, state_dim, 1)
     A1 = torch.nn.Parameter(A_tensor.clone())
@@ -263,6 +261,16 @@ def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
     loss_serial_scan = loss_fn(H_serial_scan, H_gt)
     loss_serial_scan.backward()
     
-    return torch.allclose(H_pscan, H_serial_scan), torch.allclose(A1.grad, A2.grad)
+    # Check if outputs and gradients match
+    result = (torch.allclose(H_pscan, H_serial_scan), torch.allclose(A1.grad, A2.grad))
+    
+    # Clean up
+    import gc
+    del A_tensor, A1, A2, X1, X2, H_gt, H_pscan, H_serial_scan, loss_pscan, loss_serial_scan, loss_fn
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
 
-# print(pscan_check())
+# Run the test
+# assert all(pscan_check()), "PScan implementation failed the test."
+# print("PScan implementation passed the test.")

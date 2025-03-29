@@ -2,16 +2,14 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-try:
-    from .pscan import pscan
-except:
-    from pscan import pscan
+from pscan import PScan, pscan_check
 # torch.autograd.set_detect_anomaly(True)
 
 class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
+        self._check_pscan()
         self.input_reshape_era5 = nn.Conv2d(in_channels=args.input_ch, out_channels=args.input_ch, kernel_size=(4,3), padding=(1, 1)) # C, 721, 1440 -> C, 720, 1440
         self.output_reshape_era5 = nn.ConvTranspose2d(in_channels=args.input_ch, out_channels=args.input_ch, kernel_size=(4, 3), padding=(1, 1), stride=1) # C, 720, 1440 -> C, 721, 1440
         self.embedding = Embedding(self.args)
@@ -19,6 +17,9 @@ class ConvLRU(nn.Module):
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.out_activation = getattr(nn, args.output_activation)()
         self.truncated_normal_init()
+    def _check_pscan(self):
+        assert all(pscan_check()), "PScan implementation failed the test."
+        print("PScan implementation passed the test.")
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
         with torch.no_grad():
             l = (1. + math.erf(((lower - mean) / std) / math.sqrt(2.))) / 2.
@@ -218,6 +219,8 @@ class ConvLRULayer(nn.Module):
         self.proj_B = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same', bias=self.use_bias).to(torch.cfloat)
         self.proj_C = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same', bias=self.use_bias).to(torch.cfloat)
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
+        # 
+        self.pscan = PScan.apply
     def convlru(self, x, last_hidden_in):
         B, L, _, _, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
@@ -231,7 +234,7 @@ class ConvLRULayer(nn.Module):
             B, L, _, _, W = h.size()
         else:
             pass
-        h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
+        h = self.pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
         h = torch.fft.ifft2(h, dim=(-2, -1))
         h = self.proj_C(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)

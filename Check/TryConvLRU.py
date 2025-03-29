@@ -3,21 +3,21 @@ sys.path.append('../Model/ConvLRU/')
 
 import gc
 import torch
-from ModelConvLRU_ERA5 import ConvLRU
+from ModelConvLRU import ConvLRU
 
 class Args:
     def __init__(self):
         # sample H, W
-        self.sample_input_size = (721, 1440)
+        self.sample_input_size = (64, 64)
         # input info
-        self.input_size = (720, 1440)
+        self.input_size = (64, 64)
         self.input_ch = 20
         self.out_ch = 20
         # convlru info
         self.emb_ch = 32
         self.convlru_num_blocks = 8
         #
-        self.hidden_factor = (72, 144)
+        self.hidden_factor = (16, 16)
         self.use_mhsa = False
         # emb info
         self.emb_hidden_ch = 32

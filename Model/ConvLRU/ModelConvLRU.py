@@ -2,21 +2,22 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-try:
-    from .pscan import pscan
-except:
-    from pscan import pscan
+from pscan import PScan, pscan_check
 # torch.autograd.set_detect_anomaly(True)
 
 class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
+        self._check_pscan()
         self.embedding = Embedding(self.args)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.out_activation = getattr(nn, args.output_activation)()
         self.truncated_normal_init()
+    def _check_pscan(self):
+        assert all(pscan_check()), "PScan implementation failed the test."
+        print("PScan implementation passed the test.")
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
         with torch.no_grad():
             l = (1. + math.erf(((lower - mean) / std) / math.sqrt(2.))) / 2.
@@ -38,7 +39,6 @@ class ConvLRU(nn.Module):
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
-        B, L, C, H_raw, W = x.size()
         assert mode in ['p', 'i'], f'mode should be either p or i, but got {mode}'
         if mode == 'p':
             x = self.embedding(x)
@@ -62,7 +62,7 @@ class ConvLRU(nn.Module):
                 out.append(x)
             out = torch.concat(out, dim=1)
             return out
-        
+
 class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_mhsa=False, sa_dim=128):
         super().__init__()
@@ -210,6 +210,8 @@ class ConvLRULayer(nn.Module):
         self.proj_B = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same', bias=self.use_bias).to(torch.cfloat)
         self.proj_C = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same', bias=self.use_bias).to(torch.cfloat)
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
+        # 
+        self.pscan = PScan.apply
     def convlru(self, x, last_hidden_in):
         B, L, _, _, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
@@ -223,7 +225,7 @@ class ConvLRULayer(nn.Module):
             B, L, _, _, W = h.size()
         else:
             pass
-        h = pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
+        h = self.pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
         h = torch.fft.ifft2(h, dim=(-2, -1))
         h = self.proj_C(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
