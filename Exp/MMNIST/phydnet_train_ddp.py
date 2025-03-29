@@ -17,15 +17,15 @@ import os
 import glob
 import logging
 import datetime
-sys.path.append('/data/ConvLRU/Model')
+sys.path.append('/data/ConvLRU/Model/PhyDNet')
 sys.path.append('/data/ConvLRU/DATA')
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 import torch.optim.lr_scheduler as lr_scheduler
-from PhyDNet.ModelPhyDNet import PhyCell, ConvLSTM, EncoderRNN
-from PhyDNet.constrain_moments import K2M
+from ModelPhyDNet import PhyCell, ConvLSTM, EncoderRNN
+from constrain_moments import K2M
 from MMNIST import MovingMNIST
 from tqdm import tqdm
 import warnings

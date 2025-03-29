@@ -82,7 +82,9 @@ class Conv_hidden(nn.Module):
         x_ = self.conv3(x)
         x_ = self.activation3(x_)
         x_ = self.conv1(x_)
-        x_ = self.activation1(x_).permute(0, 2, 1, 3, 4)
+        x_ = self.activation1(x_)
+        x_ = x_ + x
+        x_ = x_.permute(0, 2, 1, 3, 4)
         if self.use_mhsa:
             x_ = x_.reshape(B * L, self.ch, H * W)
             x_ = x_ + self.pos_bias

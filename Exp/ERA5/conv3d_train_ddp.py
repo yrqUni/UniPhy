@@ -17,14 +17,14 @@ import os
 import glob
 import logging
 import datetime
-sys.path.append('/mnt/data/ConvLRU/Model')
+sys.path.append('/mnt/data/ConvLRU/Model/Conv3D')
 sys.path.append('/mnt/data/ConvLRU/Exp/ERA5/DATA')
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 import torch.optim.lr_scheduler as lr_scheduler
-from Conv3D.ModelConv3D import Conv3D
+from ModelConv3D import Conv3D
 from ERA5 import ERA5_Dataset
 from tqdm import tqdm
 import warnings
