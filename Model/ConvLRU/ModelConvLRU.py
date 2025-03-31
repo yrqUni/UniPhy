@@ -9,7 +9,7 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self._check_pscan()
+        # self._check_pscan()
         self.embedding = Embedding(self.args)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)

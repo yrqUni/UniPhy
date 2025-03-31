@@ -9,7 +9,7 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self._check_pscan()
+        # self._check_pscan()
         self.input_reshape_era5 = nn.Conv2d(in_channels=args.input_ch, out_channels=args.input_ch, kernel_size=(4,3), padding=(1, 1)) # C, 721, 1440 -> C, 720, 1440
         self.output_reshape_era5 = nn.ConvTranspose2d(in_channels=args.input_ch, out_channels=args.input_ch, kernel_size=(4, 3), padding=(1, 1), stride=1) # C, 720, 1440 -> C, 721, 1440
         self.embedding = Embedding(self.args)
