@@ -81,7 +81,7 @@ class Conv_hidden(nn.Module):
         self.activation3 = getattr(nn, activation_func)()
         self.conv1 = nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding='same')
         self.activation1 = getattr(nn, activation_func)()
-        self.layer_norm_end = nn.LayerNorm([*hidden_size])
+        self.layer_norm_conv = nn.LayerNorm([*hidden_size])
         if self.use_mhsa:
             self.sa_dim = sa_dim
             self.mhsa_qk = nn.Linear(hidden_size[0]*hidden_size[1], sa_dim*2)
@@ -107,7 +107,7 @@ class Conv_hidden(nn.Module):
             x_ = x_.reshape(B, L, self.ch, H, W)
         else:
             x_ =  x_.permute(0, 2, 1, 3, 4)
-        x_ = self.layer_norm_end(x_).permute(0, 2, 1, 3, 4)
+        x_ = self.layer_norm_conv(x_).permute(0, 2, 1, 3, 4)
         x = x_ + x
         return x
 
