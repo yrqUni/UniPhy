@@ -71,7 +71,7 @@ class ConvLRU(nn.Module):
                 out.append(x)
             out = torch.concat(out, dim=1)
             return out
-        
+
 class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_mhsa=False, sa_dim=128):
         super().__init__()
@@ -81,12 +81,12 @@ class Conv_hidden(nn.Module):
         self.activation3 = getattr(nn, activation_func)()
         self.conv1 = nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding='same')
         self.activation1 = getattr(nn, activation_func)()
-        self.layer_norm = nn.LayerNorm([*hidden_size])
-        self.layer_norm_attn = nn.LayerNorm([*hidden_size])
+        self.layer_norm_conv = nn.LayerNorm([*hidden_size])
         if self.use_mhsa:
             self.sa_dim = sa_dim
             self.mhsa_qk = nn.Linear(hidden_size[0]*hidden_size[1], sa_dim*2)
             self.pos_bias = nn.Parameter(torch.randn(1, self.ch, hidden_size[0]*hidden_size[1]))
+            self.layer_norm_attn = nn.LayerNorm([*hidden_size])
     def forward(self, x):
         B, _, L, H, W = x.size()
         x_ = self.conv3(x)
@@ -94,11 +94,9 @@ class Conv_hidden(nn.Module):
         x_ = self.conv1(x_)
         x_ = self.activation1(x_)
         if self.use_mhsa:
-            x_ = x_.permute(0, 2, 1, 3, 4)
-            x_ = self.layer_norm_attn(x_).permute(0, 2, 1, 3, 4)
+            x_ = self.layer_norm_attn(x_.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             x_ = x_ + x
-            x_ = x_.permute(0, 2, 1, 3, 4)
-            x_ = x_.reshape(B * L, self.ch, H * W)
+            x_ = x_.permute(0, 2, 1, 3, 4).reshape(B * L, self.ch, H * W)
             x_ = x_ + self.pos_bias
             qk = self.mhsa_qk(x_)
             q, k = qk.split(self.sa_dim, dim=-1)
@@ -109,7 +107,7 @@ class Conv_hidden(nn.Module):
             x_ = x_.reshape(B, L, self.ch, H, W)
         else:
             x_ =  x_.permute(0, 2, 1, 3, 4)
-        x_ = self.layer_norm(x_).permute(0, 2, 1, 3, 4)
+        x_ = self.layer_norm_conv(x_).permute(0, 2, 1, 3, 4)
         x = x_ + x
         return x
 
