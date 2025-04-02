@@ -42,7 +42,7 @@ class ConvLRU(nn.Module):
                         p.add_(mean)
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
         B, L, C, H_raw, W = x.size()
-        assert mode in ['p', 'i'], f'mode should be either p or i, but got {mode}'
+        assert mode in ['p', 'i'], f'Mode should be either p or i, but got {mode}'
         if mode == 'p':
             x = self.input_reshape_era5(x.reshape(B*L, C, H_raw, W)).reshape(B, L, C, H_raw-1, W)
             x = self.embedding(x)
@@ -52,6 +52,7 @@ class ConvLRU(nn.Module):
             x = self.output_reshape_era5(x.reshape(B*L, C, H_raw-1, W)).reshape(B, L, C, H_raw, W)
             return x
         elif mode == 'i':
+            assert self.args.input_ch == self.args.out_ch, f'For iterative generation mode (i mode), input_ch should be equal to out_ch, but got {self.args.input_ch} and {self.args.out_ch}'
             out = []
             x = self.input_reshape_era5(x.reshape(B*L, C, H_raw, W)).reshape(B, L, C, H_raw-1, W)
             x = self.embedding(x)

@@ -39,7 +39,7 @@ class ConvLRU(nn.Module):
                         p.mul_(std * math.sqrt(2.))
                         p.add_(mean)
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
-        assert mode in ['p', 'i'], f'mode should be either p or i, but got {mode}'
+        assert mode in ['p', 'i'], f'Mode should be either p or i, but got {mode}'
         if mode == 'p':
             x = self.embedding(x)
             x, _ = self.convlru_model(x, last_hidden_ins=None)
@@ -47,6 +47,7 @@ class ConvLRU(nn.Module):
             x = self.out_activation(x)
             return x
         elif mode == 'i':
+            assert self.args.input_ch == self.args.out_ch, f'For iterative generation mode (i mode), input_ch should be equal to out_ch, but got {self.args.input_ch} and {self.args.out_ch}'
             out = []
             x = self.embedding(x)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
