@@ -197,47 +197,6 @@ def serial_scan(A, X):
                 H[b, l] = A[b, l] * H[b, l - 1].clone() + X[b, l].clone()
     return H
 
-def pscan_check(B=2, L=13, C=8, S=16):
-    """
-    Checks the parallel scan implementation.
-    """
-    _A = torch.rand(B, L, C, S, 1)
-    A1 = torch.nn.Parameter(_A.clone())
-    A2 = torch.nn.Parameter(_A.clone())
-    X1 = torch.rand(B, L, C, S, S)
-    X2 = X1.clone()
-    H_gt = torch.rand(B, L, C, S, S)
-
-    torch.autograd.set_detect_anomaly(True)
-    loss_fn = torch.nn.MSELoss()
-    H_pscan = pscan(A1.expand(B, L, C, S, 1), X1)
-    loss_pscan = loss_fn(H_pscan, H_gt)
-    loss_pscan.backward()
-    H_serial_scan = serial_scan(A2.expand(B, L, C, S, 1), X2)
-    loss_serial_scan = loss_fn(H_serial_scan, H_gt)
-    loss_serial_scan.backward()
-    return torch.allclose(H_pscan, H_serial_scan), torch.allclose(A1.grad, A2.grad)
-
-def serial_scan(A, X):
-    """
-    Serial implementation for verification purposes.
-    
-    Args:
-        A: Coefficient tensor
-        X: Input tensor
-        
-    Returns:
-        Sequential scan result
-    """
-    batch_size, seq_length, channels, state_dim, _ = A.size()
-    H = torch.zeros_like(X)
-    
-    H[:, 0] = X[:, 0].clone()
-    for idx in range(1, seq_length):
-        H[:, idx] = A[:, idx] * H[:, idx - 1].clone() + X[:, idx].clone()
-    
-    return H
-
 def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
     """
     Verifies the correctness of parallel scan implementation.
