@@ -118,14 +118,14 @@ def run_ddp(rank, world_size, args):
     model = load_ckpt(ConvLRU(args), args.ckpt).cuda(rank)
     model = DDP(model, device_ids=[rank], find_unused_parameters=False)
     loss_fn = torch.nn.MSELoss().cuda(rank)
-    opt = torch.optim.Adam(model.parameters(), lr=0.001)
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
     for ep in range(args.epochs):
         train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=5, rank=dist.get_rank(), gpus=dist.get_world_size())
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=2, pin_memory=True, prefetch_factor=4)
         if ep == 0:
-            scheduler = lr_scheduler.OneCycleLR(opt, max_lr=0.01, steps_per_epoch=len(train_dataloader), epochs=args.epochs)
+            scheduler = lr_scheduler.OneCycleLR(opt, max_lr=5e-4, steps_per_epoch=len(train_dataloader), epochs=args.epochs)
         train_dataloader = tqdm(train_dataloader, desc=f"Epoch {ep+1}/{args.epochs} - Strat") if rank == 0 else train_dataloader
         for train_step, data in enumerate(train_dataloader, start=1):
             model.train()
