@@ -231,7 +231,7 @@ class ConvLRULayer(nn.Module):
         B, L, _, _, W = x.size()
         nu, theta, gamma = torch.exp(self.params_log).split((self.emb_ch, self.emb_ch, self.emb_ch))
         lamb = torch.exp(torch.complex(-nu, theta))
-        h = torch.fft.fft2(x.to(torch.cfloat), dim=(-3, -2, -1))
+        h = torch.fft.fft2(x.to(torch.cfloat), dim=(-3, -2, -1), norm='ortho')
         h = self.proj_B(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         h = h * gamma.reshape(1, 1, *gamma.shape, 1).expand(B, L, *gamma.shape, W)
         C, S = lamb.size()
@@ -242,7 +242,7 @@ class ConvLRULayer(nn.Module):
             pass
         h = self.pscan(lamb.reshape(1, 1, C, S, 1).expand(B, L, C, S, 1), h)
         last_hidden_out = h[:, -1:]
-        h = torch.fft.ifft2(h, dim=(-3, -2, -1))
+        h = torch.fft.ifft2(h, dim=(-3, -2, -1), norm='ortho')
         h = self.proj_C(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         h = h.real
         h = self.layer_norm(h)
