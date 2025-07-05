@@ -225,6 +225,7 @@ class ConvLRULayer(nn.Module):
         self.proj_B = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same', bias=self.use_bias).to(torch.cfloat)
         self.proj_C = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same', bias=self.use_bias).to(torch.cfloat)
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
+        self.gate_conv = nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same'), nn.Sigmoid())
         # 
         self.pscan = PScan.apply
     def convlru(self, x, last_hidden_in):
@@ -245,14 +246,12 @@ class ConvLRULayer(nn.Module):
         h = torch.fft.ifft2(h, dim=(-3, -2, -1), norm='ortho')
         h = self.proj_C(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         h = h.real
-        h = self.layer_norm(h)
+        h = self.layer_norm(h)     
+        gate = self.gate_conv(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)         
         if last_hidden_in is not None:
-            x = h[:, 1:] + x
-        else:
-            x = h + x
-        return x, last_hidden_out
-    def forward(self, x, last_hidden_in):
-        x, last_hidden_out = self.convlru(x, last_hidden_in)
+            h = h[:, 1:]
+            gate = gate[:, 1:]
+        x = (1 - gate) * x + gate * h
         return x, last_hidden_out
 
 class FeedForward(nn.Module):

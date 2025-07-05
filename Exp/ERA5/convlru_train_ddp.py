@@ -53,11 +53,12 @@ class Args:
         # Data parameters
         self.data_root = '/mnt/ssd1/data_norm'
         self.year_range = [2016, 2021]
-        self.data_n_frames = 16
+        self.train_data_n_frames = 9
+        self.eval_data_n_frames = 16
         self.eval_sample_num = 365
         # Training parameters
         self.ckpt = ''
-        self.train_batch_size = 1
+        self.train_batch_size = 2
         self.eval_batch_size = 1
         self.epochs = 2048
         self.log_path = './exp_convlru_0/logs'  
@@ -120,7 +121,7 @@ def run_ddp(rank, world_size, args):
     opt = torch.optim.Adam(model.parameters(), lr=0.001)
 
     for ep in range(args.epochs):
-        train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=5, rank=dist.get_rank(), gpus=dist.get_world_size())
+        train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=5, rank=dist.get_rank(), gpus=dist.get_world_size())
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=2, pin_memory=True, prefetch_factor=4)
         if ep == 0:
@@ -130,12 +131,12 @@ def run_ddp(rank, world_size, args):
             model.train()
             opt.zero_grad()
             data = data.cuda(rank).to(torch.float32)
-            inputs, outputs = data[:, :args.data_n_frames//2], data[:, args.data_n_frames//2:]
+            inputs, outputs = data[:, :-1], data[:, 1:]
             del data
             gc.collect()
             torch.cuda.empty_cache()
             preds = model(inputs, 'p')
-            loss = loss_fn(preds[:,1:,:,:,:], torch.concat((inputs[:,2:,:,:,:], outputs[:,:1,:,:,:]), axis=1))
+            loss = loss_fn(preds[:,1:,:,:,:], outputs[:,1:,:,:,:])
             loss.backward()
             opt.step()
             scheduler.step()
@@ -162,13 +163,13 @@ def run_ddp(rank, world_size, args):
         model.eval()
         with torch.no_grad():
             loss_value = 0
-            eval_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=False, sample_len=args.data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=5, rank=dist.get_rank(), gpus=dist.get_world_size())
+            eval_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=False, sample_len=args.eval_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=5, rank=dist.get_rank(), gpus=dist.get_world_size())
             eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False)
             eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=2, pin_memory=True, prefetch_factor=4)
             eval_dataloader = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs} - Step {train_step} - Strat") if rank == 0 else eval_dataloader
             for eval_step, data in enumerate(eval_dataloader, start=1):
                 data = data.cuda(rank).to(torch.float32)
-                inputs, outputs = data[:,:args.data_n_frames//2], data[:,args.data_n_frames//2:]
+                inputs, outputs = data[:,:args.eval_data_n_frames//2], data[:,args.eval_data_n_frames//2:]
                 out_gen_num = outputs.shape[1] // args.gen_factor
                 preds = model(inputs, 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
                 loss = loss_fn(preds, outputs)
