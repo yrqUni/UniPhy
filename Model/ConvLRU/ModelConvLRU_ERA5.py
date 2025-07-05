@@ -253,6 +253,9 @@ class ConvLRULayer(nn.Module):
             gate = gate[:, 1:]
         x = (1 - gate) * x + gate * h
         return x, last_hidden_out
+    def forward(self, x, last_hidden_in):
+        x, last_hidden_out = self.convlru(x, last_hidden_in)
+        return x, last_hidden_out
 
 class FeedForward(nn.Module):
     def __init__(self, args, input_downsp_shape):
