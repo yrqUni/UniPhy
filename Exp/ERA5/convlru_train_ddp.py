@@ -36,7 +36,7 @@ class Args:
         self.input_size = (720, 1440)
         self.input_ch = 89
         self.use_mhsa = True
-        self.use_gate = False
+        self.use_gate = True
         self.emb_ch = 128
         self.convlru_num_blocks = 12
         self.hidden_factor = (10, 20)
@@ -67,9 +67,9 @@ class Args:
             self.eval_sample_num = 1
         self.use_tf32 = False
         self.use_compile = False
-        self.lr = 1e-3
-        self.init_lr_scheduler = True
+        self.lr = 1e-4
         self.use_scheduler = True
+        self.init_lr_scheduler = True
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr

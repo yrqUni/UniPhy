@@ -247,15 +247,14 @@ class ConvLRULayer(nn.Module):
         last_hidden_out = h[:, -1:]
         h = torch.fft.ifft2(h, dim=(-3, -2, -1), norm='ortho')
         h = self.proj_C(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-        h = h.real
+        h = self.layer_norm(h.real)
         if last_hidden_in is not None:
             h = h[:, 1:]
-        if self.gate_conv:
+        if self.gate_conv is not None:
             gate = self.gate_conv(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             x = (1 - gate) * x + gate * h
-        if not self.gate_conv:
+        if self.gate_conv is None:
             x = x + h
-        x = self.layer_norm(x)
         return x, last_hidden_out
     def forward(self, x, last_hidden_in):
         x, last_hidden_out = self.convlru(x, last_hidden_in)
@@ -283,3 +282,4 @@ class FeedForward(nn.Module):
         x_ = self.layer_norm(x_.permute(0, 2, 1, 3, 4))
         x = x_ + x
         return x
+
