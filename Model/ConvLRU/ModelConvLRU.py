@@ -242,7 +242,7 @@ class ConvLRULayer(nn.Module):
         if last_hidden_in is not None:
             h = h[:, 1:]
         if self.gate_conv is not None:
-            gate = self.gate_conv(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            gate = self.gate_conv(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             x = (1 - gate) * x + gate * h
         if self.gate_conv is None:
             x = x + h
