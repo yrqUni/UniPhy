@@ -82,29 +82,29 @@ class Conv_hidden(nn.Module):
             self.gate_conv = nn.Sequential(nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding='same'), nn.Sigmoid())  
     def forward(self, x):
         B, _, L, H, W = x.size()
-        x_ = self.conv3(x)
-        x_ = self.activation3(x_)
-        x_ = self.conv1(x_)
-        x_ = self.activation1(x_)
+        x_update = self.conv3(x)
+        x_update = self.activation3(x_update)
+        x_update = self.conv1(x_update)
+        x_update = self.activation1(x_update)
         if self.use_mhsa:
-            x_ = self.layer_norm_attn(x_.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            x_ = x_ + x
-            x_ = x_.permute(0, 2, 1, 3, 4).reshape(B * L, self.ch, H * W)
-            x_ = x_ + self.pos_bias
-            qk = self.mhsa_qk(x_)
+            x_update = self.layer_norm_attn(x_update.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            x_update = x_update + x
+            x_update = x_update.permute(0, 2, 1, 3, 4).reshape(B * L, self.ch, H * W)
+            x_update = x_update + self.pos_bias
+            qk = self.mhsa_qk(x_update)
             q, k = qk.split(self.sa_dim, dim=-1)
             attn = torch.einsum('bld,bmd->blm', q, k)
             attn = attn / math.sqrt(self.sa_dim)
             attn = torch.softmax(attn, dim=-1)
-            x_ = torch.einsum('blm,bmd->bld', attn, x_)
-            x_ = x_.reshape(B, L, self.ch, H, W)
-            x_ = self.layer_norm_conv(x_).permute(0, 2, 1, 3, 4)
-            gate = self.gate_conv(x_)
-            x = (1 - gate) * x + gate * x_
+            x_update = torch.einsum('blm,bmd->bld', attn, x_update)
+            x_update = x_update.reshape(B, L, self.ch, H, W)
+            x_update = self.layer_norm_conv(x_update).permute(0, 2, 1, 3, 4)
+            gate = self.gate_conv(x_update)
+            x = (1 - gate) * x + gate * x_update
         else:
-            x_ = x_.permute(0, 2, 1, 3, 4)
-            x_ = self.layer_norm_conv(x_).permute(0, 2, 1, 3, 4)
-            x = x_ + x
+            x_update = x_update.permute(0, 2, 1, 3, 4)
+            x_update = self.layer_norm_conv(x_update).permute(0, 2, 1, 3, 4)
+            x = x_update + x
         return x
 
 class Embedding(nn.Module):
@@ -276,12 +276,12 @@ class FeedForward(nn.Module):
         self.activation = getattr(nn, args.hidden_activation)()
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
     def forward(self, x):
-        x_ = self.c_in(x.permute(0, 2, 1, 3, 4))
-        x_ = self.activation(x_)
+        x_update = self.c_in(x.permute(0, 2, 1, 3, 4))
+        x_update = self.activation(x_update)
         for layer in self.c_hidden:
-            x_ = layer(x_)
-        x_ = self.c_out(x_)
-        x_ = self.layer_norm(x_.permute(0, 2, 1, 3, 4))
-        x = x_ + x
+            x_update = layer(x_update)
+        x_update = self.c_out(x_update)
+        x_update = self.layer_norm(x_update.permute(0, 2, 1, 3, 4))
+        x = x_update + x
         return x
 
