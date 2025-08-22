@@ -79,6 +79,7 @@ class Conv_hidden(nn.Module):
             self.mhsa_qk = nn.Linear(hidden_size[0]*hidden_size[1], sa_dim*2)
             self.pos_bias = nn.Parameter(torch.randn(1, self.ch, hidden_size[0]*hidden_size[1]))
             self.layer_norm_attn = nn.LayerNorm([*hidden_size])
+            self.gate_conv = nn.Sequential(nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding='same'), nn.Sigmoid())  
     def forward(self, x):
         B, _, L, H, W = x.size()
         x_ = self.conv3(x)
@@ -97,10 +98,13 @@ class Conv_hidden(nn.Module):
             attn = torch.softmax(attn, dim=-1)
             x_ = torch.einsum('blm,bmd->bld', attn, x_)
             x_ = x_.reshape(B, L, self.ch, H, W)
+            x_ = self.layer_norm_conv(x_).permute(0, 2, 1, 3, 4)
+            gate = self.gate_conv(x_)
+            x = (1 - gate) * x + gate * x_
         else:
-            x_ =  x_.permute(0, 2, 1, 3, 4)
-        x_ = self.layer_norm_conv(x_).permute(0, 2, 1, 3, 4)
-        x = x_ + x
+            x_ = x_.permute(0, 2, 1, 3, 4)
+            x_ = self.layer_norm_conv(x_).permute(0, 2, 1, 3, 4)
+            x = x_ + x
         return x
 
 class Embedding(nn.Module):
@@ -118,18 +122,24 @@ class Embedding(nn.Module):
             _, C, _, H, W = self.downsp(torch.zeros(1, self.input_ch, 1, *self.input_size)).size()
             self.input_downsp_shape = (C, H, W)
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
-        self.c_in = nn.Conv3d(C, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=False, sa_dim=None) for _ in range(self.emb_hidden_layers_num)])
-        self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
+        if self.emb_hidden_layers_num == 0:
+            self.c_in = nn.Conv3d(C, self.emb_ch, kernel_size=(1, 7, 7), padding='same')
+            self.c_hidden = None
+            self.c_out = None
+        if self.emb_hidden_layers_num != 0:
+            self.c_in = nn.Conv3d(C, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding='same')
+            self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=False, sa_dim=None) for _ in range(self.emb_hidden_layers_num)])
+            self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, args.hidden_activation)()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
         x = self.downsp(x.permute(0, 2, 1, 3, 4))
         x = self.c_in(x)
         x = self.activation(x)
-        for layer in self.c_hidden:
-            x = layer(x)
-        x = self.c_out(x)
+        if self.c_hidden is not None:
+            for layer in self.c_hidden:
+                x = layer(x)
+            x = self.c_out(x)
         x = self.layer_norm(x.permute(0, 2, 1, 3, 4))
         return x
 
@@ -149,22 +159,23 @@ class Decoder(nn.Module):
                 _, _, _, H, W = self.upsp(torch.zeros(1, args.emb_ch, 1, input_downsp_shape[1], input_downsp_shape[2])).size()
             self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
             self.c_out = nn.Conv3d(self.dec_hidden_ch, self.output_ch, kernel_size=(1, 1, 1), padding='same')
-        else:
+        if self.dec_hidden_layers_num == 0:
             self.upsp = nn.ConvTranspose3d(in_channels=args.emb_ch, out_channels=args.emb_ch, 
                                           kernel_size=(1, *args.hidden_factor), 
                                           stride=(1, *args.hidden_factor))
             with torch.no_grad():
                 _, _, _, H, W = self.upsp(torch.zeros(1, args.emb_ch, 1, input_downsp_shape[1], input_downsp_shape[2])).size()
             self.c_out = nn.Conv3d(self.emb_ch, self.output_ch, kernel_size=(1, 1, 1), padding='same')
+            self.c_hidden = None
         self.activation = getattr(nn, args.hidden_activation)()
     def forward(self, x):
         x = self.upsp(x.permute(0, 2, 1, 3, 4))
         x = self.activation(x)
-        if self.dec_hidden_layers_num != 0:
+        if self.c_hidden is not None:
             for layer in self.c_hidden:
                 x = layer(x)
             x = self.c_out(x)
-        else:
+        if self.c_hidden is None:
             x = self.c_out(x)
         return x.permute(0, 2, 1, 3, 4)
 

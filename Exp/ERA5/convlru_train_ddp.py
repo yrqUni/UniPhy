@@ -28,7 +28,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 import torch.optim.lr_scheduler as lr_scheduler
-from ModelConvLRU_ERA5 import ConvLRU
+from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
 from tqdm import tqdm
 
@@ -38,12 +38,12 @@ class Args:
         self.input_ch = 24
         self.use_mhsa = True
         self.use_gate = True
-        self.emb_ch = 72
-        self.convlru_num_blocks = 12
+        self.emb_ch = 48
+        self.convlru_num_blocks = 8
         self.hidden_factor = (10, 20)
-        self.emb_hidden_ch = 96
-        self.emb_hidden_layers_num = 1
-        self.ffn_hidden_ch = 144
+        self.emb_hidden_ch = 1
+        self.emb_hidden_layers_num = 72
+        self.ffn_hidden_ch = 96
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
@@ -321,7 +321,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad()
-            data = data.cuda(local_rank).to(torch.float32)
+            data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
             inputs, outputs = data[:, :-1], data[:, 1:]
             del data
             gc.collect()
@@ -387,7 +387,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     num_workers=1, pin_memory=True, prefetch_factor=1)
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                    data = data.cuda(local_rank).to(torch.float32)
+                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
                     inputs, outputs = data[:, :args.eval_data_n_frames//2], data[:, args.eval_data_n_frames//2:]
                     out_gen_num = outputs.shape[1] // args.gen_factor
                     preds = model(inputs, 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
