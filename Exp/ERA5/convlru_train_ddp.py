@@ -382,7 +382,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
         train_dataloader = DataLoader(
             train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
-            num_workers=0, pin_memory=True, prefetch_factor=0)
+            num_workers=1, pin_memory=True, prefetch_factor=2)
         train_sampler.set_epoch(ep)
         train_dataloader_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}/{args.epochs} - Start") if rank == 0 else train_dataloader
         for train_step, data in enumerate(train_dataloader_iter, start=1):
