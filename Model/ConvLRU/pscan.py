@@ -200,12 +200,14 @@ def serial_scan(A, X):
 def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
     """
     Verifies the correctness of parallel scan implementation.
-    
     Returns:
         (forward_match, gradient_match) tuple of booleans
+    Run the test
+    assert all(pscan_check()), "PScan implementation failed the test."
+    print("PScan implementation passed the test.")
     """
     pscan = PScan.apply
-    # Generate random test data
+
     A_tensor = torch.rand(batch_size, seq_length, channels, state_dim, 1)
     A1 = torch.nn.Parameter(A_tensor.clone())
     A2 = torch.nn.Parameter(A_tensor.clone())
@@ -216,26 +218,18 @@ def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
     torch.autograd.set_detect_anomaly(True)
     loss_fn = torch.nn.MSELoss()
     
-    # Test parallel implementation
     H_pscan = pscan(A1.expand(batch_size, seq_length, channels, state_dim, 1), X1)
     loss_pscan = loss_fn(H_pscan, H_gt)
     loss_pscan.backward()
     
-    # Test serial implementation
     H_serial_scan = serial_scan(A2.expand(batch_size, seq_length, channels, state_dim, 1), X2)
     loss_serial_scan = loss_fn(H_serial_scan, H_gt)
     loss_serial_scan.backward()
     
-    # Check if outputs and gradients match
     result = (torch.allclose(H_pscan, H_serial_scan), torch.allclose(A1.grad, A2.grad))
     
-    # Clean up
     import gc
     del A_tensor, A1, A2, X1, X2, H_gt, H_pscan, H_serial_scan, loss_pscan, loss_serial_scan, loss_fn
     gc.collect()
     torch.cuda.empty_cache()
     return result
-
-# Run the test
-# assert all(pscan_check()), "PScan implementation failed the test."
-# print("PScan implementation passed the test.")

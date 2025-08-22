@@ -382,20 +382,16 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
         train_dataloader = DataLoader(
             train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
-            num_workers=1, pin_memory=True, prefetch_factor=1)
+            num_workers=0, pin_memory=True, prefetch_factor=0)
         train_sampler.set_epoch(ep)
         train_dataloader_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}/{args.epochs} - Start") if rank == 0 else train_dataloader
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad()
             data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
-            inputs, outputs = data[:, :-1], data[:, 1:]
-            del data
-            gc.collect()
-            torch.cuda.empty_cache()
-            preds = model(inputs, 'p')
+            preds = model(data[:, :-1], 'p')
             pred_slice = preds[:, 1:]
-            targ_slice = outputs[:, 1:]
+            targ_slice = data[:, 2:]
             loss, latl1_val, ssim_val_loss = compute_total_loss(pred_slice, targ_slice, args, need_ssim_stats=True)
             loss.backward()
             opt.step()
@@ -413,14 +409,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 avg_ssim = 1.0 - (ssiml_tensor.item() / world_size)
             else:
                 avg_ssim = None
-            del inputs, outputs, preds, pred_slice, targ_slice, latl1_val, loss, loss_tensor, latl1_tensor
             if ssim_val_loss is not None:
                 del ssim_val_loss
-            gc.collect()
-            torch.cuda.empty_cache()
-            if train_step % 50 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
             if rank == 0:
                 if args.use_scheduler:
                     current_lr = scheduler.get_last_lr()[0]
@@ -434,8 +424,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 logging.info(message)
             if rank == 0 and (train_step % int(len(train_dataloader)*args.ckpt_step) == 0 or train_step == len(train_dataloader)):
                 save_ckpt(model, opt, ep, train_step, avg_loss, args, scheduler)
-                gc.collect()
-                torch.cuda.empty_cache()
         del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
         gc.collect()
         torch.cuda.empty_cache()
@@ -455,11 +443,10 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
                     data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
-                    inputs, outputs = data[:, :args.eval_data_n_frames//2], data[:, args.eval_data_n_frames//2:]
-                    out_gen_num = outputs.shape[1] // args.gen_factor
-                    preds = model(inputs, 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
+                    out_gen_num = data[:, args.eval_data_n_frames//2:].shape[1] // args.gen_factor
+                    preds = model(data[:, :args.eval_data_n_frames//2], 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
                     if args.loss_ssim_weight > 0:
-                        loss_total_eval, loss_latl1_eval, loss_ssim_eval = compute_total_loss(preds, outputs, args, need_ssim_stats=True)
+                        loss_total_eval, loss_latl1_eval, loss_ssim_eval = compute_total_loss(preds, data[:, args.eval_data_n_frames//2:], args, need_ssim_stats=True)
                         tot_tensor = torch.tensor(loss_total_eval.item(), device=f'cuda:{local_rank}')
                         latl1_tensor = torch.tensor(loss_latl1_eval.item(), device=f'cuda:{local_rank}')
                         ssiml_tensor = torch.tensor(loss_ssim_eval.detach().item(), device=f'cuda:{local_rank}')
@@ -470,7 +457,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                         avg_latl1 = latl1_tensor.item() / world_size
                         avg_ssim = 1.0 - (ssiml_tensor.item() / world_size)
                     else:
-                        loss_total_eval, loss_latl1_eval, _ = compute_total_loss(preds, outputs, args, need_ssim_stats=False)
+                        loss_total_eval, loss_latl1_eval, _ = compute_total_loss(preds, data[:, args.eval_data_n_frames//2:], args, need_ssim_stats=False)
                         tot_tensor = torch.tensor(loss_total_eval.item(), device=f'cuda:{local_rank}')
                         latl1_tensor = torch.tensor(loss_latl1_eval.item(), device=f'cuda:{local_rank}')
                         dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
@@ -478,9 +465,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                         avg_total = tot_tensor.item() / world_size
                         avg_latl1 = latl1_tensor.item() / world_size
                         avg_ssim = None
-                    del inputs, outputs, preds, data
-                    gc.collect()
-                    torch.cuda.empty_cache()
                     if rank == 0:
                         if avg_ssim is not None:
                             message = f"Eval step {eval_step} - Total: {avg_total:.6f} - LatL1: {avg_latl1:.6f} - SSIM: {avg_ssim:.6f} (w_latl1={args.loss_latl1_weight:.3f}, w_ssim={args.loss_ssim_weight:.3f})"
@@ -502,4 +486,3 @@ if __name__ == "__main__":
     master_addr = os.environ.get('MASTER_ADDR', '127.0.0.1')
     master_port = os.environ.get('MASTER_PORT', '12355')
     run_ddp(rank, world_size, local_rank, master_addr, master_port, args)
-
