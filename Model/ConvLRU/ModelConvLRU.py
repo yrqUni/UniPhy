@@ -284,4 +284,3 @@ class FeedForward(nn.Module):
         x_update = self.layer_norm(x_update.permute(0, 2, 1, 3, 4))
         x = x_update + x
         return x
-
