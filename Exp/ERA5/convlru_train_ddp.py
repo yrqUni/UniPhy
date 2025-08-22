@@ -56,7 +56,7 @@ class Args:
         self.train_data_n_frames = 13
         self.eval_data_n_frames = 4
         self.eval_sample_num = 32
-        self.ckpt = ''
+        self.ckpt = 'e2_s222_l0.049569.pth'
         self.train_batch_size = 3
         self.eval_batch_size = 3
         self.epochs = 50
@@ -94,6 +94,58 @@ def keep_latest_ckpts(ckpt_dir):
     for file_path in files_to_delete:
         os.remove(file_path)
 
+MODEL_ARG_KEYS = [
+    'input_size', 'input_ch', 'use_mhsa', 'use_gate',
+    'emb_ch', 'convlru_num_blocks', 'hidden_factor',
+    'emb_hidden_ch', 'emb_hidden_layers_num',
+    'ffn_hidden_ch', 'ffn_hidden_layers_num',
+    'dec_hidden_ch', 'dec_hidden_layers_num',
+    'out_ch', 'gen_factor',
+    'hidden_activation', 'output_activation',
+]
+
+def extract_model_args(args_obj):
+    d = {}
+    for k in MODEL_ARG_KEYS:
+        if hasattr(args_obj, k):
+            d[k] = getattr(args_obj, k)
+    return d
+
+def apply_model_args(args_obj, model_args_dict, verbose=True):
+    if not model_args_dict:
+        return
+    for k, v in model_args_dict.items():
+        if hasattr(args_obj, k):
+            old = getattr(args_obj, k)
+            if verbose and old != v:
+                msg = f"[Args] restore '{k}': {old} -> {v}"
+                print(msg)
+                logging.info(msg)
+            setattr(args_obj, k, v)
+
+def load_model_args_from_ckpt(ckpt_path, map_location='cpu'):
+    if not os.path.isfile(ckpt_path):
+        print(f"[Args] ckpt not found: {ckpt_path}")
+        logging.warning(f"[Args] ckpt not found: {ckpt_path}")
+        return None
+    ckpt = torch.load(ckpt_path, map_location=map_location)
+    model_args = ckpt.get('model_args', None)
+    if model_args is None:
+        args_all = ckpt.get('args_all', None)
+        if isinstance(args_all, dict):
+            model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
+    for k in ['model', 'optimizer', 'scheduler']:
+        if isinstance(ckpt, dict) and k in ckpt:
+            del ckpt[k]
+    del ckpt
+    gc.collect()
+    torch.cuda.empty_cache()
+    if not model_args:
+        print(f"[Args] Warning: no model_args found in {ckpt_path}, using code defaults.")
+        logging.warning(f"[Args] no model_args found in {ckpt_path}, using code defaults.")
+        return None
+    return model_args
+
 def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     state = {
@@ -102,6 +154,8 @@ def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
         'epoch': epoch,
         'step': step,
         'loss': loss.item() if hasattr(loss, 'item') else float(loss),
+        'args_all': dict(vars(args)),
+        'model_args': extract_model_args(args),
     }
     if scheduler is not None:
         state['scheduler'] = scheduler.state_dict()
@@ -137,9 +191,16 @@ def adapt_state_dict_keys(state_dict, model):
         new_state_dict[new_k] = v
     return new_state_dict
 
-def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu'):
+def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu', args=None, restore_model_args=False):
     if os.path.isfile(ckpt_path):
         checkpoint = torch.load(ckpt_path, map_location=map_location)
+        if restore_model_args and args is not None:
+            model_args = checkpoint.get('model_args', None)
+            if model_args is None:
+                args_all = checkpoint.get('args_all', None)
+                if isinstance(args_all, dict):
+                    model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
+            apply_model_args(args, model_args, verbose=True)
         state_dict = adapt_state_dict_keys(checkpoint['model'], model)
         model.load_state_dict(state_dict, strict=False)
         opt.load_state_dict(checkpoint['optimizer'])
@@ -275,6 +336,12 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for k, v in vars(args).items():
             logging.info(f"{k}: {v}")
         logging.info("========================================")
+    if args.ckpt and os.path.isfile(args.ckpt):
+        ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f'cuda:{local_rank}')
+        if ckpt_model_args:
+            print("[Args] applying model args from ckpt before building model.")
+            logging.info("[Args] applying model args from ckpt before building model.")
+            apply_model_args(args, ckpt_model_args, verbose=True)
     model = ConvLRU(args)
     model = model.cuda(local_rank)
     if args.use_compile:
@@ -297,7 +364,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     start_epoch = 0
     scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=len(list(range(start_epoch, args.epochs))))
     if args.ckpt and os.path.isfile(args.ckpt):
-        start_epoch, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f'cuda:{local_rank}')
+        start_epoch, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f'cuda:{local_rank}', args=args, restore_model_args=False)
     if args.init_lr_scheduler and args.use_scheduler:
         print(f"Init lr scheduler.")
         logging.info(f"Init lr scheduler.")
