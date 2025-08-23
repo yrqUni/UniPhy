@@ -370,8 +370,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         logging.info(f"Init lr scheduler.")
         scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=len(list(range(start_epoch, args.epochs))))
     if not args.use_scheduler:
-        print(f"Scheduler is disable, opt will init.")
-        logging.warning(f"Scheduler is disable, opt will init.")
+        print(f"Scheduler is disable, opt will use fixed lr.")
+        logging.warning(f"Scheduler is disable, opt will use fixed lr.")
         for g in opt.param_groups:
             g['lr'] = args.lr
     for ep in range(start_epoch, args.epochs):
