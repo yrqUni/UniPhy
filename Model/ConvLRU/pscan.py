@@ -17,7 +17,10 @@ def pad_npo2(X):
         Y : (B, npo2(L), C, S, S)
     """
     len_npo2 = npo2(X.size(1))
-    pad_tuple = (0, 0, 0, 0, 0, 0, 0, len_npo2 - X.size(1))
+    pad_tuple = (0, 0, 
+                 0, 0, 
+                 0, 0, 
+                 0, len_npo2 - X.size(1))
     return F.pad(X, pad_tuple, "constant", 0)
 
 class PScan(torch.autograd.Function):
@@ -167,7 +170,10 @@ class PScan(torch.autograd.Function):
             grad_output = pad_npo2(grad_output_in) # (B, npo2(L), C, S, S)
             A = pad_npo2(A) # (B, npo2(L), C, S, 1)
 
-        A = torch.nn.functional.pad(A[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
+        A = torch.nn.functional.pad(A[:, 1:], (0, 0, 
+                                               0, 0, 
+                                               0, 0, 
+                                               0, 1))
 
         PScan.pscan_rev(A, grad_output)
 

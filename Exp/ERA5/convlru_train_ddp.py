@@ -372,7 +372,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     if not args.use_scheduler:
         print(f"Scheduler is disable, opt will init.")
         logging.warning(f"Scheduler is disable, opt will init.")
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        for g in opt.param_groups:
+            g['lr'] = args.lr
     for ep in range(start_epoch, args.epochs):
         train_dataset = ERA5_Dataset(
             input_dir=args.data_root, year_range=args.year_range,
