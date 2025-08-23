@@ -202,9 +202,10 @@ def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
     Verifies the correctness of parallel scan implementation.
     Returns:
         (forward_match, gradient_match) tuple of booleans
-    Run the test
-    assert all(pscan_check()), "PScan implementation failed the test."
-    print("PScan implementation passed the test.")
+    Usage:
+        Run the test for the PScan implementation.
+        assert all(pscan_check()), "PScan implementation failed the test."
+        print("PScan implementation passed the test.")
     """
     pscan = PScan.apply
 
