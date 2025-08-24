@@ -23,6 +23,7 @@ class Args:
         # emb info
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 1
+        self.emb_strategy = 'pxus'
         # ffn info
         self.ffn_hidden_ch = 32
         self.ffn_hidden_layers_num = 1

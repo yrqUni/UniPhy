@@ -116,6 +116,14 @@ class Conv_hidden(nn.Module):
             x = x_update + x
         return x
 
+def pixel_unshuffle_hw_3d(x, rH: int, rW: int):
+    N, C, D, H, W = x.shape
+    assert H % rH == 0 and W % rW == 0
+    x = x.view(N, C, D, H // rH, rH, W // rW, rW)
+    x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
+    x = x.view(N, C * rH * rW, D, H // rH, W // rW)
+    return x
+
 class Embedding(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -124,25 +132,38 @@ class Embedding(nn.Module):
         self.emb_ch = args.emb_ch
         self.emb_hidden_ch = args.emb_hidden_ch
         self.emb_hidden_layers_num = args.emb_hidden_layers_num
-        self.downsp = nn.Conv3d(in_channels=self.input_ch, out_channels=self.input_ch,
-                               kernel_size=(1, *args.hidden_factor),
-                               stride=(1, *args.hidden_factor))
-        with torch.no_grad():
-            _, C, _, H, W = self.downsp(torch.zeros(1, self.input_ch, 1, *self.input_size)).size()
-            self.input_downsp_shape = (C, H, W)
+        self.down_strategy = args.emb_strategy
+        assert self.down_strategy in ['conv', 'pxus'], f"emb_strategy should be either 'conv' or 'pxus', but got {self.down_strategy}"
+        self.rH, self.rW = int(args.hidden_factor[0]), int(args.hidden_factor[1])
+        if self.down_strategy == "conv":
+            self.downsp = nn.Conv3d(in_channels=self.input_ch, out_channels=self.input_ch, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW))
+            with torch.no_grad():
+                _, C, _, H, W = self.downsp(torch.zeros(1, self.input_ch, 1, *self.input_size)).size()
+                self.input_downsp_shape = (C, H, W)
+            in_ch_after_down = self.input_downsp_shape[0]
+        if self.down_strategy == "pxus":
+            Hd, Wd = self.input_size[0] // self.rH, self.input_size[1] // self.rW
+            Cd = self.input_ch * self.rH * self.rW
+            self.input_downsp_shape = (Cd, Hd, Wd)
+            in_ch_after_down = Cd
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         if self.emb_hidden_layers_num == 0:
-            self.c_in = nn.Conv3d(C, self.emb_ch, kernel_size=(1, 7, 7), padding='same')
+            self.c_in = nn.Conv3d(in_ch_after_down, self.emb_ch, kernel_size=(1, 7, 7), padding='same')
             self.c_hidden = None
             self.c_out = None
         if self.emb_hidden_layers_num != 0:
-            self.c_in = nn.Conv3d(C, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding='same')
+            self.c_in = nn.Conv3d(in_ch_after_down, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding='same')
             self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, args.hidden_activation, use_mhsa=False, sa_dim=None) for _ in range(self.emb_hidden_layers_num)])
             self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, args.hidden_activation)()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
+
     def forward(self, x):
-        x = self.downsp(x.permute(0, 2, 1, 3, 4))
+        x = x.permute(0, 2, 1, 3, 4)
+        if self.down_strategy == "conv":
+            x = self.downsp(x)
+        if self.down_strategy == "pxus":
+            x = pixel_unshuffle_hw_3d(x, self.rH, self.rW)
         x = self.c_in(x)
         x = self.activation(x)
         if self.c_hidden is not None:
@@ -170,6 +191,7 @@ class Decoder(nn.Module):
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.dec_strategy = args.dec_strategy
+        assert self.dec_strategy in ['deconv', 'pxsf'], f"dec_strategy should be either 'deconv' or 'pxsf', but got {self.dec_strategy}"
         self.rH, self.rW = int(args.hidden_factor[0]), int(args.hidden_factor[1])
         if self.dec_hidden_layers_num != 0:
             out_ch_after_up = self.dec_hidden_ch
