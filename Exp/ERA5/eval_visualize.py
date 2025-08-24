@@ -1,8 +1,7 @@
 import argparse
-import os
 import gc
 import torch
-import numpy as np
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
@@ -83,47 +82,71 @@ def build_model_from_ckpt(ckpt_path, device):
     model.eval()
     return model, args
 
-def tensor_to_uint8(x):
-    x = x.detach().float().cpu().numpy()
-    x = (np.clip((x+1.0)*0.5, 0.0, 1.0)*255.0).astype(np.uint8)
-    return x
+def _channel_limits(pred_btchw, gt_btchw, channels):
+    vmins, vmaxs = {}, {}
+    for c in channels:
+        v = torch.cat([pred_btchw[:,:,c].reshape(-1), gt_btchw[:,:,c].reshape(-1)], dim=0)
+        vmins[c] = float(v.min().item())
+        vmaxs[c] = float(v.max().item())
+        if vmins[c] >= vmaxs[c]:
+            vmaxs[c] = vmins[c] + 1e-6
+    return vmins, vmaxs
 
-def make_mosaic(pred_btchw, gt_btchw, channels=None, pad=4, group_pad=8):
+def make_grid_figure(pred_btchw, gt_btchw, channels=None, show_diff=True,
+                     figsize_per_cell=(2.6, 2.6), cmap_main='viridis', cmap_diff='RdBu_r',
+                     annotate=True, save_path='eval_viz.png'):
+    assert pred_btchw.dim()==5 and gt_btchw.dim()==5 and pred_btchw.size(0)==1 and gt_btchw.size(0)==1
     B,T,C,H,W = pred_btchw.shape
-    assert B==1
     if channels is None:
         channels = list(range(C))
-    Cn = len(channels)
-    row_h = H
-    col_w = W
-    h_sep = 1
-    v_sep = 1
-    unit_rows = 2
-    total_rows = T*unit_rows + (T-1)
-    total_cols = Cn + (Cn-1)
-    H_img = total_rows*row_h + (T-1)*group_pad + (total_rows-1)*h_sep
-    W_img = total_cols*col_w + (Cn-1)*v_sep
-    canvas = np.zeros((H_img, W_img), dtype=np.uint8)
-    y = 0
+    rows_per_t = 3 if show_diff else 2
+    nrows = T * rows_per_t
+    ncols = len(channels)
+    pred, gt = pred_btchw, gt_btchw
+    vmins, vmaxs = _channel_limits(pred, gt, channels)
+    fig_w = ncols * figsize_per_cell[0]
+    fig_h = nrows * figsize_per_cell[1]
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(fig_w, fig_h), constrained_layout=True)
+    if nrows==1 and ncols==1:
+        axes = [[axes]]
+    elif nrows==1:
+        axes = [axes]
+    elif ncols==1:
+        axes = [[ax] for ax in axes]
     for t in range(T):
-        for r in range(2):
-            row_src = pred_btchw if r==0 else gt_btchw
-            y_row = y + r*(row_h + h_sep)
-            x = 0
-            for ci, c in enumerate(channels):
-                img = tensor_to_uint8(row_src[0,t,c])
-                canvas[y_row:y_row+row_h, x:x+col_w] = img
-                x += col_w
-                if ci < Cn-1:
-                    canvas[y_row:y_row+row_h, x:x+v_sep] = 255
-                    x += v_sep
-        y += 2*row_h + h_sep
-        if t < T-1:
-            canvas[y:y+h_sep, :] = 255
-            y += h_sep
-            canvas[y:y+group_pad, :] = 255
-            y += group_pad
-    return canvas
+        for j, c in enumerate(channels):
+            r0 = t*rows_per_t
+            ax = axes[r0+0][j]
+            im0 = ax.imshow(pred[0, t, c].cpu(), cmap=cmap_main, vmin=vmins[c], vmax=vmaxs[c], origin='upper')
+            ax.set_xticks([]); ax.set_yticks([])
+            if annotate:
+                ax.set_title(f'Ch {c}', fontsize=10)
+                ax.text(0.01, 0.95, f't={t}  Pred', transform=ax.transAxes, va='top', ha='left',
+                        fontsize=9, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+            if t==0:
+                fig.colorbar(im0, ax=ax, fraction=0.046, pad=0.02)
+            ax = axes[r0+1][j]
+            im1 = ax.imshow(gt[0, t, c].cpu(), cmap=cmap_main, vmin=vmins[c], vmax=vmaxs[c], origin='upper')
+            ax.set_xticks([]); ax.set_yticks([])
+            if annotate:
+                ax.text(0.01, 0.95, 'GT', transform=ax.transAxes, va='top', ha='left',
+                        fontsize=9, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+            if show_diff:
+                ax = axes[r0+2][j]
+                diff = (pred[0, t, c] - gt[0, t, c]).cpu()
+                rng = max(vmaxs[c]-vmins[c], 1e-6)
+                dv = 0.2 * rng
+                im2 = ax.imshow(diff, cmap=cmap_diff, vmin=-dv, vmax=+dv, origin='upper')
+                ax.set_xticks([]); ax.set_yticks([])
+                if annotate:
+                    ax.text(0.01, 0.95, 'Diff', transform=ax.transAxes, va='top', ha='left',
+                            fontsize=9, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+                if t==0:
+                    fig.colorbar(im2, ax=ax, fraction=0.046, pad=0.02)
+    fig.suptitle('Prediction vs Ground Truth (per-channel, per-timestep)', fontsize=12)
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    return save_path
 
 def main():
     p = argparse.ArgumentParser()
@@ -137,10 +160,8 @@ def main():
     p.add_argument('--channels', type=str, default=None)
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = p.parse_args()
-
     device = torch.device(args.device)
     model, margs = build_model_from_ckpt(args.ckpt, device)
-
     ds = ERA5_Dataset(
         input_dir=args.data_root,
         year_range=[args.year_start, args.year_end],
@@ -167,10 +188,11 @@ def main():
         ch = [int(x) for x in args.channels.split(',') if x.strip()!='']
     else:
         ch = list(range(preds.shape[2]))
-    img = make_mosaic(preds, out, channels=ch)
-    from PIL import Image
-    Image.fromarray(img).save(args.save)
+    make_grid_figure(
+        preds, out, channels=ch, show_diff=True,
+        figsize_per_cell=(2.6, 2.6), cmap_main='viridis', cmap_diff='RdBu_r',
+        annotate=True, save_path=args.save
+    )
 
 if __name__ == '__main__':
     main()
-
