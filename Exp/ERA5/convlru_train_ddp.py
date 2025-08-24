@@ -43,6 +43,7 @@ class Args:
         self.hidden_factor = (10, 20)
         self.emb_hidden_ch = 128
         self.emb_hidden_layers_num = 2
+        self.emb_strategy = 'pxus'
         self.ffn_hidden_ch = 128
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
