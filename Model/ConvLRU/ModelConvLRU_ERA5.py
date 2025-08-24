@@ -154,6 +154,7 @@ class Embedding(nn.Module):
 
 def pixel_shuffle_hw_3d(x, rH: int, rW: int):
     N, C_mul, D, H, W = x.shape
+    assert C_mul % (rH * rW) == 0
     C = C_mul // (rH * rW)
     x = x.view(N, C, rH, rW, D, H, W)
     x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
