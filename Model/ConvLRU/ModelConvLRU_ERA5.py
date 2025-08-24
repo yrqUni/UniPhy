@@ -152,6 +152,14 @@ class Embedding(nn.Module):
         x = self.layer_norm(x.permute(0, 2, 1, 3, 4))
         return x
 
+def pixel_shuffle_hw_3d(x, rH: int, rW: int):
+    N, C_mul, D, H, W = x.shape
+    C = C_mul // (rH * rW)
+    x = x.view(N, C, rH, rW, D, H, W)
+    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
+    x = x.view(N, C, D, H * rH, W * rW)
+    return x
+
 class Decoder(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
@@ -159,26 +167,53 @@ class Decoder(nn.Module):
         self.emb_ch = args.emb_ch
         self.dec_hidden_ch = args.dec_hidden_ch
         self.dec_hidden_layers_num = args.dec_hidden_layers_num
-        self.hidden_size = ([input_downsp_shape[1], input_downsp_shape[2]])
+        self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
+        self.dec_strategy = args.dec_strategy
+        self.rH, self.rW = int(args.hidden_factor[0]), int(args.hidden_factor[1])
         if self.dec_hidden_layers_num != 0:
-            self.upsp = nn.ConvTranspose3d(in_channels=args.emb_ch, out_channels=args.dec_hidden_ch, 
-                                          kernel_size=(1, *args.hidden_factor), 
-                                          stride=(1, *args.hidden_factor))
+            out_ch_after_up = self.dec_hidden_ch
+        else:
+            out_ch_after_up = self.emb_ch
+        if self.dec_strategy == "deconv":
+            self.upsp = nn.ConvTranspose3d(
+                in_channels=self.emb_ch,
+                out_channels=out_ch_after_up,
+                kernel_size=(1, self.rH, self.rW),
+                stride=(1, self.rH, self.rW)
+            )
             with torch.no_grad():
-                _, _, _, H, W = self.upsp(torch.zeros(1, args.emb_ch, 1, input_downsp_shape[1], input_downsp_shape[2])).size()
-            self.c_hidden = nn.ModuleList([Conv_hidden(self.dec_hidden_ch, (H, W), args.hidden_activation, use_mhsa=False, sa_dim=None) for i in range(self.dec_hidden_layers_num)])
-            self.c_out = nn.Conv3d(self.dec_hidden_ch, self.output_ch, kernel_size=(1, 1, 1), padding='same')
-        if self.dec_hidden_layers_num == 0:
-            self.upsp = nn.ConvTranspose3d(in_channels=args.emb_ch, out_channels=args.emb_ch, 
-                                          kernel_size=(1, *args.hidden_factor), 
-                                          stride=(1, *args.hidden_factor))
-            with torch.no_grad():
-                _, _, _, H, W = self.upsp(torch.zeros(1, args.emb_ch, 1, input_downsp_shape[1], input_downsp_shape[2])).size()
-            self.c_out = nn.Conv3d(self.emb_ch, self.output_ch, kernel_size=(1, 1, 1), padding='same')
+                dummy = torch.zeros(1, self.emb_ch, 1, self.hidden_size[0], self.hidden_size[1])
+                _, _, _, H, W = self.upsp(dummy).size()
+        if self.dec_strategy == "pxsf":
+            self.pre_shuffle_conv = nn.Conv3d(
+                in_channels=self.emb_ch,
+                out_channels=out_ch_after_up * self.rH * self.rW,
+                kernel_size=(1, 3, 3),
+                padding=(0, 1, 1)
+            )
+            H = self.hidden_size[0] * self.rH
+            W = self.hidden_size[1] * self.rW
+        if self.dec_hidden_layers_num != 0:
+            self.c_hidden = nn.ModuleList([
+                Conv_hidden(out_ch_after_up, (H, W), args.hidden_activation,
+                            use_mhsa=False, sa_dim=None)
+                for _ in range(self.dec_hidden_layers_num)
+            ])
+            self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch,
+                                   kernel_size=(1, 1, 1), padding='same')
+        else:
             self.c_hidden = None
+            self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch,
+                                   kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, args.hidden_activation)()
+
     def forward(self, x):
-        x = self.upsp(x.permute(0, 2, 1, 3, 4))
+        x = x.permute(0, 2, 1, 3, 4)
+        if self.dec_strategy == "deconv":
+            x = self.upsp(x)
+        if self.dec_strategy == "pxsf":
+            x = self.pre_shuffle_conv(x)
+            x = pixel_shuffle_hw_3d(x, self.rH, self.rW)
         x = self.activation(x)
         if self.c_hidden is not None:
             for layer in self.c_hidden:

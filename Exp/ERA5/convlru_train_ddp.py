@@ -40,13 +40,14 @@ class Args:
         self.use_gate = True
         self.emb_ch = 96
         self.convlru_num_blocks = 8
-        self.hidden_factor = (20, 40)
+        self.hidden_factor = (10, 20)
         self.emb_hidden_ch = 128
         self.emb_hidden_layers_num = 2
         self.ffn_hidden_ch = 128
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
+        self.dec_strategy = 'pxsf'
         self.out_ch = 24
         self.gen_factor = 1
         self.hidden_activation = 'Tanh'

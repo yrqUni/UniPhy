@@ -29,6 +29,7 @@ class Args:
         # dec info
         self.dec_hidden_ch = 32
         self.dec_hidden_layers_num = 4
+        self.dec_strategy = 'pxsf'
         # output info
         self.gen_factor = 8
         # activation
