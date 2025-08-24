@@ -38,12 +38,12 @@ class Args:
         self.input_ch = 24
         self.use_mhsa = True
         self.use_gate = True
-        self.emb_ch = 48
+        self.emb_ch = 96
         self.convlru_num_blocks = 8
-        self.hidden_factor = (10, 20)
-        self.emb_hidden_ch = 1
-        self.emb_hidden_layers_num = 72
-        self.ffn_hidden_ch = 96
+        self.hidden_factor = (20, 40)
+        self.emb_hidden_ch = 128
+        self.emb_hidden_layers_num = 2
+        self.ffn_hidden_ch = 128
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
@@ -56,7 +56,7 @@ class Args:
         self.train_data_n_frames = 13
         self.eval_data_n_frames = 4
         self.eval_sample_num = 32
-        self.ckpt = 'e2_s222_l0.049569.pth'
+        self.ckpt = ''
         self.train_batch_size = 3
         self.eval_batch_size = 3
         self.epochs = 50
@@ -311,10 +311,10 @@ def latitude_weighted_l1(preds, targets):
     loss = (diff * w).mean()
     return loss
 
-def compute_total_loss(pred_slice, targ_slice, args, need_ssim_stats=False):
-    latl1_val = latitude_weighted_l1(pred_slice, targ_slice) if args.loss_latl1_weight > 0 else torch.tensor(0.0, device=pred_slice.device)
+def compute_total_loss(preds, target, args, need_ssim_stats=False):
+    latl1_val = latitude_weighted_l1(preds, target) if args.loss_latl1_weight > 0 else torch.tensor(0.0, device=preds.device)
     if args.loss_ssim_weight > 0:
-        ssim_val_loss = ssim_loss(pred_slice, targ_slice, window_size=args.ssim_window_size, sigma=args.ssim_sigma)
+        ssim_val_loss = ssim_loss(preds, target, window_size=args.ssim_window_size, sigma=args.ssim_sigma)
         total = args.loss_latl1_weight * latl1_val + args.loss_ssim_weight * ssim_val_loss
         if need_ssim_stats:
             return total, latl1_val, ssim_val_loss
@@ -391,9 +391,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             opt.zero_grad()
             data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
             preds = model(data[:, :-1], 'p')
-            pred_slice = preds[:, 1:]
-            targ_slice = data[:, 2:]
-            loss, latl1_val, ssim_val_loss = compute_total_loss(pred_slice, targ_slice, args, need_ssim_stats=True)
+            preds = preds[:, 1:]
+            target = data[:, 2:]
+            loss, latl1_val, ssim_val_loss = compute_total_loss(preds, target, args, need_ssim_stats=True)
             loss.backward()
             opt.step()
             if args.use_scheduler:
