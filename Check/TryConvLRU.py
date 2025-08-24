@@ -8,27 +8,27 @@ from ModelConvLRU import ConvLRU
 class Args:
     def __init__(self):
         # sample H, W
-        self.sample_input_size = (100, 100)
+        self.sample_input_size = (720, 1440)
         # input info
-        self.input_size = (100, 100)
+        self.input_size = (720, 1440)
         self.input_ch = 20
         self.out_ch = 20
         # convlru info
         self.emb_ch = 32
-        self.convlru_num_blocks = 8
+        self.convlru_num_blocks = 1
         #
-        self.hidden_factor = (10, 10)
+        self.hidden_factor = (10, 20)
         self.use_mhsa = True
         self.use_gate = True
         # emb info
         self.emb_hidden_ch = 32
-        self.emb_hidden_layers_num = 4
+        self.emb_hidden_layers_num = 1
         # ffn info
         self.ffn_hidden_ch = 32
-        self.ffn_hidden_layers_num = 2
+        self.ffn_hidden_layers_num = 1
         # dec info
-        self.dec_hidden_ch = 32
-        self.dec_hidden_layers_num = 4
+        self.dec_hidden_ch = 0
+        self.dec_hidden_layers_num = 0
         self.dec_strategy = 'pxsf'
         # output info
         self.gen_factor = 8
