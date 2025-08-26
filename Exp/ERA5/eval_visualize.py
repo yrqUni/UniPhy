@@ -1,6 +1,6 @@
 import sys
-sys.path.append('/nfs/yrqUni/Workspace/ConvLRU/Model/ConvLRU')
-sys.path.append('/nfs/yrqUni/Workspace/ERA5')
+sys.path.append('/home/ruiqingyan/Workspace/ConvLRU/Model/ConvLRU')
+sys.path.append('/home/ruiqingyan/Workspace/ERA5')
 
 import argparse
 import gc
@@ -13,28 +13,70 @@ from ERA5 import ERA5_Dataset
 MODEL_ARG_KEYS = [
     'input_size','input_ch','use_mhsa','use_gate','emb_ch','convlru_num_blocks','hidden_factor',
     'emb_hidden_ch','emb_hidden_layers_num','ffn_hidden_ch','ffn_hidden_layers_num',
-    'dec_hidden_ch','dec_hidden_layers_num','out_ch','gen_factor','hidden_activation','output_activation'
+    'dec_hidden_ch','dec_hidden_layers_num','out_ch','gen_factor','hidden_activation','output_activation',
+    'emb_strategy','dec_strategy'
 ]
 
+DEFAULT_ARGS = {
+    'input_size': (720, 1440),
+    'input_ch': 24,
+    'use_mhsa': True,
+    'use_gate': True,
+    'emb_ch': 48,
+    'convlru_num_blocks': 8,
+    'hidden_factor': (10, 20),
+    'emb_strategy': 'pxus',
+    'emb_hidden_ch': 1,
+    'emb_hidden_layers_num': 72,
+    'ffn_hidden_ch': 96,
+    'ffn_hidden_layers_num': 2,
+    'dec_strategy': 'pxsf',
+    'dec_hidden_ch': 0,
+    'dec_hidden_layers_num': 0,
+    'out_ch': 24,
+    'gen_factor': 1,
+    'hidden_activation': 'Tanh',
+    'output_activation': 'Tanh',
+}
+
 def extract_model_args_from_ckpt(ckpt_path, map_location='cpu'):
-    ckpt = torch.load(ckpt_path, map_location=map_location)
-    d = ckpt.get('model_args', None)
-    if d is None:
-        a = ckpt.get('args_all', None)
-        if isinstance(a, dict):
+    try:
+        ckpt = torch.load(ckpt_path, map_location=map_location)
+    except Exception:
+        return {}
+    d = {}
+    if isinstance(ckpt, dict):
+        if 'model_args' in ckpt and isinstance(ckpt['model_args'], dict):
+            d = {k: ckpt['model_args'][k] for k in MODEL_ARG_KEYS if k in ckpt['model_args']}
+        elif 'args_all' in ckpt and isinstance(ckpt['args_all'], dict):
+            a = ckpt['args_all']
             d = {k: a[k] for k in MODEL_ARG_KEYS if k in a}
-    for k in ['model','optimizer','scheduler']:
-        if isinstance(ckpt, dict) and k in ckpt:
-            del ckpt[k]
+        for k in ['model','optimizer','scheduler']:
+            if k in ckpt:
+                del ckpt[k]
     del ckpt
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return d
+
+def make_args_from_defaults(overrides: dict):
+    class A: pass
+    args = A()
+    for k, v in DEFAULT_ARGS.items():
+        setattr(args, k, v)
+    for k, v in (overrides or {}).items():
+        if k in MODEL_ARG_KEYS:
+            setattr(args, k, v)
+    if hasattr(args, 'emb_strategy') and isinstance(args.emb_strategy, str):
+        args.emb_strategy = args.emb_strategy.lower()
+    if hasattr(args, 'dec_strategy') and isinstance(args.dec_strategy, str):
+        args.dec_strategy = args.dec_strategy.lower()
+    return args
 
 def adapt_state_dict_keys(state_dict, model):
     def pref(keys):
-        if not keys:
-            return ''
+        if not keys: return ''
         k = keys[0]
         if k.startswith('module._orig_mod.'):
             return 'module._orig_mod.'
@@ -55,42 +97,27 @@ def adapt_state_dict_keys(state_dict, model):
         out[nk] = v
     return out
 
+def load_state_dict_safely(ckpt_path, device):
+    obj = torch.load(ckpt_path, map_location=device, weights_only=True)
+    if isinstance(obj, dict):
+        if 'model' in obj and isinstance(obj['model'], dict):
+            return obj['model']
+        if 'state_dict' in obj and isinstance(obj['state_dict'], dict):
+            return obj['state_dict']
+        return obj
+    return obj
+
 def build_model_from_ckpt(ckpt_path, device):
     ma = extract_model_args_from_ckpt(ckpt_path, map_location=device)
-    class A: pass
-    args = A()
-    if ma:
-        for k, v in ma.items():
-            setattr(args, k, v)
-    else:
-        setattr(args, 'input_size', (720, 1440))
-        setattr(args, 'input_ch', 24)
-        setattr(args, 'use_mhsa', True)
-        setattr(args, 'use_gate', True)
-        setattr(args, 'emb_ch', 48)
-        setattr(args, 'convlru_num_blocks', 8)
-        setattr(args, 'hidden_factor', (10, 20))
-        setattr(args, 'emb_hidden_ch', 1)
-        setattr(args, 'emb_hidden_layers_num', 72)
-        setattr(args, 'ffn_hidden_ch', 96)
-        setattr(args, 'ffn_hidden_layers_num', 2)
-        setattr(args, 'dec_hidden_ch', 0)
-        setattr(args, 'dec_hidden_layers_num', 0)
-        setattr(args, 'out_ch', 24)
-        setattr(args, 'gen_factor', 1)
-        setattr(args, 'hidden_activation', 'Tanh')
-        setattr(args, 'output_activation', 'Tanh')
+    args = make_args_from_defaults(ma)
     model = ConvLRU(args).to(device)
-    ck = torch.load(ckpt_path, map_location=device)
-    sd = adapt_state_dict_keys(ck['model'], model)
+    sd_raw = load_state_dict_safely(ckpt_path, device)
+    sd = adapt_state_dict_keys(sd_raw, model)
     model.load_state_dict(sd, strict=False)
-    del sd
-    for k in ['model', 'optimizer', 'scheduler']:
-        if k in ck:
-            del ck[k]
-    del ck
+    del sd, sd_raw
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     model.eval()
     return model, args
 
@@ -112,7 +139,7 @@ def make_grid_figure(pred_btchw, gt_btchw, channels=None,
     B, T, C, H, W = pred_btchw.shape
     if channels is None:
         channels = list(range(C))
-    nrows = len(channels) * 3   # pred/gt/diff
+    nrows = len(channels) * 3
     ncols = T
     vmins, vmaxs = {}, {}
     for c in channels:
@@ -172,8 +199,8 @@ def main():
         year_range=[args.year_start, args.year_end],
         is_train=False,
         sample_len=args.sample_len,
-        eval_sample=1,
-        max_cache_size=2,
+        eval_sample=4,
+        max_cache_size=32,
         rank=0,
         gpus=1
     )
