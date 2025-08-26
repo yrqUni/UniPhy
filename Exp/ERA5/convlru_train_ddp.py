@@ -99,9 +99,9 @@ def keep_latest_ckpts(ckpt_dir):
 MODEL_ARG_KEYS = [
     'input_size', 'input_ch', 'use_mhsa', 'use_gate',
     'emb_ch', 'convlru_num_blocks', 'hidden_factor',
-    'emb_hidden_ch', 'emb_hidden_layers_num',
+    'emb_hidden_ch', 'emb_hidden_layers_num', 'emb_strategy', 
     'ffn_hidden_ch', 'ffn_hidden_layers_num',
-    'dec_hidden_ch', 'dec_hidden_layers_num',
+    'dec_hidden_ch', 'dec_hidden_layers_num', 'dec_strategy',
     'out_ch', 'gen_factor',
     'hidden_activation', 'output_activation',
 ]
