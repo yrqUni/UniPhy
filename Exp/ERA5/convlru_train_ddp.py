@@ -426,7 +426,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 train_dataloader_iter.set_description(message)
                 logging.info(message)
             if rank == 0 and (train_step % int(len(train_dataloader)*args.ckpt_step) == 0 or train_step == len(train_dataloader)):
-                save_ckpt(model, opt, ep, train_step, avg_loss, args, scheduler)
+                save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler)
         del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
         gc.collect()
         torch.cuda.empty_cache()
