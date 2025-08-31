@@ -59,9 +59,6 @@ class Args:
         self.ms_state_size = 32
         self.gate_lru = True
         self.gate_conv = True
-        self.use_cbam = True
-        self.cbam_reduction = 16
-        self.cbam_kernel = (1, 7, 7)
         self.mix_ratio = 4
         self.mix_groups = 1
         self.mix_act = 'SiLU'
@@ -115,7 +112,7 @@ MODEL_ARG_KEYS = [
     'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
     'out_ch','gen_factor','hidden_activation','output_activation',
     'prior_mode','orth_every','state_size','ms_enable','ms_scale','ms_state_size',
-    'gate_lru','gate_conv','use_cbam','cbam_reduction','cbam_kernel',
+    'gate_lru','gate_conv',
     'mix_ratio','mix_groups','mix_act'
 ]
 
