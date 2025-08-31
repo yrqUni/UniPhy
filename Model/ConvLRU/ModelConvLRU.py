@@ -21,18 +21,26 @@ def icnr_conv3d_weight_(weight, rH: int, rW: int):
         weight.copy_(base)
     return weight
 
-def icnr_deconv3d_weight_(weight, rH: int, rW: int):
+def _bilinear_kernel_2d(kH: int, kW: int, device, dtype):
+    factor_h = (kH + 1) // 2
+    factor_w = (kW + 1) // 2
+    center_h = factor_h - 1 if kH % 2 == 1 else factor_h - 0.5
+    center_w = factor_w - 1 if kW % 2 == 1 else factor_w - 0.5
+    og_h = torch.arange(kH, device=device, dtype=dtype)
+    og_w = torch.arange(kW, device=device, dtype=dtype)
+    fh = (1 - torch.abs(og_h - center_h) / factor_h).unsqueeze(1)
+    fw = (1 - torch.abs(og_w - center_w) / factor_w).unsqueeze(0)
+    return fh @ fw
+
+def deconv3d_bilinear_init_(weight):
     in_ch, out_ch, kD, kH, kW = weight.shape
     assert kD == 1
-    r2 = rH * rW
-    assert out_ch % r2 == 0
-    base_out = out_ch // r2
-    base = weight.new_zeros((base_out, in_ch, 1, kH, kW))
-    _kaiming_like_(base)
-    base = base.repeat_interleave(r2, dim=0)
-    base_t = base.permute(1, 0, 2, 3, 4).contiguous()
     with torch.no_grad():
-        weight.copy_(base_t)
+        weight.zero_()
+        kernel = _bilinear_kernel_2d(kH, kW, weight.device, weight.dtype)
+        c = min(in_ch, out_ch)
+        for i in range(c):
+            weight[i, i, 0, :, :] = kernel
     return weight
 
 class SpectralPrior2D(nn.Module):
@@ -185,45 +193,32 @@ class ConvLRU(nn.Module):
         self.embedding = Embedding(self.args)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
-        self.out_activation = getattr(nn, args.output_activation)()
+        output_activation = getattr(args, "output_activation", "Identity")
+        self.out_activation = getattr(nn, output_activation)()
         self.truncated_normal_init()
     def _check_pscan(self):
         assert all(pscan_check())
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
-        skip_contains = [
-            'layer_norm',
-            'params_log',
-            'freq_prior.',
-            'sh_prior.',
-        ]
-        skip_suffix = (
-            '.U_row', '.V_col',
-            'upsp.weight', 'upsp.bias',
-            'pre_shuffle_conv.weight', 'pre_shuffle_conv.bias',
-        )
+        skip_contains = ['layer_norm','params_log','freq_prior.','sh_prior.']
+        skip_suffix = ('.U_row', '.V_col','upsp.weight', 'upsp.bias','pre_shuffle_conv.weight', 'pre_shuffle_conv.bias')
         def should_skip(name: str) -> bool:
-            if any(tok in name for tok in skip_contains):
-                return True
-            if name.endswith(skip_suffix):
-                return True
+            if any(tok in name for tok in skip_contains): return True
+            if name.endswith(skip_suffix): return True
             return False
         with torch.no_grad():
             l = (1. + math.erf(((lower - mean) / std) / math.sqrt(2.))) / 2.
             u = (1. + math.erf(((upper - mean) / std) / math.sqrt(2.))) / 2.
             for n, p in self.named_parameters():
-                if should_skip(n):
-                    continue
+                if should_skip(n): continue
                 if n.endswith('.bias') and p.dtype.is_floating_point:
-                    p.zero_()
-                    continue
+                    p.zero_(); continue
                 if torch.is_complex(p):
-                    p.real.uniform_(2 * l - 1, 2 * u - 1); p.imag.uniform_(2 * l - 1, 2 * u - 1)
+                    p.real.uniform_(2*l-1, 2*u-1); p.imag.uniform_(2*l-1, 2*u-1)
                     p.real.erfinv_(); p.imag.erfinv_()
-                    p.real.mul_(std * math.sqrt(2.)); p.imag.mul_(std * math.sqrt(2.))
+                    p.real.mul_(std*math.sqrt(2.)); p.imag.mul_(std*math.sqrt(2.))
                     p.real.add_(mean); p.imag.add_(mean)
                 else:
-                    p.uniform_(2 * l - 1, 2 * u - 1)
-                    p.erfinv_(); p.mul_(std * math.sqrt(2.)); p.add_(mean)
+                    p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*math.sqrt(2.)); p.add_(mean)
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
         assert mode in ['p', 'i']
         if mode == 'p':
@@ -233,7 +228,7 @@ class ConvLRU(nn.Module):
             x = self.out_activation(x)
             return x
         else:
-            assert self.args.input_ch == self.args.out_ch
+            assert getattr(self.args, "input_ch", 1) == getattr(self.args, "out_ch", 1)
             out = []
             x = self.embedding(x)
             x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
@@ -262,9 +257,7 @@ class Conv_hidden(nn.Module):
         if self.use_cbam:
             self.cbam = CBAM2DPerStep(self.ch, reduction=16, spatial_kernel=7)
             self.layer_norm_attn = nn.LayerNorm([*hidden_size])
-            self.gate_conv = nn.Sequential(
-                nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding='same'), nn.Sigmoid()
-            )
+            self.gate_conv = nn.Sequential(nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding='same'), nn.Sigmoid())
         else:
             self.cbam = None
             self.layer_norm_attn = None
@@ -295,17 +288,16 @@ def pixel_unshuffle_hw_3d(x, rH: int, rW: int):
 class Embedding(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.input_ch = args.input_ch
-        self.input_size = args.input_size
-        self.emb_ch = args.emb_ch
-        self.emb_hidden_ch = args.emb_hidden_ch
-        self.emb_hidden_layers_num = args.emb_hidden_layers_num
-        self.down_strategy = args.emb_strategy
+        self.input_ch = getattr(args, "input_ch", 1)
+        self.input_size = getattr(args, "input_size", (64, 64))
+        self.emb_ch = getattr(args, "emb_ch", 32)
+        self.emb_hidden_ch = getattr(args, "emb_hidden_ch", 32)
+        self.emb_hidden_layers_num = getattr(args, "emb_hidden_layers_num", 0)
+        self.down_strategy = getattr(args, "emb_strategy", "pxus")
         assert self.down_strategy in ['conv', 'pxus']
-        self.rH, self.rW = int(args.hidden_factor[0]), int(args.hidden_factor[1])
+        self.rH, self.rW = int(getattr(args, "hidden_factor", (2, 2))[0]), int(getattr(args, "hidden_factor", (2, 2))[1])
         if self.down_strategy == "conv":
-            self.downsp = nn.Conv3d(self.input_ch, self.input_ch,
-                                    kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW))
+            self.downsp = nn.Conv3d(self.input_ch, self.input_ch, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW))
             with torch.no_grad():
                 _, C, _, H, W = self.downsp(torch.zeros(1, self.input_ch, 1, *self.input_size)).size()
                 self.input_downsp_shape = (C, H, W)
@@ -318,15 +310,13 @@ class Embedding(nn.Module):
         self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
         if self.emb_hidden_layers_num == 0:
             self.c_in = nn.Conv3d(in_ch_after_down, self.emb_ch, kernel_size=(1, 7, 7), padding='same')
-            self.c_hidden = None; self.c_out = None
+            self.c_hidden = None
+            self.c_out = None
         if self.emb_hidden_layers_num != 0:
             self.c_in = nn.Conv3d(in_ch_after_down, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding='same')
-            self.c_hidden = nn.ModuleList([
-                Conv_hidden(self.emb_hidden_ch, self.hidden_size, args.hidden_activation, use_cbam=False)
-                for _ in range(self.emb_hidden_layers_num)
-            ])
+            self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.emb_hidden_layers_num)])
             self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
-        self.activation = getattr(nn, args.hidden_activation)()
+        self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
     def forward(self, x):
         x = x.permute(0, 2, 1, 3, 4)
@@ -334,9 +324,11 @@ class Embedding(nn.Module):
             x = self.downsp(x)
         if self.down_strategy == "pxus":
             x = pixel_unshuffle_hw_3d(x, self.rH, self.rW)
-        x = self.c_in(x); x = self.activation(x)
+        x = self.c_in(x)
+        x = self.activation(x)
         if self.c_hidden is not None:
-            for layer in self.c_hidden: x = layer(x)
+            for layer in self.c_hidden:
+                x = layer(x)
             x = self.c_out(x)
         x = self.layer_norm(x.permute(0, 2, 1, 3, 4))
         return x
@@ -353,49 +345,38 @@ def pixel_shuffle_hw_3d(x, rH: int, rW: int):
 class Decoder(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
-        self.output_ch = args.out_ch
-        self.emb_ch = args.emb_ch
-        self.dec_hidden_ch = args.dec_hidden_ch
-        self.dec_hidden_layers_num = args.dec_hidden_layers_num
+        self.output_ch = getattr(args, "out_ch", 1)
+        self.emb_ch = getattr(args, "emb_ch", 32)
+        self.dec_hidden_ch = getattr(args, "dec_hidden_ch", 0)
+        self.dec_hidden_layers_num = getattr(args, "dec_hidden_layers_num", 0)
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
-        self.dec_strategy = args.dec_strategy
+        self.dec_strategy = getattr(args, "dec_strategy", "pxsf")
         assert self.dec_strategy in ['deconv', 'pxsf']
-        self.rH, self.rW = int(args.hidden_factor[0]), int(args.hidden_factor[1])
-        if self.dec_hidden_layers_num != 0: out_ch_after_up = self.dec_hidden_ch
-        else: out_ch_after_up = self.emb_ch
+        self.rH, self.rW = int(getattr(args, "hidden_factor", (2, 2))[0]), int(getattr(args, "hidden_factor", (2, 2))[1])
+        out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
         if self.dec_strategy == "deconv":
-            self.upsp = nn.ConvTranspose3d(
-                in_channels=self.emb_ch, out_channels=out_ch_after_up,
-                kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW)
-            )
-            icnr_deconv3d_weight_(self.upsp.weight, self.rH, self.rW)
+            self.upsp = nn.ConvTranspose3d(in_channels=self.emb_ch, out_channels=out_ch_after_up, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW))
+            deconv3d_bilinear_init_(self.upsp.weight)
             with torch.no_grad():
-                if self.upsp.bias is not None: self.upsp.bias.zero_()
+                if self.upsp.bias is not None:
+                    self.upsp.bias.zero_()
             with torch.no_grad():
-                dummy = torch.zeros(1, self.emb_ch, 1, self.hidden_size[0], self.hidden_size[1])
-                _ = self.upsp(dummy).size()
+                _ = self.upsp(torch.zeros(1, self.emb_ch, 1, self.hidden_size[0], self.hidden_size[1])).size()
         if self.dec_strategy == "pxsf":
-            self.pre_shuffle_conv = nn.Conv3d(
-                in_channels=self.emb_ch,
-                out_channels=out_ch_after_up * self.rH * self.rW,
-                kernel_size=(1, 3, 3),
-                padding=(0, 1, 1)
-            )
+            self.pre_shuffle_conv = nn.Conv3d(in_channels=self.emb_ch, out_channels=out_ch_after_up * self.rH * self.rW, kernel_size=(1, 3, 3), padding=(0, 1, 1))
             icnr_conv3d_weight_(self.pre_shuffle_conv.weight, self.rH, self.rW)
             with torch.no_grad():
-                if self.pre_shuffle_conv.bias is not None: self.pre_shuffle_conv.bias.zero_()
+                if self.pre_shuffle_conv.bias is not None:
+                    self.pre_shuffle_conv.bias.zero_()
             H = self.hidden_size[0] * self.rH
             W = self.hidden_size[1] * self.rW
         if self.dec_hidden_layers_num != 0:
-            self.c_hidden = nn.ModuleList([
-                Conv_hidden(out_ch_after_up, (H, W), args.hidden_activation, use_cbam=False)
-                for _ in range(self.dec_hidden_layers_num)
-            ])
+            self.c_hidden = nn.ModuleList([Conv_hidden(out_ch_after_up, (H, W), getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.dec_hidden_layers_num)])
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch, kernel_size=(1, 1, 1), padding='same')
         else:
             self.c_hidden = None
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch, kernel_size=(1, 1, 1), padding='same')
-        self.activation = getattr(nn, args.hidden_activation)()
+        self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
     def forward(self, x):
         x = x.permute(0, 2, 1, 3, 4)
         if self.dec_strategy == "deconv":
@@ -405,16 +386,18 @@ class Decoder(nn.Module):
             x = pixel_shuffle_hw_3d(x, self.rH, self.rW)
         x = self.activation(x)
         if self.c_hidden is not None:
-            for layer in self.c_hidden: x = layer(x)
+            for layer in self.c_hidden:
+                x = layer(x)
             x = self.c_out(x)
-        if self.c_hidden is None: x = self.c_out(x)
+        if self.c_hidden is None:
+            x = self.c_out(x)
         return x.permute(0, 2, 1, 3, 4)
 
 class ConvLRUModel(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
         self.args = args
-        layers = args.convlru_num_blocks
+        layers = getattr(args, "convlru_num_blocks", 1)
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
     def forward(self, x, last_hidden_ins=None):
         last_hidden_outs = []
@@ -424,7 +407,8 @@ class ConvLRUModel(nn.Module):
                 x, last_hidden_out = convlru_block(x, last_hidden_ins[convlru_block_num])
             else:
                 x, last_hidden_out = convlru_block(x, None)
-            last_hidden_outs.append(last_hidden_out); convlru_block_num += 1
+            last_hidden_outs.append(last_hidden_out)
+            convlru_block_num += 1
         return x, last_hidden_outs
 
 class ConvLRUBlock(nn.Module):
@@ -443,7 +427,7 @@ class ConvLRULayer(nn.Module):
         self.use_bias = True
         self.r_min = 0.8
         self.r_max = 0.99
-        self.emb_ch = args.emb_ch
+        self.emb_ch = getattr(args, "emb_ch", 32)
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         S, W = self.hidden_size
         self.rank = int(getattr(args, "lru_rank", min(S, W, 32)))
@@ -469,9 +453,8 @@ class ConvLRULayer(nn.Module):
         self.post_ifft_proj = nn.Conv3d(in_channels=self.emb_ch*2, out_channels=self.emb_ch, kernel_size=(1,1,1), padding='same', bias=True)
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
         self.gate_conv = None
-        if getattr(args, "use_gate", False):
-            self.gate_conv = nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,1,1), padding='same'),
-                                           nn.Sigmoid())
+        if bool(getattr(args, "use_gate", False)):
+            self.gate_conv = nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,1,1), padding='same'), nn.Sigmoid())
         self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
         self.use_sh_prior   = bool(getattr(args, "use_sh_prior", False))
         if self.use_freq_prior:
@@ -563,22 +546,20 @@ class ConvLRULayer(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
-        self.emb_ch = args.emb_ch
-        self.ffn_hidden_ch = args.ffn_hidden_ch
-        self.ffn_hidden_layers_num = args.ffn_hidden_layers_num
+        self.emb_ch = getattr(args, "emb_ch", 32)
+        self.ffn_hidden_ch = getattr(args, "ffn_hidden_ch", 32)
+        self.ffn_hidden_layers_num = getattr(args, "ffn_hidden_layers_num", 1)
         self.use_cbam = bool(getattr(args, "use_cbam", False))
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv3d(self.emb_ch, self.ffn_hidden_ch, kernel_size=(1, 7, 7), padding='same')
-        self.c_hidden = nn.ModuleList([
-            Conv_hidden(self.ffn_hidden_ch, self.hidden_size, args.hidden_activation, use_cbam=self.use_cbam)
-            for _ in range(self.ffn_hidden_layers_num)
-        ])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=self.use_cbam) for _ in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
-        self.activation = getattr(nn, args.hidden_activation)()
+        self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
     def forward(self, x):
         x_update = self.c_in(x.permute(0,2,1,3,4)); x_update = self.activation(x_update)
-        for layer in self.c_hidden: x_update = layer(x_update)
+        for layer in self.c_hidden:
+            x_update = layer(x_update)
         x_update = self.c_out(x_update)
         x_update = self.layer_norm(x_update.permute(0,2,1,3,4))
         x = x_update + x
