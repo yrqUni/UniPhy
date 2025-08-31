@@ -47,10 +47,8 @@ class SpectralPrior2D(nn.Module):
         self.gain = nn.Parameter(torch.full((self.C,), float(gain_init)))
         nn.init.normal_(self.A, std=1e-3)
         nn.init.normal_(self.B, std=1e-3)
-
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         B, L, C, S, W = h.shape
-        assert C == self.C and S == self.S and W == self.W
         F = torch.einsum('cri,crj->cij', self.A, self.B)
         G = (1.0 + self.gain.view(C, 1, 1) * F)
         return h * G.view(1, 1, C, S, W)
@@ -70,9 +68,8 @@ class SphericalHarmonicsPrior(nn.Module):
         nn.init.normal_(self.W1, std=1e-3)
         nn.init.normal_(self.W2, std=1e-3)
         theta, phi = self._latlon_to_spherical(H, W, device=None)
-        Y = self._compute_real_sph_basis(theta, phi, Lmax)
+        Y = self._real_sph_harm_basis(theta, phi, Lmax)
         self.register_buffer('Y_real', Y)
-
     @staticmethod
     def _latlon_to_spherical(H, W, device):
         lat = torch.linspace(math.pi/2, -math.pi/2, steps=H, device=device)
@@ -80,18 +77,61 @@ class SphericalHarmonicsPrior(nn.Module):
         theta = (math.pi/2 - lat).unsqueeze(1).repeat(1, W)
         phi = lon.unsqueeze(0).repeat(H, 1)
         return theta, phi
-
-    def _compute_real_sph_basis(self, theta, phi, Lmax):
-        Y_real = []
+    @staticmethod
+    def _real_sph_harm_basis(theta: torch.Tensor, phi: torch.Tensor, Lmax: int) -> torch.Tensor:
+        H, W = theta.shape
+        device = theta.device
+        dtype = theta.dtype
+        x = torch.cos(theta)
+        one = torch.ones_like(x)
+        pi = torch.tensor(math.pi, device=device, dtype=dtype)
+        P = [[None]*(l+1) for l in range(Lmax)]
+        P[0][0] = one
+        if Lmax >= 2:
+            P[1][0] = x
+        for l in range(2, Lmax):
+            l_f = torch.tensor(l, device=device, dtype=dtype)
+            P[l][0] = ((2*l_f-1)*x*P[l-1][0] - (l_f-1)*P[l-2][0]) / l_f
+        for m in range(1, Lmax):
+            m_f = torch.tensor(m, device=device, dtype=dtype)
+            P_mm = ((-1)**m) * SphericalHarmonicsPrior._double_factorial(2*m-1, dtype, device) * (1 - x*x).pow(m_f/2)
+            P[m][m] = P_mm
+            if m+1 < Lmax:
+                P[m+1][m] = (2*m_f+1)*x*P_mm
+            for l in range(m+2, Lmax):
+                l_f = torch.tensor(l, device=device, dtype=dtype)
+                P[l][m] = ((2*l_f-1)*x*P[l-1][m] - (l_f+m_f-1)*P[l-2][m]) / (l_f-m_f)
+        idx = torch.arange(0, Lmax, device=device, dtype=dtype).view(-1, 1, 1)
+        cos_mphi = torch.cos(idx * phi)
+        sin_mphi = torch.sin(idx * phi)
+        Ys = []
         for l in range(Lmax):
-            for m in range(-l, l + 1):
-                sph = torch.special.sph_harm(m, l, phi, theta)
-                Y_real.append(sph.real)
-        return torch.stack(Y_real, dim=0)
-
+            l_f = torch.tensor(l, device=device, dtype=dtype)
+            for m in range(-l, l+1):
+                m_abs = abs(m)
+                N_lm = torch.sqrt((2*l_f+1)/(4*pi) * SphericalHarmonicsPrior._fact_ratio(l, m_abs, dtype, device))
+                if m == 0:
+                    Y = N_lm * P[l][0]
+                elif m > 0:
+                    Y = math.sqrt(2.0) * N_lm * P[l][m_abs] * cos_mphi[m_abs]
+                else:
+                    Y = math.sqrt(2.0) * N_lm * P[l][m_abs] * sin_mphi[m_abs]
+                Ys.append(Y)
+        Y_stack = torch.stack(Ys, dim=0)
+        return Y_stack
+    @staticmethod
+    def _fact_ratio(l: int, m_abs: int, dtype, device):
+        l = torch.tensor(l, dtype=dtype, device=device)
+        m = torch.tensor(m_abs, dtype=dtype, device=device)
+        return torch.exp(torch.lgamma(l - m + 1) - torch.lgamma(l + m + 1))
+    @staticmethod
+    def _double_factorial(n: int, dtype, device):
+        if n < 1:
+            return torch.tensor(1.0, dtype=dtype, device=device)
+        seq = torch.arange(n, 0, -2, dtype=dtype, device=device)
+        return torch.prod(seq)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C, H, W = x.shape
-        assert C == self.C and H == self.H and W == self.W
         coeff = torch.matmul(self.W1, self.W2)
         bias = torch.einsum('ck,khw->chw', coeff, self.Y_real)
         bias = (self.gain.view(C, 1, 1) * bias).view(1, 1, C, H, W)
@@ -147,10 +187,8 @@ class ConvLRU(nn.Module):
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.out_activation = getattr(nn, args.output_activation)()
         self.truncated_normal_init()
-
     def _check_pscan(self):
-        assert all(pscan_check()), "PScan implementation failed the test."
-
+        assert all(pscan_check())
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
         skip_contains = [
             'layer_norm',
@@ -186,7 +224,6 @@ class ConvLRU(nn.Module):
                 else:
                     p.uniform_(2 * l - 1, 2 * u - 1)
                     p.erfinv_(); p.mul_(std * math.sqrt(2.)); p.add_(mean)
-
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
         assert mode in ['p', 'i']
         if mode == 'p':
@@ -451,7 +488,6 @@ class ConvLRULayer(nn.Module):
         else:
             self.sh_prior = None
         self.pscan = PScan.apply
-
     def _project_to_square(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
         z = torch.einsum('blcrw,cwr->blcrr', t, self.V_col)
@@ -461,7 +497,6 @@ class ConvLRULayer(nn.Module):
         t = torch.einsum('blcrr,crw->blcrw', z, Vt)
         h = torch.einsum('blcrw,csr->blcsw', t, self.U_row)
         return h
-
     def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
         h_spatial = torch.fft.ifft2(h_complex, dim=(-2, -1), norm='ortho')
         hr = h_spatial.real
@@ -471,16 +506,15 @@ class ConvLRULayer(nn.Module):
         h_cat = torch.cat([hr, hi], dim=2)
         h_out = self.post_ifft_proj(h_cat.permute(0,2,1,3,4)).permute(0,2,1,3,4)
         return h_out
-
     def convlru(self, x, last_hidden_in):
         B, L, C, S, W = x.size()
         h = torch.fft.fft2(x.to(torch.cfloat), dim=(-2, -1), norm='ortho')
         h = self.proj_B(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
+        if self.use_freq_prior:
+            h = self.freq_prior(h)
         if S == W:
             nu_s, theta_s, gamma_s = torch.exp(self.params_log_square).split((self.emb_ch, self.emb_ch, self.emb_ch))
             lamb_s = torch.exp(torch.complex(-nu_s, theta_s))
-            if self.use_freq_prior:
-                h = self.freq_prior(h)
             h = h * gamma_s.reshape(1,1,C,S,1)
             if last_hidden_in is not None:
                 h = torch.concat([last_hidden_in[:, -1:], h], dim=1)
@@ -498,8 +532,6 @@ class ConvLRULayer(nn.Module):
         else:
             nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch))
             lamb_r = torch.exp(torch.complex(-nu_r, theta_r))
-            if self.use_freq_prior:
-                h = self.freq_prior(h)
             z = self._project_to_square(h)
             z = z * gamma_r.reshape(1,1,C,self.rank,1)
             if last_hidden_in is not None:
@@ -524,7 +556,6 @@ class ConvLRULayer(nn.Module):
         else:
             x = x + h
         return x, last_hidden_out
-
     def forward(self, x, last_hidden_in):
         x, last_hidden_out = self.convlru(x, last_hidden_in)
         return x, last_hidden_out
