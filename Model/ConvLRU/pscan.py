@@ -110,10 +110,10 @@ class PScan(torch.autograd.Function):
             grad_output = pad_npo2(grad_output_in)
             A_pad = pad_npo2(A_in)
         A_shift = F.pad(A_pad[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
-        PScan.pscan_rev(A_shift, grad_output)
+        PScan.pscan_rev(A_shift.conj(), grad_output)
         gradX = grad_output[:, :L]
         gradA_full = torch.zeros_like(A_pad)
-        gradA_full[:, 1:, :, :, 0] = (H_pad[:, :-1] * grad_output[:, 1:]).sum(dim=-1)
+        gradA_full[:, 1:, :, :, 0] = (H_pad[:, :-1].conj() * grad_output[:, 1:]).sum(dim=-1)
         gradA = gradA_full[:, :L]
         return gradA, gradX
 
@@ -131,6 +131,7 @@ def serial_scan(A, X):
     return H
 
 def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
+    # assert pscan_check(), "PScan check failed (real dtype)"
     torch.manual_seed(0)
     A_tensor = torch.rand(batch_size, seq_length, channels, state_dim, 1, dtype=torch.float64)
     A1 = torch.nn.Parameter(A_tensor.clone())
@@ -153,5 +154,3 @@ def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
     gc.collect()
     torch.cuda.empty_cache()
     return (fwd_ok, gradA_ok and gradX_ok)
-
-assert pscan_check(), "PScan check failed"

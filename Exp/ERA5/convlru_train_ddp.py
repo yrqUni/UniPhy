@@ -36,7 +36,16 @@ class Args:
     def __init__(self):
         self.input_size = (720, 1440)
         self.input_ch = 24
-        self.out_ch = 24
+        self.use_cbam = False
+        self.use_gate = True
+        self.use_freq_prior = False
+        self.use_sh_prior = False
+        self.freq_rank = 8
+        self.freq_gain_init = 0.0
+        self.sh_Lmax = 6
+        self.sh_rank = 8
+        self.sh_gain_init = 0.0
+        self.lru_rank = 32
         self.emb_ch = 96
         self.convlru_num_blocks = 8
         self.hidden_factor = (10, 20)
@@ -48,20 +57,10 @@ class Args:
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
         self.dec_strategy = 'pxsf'
+        self.out_ch = 24
         self.gen_factor = 1
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
-        self.prior_mode = 'fft_dct'
-        self.orth_every = 50
-        self.state_size = 64
-        self.ms_enable = True
-        self.ms_scale = 2
-        self.ms_state_size = 32
-        self.gate_lru = True
-        self.gate_conv = True
-        self.mix_ratio = 4
-        self.mix_groups = 1
-        self.mix_act = 'SiLU'
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 13
@@ -83,9 +82,6 @@ class Args:
         self.use_scheduler = False
         self.init_lr_scheduler = False
         self.loss_latl1_weight = 1.0
-        self.loss_ssim_weight = 0.0
-        self.ssim_window_size = 11
-        self.ssim_sigma = 1.5
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -106,14 +102,15 @@ def keep_latest_ckpts(ckpt_dir):
         os.remove(file_path)
 
 MODEL_ARG_KEYS = [
-    'input_size','input_ch','emb_ch','convlru_num_blocks','hidden_factor',
-    'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
-    'ffn_hidden_ch','ffn_hidden_layers_num',
-    'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
-    'out_ch','gen_factor','hidden_activation','output_activation',
-    'prior_mode','orth_every','state_size','ms_enable','ms_scale','ms_state_size',
-    'gate_lru','gate_conv',
-    'mix_ratio','mix_groups','mix_act'
+    'input_size', 'input_ch', 'use_cbam', 'use_gate',
+    'use_freq_prior', 'use_sh_prior', 'freq_rank', 'freq_gain_init',
+    'sh_Lmax', 'sh_rank', 'sh_gain_init', 'lru_rank',
+    'emb_ch', 'convlru_num_blocks', 'hidden_factor',
+    'emb_hidden_ch', 'emb_hidden_layers_num', 'emb_strategy', 
+    'ffn_hidden_ch', 'ffn_hidden_layers_num',
+    'dec_hidden_ch', 'dec_hidden_layers_num', 'dec_strategy',
+    'out_ch', 'gen_factor',
+    'hidden_activation', 'output_activation',
 ]
 
 def extract_model_args(args_obj):
@@ -251,56 +248,7 @@ def setup_logging(args):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-_SSIM_WIN_CACHE = {}
 _LAT_WEIGHT_CACHE = {}
-
-def _gaussian_window(window_size=11, sigma=1.5, channels=1, device='cpu', dtype=torch.float32):
-    key = (window_size, sigma, channels, device, dtype)
-    if key in _SSIM_WIN_CACHE:
-        return _SSIM_WIN_CACHE[key]
-    coords = torch.arange(window_size, dtype=dtype, device=device) - (window_size - 1) / 2.0
-    g = torch.exp(-(coords**2) / (2 * sigma**2))
-    g = (g / g.sum()).unsqueeze(1)
-    window_2d = (g @ g.t())
-    window_2d = window_2d / window_2d.sum()
-    window = window_2d.expand(channels, 1, window_size, window_size).contiguous()
-    _SSIM_WIN_CACHE[key] = window
-    return window
-
-def _ssim_map(x, y, window, data_range=1.0, K=(0.01, 0.03)):
-    C1 = (K[0] * data_range) ** 2
-    C2 = (K[1] * data_range) ** 2
-    padding = window.shape[-1] // 2
-    channels = x.shape[1]
-    mu_x = F.conv2d(x, window, padding=padding, groups=channels)
-    mu_y = F.conv2d(y, window, padding=padding, groups=channels)
-    mu_x2 = mu_x * mu_x
-    mu_y2 = mu_y * mu_y
-    mu_xy = mu_x * mu_y
-    sigma_x2 = F.conv2d(x * x, window, padding=padding, groups=channels) - mu_x2
-    sigma_y2 = F.conv2d(y * y, window, padding=padding, groups=channels) - mu_y2
-    sigma_xy = F.conv2d(x * y, window, padding=padding, groups=channels) - mu_xy
-    numerator = (2 * mu_xy + C1) * (2 * sigma_xy + C2)
-    denominator = (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
-    ssim = numerator / (denominator + 1e-12)
-    return ssim
-
-def ssim_value(preds, targets, window_size=11, sigma=1.5):
-    assert preds.shape == targets.shape
-    B, T, C, H, W = preds.shape
-    device = preds.device
-    dtype = preds.dtype
-    x = (preds + 1.0) * 0.5
-    y = (targets + 1.0) * 0.5
-    x = x.reshape(B * T, C, H, W)
-    y = y.reshape(B * T, C, H, W)
-    window = _gaussian_window(window_size=window_size, sigma=sigma, channels=C, device=device, dtype=dtype)
-    ssim_map = _ssim_map(x, y, window, data_range=1.0)
-    ssim_val = ssim_map.mean()
-    return ssim_val
-
-def ssim_loss(preds, targets, window_size=11, sigma=1.5):
-    return 1.0 - ssim_value(preds, targets, window_size, sigma)
 
 def get_latitude_weights(H, device, dtype):
     key = (H, device, dtype)
@@ -323,18 +271,10 @@ def latitude_weighted_l1(preds, targets):
     loss = (diff * w).mean()
     return loss
 
-def compute_total_loss(preds, target, args, need_ssim_stats=False):
+def compute_total_loss(preds, target, args):
     latl1_val = latitude_weighted_l1(preds, target) if args.loss_latl1_weight > 0 else torch.tensor(0.0, device=preds.device)
-    if args.loss_ssim_weight > 0:
-        ssim_val_loss = ssim_loss(preds, target, window_size=args.ssim_window_size, sigma=args.ssim_sigma)
-        total = args.loss_latl1_weight * latl1_val + args.loss_ssim_weight * ssim_val_loss
-        if need_ssim_stats:
-            return total, latl1_val, ssim_val_loss
-        else:
-            return total, latl1_val, None
-    else:
-        total = args.loss_latl1_weight * latl1_val
-        return total, latl1_val, None
+    total = args.loss_latl1_weight * latl1_val
+    return total, latl1_val
 
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
@@ -378,12 +318,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     if args.ckpt and os.path.isfile(args.ckpt):
         start_epoch, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f'cuda:{local_rank}', args=args, restore_model_args=False)
     if args.init_lr_scheduler and args.use_scheduler:
-        print(f"Init lr scheduler.")
-        logging.info(f"Init lr scheduler.")
         scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=len(list(range(start_epoch, args.epochs))))
     if not args.use_scheduler:
-        print(f"Scheduler is disable, opt will use fixed lr.")
-        logging.warning(f"Scheduler is disable, opt will use fixed lr.")
         for g in opt.param_groups:
             g['lr'] = args.lr
     for ep in range(start_epoch, args.epochs):
@@ -401,11 +337,11 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad()
-            data = data.cuda(local_rank).to(torch.float32)[:, :, :, :-1, :]
+            data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
             preds = model(data[:, :-1], 'p')
             preds = preds[:, 1:]
             target = data[:, 2:]
-            loss, latl1_val, ssim_val_loss = compute_total_loss(preds, target, args, need_ssim_stats=True)
+            loss, latl1_val = compute_total_loss(preds, target, args)
             loss.backward()
             opt.step()
             if args.use_scheduler:
@@ -416,24 +352,13 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             dist.all_reduce(latl1_tensor, op=dist.ReduceOp.SUM)
             avg_loss = loss_tensor.item() / world_size
             avg_latl1 = latl1_tensor.item() / world_size
-            if ssim_val_loss is not None:
-                ssiml_tensor = torch.tensor(ssim_val_loss.detach().item(), device=f'cuda:{local_rank}')
-                dist.all_reduce(ssiml_tensor, op=dist.ReduceOp.SUM)
-                avg_ssim = 1.0 - (ssiml_tensor.item() / world_size)
-            else:
-                avg_ssim = None
-            if ssim_val_loss is not None:
-                del ssim_val_loss
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if args.use_scheduler else args.lr
-                if avg_ssim is not None:
-                    message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LatL1: {avg_latl1:.6f} - SSIM: {avg_ssim:.6f} (w_latl1={args.loss_latl1_weight:.3f}, w_ssim={args.loss_ssim_weight:.3f}) - LR: {current_lr:.6e}"
-                else:
-                    message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LatL1: {avg_latl1:.6f} (w_latl1={args.loss_latl1_weight:.3f}, w_ssim={args.loss_ssim_weight:.3f}) - LR: {current_lr:.6e}"
+                message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LatL1: {avg_latl1:.6f} - LR: {current_lr:.6e}"
                 train_dataloader_iter.set_description(message)
                 logging.info(message)
             if rank == 0 and (train_step % int(len(train_dataloader)*args.ckpt_step) == 0 or train_step == len(train_dataloader)):
-                save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler if args.use_scheduler else None)
+                save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler)
         del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
         gc.collect()
         torch.cuda.empty_cache()
@@ -452,34 +377,18 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     num_workers=1, pin_memory=True, prefetch_factor=1)
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, :-1, :]
+                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
                     out_gen_num = data[:, args.eval_data_n_frames//2:].shape[1] // args.gen_factor
                     preds = model(data[:, :args.eval_data_n_frames//2], 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
-                    if args.loss_ssim_weight > 0:
-                        loss_total_eval, loss_latl1_eval, loss_ssim_eval = compute_total_loss(preds, data[:, args.eval_data_n_frames//2:], args, need_ssim_stats=True)
-                        tot_tensor = torch.tensor(loss_total_eval.item(), device=f'cuda:{local_rank}')
-                        latl1_tensor = torch.tensor(loss_latl1_eval.item(), device=f'cuda:{local_rank}')
-                        ssiml_tensor = torch.tensor(loss_ssim_eval.detach().item(), device=f'cuda:{local_rank}')
-                        dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
-                        dist.all_reduce(latl1_tensor, op=dist.ReduceOp.SUM)
-                        dist.all_reduce(ssiml_tensor, op=dist.ReduceOp.SUM)
-                        avg_total = tot_tensor.item() / world_size
-                        avg_latl1 = latl1_tensor.item() / world_size
-                        avg_ssim = 1.0 - (ssiml_tensor.item() / world_size)
-                    else:
-                        loss_total_eval, loss_latl1_eval, _ = compute_total_loss(preds, data[:, args.eval_data_n_frames//2:], args, need_ssim_stats=False)
-                        tot_tensor = torch.tensor(loss_total_eval.item(), device=f'cuda:{local_rank}')
-                        latl1_tensor = torch.tensor(loss_latl1_eval.item(), device=f'cuda:{local_rank}')
-                        dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
-                        dist.all_reduce(latl1_tensor, op=dist.ReduceOp.SUM)
-                        avg_total = tot_tensor.item() / world_size
-                        avg_latl1 = latl1_tensor.item() / world_size
-                        avg_ssim = None
+                    loss_total_eval, loss_latl1_eval = compute_total_loss(preds, data[:, args.eval_data_n_frames//2:], args)
+                    tot_tensor = torch.tensor(loss_total_eval.item(), device=f'cuda:{local_rank}')
+                    latl1_tensor = torch.tensor(loss_latl1_eval.item(), device=f'cuda:{local_rank}')
+                    dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(latl1_tensor, op=dist.ReduceOp.SUM)
+                    avg_total = tot_tensor.item() / world_size
+                    avg_latl1 = latl1_tensor.item() / world_size
                     if rank == 0:
-                        if avg_ssim is not None:
-                            message = f"Eval step {eval_step} - Total: {avg_total:.6f} - LatL1: {avg_latl1:.6f} - SSIM: {avg_ssim:.6f} (w_latl1={args.loss_latl1_weight:.3f}, w_ssim={args.loss_ssim_weight:.3f})"
-                        else:
-                            message = f"Eval step {eval_step} - Total: {avg_total:.6f} - LatL1: {avg_latl1:.6f} (w_latl1={args.loss_latl1_weight:.3f}, w_ssim={args.loss_ssim_weight:.3f})"
+                        message = f"Eval step {eval_step} - Total: {avg_total:.6f} - LatL1: {avg_latl1:.6f}"
                         eval_dataloader_iter.set_description(message)
                         logging.info(message)
                 del eval_dataset, eval_sampler, eval_dataloader, eval_dataloader_iter
