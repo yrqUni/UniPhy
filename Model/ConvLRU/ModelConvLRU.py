@@ -1,3 +1,4 @@
+# ModelConvLRU.py
 import torch
 import torch.nn as nn
 import math
@@ -535,6 +536,11 @@ class ConvLRULayer(nn.Module):
             h = self.layer_norm(h)
             if last_hidden_in is not None:
                 h = h[:, 1:]
+        dummy_use = (self.params_log_square.sum().real
+                     + self.params_log_rank.sum().real
+                     + self.U_row.real.sum()
+                     + self.V_col.real.sum()) * 0.0
+        h = h + dummy_use
         if self.gate_conv is not None:
             gate = self.gate_conv(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
             x = (1 - gate) * x + gate * h
