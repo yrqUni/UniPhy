@@ -32,12 +32,29 @@ from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
 from tqdm import tqdm
 
+def align_hw(x, target_hw, pad_mode_w='circular', pad_mode_h='reflect'):
+    B,T,C,H,W = x.shape
+    Ht, Wt = target_hw
+    if H == Ht and W == Wt:
+        return x
+    dh = max(0, Ht - H)
+    dw = max(0, Wt - W)
+    if dh > 0 or dw > 0:
+        pad = (0, dw, 0, dh)
+        x = F.pad(x.view(B*T, C, H, W), pad, mode=pad_mode_w if dw>0 else pad_mode_h)
+        x = x.view(B, T, C, H+dh, W+dw)
+        H, W = H+dh, W+dw
+    if H > Ht:
+        x = x[..., :Ht, :]
+    if W > Wt:
+        x = x[..., :Wt]
+    return x
+
 class Args:
     def __init__(self):
         self.input_size = (720, 1440)
         self.input_ch = 24
-        self.use_mhsa = True
-        self.use_gate = True
+        self.out_ch = 24
         self.emb_ch = 96
         self.convlru_num_blocks = 8
         self.hidden_factor = (10, 20)
@@ -49,10 +66,23 @@ class Args:
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
         self.dec_strategy = 'pxsf'
-        self.out_ch = 24
         self.gen_factor = 1
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
+        self.prior_mode = 'fft_dct'
+        self.orth_every = 50
+        self.state_size = 64
+        self.ms_enable = True
+        self.ms_scale = 2
+        self.ms_state_size = 32
+        self.gate_lru = True
+        self.gate_conv = True
+        self.use_cbam = True
+        self.cbam_reduction = 16
+        self.cbam_kernel = (1, 7, 7)
+        self.mix_ratio = 4
+        self.mix_groups = 1
+        self.mix_act = 'SiLU'
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 13
@@ -97,13 +127,14 @@ def keep_latest_ckpts(ckpt_dir):
         os.remove(file_path)
 
 MODEL_ARG_KEYS = [
-    'input_size', 'input_ch', 'use_mhsa', 'use_gate',
-    'emb_ch', 'convlru_num_blocks', 'hidden_factor',
-    'emb_hidden_ch', 'emb_hidden_layers_num', 'emb_strategy', 
-    'ffn_hidden_ch', 'ffn_hidden_layers_num',
-    'dec_hidden_ch', 'dec_hidden_layers_num', 'dec_strategy',
-    'out_ch', 'gen_factor',
-    'hidden_activation', 'output_activation',
+    'input_size','input_ch','emb_ch','convlru_num_blocks','hidden_factor',
+    'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
+    'ffn_hidden_ch','ffn_hidden_layers_num',
+    'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
+    'out_ch','gen_factor','hidden_activation','output_activation',
+    'prior_mode','orth_every','state_size','ms_enable','ms_scale','ms_state_size',
+    'gate_lru','gate_conv','use_cbam','cbam_reduction','cbam_kernel',
+    'mix_ratio','mix_groups','mix_act'
 ]
 
 def extract_model_args(args_obj):
@@ -391,7 +422,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad()
-            data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
+            data = data.cuda(local_rank).to(torch.float32)
+            data = align_hw(data, args.input_size)
             preds = model(data[:, :-1], 'p')
             preds = preds[:, 1:]
             target = data[:, 2:]
@@ -415,10 +447,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             if ssim_val_loss is not None:
                 del ssim_val_loss
             if rank == 0:
-                if args.use_scheduler:
-                    current_lr = scheduler.get_last_lr()[0]
-                if not args.use_scheduler:
-                    current_lr = args.lr
+                current_lr = scheduler.get_last_lr()[0] if args.use_scheduler else args.lr
                 if avg_ssim is not None:
                     message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LatL1: {avg_latl1:.6f} - SSIM: {avg_ssim:.6f} (w_latl1={args.loss_latl1_weight:.3f}, w_ssim={args.loss_ssim_weight:.3f}) - LR: {current_lr:.6e}"
                 else:
@@ -426,7 +455,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 train_dataloader_iter.set_description(message)
                 logging.info(message)
             if rank == 0 and (train_step % int(len(train_dataloader)*args.ckpt_step) == 0 or train_step == len(train_dataloader)):
-                save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler)
+                save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler if args.use_scheduler else None)
         del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
         gc.collect()
         torch.cuda.empty_cache()
@@ -445,7 +474,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     num_workers=1, pin_memory=True, prefetch_factor=1)
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
+                    data = data.cuda(local_rank).to(torch.float32)
+                    data = align_hw(data, args.input_size)
                     out_gen_num = data[:, args.eval_data_n_frames//2:].shape[1] // args.gen_factor
                     preds = model(data[:, :args.eval_data_n_frames//2], 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
                     if args.loss_ssim_weight > 0:
