@@ -490,12 +490,12 @@ class ConvLRULayer(nn.Module):
         self.pscan = PScan.apply
     def _project_to_square(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
-        z = torch.einsum('blcrw,cwr->blcrr', t, self.V_col)
+        z = torch.einsum('blcrw,cwr->blcrq', t, self.V_col)
         return z
     def _deproject_from_square(self, z):
         Vt = self.V_col.conj().transpose(1, 2)
-        t = torch.einsum('blcrr,crw->blcrw', z, Vt)
-        h = torch.einsum('blcrw,csr->blcsw', t, self.U_row)
+        t = torch.einsum('blcrq,crw->blcqw', z, Vt)
+        h = torch.einsum('blcqw,csq->blcsw', t, self.U_row)
         return h
     def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
         h_spatial = torch.fft.ifft2(h_complex, dim=(-2, -1), norm='ortho')
