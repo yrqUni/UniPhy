@@ -295,7 +295,8 @@ class Embedding(nn.Module):
         self.emb_hidden_layers_num = getattr(args, "emb_hidden_layers_num", 0)
         self.down_strategy = getattr(args, "emb_strategy", "pxus")
         assert self.down_strategy in ['conv', 'pxus']
-        self.rH, self.rW = int(getattr(args, "hidden_factor", (2, 2))[0]), int(getattr(args, "hidden_factor", (2, 2))[1])
+        hf = getattr(args, "hidden_factor", (2, 2))
+        self.rH, self.rW = int(hf[0]), int(hf[1])
         if self.down_strategy == "conv":
             self.downsp = nn.Conv3d(self.input_ch, self.input_ch, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW))
             with torch.no_grad():
@@ -352,7 +353,8 @@ class Decoder(nn.Module):
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.dec_strategy = getattr(args, "dec_strategy", "pxsf")
         assert self.dec_strategy in ['deconv', 'pxsf']
-        self.rH, self.rW = int(getattr(args, "hidden_factor", (2, 2))[0]), int(getattr(args, "hidden_factor", (2, 2))[1])
+        hf = getattr(args, "hidden_factor", (2, 2))
+        self.rH, self.rW = int(hf[0]), int(hf[1])
         out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
         if self.dec_strategy == "deconv":
             self.upsp = nn.ConvTranspose3d(in_channels=self.emb_ch, out_channels=out_ch_after_up, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW))
@@ -401,14 +403,14 @@ class ConvLRUModel(nn.Module):
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
     def forward(self, x, last_hidden_ins=None):
         last_hidden_outs = []
-        convlru_block_num = 0
+        idx = 0
         for convlru_block in self.convlru_blocks:
             if last_hidden_ins is not None:
-                x, last_hidden_out = convlru_block(x, last_hidden_ins[convlru_block_num])
+                x, last_hidden_out = convlru_block(x, last_hidden_ins[idx])
             else:
                 x, last_hidden_out = convlru_block(x, None)
             last_hidden_outs.append(last_hidden_out)
-            convlru_block_num += 1
+            idx += 1
         return x, last_hidden_outs
 
 class ConvLRUBlock(nn.Module):
@@ -473,12 +475,12 @@ class ConvLRULayer(nn.Module):
         self.pscan = PScan.apply
     def _project_to_square(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
-        z = torch.einsum('blcrw,cwr->blcrq', t, self.V_col)
+        z = torch.einsum('blcrw,cwp->blcrp', t, self.V_col)
         return z
     def _deproject_from_square(self, z):
         Vt = self.V_col.conj().transpose(1, 2)
-        t = torch.einsum('blcrq,crw->blcqw', z, Vt)
-        h = torch.einsum('blcqw,csq->blcsw', t, self.U_row)
+        t = torch.einsum('blcrp,crw->blcrw', z, Vt)
+        h = torch.einsum('blcrw,csr->blcsw', t, self.U_row)
         return h
     def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
         h_spatial = torch.fft.ifft2(h_complex, dim=(-2, -1), norm='ortho')
