@@ -32,24 +32,6 @@ from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
 from tqdm import tqdm
 
-def align_hw(x, target_hw, pad_mode_w='circular', pad_mode_h='reflect'):
-    B,T,C,H,W = x.shape
-    Ht, Wt = target_hw
-    if H == Ht and W == Wt:
-        return x
-    dh = max(0, Ht - H)
-    dw = max(0, Wt - W)
-    if dh > 0 or dw > 0:
-        pad = (0, dw, 0, dh)
-        x = F.pad(x.view(B*T, C, H, W), pad, mode=pad_mode_w if dw>0 else pad_mode_h)
-        x = x.view(B, T, C, H+dh, W+dw)
-        H, W = H+dh, W+dw
-    if H > Ht:
-        x = x[..., :Ht, :]
-    if W > Wt:
-        x = x[..., :Wt]
-    return x
-
 class Args:
     def __init__(self):
         self.input_size = (720, 1440)
@@ -422,8 +404,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad()
-            data = data.cuda(local_rank).to(torch.float32)
-            data = align_hw(data, args.input_size)
+            data = data.cuda(local_rank).to(torch.float32)[:, :, :, :-1, :]
             preds = model(data[:, :-1], 'p')
             preds = preds[:, 1:]
             target = data[:, 2:]
@@ -474,8 +455,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     num_workers=1, pin_memory=True, prefetch_factor=1)
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                    data = data.cuda(local_rank).to(torch.float32)
-                    data = align_hw(data, args.input_size)
+                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, :-1, :]
                     out_gen_num = data[:, args.eval_data_n_frames//2:].shape[1] // args.gen_factor
                     preds = model(data[:, :args.eval_data_n_frames//2], 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
                     if args.loss_ssim_weight > 0:
