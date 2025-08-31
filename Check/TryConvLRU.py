@@ -35,7 +35,7 @@ class Args:
         self.ms_state_size = 32
         self.gate_lru = True
         self.gate_conv = True
-        self.use_cbam = True
+        self.use_cbam = False
         self.cbam_reduction = 16
         self.cbam_kernel = (1, 7, 7)
         self.mix_ratio = 4
@@ -47,6 +47,9 @@ def run_once(prior_mode):
     args = Args(prior_mode=prior_mode)
     B, L = 2, 8
     torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     model = ConvLRU(args).to(d)
     total_params = sum(p.numel() for p in model.parameters())
@@ -66,7 +69,9 @@ def run_once(prior_mode):
     print(f"[{prior_mode}] p mode Loss {loss_p.item():.6f}")
 
     del x, y, yp, loss_p
-    torch.cuda.empty_cache(); gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
     model.train()
     loss_fn = torch.nn.MSELoss()
@@ -85,7 +90,9 @@ def run_once(prior_mode):
     print(f"[{prior_mode}] i mode Loss {loss_i.item():.6f}")
 
     del model, loss_fn, opt, x, y, yi, loss_i
-    torch.cuda.empty_cache(); gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 if __name__ == "__main__":
     run_once('fft_dct')
