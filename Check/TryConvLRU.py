@@ -94,10 +94,10 @@ args_smoke = Args(
     hidden_factor=(6, 12),
     emb_strategy='pxus',
     dec_strategy='pxsf',
-    use_cbam=False,
+    use_cbam=True,
     use_gate=True,
-    use_freq_prior=False,
-    use_sh_prior=False,
+    use_freq_prior=True,
+    use_sh_prior=True,
     gen_factor=8
 )
 run_once(args_smoke, B=1, L=8, out_frames_num=8, mode='p')
@@ -109,10 +109,10 @@ args_full = Args(
     hidden_factor=(10, 20),
     emb_strategy='pxus',
     dec_strategy='pxsf',
-    use_cbam=False,
+    use_cbam=True,
     use_gate=True,
-    use_freq_prior=False,
-    use_sh_prior=False,
+    use_freq_prior=True,
+    use_sh_prior=True,
     gen_factor=2
 )
 run_once(args_full, B=1, L=2, out_frames_num=8, mode='p')
