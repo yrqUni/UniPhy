@@ -10,8 +10,8 @@ from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
 
 ARGS = {
-    'ckpt': '/path/to/checkpoint.ckpt',
-    'data_root': '/path/to/era5_data',
+    'ckpt': 'e3_s333_l0.020307.pth',
+    'data_root': '/nfs/ERA5_data/data_norm',
     'year_start': 2000,
     'year_end': 2021,
     'sample_len': 4,
@@ -22,10 +22,16 @@ ARGS = {
 }
 
 MODEL_ARG_KEYS = [
-    'input_size','input_ch','use_mhsa','use_gate','emb_ch','convlru_num_blocks','hidden_factor',
-    'emb_hidden_ch','emb_hidden_layers_num','ffn_hidden_ch','ffn_hidden_layers_num',
-    'dec_hidden_ch','dec_hidden_layers_num','out_ch','gen_factor','hidden_activation','output_activation',
-    'use_aa_down','use_aa_up_pre','use_aa_up_post','aa_kernel','emb_strategy','dec_strategy'
+    'input_size','input_ch','use_cbam','use_gate',
+    'use_freq_prior','use_sh_prior','freq_rank','freq_gain_init',
+    'sh_Lmax','sh_rank','sh_gain_init','lru_rank',
+    'emb_ch','convlru_num_blocks','hidden_factor',
+    'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
+    'ffn_hidden_ch','ffn_hidden_layers_num',
+    'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
+    'use_aa_down','use_aa_up_pre','use_aa_up_post','aa_kernel',
+    'out_ch','gen_factor',
+    'hidden_activation','output_activation',
 ]
 
 def extract_model_args_from_ckpt(ckpt_path, map_location):
@@ -50,7 +56,6 @@ def extract_model_args_from_ckpt(ckpt_path, map_location):
         raise RuntimeError('no usable model args found')
     return d
 
-
 def make_args_from_overrides(overrides):
     class A: ...
     args = A()
@@ -61,7 +66,6 @@ def make_args_from_overrides(overrides):
     if hasattr(args, 'dec_strategy') and isinstance(args.dec_strategy, str):
         args.dec_strategy = args.dec_strategy.lower()
     return args
-
 
 def adapt_state_dict_keys(state_dict, model):
     def pref(keys):
@@ -87,7 +91,6 @@ def adapt_state_dict_keys(state_dict, model):
         out[nk] = v
     return out
 
-
 def load_state_dict_safely(ckpt_path, device):
     obj = torch.load(ckpt_path, map_location=device)
     if isinstance(obj, dict):
@@ -98,12 +101,16 @@ def load_state_dict_safely(ckpt_path, device):
         return obj
     return obj
 
-
 def build_model_from_ckpt(ckpt_path, device):
+    sd_raw = load_state_dict_safely(ckpt_path, device)
     ma = extract_model_args_from_ckpt(ckpt_path, map_location=device)
+    if 'lru_rank' not in ma:
+        for k, v in sd_raw.items():
+            if k.endswith('lru_layer.U_row'):
+                ma['lru_rank'] = int(v.shape[-1])
+                break
     args = make_args_from_overrides(ma)
     model = ConvLRU(args).to(device)
-    sd_raw = load_state_dict_safely(ckpt_path, device)
     sd = adapt_state_dict_keys(sd_raw, model)
     model.load_state_dict(sd, strict=False)
     del sd, sd_raw
@@ -112,7 +119,6 @@ def build_model_from_ckpt(ckpt_path, device):
         torch.cuda.empty_cache()
     model.eval()
     return model, args
-
 
 def calc_acc(pred, gt):
     f = pred.flatten().double()
@@ -125,7 +131,6 @@ def calc_acc(pred, gt):
     if den_val == 0.0:
         return 0.0
     return (num / den).item()
-
 
 def make_grid_figure(pred_btchw, gt_btchw, channels, figsize_per_cell, cmap_main, cmap_diff, save_path):
     B, T, C, H, W = pred_btchw.shape
@@ -170,7 +175,6 @@ def make_grid_figure(pred_btchw, gt_btchw, channels, figsize_per_cell, cmap_main
     for c in channels:
         print(f'ACC ch{c}: {[round(x, 3) for x in accs[c]]}')
 
-
 def main():
     args = ARGS
     device = torch.device(args['device'])
@@ -207,7 +211,6 @@ def main():
         cmap_diff='RdBu_r',
         save_path=args['save']
     )
-
 
 if __name__ == '__main__':
     main()

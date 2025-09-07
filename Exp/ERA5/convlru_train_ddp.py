@@ -234,10 +234,6 @@ def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu', args=No
 def setup_logging(args):
     os.makedirs(args.log_path, exist_ok=True)
     log_filename = os.path.join(args.log_path, f'training_log_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-    with open(__file__, 'r') as f_script, open(log_filename, 'w') as f_log:
-        f_log.write("========== convlru_train_ddp.py ==========\n")
-        f_log.write(f_script.read())
-        f_log.write("\n========== End of Script ==========\n\n")
     logging.basicConfig(
         filename=log_filename,
         level=logging.INFO,
