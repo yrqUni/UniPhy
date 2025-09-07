@@ -59,19 +59,22 @@ class Args:
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
-        self.dec_strategy = 'pxsf'
+        self.use_aa_down = True
+        self.use_aa_up_pre = True
+        self.use_aa_up_post = True
+        self.aa_kernel = 5
         self.out_ch = 26
         self.gen_factor = 1
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 13
+        self.train_data_n_frames = 17
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ''
-        self.train_batch_size = 2
-        self.eval_batch_size = 2
+        self.train_batch_size = 1
+        self.eval_batch_size = 1
         self.epochs = 1000
         self.log_path = './convlru_base/logs'
         self.ckpt_dir = './convlru_base/ckpt'
@@ -108,6 +111,7 @@ MODEL_ARG_KEYS = [
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',
     'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
+    'use_aa_down','use_aa_up_pre','use_aa_up_post','aa_kernel',
     'out_ch','gen_factor',
     'hidden_activation','output_activation',
 ]
