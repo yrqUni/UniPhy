@@ -29,7 +29,6 @@ MODEL_ARG_KEYS = [
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',
     'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
-    'use_aa_down','use_aa_up_pre','use_aa_up_post','aa_kernel',
     'out_ch','gen_factor',
     'hidden_activation','output_activation',
 ]
@@ -61,10 +60,6 @@ def make_args_from_overrides(overrides):
     args = A()
     for k, v in overrides.items():
         setattr(args, k, v)
-    if hasattr(args, 'emb_strategy') and isinstance(args.emb_strategy, str):
-        args.emb_strategy = args.emb_strategy.lower()
-    if hasattr(args, 'dec_strategy') and isinstance(args.dec_strategy, str):
-        args.dec_strategy = args.dec_strategy.lower()
     return args
 
 def adapt_state_dict_keys(state_dict, model):

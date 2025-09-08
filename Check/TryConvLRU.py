@@ -48,66 +48,113 @@ class ArgsBase:
         self.use_freq_prior = False
         self.freq_rank = 8
         self.freq_gain_init = 0.0
+        self.spectral_prior_mode = "linear"
         self.use_sh_prior = False
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
         self.lru_rank = 32
+        self.uv_orth_every = 0
 
 def build_args(name):
     a = ArgsBase()
     if name == "square_pxus_pxsf_no_priors":
         a.input_size = (144, 144)
-        a.emb_strategy = "pxus"
-        a.hidden_factor = (2, 2)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = False
         a.use_sh_prior = False
     elif name == "rect_pxus_pxsf_no_priors":
         a.input_size = (144, 288)
-        a.emb_strategy = "pxus"
-        a.hidden_factor = (2, 2)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = False
         a.use_sh_prior = False
     elif name == "rect_pxus_deconv_no_priors":
         a.input_size = (144, 288)
-        a.emb_strategy = "pxus"
-        a.hidden_factor = (2, 2)
         a.dec_strategy = "deconv"
         a.use_freq_prior = False
         a.use_sh_prior = False
-    elif name == "square_pxus_pxsf_freq":
-        a.input_size = (144, 144)
-        a.emb_strategy = "pxus"
-        a.hidden_factor = (2, 2)
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = True
-        a.freq_rank = 8
-        a.freq_gain_init = 0.1
-        a.use_sh_prior = False
-    elif name == "rect_pxus_pxsf_sh":
+    elif name == "rect_pxus_pxsf_freq_linear":
         a.input_size = (144, 288)
-        a.emb_strategy = "pxus"
-        a.hidden_factor = (2, 2)
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = False
-        a.use_sh_prior = True
-        a.sh_Lmax = 6
-        a.sh_rank = 8
-        a.sh_gain_init = 0.05
-    elif name == "rect_pxus_pxsf_both":
-        a.input_size = (144, 288)
-        a.emb_strategy = "pxus"
-        a.hidden_factor = (2, 2)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = True
         a.freq_rank = 8
         a.freq_gain_init = 0.05
+        a.spectral_prior_mode = "linear"
+        a.use_sh_prior = False
+    elif name == "rect_pxus_pxsf_freq_exp":
+        a.input_size = (144, 288)
+        a.dec_strategy = "pxsf"
+        a.use_freq_prior = True
+        a.freq_rank = 8
+        a.freq_gain_init = 0.05
+        a.spectral_prior_mode = "exp"
+        a.use_sh_prior = False
+    elif name == "rect_pxus_pxsf_sh":
+        a.input_size = (144, 288)
+        a.dec_strategy = "pxsf"
+        a.use_freq_prior = False
         a.use_sh_prior = True
         a.sh_Lmax = 6
         a.sh_rank = 8
         a.sh_gain_init = 0.05
+    elif name == "rect_pxus_pxsf_both_linear":
+        a.input_size = (144, 288)
+        a.dec_strategy = "pxsf"
+        a.use_freq_prior = True
+        a.freq_rank = 8
+        a.freq_gain_init = 0.05
+        a.spectral_prior_mode = "linear"
+        a.use_sh_prior = True
+        a.sh_Lmax = 6
+        a.sh_rank = 8
+        a.sh_gain_init = 0.05
+    elif name == "rect_pxus_pxsf_both_exp_cbam_gate_uvorth":
+        a.input_size = (144, 288)
+        a.dec_strategy = "pxsf"
+        a.use_freq_prior = True
+        a.freq_rank = 8
+        a.freq_gain_init = 0.05
+        a.spectral_prior_mode = "exp"
+        a.use_sh_prior = True
+        a.sh_Lmax = 6
+        a.sh_rank = 8
+        a.sh_gain_init = 0.05
+        a.use_cbam = True
+        a.use_gate = True
+        a.uv_orth_every = 1
+    elif name == "rect_720x1440_pxus_pxsf_no_priors":
+        a.input_size = (720, 1440)
+        a.emb_ch = 8
+        a.emb_hidden_ch = 8
+        a.ffn_hidden_ch = 8
+        a.convlru_num_blocks = 1
+        a.gen_factor = 2
+        a.use_freq_prior = False
+        a.use_sh_prior = False
+        a.dec_strategy = "pxsf"
+    elif name == "rect_720x1440_pxus_pxsf_freq_exp":
+        a.input_size = (720, 1440)
+        a.emb_ch = 8
+        a.emb_hidden_ch = 8
+        a.ffn_hidden_ch = 8
+        a.convlru_num_blocks = 1
+        a.gen_factor = 2
+        a.use_freq_prior = True
+        a.spectral_prior_mode = "exp"
+        a.freq_gain_init = 0.02
+        a.use_sh_prior = False
+        a.dec_strategy = "pxsf"
+    elif name == "rect_720x1440_pxus_pxsf_sh":
+        a.input_size = (720, 1440)
+        a.emb_ch = 8
+        a.emb_hidden_ch = 8
+        a.ffn_hidden_ch = 8
+        a.convlru_num_blocks = 1
+        a.gen_factor = 2
+        a.use_freq_prior = False
+        a.use_sh_prior = True
+        a.sh_gain_init = 0.02
+        a.dec_strategy = "pxsf"
     else:
         pass
     return a
@@ -134,7 +181,8 @@ def run_once(name, args, B=1, L=8, out_frames_num=8, lr=1e-3):
     opt.step()
     print("[p]loss", float(loss_p.detach().cpu()), "shape", tuple(out.shape))
     del out, loss_p
-    torch.cuda.empty_cache() if device.type == "cuda" else None
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     opt.zero_grad()
     assert out_frames_num % args.gen_factor == 0
     out_gen_num = out_frames_num // args.gen_factor
@@ -148,21 +196,38 @@ def run_once(name, args, B=1, L=8, out_frames_num=8, lr=1e-3):
     t1 = time.time()
     print("[time]" + f"{t1 - t0:.3f}s")
     del model, x, y, out_i, loss_i, opt
-    torch.cuda.empty_cache() if device.type == "cuda" else None
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 def main():
     print("[pscan]", pscan_check())
-    names = [
+    names_small = [
         "square_pxus_pxsf_no_priors",
         "rect_pxus_pxsf_no_priors",
         "rect_pxus_deconv_no_priors",
-        "square_pxus_pxsf_freq",
+        "rect_pxus_pxsf_freq_linear",
+        "rect_pxus_pxsf_freq_exp",
         "rect_pxus_pxsf_sh",
-        "rect_pxus_pxsf_both",
+        "rect_pxus_pxsf_both_linear",
+        "rect_pxus_pxsf_both_exp_cbam_gate_uvorth",
     ]
-    for nm in names:
+    for nm in names_small:
         a = build_args(nm)
-        run_once(nm, a, B=1, L=8, out_frames_num=8, lr=1e-3)
+        try:
+            run_once(nm, a, B=1, L=8, out_frames_num=8, lr=1e-3)
+        except Exception as e:
+            print("[error]", nm, repr(e))
+    names_large = [
+        "rect_720x1440_pxus_pxsf_no_priors",
+        "rect_720x1440_pxus_pxsf_freq_exp",
+        "rect_720x1440_pxus_pxsf_sh",
+    ]
+    for nm in names_large:
+        a = build_args(nm)
+        try:
+            run_once(nm, a, B=1, L=2, out_frames_num=4, lr=5e-4)
+        except Exception as e:
+            print("[error]", nm, repr(e))
 
 if __name__ == "__main__":
     main()

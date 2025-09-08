@@ -50,6 +50,7 @@ class Args:
         self.sh_gain_init = 0.0
         self.lru_rank = 64
         self.emb_ch = 128
+        self.freq_amp_mode = "linear"
         self.convlru_num_blocks = 8
         self.hidden_factor = (10, 10)
         self.emb_hidden_ch = 152
@@ -59,10 +60,6 @@ class Args:
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
-        self.use_aa_down = True
-        self.use_aa_up_pre = True
-        self.use_aa_up_post = True
-        self.aa_kernel = 5
         self.out_ch = 26
         self.gen_factor = 1
         self.hidden_activation = 'Tanh'
@@ -111,7 +108,6 @@ MODEL_ARG_KEYS = [
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',
     'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
-    'use_aa_down','use_aa_up_pre','use_aa_up_post','aa_kernel',
     'out_ch','gen_factor',
     'hidden_activation','output_activation',
 ]
