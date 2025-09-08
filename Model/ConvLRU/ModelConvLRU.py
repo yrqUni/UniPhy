@@ -249,7 +249,7 @@ class ConvLRU(nn.Module):
                 out.append(x)
             return torch.concat(out, dim=1)
 
-class Conv_hidden(nn.Module):
+class ConvHidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_cbam=False):
         super().__init__()
         self.ch = ch
@@ -319,7 +319,7 @@ class Embedding(nn.Module):
             self.c_out = None
         if self.emb_hidden_layers_num != 0:
             self.c_in = nn.Conv3d(in_ch_after_down, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding='same')
-            self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.emb_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList([ConvHidden(self.emb_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.emb_hidden_layers_num)])
             self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
@@ -376,7 +376,7 @@ class Decoder(nn.Module):
             H = self.hidden_size[0] * self.rH
             W = self.hidden_size[1] * self.rW
         if self.dec_hidden_layers_num != 0:
-            self.c_hidden = nn.ModuleList([Conv_hidden(out_ch_after_up, (H, W), getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.dec_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList([ConvHidden(out_ch_after_up, (H, W), getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.dec_hidden_layers_num)])
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch, kernel_size=(1, 1, 1), padding='same')
         else:
             self.c_hidden = None
@@ -479,8 +479,8 @@ class ConvLRULayer(nn.Module):
         else:
             self.sh_prior = None
         self.pscan = PScan.apply
-    def _maybe_orth_uv(self):
-        if self.uv_orth_every <= 0:
+    def orthonormalize_uv(self):
+        if self.uv_orth_every <= 0 or torch.is_grad_enabled():
             return
         self._uv_step = (self._uv_step + 1) % self.uv_orth_every
         if self._uv_step != 0:
@@ -495,9 +495,10 @@ class ConvLRULayer(nn.Module):
                     Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
                     self.U_row[c].copy_(Qc)
             else:
-                eps = 1e-6
-                n = torch.linalg.norm(self.U_row, dim=1, keepdim=True)
-                self.U_row.div_(n.clamp_min(eps))
+                for c in range(C):
+                    col_norm = torch.linalg.norm(self.U_row[c], dim=0)
+                    col_norm = torch.clamp(col_norm, min=1e-8)
+                    self.U_row[c].copy_(self.U_row[c] / col_norm)
             C, W, R = self.V_col.shape
             if 2 * R <= W:
                 for c in range(C):
@@ -507,19 +508,20 @@ class ConvLRULayer(nn.Module):
                     Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
                     self.V_col[c].copy_(Qc)
             else:
-                eps = 1e-6
-                n = torch.linalg.norm(self.V_col, dim=1, keepdim=True)
-                self.V_col.div_(n.clamp_min(eps))
-    def _project_to_square(self, h):
+                for c in range(C):
+                    col_norm = torch.linalg.norm(self.V_col[c], dim=0)
+                    col_norm = torch.clamp(col_norm, min=1e-8)
+                    self.V_col[c].copy_(self.V_col[c] / col_norm)
+    def project_to_rank(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
         z = torch.einsum('blcrw,cwp->blcrp', t, self.V_col)
         return z
-    def _deproject_from_square(self, z):
+    def reconstruct_from_rank(self, z):
         Vt = self.V_col.conj().transpose(1, 2)
         t = torch.einsum('blcrp,crw->blcrw', z, Vt)
         h = torch.einsum('blcrw,csr->blcsw', t, self.U_row)
         return h
-    def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
+    def ifft2_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
         h_spatial = torch.fft.ifft2(h_complex, dim=(-2, -1), norm='ortho')
         hr = h_spatial.real
         hi = h_spatial.imag
@@ -545,7 +547,7 @@ class ConvLRULayer(nn.Module):
                 B2, L2 = B, L
             h = self.pscan(lamb_s.reshape(1,1,C,S,1).expand(B2, L2, C, S, 1), h)
             last_hidden_out = h[:, -1:]
-            h = self._ifft_and_fuse(h)
+            h = self.ifft2_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
             h = self.layer_norm(h)
@@ -554,19 +556,19 @@ class ConvLRULayer(nn.Module):
         else:
             nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch))
             lamb_r = torch.exp(torch.complex(-nu_r, theta_r))
-            self._maybe_orth_uv()
-            z = self._project_to_square(h)
+            self.orthonormalize_uv()
+            z = self.project_to_rank(h)
             z = z * gamma_r.reshape(1,1,C,self.rank,1)
             if last_hidden_in is not None:
-                last_z = self._project_to_square(last_hidden_in[:, -1:])
+                last_z = self.project_to_rank(last_hidden_in[:, -1:])
                 z = torch.concat([last_z, z], dim=1)
                 B2, L2 = B, L+1
             else:
                 B2, L2 = B, L
             z = self.pscan(lamb_r.reshape(1,1,C,self.rank,1).expand(B2, L2, C, self.rank, 1), z)
-            last_hidden_out = self._deproject_from_square(z[:, -1:])
-            h = self._deproject_from_square(z)
-            h = self._ifft_and_fuse(h)
+            last_hidden_out = self.reconstruct_from_rank(z[:, -1:])
+            h = self.reconstruct_from_rank(z)
+            h = self.ifft2_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
             h = self.layer_norm(h)
@@ -596,7 +598,7 @@ class FeedForward(nn.Module):
         self.use_cbam = bool(getattr(args, "use_cbam", False))
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv3d(self.emb_ch, self.ffn_hidden_ch, kernel_size=(1, 7, 7), padding='same')
-        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=self.use_cbam) for _ in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([ConvHidden(self.ffn_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=self.use_cbam) for _ in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
