@@ -73,21 +73,21 @@ def build_args(name):
         a.dec_strategy = "deconv"
         a.use_freq_prior = False
         a.use_sh_prior = False
-    elif name == "rect_pxus_pxsf_freq_linear":
-        a.input_size = (144, 288)
+    elif name == "square_pxus_pxsf_freq_linear":
+        a.input_size = (144, 144)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = True
-        a.freq_rank = 8
-        a.freq_gain_init = 0.05
         a.spectral_prior_mode = "linear"
+        a.freq_rank = 8
+        a.freq_gain_init = 0.1
         a.use_sh_prior = False
-    elif name == "rect_pxus_pxsf_freq_exp":
-        a.input_size = (144, 288)
+    elif name == "square_pxus_pxsf_freq_exp":
+        a.input_size = (144, 144)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = True
+        a.spectral_prior_mode = "exp"
         a.freq_rank = 8
         a.freq_gain_init = 0.05
-        a.spectral_prior_mode = "exp"
         a.use_sh_prior = False
     elif name == "rect_pxus_pxsf_sh":
         a.input_size = (144, 288)
@@ -101,63 +101,62 @@ def build_args(name):
         a.input_size = (144, 288)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = True
+        a.spectral_prior_mode = "linear"
         a.freq_rank = 8
         a.freq_gain_init = 0.05
-        a.spectral_prior_mode = "linear"
         a.use_sh_prior = True
         a.sh_Lmax = 6
         a.sh_rank = 8
         a.sh_gain_init = 0.05
-    elif name == "rect_pxus_pxsf_both_exp_cbam_gate_uvorth":
+    elif name == "rect_pxus_pxsf_both_exp":
         a.input_size = (144, 288)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = True
+        a.spectral_prior_mode = "exp"
         a.freq_rank = 8
         a.freq_gain_init = 0.05
-        a.spectral_prior_mode = "exp"
         a.use_sh_prior = True
         a.sh_Lmax = 6
         a.sh_rank = 8
         a.sh_gain_init = 0.05
-        a.use_cbam = True
-        a.use_gate = True
-        a.uv_orth_every = 1
-    elif name == "rect_720x1440_pxus_pxsf_no_priors":
-        a.input_size = (720, 1440)
-        a.emb_ch = 8
-        a.emb_hidden_ch = 8
-        a.ffn_hidden_ch = 8
-        a.convlru_num_blocks = 1
-        a.gen_factor = 2
-        a.use_freq_prior = False
-        a.use_sh_prior = False
+    elif name == "rect_pxus_pxsf_both_linear_uvorth":
+        a.input_size = (144, 288)
         a.dec_strategy = "pxsf"
-    elif name == "rect_720x1440_pxus_pxsf_freq_exp":
-        a.input_size = (720, 1440)
-        a.emb_ch = 8
-        a.emb_hidden_ch = 8
-        a.ffn_hidden_ch = 8
-        a.convlru_num_blocks = 1
-        a.gen_factor = 2
         a.use_freq_prior = True
-        a.spectral_prior_mode = "exp"
-        a.freq_gain_init = 0.02
-        a.use_sh_prior = False
-        a.dec_strategy = "pxsf"
-    elif name == "rect_720x1440_pxus_pxsf_sh":
-        a.input_size = (720, 1440)
-        a.emb_ch = 8
-        a.emb_hidden_ch = 8
-        a.ffn_hidden_ch = 8
-        a.convlru_num_blocks = 1
-        a.gen_factor = 2
-        a.use_freq_prior = False
+        a.spectral_prior_mode = "linear"
+        a.freq_rank = 8
+        a.freq_gain_init = 0.05
         a.use_sh_prior = True
-        a.sh_gain_init = 0.02
+        a.sh_Lmax = 6
+        a.sh_rank = 8
+        a.sh_gain_init = 0.05
+        a.uv_orth_every = 1
+    elif name == "large_era5_like":
+        a.input_size = (720, 1440)
+        a.input_ch = 24
+        a.out_ch = 24
+        a.emb_ch = 32
+        a.ffn_hidden_ch = 32
+        a.convlru_num_blocks = 2
+        a.hidden_factor = (10, 20)
+        a.lru_rank = 32
+        a.gen_factor = 1
         a.dec_strategy = "pxsf"
-    else:
-        pass
+        a.use_freq_prior = True
+        a.spectral_prior_mode = "linear"
+        a.freq_rank = 8
+        a.freq_gain_init = 0.02
+        a.use_sh_prior = True
+        a.sh_Lmax = 6
+        a.sh_rank = 8
+        a.sh_gain_init = 0.01
+        a.uv_orth_every = 0
     return a
+
+def count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 def run_once(name, args, B=1, L=8, out_frames_num=8, lr=1e-3):
     device = pick_device()
@@ -165,8 +164,7 @@ def run_once(name, args, B=1, L=8, out_frames_num=8, lr=1e-3):
     print("[case]", name)
     print("[dev]", device.type)
     model = ConvLRU(args).to(device).train()
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total, trainable = count_params(model)
     print("[params]", total, trainable)
     H, W = args.input_size
     x = torch.randn(B, L, args.input_ch, H, W, device=device)
@@ -201,33 +199,24 @@ def run_once(name, args, B=1, L=8, out_frames_num=8, lr=1e-3):
 
 def main():
     print("[pscan]", pscan_check())
-    names_small = [
+    names = [
         "square_pxus_pxsf_no_priors",
         "rect_pxus_pxsf_no_priors",
         "rect_pxus_deconv_no_priors",
-        "rect_pxus_pxsf_freq_linear",
-        "rect_pxus_pxsf_freq_exp",
+        "square_pxus_pxsf_freq_linear",
+        "square_pxus_pxsf_freq_exp",
         "rect_pxus_pxsf_sh",
         "rect_pxus_pxsf_both_linear",
-        "rect_pxus_pxsf_both_exp_cbam_gate_uvorth",
+        "rect_pxus_pxsf_both_exp",
+        "rect_pxus_pxsf_both_linear_uvorth",
     ]
-    for nm in names_small:
+    for nm in names:
         a = build_args(nm)
-        try:
-            run_once(nm, a, B=1, L=8, out_frames_num=8, lr=1e-3)
-        except Exception as e:
-            print("[error]", nm, repr(e))
-    names_large = [
-        "rect_720x1440_pxus_pxsf_no_priors",
-        "rect_720x1440_pxus_pxsf_freq_exp",
-        "rect_720x1440_pxus_pxsf_sh",
-    ]
-    for nm in names_large:
+        run_once(nm, a, B=1, L=8, out_frames_num=8, lr=1e-3)
+    if os.getenv("HEAVY", "0") == "1":
+        nm = "large_era5_like"
         a = build_args(nm)
-        try:
-            run_once(nm, a, B=1, L=2, out_frames_num=4, lr=5e-4)
-        except Exception as e:
-            print("[error]", nm, repr(e))
+        run_once(nm, a, B=1, L=4, out_frames_num=4, lr=5e-4)
 
 if __name__ == "__main__":
     main()
