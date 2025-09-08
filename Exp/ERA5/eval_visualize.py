@@ -10,14 +10,14 @@ from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
 
 ARGS = {
-    'ckpt': 'e3_s333_l0.020307.pth',
-    'data_root': '/nfs/ERA5_data/data_norm',
+    'ckpt': 'e16_s666_l0.013081.pth',
+    'data_root': '/mnt/esm10/ERA5_data/data_norm',
     'year_start': 2000,
     'year_end': 2021,
     'sample_len': 4,
     'batch_size': 1,
     'save': 'eval_viz.png',
-    'channels': '0,1,2',
+    'channels': None,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
@@ -175,6 +175,25 @@ def make_grid_figure(pred_btchw, gt_btchw, channels, figsize_per_cell, cmap_main
     for c in channels:
         print(f'ACC ch{c}: {[round(x, 3) for x in accs[c]]}')
 
+def parse_channels(ch_arg, C):
+    if ch_arg is None:
+        return list(range(C))
+    if isinstance(ch_arg, str):
+        s = ch_arg.strip().lower()
+        if s in ('', 'all', '*'):
+            return list(range(C))
+        out = []
+        for x in s.split(','):
+            x = x.strip()
+            if not x:
+                continue
+            out.append(int(x))
+        return sorted(set([i for i in out if 0 <= i < C]))
+    if isinstance(ch_arg, (list, tuple)):
+        out = [int(i) for i in ch_arg]
+        return sorted(set([i for i in out if 0 <= i < C]))
+    raise ValueError(f'Unsupported channels arg: {ch_arg!r}')
+
 def main():
     args = ARGS
     device = torch.device(args['device'])
@@ -201,7 +220,8 @@ def main():
         preds = preds.unsqueeze(0)
     if out.dim() == 4:
         out = out.unsqueeze(0)
-    ch = [int(x) for x in args['channels'].split(',') if x.strip() != '']
+    C = preds.shape[2]
+    ch = parse_channels(args['channels'], C)
     make_grid_figure(
         preds,
         out,
