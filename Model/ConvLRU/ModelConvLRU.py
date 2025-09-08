@@ -1,4 +1,3 @@
-# ModelConvLRU.py
 import torch
 import torch.nn as nn
 import math
@@ -488,19 +487,29 @@ class ConvLRULayer(nn.Module):
             return
         with torch.no_grad():
             C, S, R = self.U_row.shape
-            for c in range(C):
-                Ur = torch.view_as_real(self.U_row[c])
-                Umat = torch.stack([Ur[...,0], Ur[...,1]], dim=-2).reshape(S, 2*R)
-                Q, _ = torch.linalg.qr(Umat, mode='reduced')
-                Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
-                self.U_row[c].copy_(Qc)
+            if 2 * R <= S:
+                for c in range(C):
+                    Ur = torch.view_as_real(self.U_row[c])
+                    Umat = torch.stack([Ur[...,0], Ur[...,1]], dim=-2).reshape(S, 2*R)
+                    Q, _ = torch.linalg.qr(Umat, mode='reduced')
+                    Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
+                    self.U_row[c].copy_(Qc)
+            else:
+                eps = 1e-6
+                n = torch.linalg.norm(self.U_row, dim=1, keepdim=True)
+                self.U_row.div_(n.clamp_min(eps))
             C, W, R = self.V_col.shape
-            for c in range(C):
-                Vr = torch.view_as_real(self.V_col[c])
-                Vmat = torch.stack([Vr[...,0], Vr[...,1]], dim=-2).reshape(W, 2*R)
-                Q, _ = torch.linalg.qr(Vmat, mode='reduced')
-                Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
-                self.V_col[c].copy_(Qc)
+            if 2 * R <= W:
+                for c in range(C):
+                    Vr = torch.view_as_real(self.V_col[c])
+                    Vmat = torch.stack([Vr[...,0], Vr[...,1]], dim=-2).reshape(W, 2*R)
+                    Q, _ = torch.linalg.qr(Vmat, mode='reduced')
+                    Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
+                    self.V_col[c].copy_(Qc)
+            else:
+                eps = 1e-6
+                n = torch.linalg.norm(self.V_col, dim=1, keepdim=True)
+                self.V_col.div_(n.clamp_min(eps))
     def _project_to_square(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
         z = torch.einsum('blcrw,cwp->blcrp', t, self.V_col)
