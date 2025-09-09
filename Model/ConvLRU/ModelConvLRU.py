@@ -61,7 +61,7 @@ class SpectralPrior2D(nn.Module):
         F = torch.einsum('cri,crj->cij', self.A, self.B)
         if self.mode == "exp":
             G = torch.exp(self.gain.view(C, 1, 1) * F)
-        else:
+        if self.mode == "linear":
             G = 1.0 + self.gain.view(C, 1, 1) * F
         return h * G.view(1, 1, C, S, W)
 
@@ -220,7 +220,7 @@ class ConvLRU(nn.Module):
                 if n.endswith('.bias'):
                     if torch.is_complex(p):
                         p.copy_(torch.zeros_like(p))
-                    else:
+                    if not torch.is_complex(p):
                         p.zero_()
                     continue
                 if torch.is_complex(p):
@@ -228,7 +228,7 @@ class ConvLRU(nn.Module):
                     p.real.erfinv_(); p.imag.erfinv_()
                     p.real.mul_(std*math.sqrt(2.)); p.imag.mul_(std*math.sqrt(2.))
                     p.real.add_(mean); p.imag.add_(mean)
-                else:
+                if not torch.is_complex(p):
                     p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*math.sqrt(2.)); p.add_(mean)
     def forward(self, x, mode, out_gen_num=None, gen_factor=None):
         assert mode in ['p', 'i']
@@ -238,7 +238,7 @@ class ConvLRU(nn.Module):
             x = self.decoder(x)
             x = self.out_activation(x)
             return x
-        else:
+        if mode == 'i':
             assert getattr(self.args, "input_ch", 1) == getattr(self.args, "out_ch", 1)
             out = []
             x = self.embedding(x)
@@ -269,7 +269,7 @@ class Conv_hidden(nn.Module):
             self.cbam = CBAM2DPerStep(self.ch, reduction=16, spatial_kernel=7)
             self.layer_norm_attn = nn.LayerNorm([*hidden_size])
             self.gate_conv = nn.Sequential(nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding='same'), nn.Sigmoid())
-        else:
+        if not self.use_cbam:
             self.cbam = None
             self.layer_norm_attn = None
             self.gate_conv = None
@@ -283,7 +283,7 @@ class Conv_hidden(nn.Module):
             x_update = self.layer_norm_conv(x_update.permute(0,2,1,3,4)).permute(0,2,1,3,4)
             gate = self.gate_conv(x_update)
             x = (1 - gate) * x + gate * x_update
-        else:
+        if not self.use_cbam:
             x_update = self.layer_norm_conv(x_update.permute(0,2,1,3,4)).permute(0,2,1,3,4)
             x = x_update + x
         return x
@@ -374,7 +374,7 @@ class Decoder(nn.Module):
                 if self.upsp.bias is not None:
                     self.upsp.bias.zero_()
             with torch.no_grad():
-                _ = self.upsp(torch.zeros(1, self.emb_ch, 1, self.hidden_size[0], self.hidden_size[1])).size()
+                _, _, _, H, W = self.upsp(torch.zeros(1, self.emb_ch, 1, self.hidden_size[0], self.hidden_size[1])).size()
         if self.dec_strategy == "pxsf":
             self.pre_shuffle_conv = nn.Conv3d(in_channels=self.emb_ch, out_channels=out_ch_after_up * self.rH * self.rW, kernel_size=(1, 3, 3), padding=(0, 1, 1))
             icnr_conv3d_weight_(self.pre_shuffle_conv.weight, self.rH, self.rW)
@@ -386,7 +386,7 @@ class Decoder(nn.Module):
         if self.dec_hidden_layers_num != 0:
             self.c_hidden = nn.ModuleList([Conv_hidden(out_ch_after_up, (H, W), getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.dec_hidden_layers_num)])
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch, kernel_size=(1, 1, 1), padding='same')
-        else:
+        if self.dec_hidden_layers_num == 0:
             self.c_hidden = None
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch, kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
@@ -418,7 +418,7 @@ class ConvLRUModel(nn.Module):
         for convlru_block in self.convlru_blocks:
             if last_hidden_ins is not None:
                 x, last_hidden_out = convlru_block(x, last_hidden_ins[idx])
-            else:
+            if last_hidden_ins is None:
                 x, last_hidden_out = convlru_block(x, None)
             last_hidden_outs.append(last_hidden_out)
             idx += 1
@@ -475,14 +475,14 @@ class ConvLRULayer(nn.Module):
             freq_rank = int(getattr(args, "freq_rank", 8))
             freq_gain_init = float(getattr(args, "freq_gain_init", 0.0))
             self.freq_prior = SpectralPrior2D(self.emb_ch, S, W, rank=freq_rank, gain_init=freq_gain_init, mode=self.freq_mode)
-        else:
+        if not self.use_freq_prior:
             self.freq_prior = None
         if self.use_sh_prior:
             Lmax = int(getattr(args, "sh_Lmax", 6))
             sh_rank = int(getattr(args, "sh_rank", 8))
             sh_gain_init = float(getattr(args, "sh_gain_init", 0.0))
             self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, S, W, Lmax=Lmax, rank=sh_rank, gain_init=sh_gain_init)
-        else:
+        if not self.use_sh_prior:
             self.sh_prior = None
         self.pscan = PScan.apply
     def _project_to_square(self, h):
@@ -516,7 +516,7 @@ class ConvLRULayer(nn.Module):
             if last_hidden_in is not None:
                 h = torch.concat([last_hidden_in[:, -1:], h], dim=1)
                 B2, L2 = B, L+1
-            else:
+            if last_hidden_in is None:
                 B2, L2 = B, L
             h = self.pscan(lamb_s.reshape(1,1,C,S,1).expand(B2, L2, C, S, 1), h)
             last_hidden_out = h[:, -1:]
@@ -526,7 +526,7 @@ class ConvLRULayer(nn.Module):
             h = self.layer_norm(h)
             if last_hidden_in is not None:
                 h = h[:, 1:]
-        else:
+        if S != W:
             nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch))
             lamb_r = torch.exp(torch.complex(-nu_r, theta_r))
             z = self._project_to_square(h)
@@ -536,7 +536,7 @@ class ConvLRULayer(nn.Module):
                 last_z = self._project_to_square(last_h)
                 z = torch.concat([last_z, z], dim=1)
                 B2, L2 = B, L+1
-            else:
+            if last_hidden_in is None:
                 B2, L2 = B, L
             z = self.pscan(lamb_r.reshape(1,1,C,self.rank,1).expand(B2, L2, C, self.rank, 1), z)
             last_hidden_out = self._deproject_from_square(z[:, -1:])
@@ -552,7 +552,7 @@ class ConvLRULayer(nn.Module):
         if self.gate_conv is not None:
             gate = self.gate_conv(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
             x = (1 - gate) * x + gate * h
-        else:
+        if self.gate_conv is None:
             x = x + h
         return x, last_hidden_out
     def forward(self, x, last_hidden_in):
