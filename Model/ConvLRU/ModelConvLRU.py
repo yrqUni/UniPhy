@@ -144,7 +144,9 @@ class SphericalHarmonicsPrior(nn.Module):
         return torch.prod(seq)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C, H, W = x.shape
-        Y = self.Y_real.to(device=x.device, dtype=x.dtype)
+        Y = self.Y_real
+        if Y.dtype != x.dtype:
+            Y = Y.to(dtype=x.dtype)
         coeff = torch.matmul(self.W1, self.W2)
         bias = torch.einsum('ck,khw->chw', coeff, Y)
         bias = (self.gain.view(C, 1, 1) * bias).view(1, 1, C, H, W)
@@ -204,7 +206,7 @@ class ConvLRU(nn.Module):
     def _check_pscan(self):
         assert all(pscan_check())
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
-        skip_contains = ['layer_norm','params_log','freq_prior.','sh_prior.']
+        skip_contains = ['layer_norm','params_log','freq_prior.','sh_prior.','post_ifft_conv_real','post_ifft_conv_imag','post_ifft_proj']
         skip_suffix = ('.U_row', '.V_col','upsp.weight', 'upsp.bias','pre_shuffle_conv.weight', 'pre_shuffle_conv.bias')
         def should_skip(name: str) -> bool:
             if any(tok in name for tok in skip_contains): return True
@@ -215,8 +217,12 @@ class ConvLRU(nn.Module):
             u = (1. + math.erf(((upper - mean) / std) / math.sqrt(2.))) / 2.
             for n, p in self.named_parameters():
                 if should_skip(n): continue
-                if n.endswith('.bias') and p.dtype.is_floating_point:
-                    p.zero_(); continue
+                if n.endswith('.bias'):
+                    if torch.is_complex(p):
+                        p.copy_(torch.zeros_like(p))
+                    else:
+                        p.zero_()
+                    continue
                 if torch.is_complex(p):
                     p.real.uniform_(2*l-1, 2*u-1); p.imag.uniform_(2*l-1, 2*u-1)
                     p.real.erfinv_(); p.imag.erfinv_()
@@ -249,7 +255,7 @@ class ConvLRU(nn.Module):
                 out.append(x)
             return torch.concat(out, dim=1)
 
-class ConvHidden(nn.Module):
+class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_cbam=False):
         super().__init__()
         self.ch = ch
@@ -299,6 +305,7 @@ class Embedding(nn.Module):
         self.emb_hidden_ch = getattr(args, "emb_hidden_ch", 32)
         self.emb_hidden_layers_num = getattr(args, "emb_hidden_layers_num", 0)
         self.down_strategy = getattr(args, "emb_strategy", "pxus")
+        assert self.down_strategy in ['conv', 'pxus']
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
         if self.down_strategy == "conv":
@@ -319,7 +326,7 @@ class Embedding(nn.Module):
             self.c_out = None
         if self.emb_hidden_layers_num != 0:
             self.c_in = nn.Conv3d(in_ch_after_down, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding='same')
-            self.c_hidden = nn.ModuleList([ConvHidden(self.emb_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.emb_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList([Conv_hidden(self.emb_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.emb_hidden_layers_num)])
             self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
         self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
@@ -356,6 +363,7 @@ class Decoder(nn.Module):
         self.dec_hidden_layers_num = getattr(args, "dec_hidden_layers_num", 0)
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.dec_strategy = getattr(args, "dec_strategy", "pxsf")
+        assert self.dec_strategy in ['deconv', 'pxsf']
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
         out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
@@ -365,8 +373,8 @@ class Decoder(nn.Module):
             with torch.no_grad():
                 if self.upsp.bias is not None:
                     self.upsp.bias.zero_()
-            H = self.hidden_size[0] * self.rH
-            W = self.hidden_size[1] * self.rW
+            with torch.no_grad():
+                _ = self.upsp(torch.zeros(1, self.emb_ch, 1, self.hidden_size[0], self.hidden_size[1])).size()
         if self.dec_strategy == "pxsf":
             self.pre_shuffle_conv = nn.Conv3d(in_channels=self.emb_ch, out_channels=out_ch_after_up * self.rH * self.rW, kernel_size=(1, 3, 3), padding=(0, 1, 1))
             icnr_conv3d_weight_(self.pre_shuffle_conv.weight, self.rH, self.rW)
@@ -376,7 +384,7 @@ class Decoder(nn.Module):
             H = self.hidden_size[0] * self.rH
             W = self.hidden_size[1] * self.rW
         if self.dec_hidden_layers_num != 0:
-            self.c_hidden = nn.ModuleList([ConvHidden(out_ch_after_up, (H, W), getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.dec_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList([Conv_hidden(out_ch_after_up, (H, W), getattr(args, "hidden_activation", "ReLU"), use_cbam=False) for _ in range(self.dec_hidden_layers_num)])
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch, kernel_size=(1, 1, 1), padding='same')
         else:
             self.c_hidden = None
@@ -452,8 +460,6 @@ class ConvLRULayer(nn.Module):
         self.params_log_rank = nn.Parameter(torch.vstack((nu_r_log, theta_r_log, gamma_r_log)))
         self.U_row = nn.Parameter(torch.randn(self.emb_ch, S, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(S)))
         self.V_col = nn.Parameter(torch.randn(self.emb_ch, W, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(W)))
-        self.uv_orth_every = int(getattr(args, "uv_orth_every", 0))
-        self._uv_step = 0
         self.proj_B = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,1,1), padding='same', bias=self.use_bias).to(torch.cfloat)
         self.post_ifft_conv_real = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,3,3), padding=(0,1,1), bias=True)
         self.post_ifft_conv_imag = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,3,3), padding=(0,1,1), bias=True)
@@ -464,11 +470,11 @@ class ConvLRULayer(nn.Module):
             self.gate_conv = nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,1,1), padding='same'), nn.Sigmoid())
         self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
         self.use_sh_prior   = bool(getattr(args, "use_sh_prior", False))
-        spectral_mode = getattr(args, "spectral_prior_mode", "linear")
+        self.freq_mode = str(getattr(args, "freq_mode", "linear")).lower()
         if self.use_freq_prior:
             freq_rank = int(getattr(args, "freq_rank", 8))
             freq_gain_init = float(getattr(args, "freq_gain_init", 0.0))
-            self.freq_prior = SpectralPrior2D(self.emb_ch, S, W, rank=freq_rank, gain_init=freq_gain_init, mode=spectral_mode)
+            self.freq_prior = SpectralPrior2D(self.emb_ch, S, W, rank=freq_rank, gain_init=freq_gain_init, mode=self.freq_mode)
         else:
             self.freq_prior = None
         if self.use_sh_prior:
@@ -479,49 +485,16 @@ class ConvLRULayer(nn.Module):
         else:
             self.sh_prior = None
         self.pscan = PScan.apply
-    def orthonormalize_uv(self):
-        if self.uv_orth_every <= 0 or torch.is_grad_enabled():
-            return
-        self._uv_step = (self._uv_step + 1) % self.uv_orth_every
-        if self._uv_step != 0:
-            return
-        with torch.no_grad():
-            C, S, R = self.U_row.shape
-            if 2 * R <= S:
-                for c in range(C):
-                    Ur = torch.view_as_real(self.U_row[c])
-                    Umat = torch.stack([Ur[...,0], Ur[...,1]], dim=-2).reshape(S, 2*R)
-                    Q, _ = torch.linalg.qr(Umat, mode='reduced')
-                    Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
-                    self.U_row[c].copy_(Qc)
-            else:
-                for c in range(C):
-                    col_norm = torch.linalg.norm(self.U_row[c], dim=0)
-                    col_norm = torch.clamp(col_norm, min=1e-8)
-                    self.U_row[c].copy_(self.U_row[c] / col_norm)
-            C, W, R = self.V_col.shape
-            if 2 * R <= W:
-                for c in range(C):
-                    Vr = torch.view_as_real(self.V_col[c])
-                    Vmat = torch.stack([Vr[...,0], Vr[...,1]], dim=-2).reshape(W, 2*R)
-                    Q, _ = torch.linalg.qr(Vmat, mode='reduced')
-                    Qc = torch.complex(Q[:, :R], Q[:, R:2*R])
-                    self.V_col[c].copy_(Qc)
-            else:
-                for c in range(C):
-                    col_norm = torch.linalg.norm(self.V_col[c], dim=0)
-                    col_norm = torch.clamp(col_norm, min=1e-8)
-                    self.V_col[c].copy_(self.V_col[c] / col_norm)
-    def project_to_rank(self, h):
+    def _project_to_square(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
         z = torch.einsum('blcrw,cwp->blcrp', t, self.V_col)
         return z
-    def reconstruct_from_rank(self, z):
+    def _deproject_from_square(self, z):
         Vt = self.V_col.conj().transpose(1, 2)
         t = torch.einsum('blcrp,crw->blcrw', z, Vt)
         h = torch.einsum('blcrw,csr->blcsw', t, self.U_row)
         return h
-    def ifft2_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
+    def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
         h_spatial = torch.fft.ifft2(h_complex, dim=(-2, -1), norm='ortho')
         hr = h_spatial.real
         hi = h_spatial.imag
@@ -547,7 +520,7 @@ class ConvLRULayer(nn.Module):
                 B2, L2 = B, L
             h = self.pscan(lamb_s.reshape(1,1,C,S,1).expand(B2, L2, C, S, 1), h)
             last_hidden_out = h[:, -1:]
-            h = self.ifft2_fuse(h)
+            h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
             h = self.layer_norm(h)
@@ -556,28 +529,25 @@ class ConvLRULayer(nn.Module):
         else:
             nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch))
             lamb_r = torch.exp(torch.complex(-nu_r, theta_r))
-            self.orthonormalize_uv()
-            z = self.project_to_rank(h)
+            z = self._project_to_square(h)
             z = z * gamma_r.reshape(1,1,C,self.rank,1)
             if last_hidden_in is not None:
-                last_z = self.project_to_rank(last_hidden_in[:, -1:])
+                last_h = last_hidden_in[:, -1:]
+                last_z = self._project_to_square(last_h)
                 z = torch.concat([last_z, z], dim=1)
                 B2, L2 = B, L+1
             else:
                 B2, L2 = B, L
             z = self.pscan(lamb_r.reshape(1,1,C,self.rank,1).expand(B2, L2, C, self.rank, 1), z)
-            last_hidden_out = self.reconstruct_from_rank(z[:, -1:])
-            h = self.reconstruct_from_rank(z)
-            h = self.ifft2_fuse(h)
+            last_hidden_out = self._deproject_from_square(z[:, -1:])
+            h = self._deproject_from_square(z)
+            h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
             h = self.layer_norm(h)
             if last_hidden_in is not None:
                 h = h[:, 1:]
-        dummy_use = (self.params_log_square.sum().real
-                     + self.params_log_rank.sum().real
-                     + self.U_row.real.sum()
-                     + self.V_col.real.sum()) * 0.0
+        dummy_use = (self.params_log_square.sum().real + self.params_log_rank.sum().real + self.U_row.real.sum() + self.V_col.real.sum()) * 0.0
         h = h + dummy_use
         if self.gate_conv is not None:
             gate = self.gate_conv(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
@@ -598,7 +568,7 @@ class FeedForward(nn.Module):
         self.use_cbam = bool(getattr(args, "use_cbam", False))
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.c_in = nn.Conv3d(self.emb_ch, self.ffn_hidden_ch, kernel_size=(1, 7, 7), padding='same')
-        self.c_hidden = nn.ModuleList([ConvHidden(self.ffn_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=self.use_cbam) for _ in range(self.ffn_hidden_layers_num)])
+        self.c_hidden = nn.ModuleList([Conv_hidden(self.ffn_hidden_ch, self.hidden_size, getattr(args, "hidden_activation", "ReLU"), use_cbam=self.use_cbam) for _ in range(self.ffn_hidden_layers_num)])
         self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding='same')
         self.activation = getattr(nn, getattr(args, "hidden_activation", "ReLU"))()
         self.layer_norm = nn.LayerNorm([*self.hidden_size])

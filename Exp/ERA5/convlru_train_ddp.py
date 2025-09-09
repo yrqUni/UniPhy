@@ -66,12 +66,12 @@ class Args:
         self.output_activation = 'Tanh'
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 17
+        self.train_data_n_frames = 9
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ''
-        self.train_batch_size = 1
-        self.eval_batch_size = 1
+        self.train_batch_size = 2
+        self.eval_batch_size = 2
         self.epochs = 1000
         self.log_path = './convlru_base/logs'
         self.ckpt_dir = './convlru_base/ckpt'
