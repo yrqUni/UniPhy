@@ -529,18 +529,16 @@ class ConvLRULayer(nn.Module):
         if S != W:
             nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch))
             lamb_r = torch.exp(torch.complex(-nu_r, theta_r))
-            z = self._project_to_square(h)
-            z = z * gamma_r.reshape(1,1,C,self.rank,1)
+            h = self._project_to_square(h)
+            h = h * gamma_r.reshape(1, 1, C, self.rank, 1)
             if last_hidden_in is not None:
-                last_h = last_hidden_in[:, -1:]
-                last_z = self._project_to_square(last_h)
-                z = torch.concat([last_z, z], dim=1)
+                h = torch.concat([last_hidden_in[:, -1:], h], dim=1)
                 B2, L2 = B, L+1
             if last_hidden_in is None:
                 B2, L2 = B, L
-            z = self.pscan(lamb_r.reshape(1,1,C,self.rank,1).expand(B2, L2, C, self.rank, 1), z)
-            last_hidden_out = self._deproject_from_square(z[:, -1:])
-            h = self._deproject_from_square(z)
+            h = self.pscan(lamb_r.reshape(1,1,C,self.rank,1).expand(B2, L2, C, self.rank, 1), h)
+            last_hidden_out = h[:, -1:]
+            h = self._deproject_from_square(h)
             h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
