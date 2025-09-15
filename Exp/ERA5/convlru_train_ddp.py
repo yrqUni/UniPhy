@@ -50,7 +50,7 @@ class Args:
         self.sh_gain_init = 0.0
         self.lru_rank = 64
         self.emb_ch = 128
-        self.freq_amp_mode = "linear"
+        self.freq_mode = "linear"
         self.convlru_num_blocks = 8
         self.hidden_factor = (10, 10)
         self.emb_hidden_ch = 152
