@@ -8,7 +8,6 @@ import glob
 import logging
 import datetime
 import warnings
-import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
 
@@ -262,18 +261,18 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
-    if rank == 0:
-        setup_logging(args)
-        logging.info("========== Training Arguments ==========")
-        for k, v in vars(args).items():
-            logging.info(f"{k}: {v}")
-        logging.info("========================================")
     if args.ckpt and os.path.isfile(args.ckpt):
         ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f'cuda:{local_rank}')
         if ckpt_model_args:
             print("[Args] applying model args from ckpt before building model.")
             logging.info("[Args] applying model args from ckpt before building model.")
             apply_model_args(args, ckpt_model_args, verbose=True)
+    if rank == 0:
+        setup_logging(args)
+        logging.info("==== Training Arguments (Updated) ====")
+        for k, v in vars(args).items():
+            logging.info(f"{k}: {v}")
+        logging.info("======================================")
 
     model = ConvLRU(args)
     model = model.cuda(local_rank)
