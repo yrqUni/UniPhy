@@ -81,7 +81,8 @@ class Args:
         self.lr = 1e-4
         self.use_scheduler = False
         self.init_lr_scheduler = False
-
+        self.loss = 'l1' 
+        
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = str(master_port)
@@ -277,7 +278,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
 
     model = ConvLRU(args)
     model = model.cuda(local_rank)
-
+    loss_fn = latitude_weighted_l1 if args.loss == 'lat' else torch.nn.L1Loss()
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
@@ -332,7 +333,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             preds = model(data[:, :-1], 'p')
             preds = preds[:, 1:]
             target = data[:, 2:]
-            loss = latitude_weighted_l1(preds, target)
+            loss = loss_fn(preds, target)
             loss.backward()
             opt.step()
             if args.use_scheduler:
@@ -369,7 +370,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
                     out_gen_num = data[:, args.eval_data_n_frames//2:].shape[1] // args.gen_factor
                     preds = model(data[:, :args.eval_data_n_frames//2], 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
-                    loss_eval = latitude_weighted_l1(preds, data[:, args.eval_data_n_frames//2:])
+                    loss_eval = loss_fn(preds, data[:, args.eval_data_n_frames//2:])
                     tot_tensor = torch.tensor(loss_eval.item(), device=f'cuda:{local_rank}')
                     dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
                     avg_total = tot_tensor.item() / world_size
