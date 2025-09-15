@@ -257,6 +257,8 @@ def latitude_weighted_l1(preds, targets):
 
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
+    if rank == 0:
+        setup_logging(args)
     if args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -268,7 +270,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             logging.info("[Args] applying model args from ckpt before building model.")
             apply_model_args(args, ckpt_model_args, verbose=True)
     if rank == 0:
-        setup_logging(args)
         logging.info("==== Training Arguments (Updated) ====")
         for k, v in vars(args).items():
             logging.info(f"{k}: {v}")
