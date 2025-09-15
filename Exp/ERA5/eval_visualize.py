@@ -24,13 +24,12 @@ ARGS = {
 MODEL_ARG_KEYS = [
     'input_size','input_ch','use_cbam','use_gate',
     'use_freq_prior','use_sh_prior','freq_rank','freq_gain_init',
-    'sh_Lmax','sh_rank','sh_gain_init','lru_rank',
-    'emb_ch','convlru_num_blocks','hidden_factor', 'freq_mode',
+    'sh_Lmax','sh_rank','sh_gain_init','lru_rank','freq_amp_mode',
+    'emb_ch','convlru_num_blocks','hidden_factor',
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',
     'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
-    'out_ch','gen_factor',
-    'hidden_activation','output_activation',
+    'out_ch','gen_factor', 'hidden_activation','output_activation',
 ]
 
 def extract_model_args_from_ckpt(ckpt_path, map_location):

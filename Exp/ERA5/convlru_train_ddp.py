@@ -45,12 +45,12 @@ class Args:
         self.use_sh_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
+        self.freq_amp_mode = "linear"
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
         self.lru_rank = 64
         self.emb_ch = 128
-        self.freq_mode = "linear"
         self.convlru_num_blocks = 8
         self.hidden_factor = (10, 10)
         self.emb_hidden_ch = 152
@@ -103,7 +103,7 @@ def keep_latest_ckpts(ckpt_dir):
 MODEL_ARG_KEYS = [
     'input_size','input_ch','use_cbam','use_gate',
     'use_freq_prior','use_sh_prior','freq_rank','freq_gain_init',
-    'sh_Lmax','sh_rank','sh_gain_init','lru_rank','freq_mode',
+    'sh_Lmax','sh_rank','sh_gain_init','lru_rank','freq_amp_mode',
     'emb_ch','convlru_num_blocks','hidden_factor',
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',

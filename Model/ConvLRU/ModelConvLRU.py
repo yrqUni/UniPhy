@@ -470,11 +470,11 @@ class ConvLRULayer(nn.Module):
             self.gate_conv = nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,1,1), padding='same'), nn.Sigmoid())
         self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
         self.use_sh_prior   = bool(getattr(args, "use_sh_prior", False))
-        self.freq_mode = str(getattr(args, "freq_mode", "linear")).lower()
+        self.freq_amp_mode = str(getattr(args, "freq_amp_mode", "linear")).lower()
         if self.use_freq_prior:
             freq_rank = int(getattr(args, "freq_rank", 8))
             freq_gain_init = float(getattr(args, "freq_gain_init", 0.0))
-            self.freq_prior = SpectralPrior2D(self.emb_ch, S, W, rank=freq_rank, gain_init=freq_gain_init, mode=self.freq_mode)
+            self.freq_prior = SpectralPrior2D(self.emb_ch, S, W, rank=freq_rank, gain_init=freq_gain_init, mode=self.freq_amp_mode)
         if not self.use_freq_prior:
             self.freq_prior = None
         if self.use_sh_prior:
