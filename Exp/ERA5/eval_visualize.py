@@ -25,7 +25,7 @@ MODEL_ARG_KEYS = [
     'input_size','input_ch','use_cbam','use_gate',
     'use_freq_prior','use_sh_prior','freq_rank','freq_gain_init',
     'sh_Lmax','sh_rank','sh_gain_init','lru_rank',
-    'emb_ch','convlru_num_blocks','hidden_factor', 'freq_amp_mode',
+    'emb_ch','convlru_num_blocks','hidden_factor', 'freq_mode',
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',
     'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
