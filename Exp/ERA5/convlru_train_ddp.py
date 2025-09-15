@@ -24,8 +24,8 @@ def set_random_seed(seed):
 
 set_random_seed(1017)
 
-sys.path.append('/nfs/temp/ConvLRU/Model/ConvLRU')
-sys.path.append('/nfs/temp/ConvLRU/Exp/ERA5')
+sys.path.append('/nfs/ConvLRU/Model/ConvLRU')
+sys.path.append('/nfs/ConvLRU/Exp/ERA5')
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
