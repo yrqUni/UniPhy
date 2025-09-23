@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import argparse
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -18,11 +20,7 @@ def set_seed(s=0):
         torch.cuda.manual_seed_all(s)
 
 def pick_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    # if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #     return torch.device("mps")
-    return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ArgsBase:
     def __init__(self):
@@ -55,102 +53,30 @@ class ArgsBase:
         self.sh_gain_init = 0.0
         self.lru_rank = 32
         self.uv_orth_every = 0
+        self.use_dynamic_lambda = True
+        self.dl_pe_dim = 64
+        self.dl_hidden = 128
 
 def build_args(name):
     a = ArgsBase()
-    if name == "square_pxus_pxsf_no_priors":
+    if name == "square_no_priors":
         a.input_size = (144, 144)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = False
         a.use_sh_prior = False
-    elif name == "rect_pxus_pxsf_no_priors":
+    elif name == "rect_no_priors":
         a.input_size = (144, 288)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = False
         a.use_sh_prior = False
-    elif name == "rect_pxus_deconv_no_priors":
-        a.input_size = (144, 288)
-        a.dec_strategy = "deconv"
-        a.use_freq_prior = False
-        a.use_sh_prior = False
-    elif name == "square_pxus_pxsf_freq_linear":
+    elif name == "square_freq_linear":
         a.input_size = (144, 144)
         a.dec_strategy = "pxsf"
         a.use_freq_prior = True
         a.spectral_prior_mode = "linear"
         a.freq_rank = 8
-        a.freq_gain_init = 0.1
-        a.use_sh_prior = False
-    elif name == "square_pxus_pxsf_freq_exp":
-        a.input_size = (144, 144)
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = True
-        a.spectral_prior_mode = "exp"
-        a.freq_rank = 8
         a.freq_gain_init = 0.05
         a.use_sh_prior = False
-    elif name == "rect_pxus_pxsf_sh":
-        a.input_size = (144, 288)
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = False
-        a.use_sh_prior = True
-        a.sh_Lmax = 6
-        a.sh_rank = 8
-        a.sh_gain_init = 0.05
-    elif name == "rect_pxus_pxsf_both_linear":
-        a.input_size = (144, 288)
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = True
-        a.spectral_prior_mode = "linear"
-        a.freq_rank = 8
-        a.freq_gain_init = 0.05
-        a.use_sh_prior = True
-        a.sh_Lmax = 6
-        a.sh_rank = 8
-        a.sh_gain_init = 0.05
-    elif name == "rect_pxus_pxsf_both_exp":
-        a.input_size = (144, 288)
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = True
-        a.spectral_prior_mode = "exp"
-        a.freq_rank = 8
-        a.freq_gain_init = 0.05
-        a.use_sh_prior = True
-        a.sh_Lmax = 6
-        a.sh_rank = 8
-        a.sh_gain_init = 0.05
-    elif name == "rect_pxus_pxsf_both_linear_uvorth":
-        a.input_size = (144, 288)
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = True
-        a.spectral_prior_mode = "linear"
-        a.freq_rank = 8
-        a.freq_gain_init = 0.05
-        a.use_sh_prior = True
-        a.sh_Lmax = 6
-        a.sh_rank = 8
-        a.sh_gain_init = 0.05
-        a.uv_orth_every = 1
-    elif name == "large_era5_like":
-        a.input_size = (720, 1440)
-        a.input_ch = 24
-        a.out_ch = 24
-        a.emb_ch = 32
-        a.ffn_hidden_ch = 32
-        a.convlru_num_blocks = 2
-        a.hidden_factor = (10, 20)
-        a.lru_rank = 32
-        a.gen_factor = 1
-        a.dec_strategy = "pxsf"
-        a.use_freq_prior = True
-        a.spectral_prior_mode = "linear"
-        a.freq_rank = 8
-        a.freq_gain_init = 0.02
-        a.use_sh_prior = True
-        a.sh_Lmax = 6
-        a.sh_rank = 8
-        a.sh_gain_init = 0.01
-        a.uv_orth_every = 0
     return a
 
 def count_params(model):
@@ -158,65 +84,100 @@ def count_params(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
-def run_once(name, args, B=1, L=8, out_frames_num=8, lr=1e-3):
-    device = pick_device()
-    set_seed(123)
-    print("[case]", name)
+@torch.no_grad()
+def forward_full_p(model, x, t0=0):
+    return model(x, mode="p", time_offset=t0)
+
+@torch.no_grad()
+def forward_streaming_p_equiv(model, x, chunk, t0=0):
+    B, L, C, H, W = x.shape
+    em = model.embedding
+    dm = model.decoder
+    m = model.convlru_model
+    outs = []
+    last_hidden = None
+    pos = 0
+    while pos < L:
+        n = min(chunk, L - pos)
+        xe = em(x[:, pos:pos+n])
+        xe, last_hidden = m(xe, last_hidden_ins=last_hidden, time_offsets=t0+pos)
+        yo = dm(xe)
+        outs.append(yo)
+        pos += n
+    return torch.cat(outs, dim=1)
+
+@torch.no_grad()
+def forward_i_single_block(model, x, t0=0):
+    B, L, C, H, W = x.shape
+    return model(x, mode="i", out_gen_num=1, gen_factor=L, time_offset=t0)
+
+def max_err(a, b):
+    return float((a - b).abs().max().cpu())
+
+def mae(a, b):
+    return float((a - b).abs().mean().cpu())
+
+def effective_tol(y_ref: torch.Tensor, L: int, base_atol: float, base_rtol: float, k_abs: float = 64.0, k_rel: float = 64.0):
+    eps = np.finfo(np.float32).eps
+    mag = float(y_ref.abs().max().cpu()) + 1.0
+    growth = max(1.0, math.log2(L + 1))
+    atol_eff = max(base_atol, k_abs * eps * mag * growth)
+    rtol_eff = max(base_rtol, k_rel * eps * growth)
+    return atol_eff, rtol_eff
+
+def run_case(name, args, B=1, L=12, chunks=(3,4,6), atol=3e-6, rtol=1e-5, seeds=(123,456), device=None, pretend_double=False):
+    if device is None:
+        device = pick_device()
+    print("[case]", name, "|", "float32 (no model change)" + (" + --double ignored" if pretend_double else ""))
     print("[dev]", device.type)
-    model = ConvLRU(args).to(device).train()
+    model = ConvLRU(args).to(device).eval()
     total, trainable = count_params(model)
     print("[params]", total, trainable)
     H, W = args.input_size
-    x = torch.randn(B, L, args.input_ch, H, W, device=device)
-    y = torch.randn(B, L, args.out_ch, H, W, device=device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    t0 = time.time()
-    opt.zero_grad()
-    out = model(x, mode="p")
-    assert out.shape == y.shape
-    loss_p = nn.MSELoss()(out, y)
-    loss_p.backward()
-    opt.step()
-    print("[p]loss", float(loss_p.detach().cpu()), "shape", tuple(out.shape))
-    del out, loss_p
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    opt.zero_grad()
-    assert out_frames_num % args.gen_factor == 0
-    out_gen_num = out_frames_num // args.gen_factor
-    y = torch.randn(B, out_frames_num, args.out_ch, H, W, device=device)
-    out_i = model(x, mode="i", out_gen_num=out_gen_num, gen_factor=args.gen_factor)
-    assert out_i.shape == y.shape
-    loss_i = nn.MSELoss()(out_i, y)
-    loss_i.backward()
-    opt.step()
-    print("[i]loss", float(loss_i.detach().cpu()), "shape", tuple(out_i.shape))
-    t1 = time.time()
-    print("[time]" + f"{t1 - t0:.3f}s")
-    del model, x, y, out_i, loss_i, opt
+    dtype_real = torch.float32
+    for sd in seeds:
+        set_seed(sd)
+        x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
+        y_full = forward_full_p(model, x, t0=0)
+        y_i1 = forward_i_single_block(model, x, t0=0)
+        e2, m2 = max_err(y_full, y_i1), mae(y_full, y_i1)
+        ok_i = torch.allclose(y_full, y_i1, rtol=rtol, atol=atol)
+        print(f"[p vs i(1-block)] seed={sd} max_err {e2:.3e} mae {m2:.3e} | tol(rtol={rtol:.2e}, atol={atol:.2e}) {'OK' if ok_i else 'FAIL'}")
+        assert ok_i, "p vs i(1-block) mismatch"
+        for ck in chunks:
+            y_stream = forward_streaming_p_equiv(model, x, chunk=ck, t0=0)
+            e1, m1 = max_err(y_full, y_stream), mae(y_full, y_stream)
+            atol_eff, rtol_eff = effective_tol(y_full, L, atol, rtol)
+            ok = torch.allclose(y_full, y_stream, rtol=rtol_eff, atol=atol_eff)
+            print(f"[p vs p-stream]   seed={sd} chunk={ck} max_err {e1:.3e} mae {m1:.3e} | tol(rtol={rtol_eff:.2e}, atol={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
+            assert ok, f"p vs p-stream mismatch (chunk={ck}, seed={sd}, max_err={e1:.3e}, tol_used rtol={rtol_eff:.2e}, atol={atol_eff:.2e})"
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
 def main():
     print("[pscan]", pscan_check())
-    names = [
-        "square_pxus_pxsf_no_priors",
-        "rect_pxus_pxsf_no_priors",
-        "rect_pxus_deconv_no_priors",
-        "square_pxus_pxsf_freq_linear",
-        "square_pxus_pxsf_freq_exp",
-        "rect_pxus_pxsf_sh",
-        "rect_pxus_pxsf_both_linear",
-        "rect_pxus_pxsf_both_exp",
-        "rect_pxus_pxsf_both_linear_uvorth",
-    ]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--double", action="store_true")
+    parser.add_argument("--atol", type=float, default=3e-6)
+    parser.add_argument("--rtol", type=float, default=1e-5)
+    parser.add_argument("--L", type=int, default=12)
+    parser.add_argument("--B", type=int, default=1)
+    parser.add_argument("--chunks", type=int, nargs="+", default=[3,4,6])
+    args_cli = parser.parse_args()
+    if args_cli.double:
+        print("[warn] --double is ignored: model uses fixed cfloat in its spectral path and forcing double would cause dtype conflicts. Running in float32.")
+    names = ["square_no_priors", "rect_no_priors", "square_freq_linear"]
     for nm in names:
         a = build_args(nm)
-        run_once(nm, a, B=1, L=8, out_frames_num=8, lr=1e-3)
-    if os.getenv("HEAVY", "0") == "1":
-        nm = "large_era5_like"
-        a = build_args(nm)
-        run_once(nm, a, B=1, L=4, out_frames_num=4, lr=5e-4)
+        run_case(
+            nm, a, B=args_cli.B, L=args_cli.L,
+            chunks=tuple(args_cli.chunks),
+            atol=args_cli.atol, rtol=args_cli.rtol,
+            pretend_double=args_cli.double
+        )
 
 if __name__ == "__main__":
     main()

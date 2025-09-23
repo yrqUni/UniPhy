@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
 from pscan import PScan, pscan_check
@@ -42,6 +43,37 @@ def deconv3d_bilinear_init_(weight):
         for i in range(c):
             weight[i, i, 0, :, :] = kernel
     return weight
+
+class SinusoidalPE(nn.Module):
+    def __init__(self, d_pe: int):
+        super().__init__()
+        assert d_pe % 2 == 0
+        self.d_pe = d_pe
+    def forward(self, L: int, *, t0: int = 0, device=None, dtype=None):
+        if device is None: device = torch.device('cpu')
+        if dtype is None: dtype = torch.get_default_dtype()
+        pe = torch.zeros(L, self.d_pe, device=device, dtype=dtype)
+        position = torch.arange(t0, t0 + L, device=device, dtype=dtype).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_pe, 2, device=device, dtype=dtype) * (-math.log(10000.0) / self.d_pe))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+
+class LambdaModulator(nn.Module):
+    def __init__(self, d_pe: int = 64, hidden: int = 128):
+        super().__init__()
+        self.pe = SinusoidalPE(d_pe)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_pe, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 2)
+        )
+    def forward(self, L: int, *, t0: int = 0, device, dtype):
+        pe = self.pe(L, t0=t0, device=device, dtype=dtype)
+        delta = self.mlp(pe)
+        dnu = F.softplus(delta[:, 0])
+        dth = delta[:, 1]
+        return dnu, dth
 
 class SpectralPrior2D(nn.Module):
     def __init__(self, channels: int, S: int, W: int, rank: int = 8, gain_init: float = 0.0, mode: str = "linear"):
@@ -218,41 +250,42 @@ class ConvLRU(nn.Module):
             for n, p in self.named_parameters():
                 if should_skip(n): continue
                 if n.endswith('.bias'):
-                    if torch.is_complex(p):
-                        p.copy_(torch.zeros_like(p))
-                    if not torch.is_complex(p):
-                        p.zero_()
+                    if torch.is_complex(p): p.copy_(torch.zeros_like(p))
+                    else: p.zero_()
                     continue
                 if torch.is_complex(p):
                     p.real.uniform_(2*l-1, 2*u-1); p.imag.uniform_(2*l-1, 2*u-1)
                     p.real.erfinv_(); p.imag.erfinv_()
                     p.real.mul_(std*math.sqrt(2.)); p.imag.mul_(std*math.sqrt(2.))
                     p.real.add_(mean); p.imag.add_(mean)
-                if not torch.is_complex(p):
+                else:
                     p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*math.sqrt(2.)); p.add_(mean)
-    def forward(self, x, mode, out_gen_num=None, gen_factor=None):
+    def forward(self, x, mode, out_gen_num=None, gen_factor=None, time_offset: int = 0):
         assert mode in ['p', 'i']
         if mode == 'p':
             x = self.embedding(x)
-            x, _ = self.convlru_model(x, last_hidden_ins=None)
+            x, _ = self.convlru_model(x, last_hidden_ins=None, time_offsets=time_offset)
             x = self.decoder(x)
             x = self.out_activation(x)
             return x
         if mode == 'i':
             assert getattr(self.args, "input_ch", 1) == getattr(self.args, "out_ch", 1)
             out = []
+            cur_t0 = int(time_offset)
             x = self.embedding(x)
-            x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
+            x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None, time_offsets=cur_t0)
             x = self.decoder(x)
             x = x[:, -gen_factor:]
             x = self.out_activation(x)
             out.append(x)
+            cur_t0 += x.size(1)
             for _ in range(out_gen_num - 1):
                 x = self.embedding(x)
-                x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
+                x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs, time_offsets=cur_t0)
                 x = self.decoder(x)[:, -gen_factor:]
                 x = self.out_activation(x)
                 out.append(x)
+                cur_t0 += x.size(1)
             return torch.concat(out, dim=1)
 
 class Conv_hidden(nn.Module):
@@ -412,16 +445,16 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = getattr(args, "convlru_num_blocks", 1)
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
-    def forward(self, x, last_hidden_ins=None):
+    def forward(self, x, last_hidden_ins=None, time_offsets=None):
         last_hidden_outs = []
-        idx = 0
-        for convlru_block in self.convlru_blocks:
-            if last_hidden_ins is not None:
-                x, last_hidden_out = convlru_block(x, last_hidden_ins[idx])
-            if last_hidden_ins is None:
-                x, last_hidden_out = convlru_block(x, None)
+        if isinstance(time_offsets, (int, float)) or time_offsets is None:
+            time_offsets = [int(time_offsets or 0)] * len(self.convlru_blocks)
+        assert len(time_offsets) == len(self.convlru_blocks)
+        for idx, convlru_block in enumerate(self.convlru_blocks):
+            t0 = int(time_offsets[idx])
+            last_in = None if last_hidden_ins is None else last_hidden_ins[idx]
+            x, last_hidden_out = convlru_block(x, last_in, time_offset=t0)
             last_hidden_outs.append(last_hidden_out)
-            idx += 1
         return x, last_hidden_outs
 
 class ConvLRUBlock(nn.Module):
@@ -429,8 +462,8 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-    def forward(self, x, last_hidden_in):
-        x, last_hidden_out = self.lru_layer(x, last_hidden_in)
+    def forward(self, x, last_hidden_in, time_offset: int = 0):
+        x, last_hidden_out = self.lru_layer(x, last_hidden_in, time_offset=time_offset)
         x = self.feed_forward(x)
         return x, last_hidden_out
 
@@ -444,6 +477,13 @@ class ConvLRULayer(nn.Module):
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         S, W = self.hidden_size
         self.rank = int(getattr(args, "lru_rank", min(S, W, 32)))
+        self.use_dynamic_lambda = bool(getattr(args, "use_dynamic_lambda", False))
+        self.dl_pe_dim = int(getattr(args, "dl_pe_dim", 64))
+        self.dl_hidden = int(getattr(args, "dl_hidden", 128))
+        if self.use_dynamic_lambda:
+            self.lambda_mod = LambdaModulator(self.dl_pe_dim, self.dl_hidden)
+        else:
+            self.lambda_mod = None
         u1_s = torch.rand(self.emb_ch, S)
         u2_s = torch.rand(self.emb_ch, S)
         nu_s_log = torch.log(-0.5 * torch.log(u1_s * (self.r_max ** 2 - self.r_min ** 2) + self.r_min ** 2))
@@ -470,19 +510,19 @@ class ConvLRULayer(nn.Module):
             self.gate_conv = nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,1,1), padding='same'), nn.Sigmoid())
         self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
         self.use_sh_prior   = bool(getattr(args, "use_sh_prior", False))
-        self.freq_mode = str(getattr(args, "freq_mode", "linear")).lower()
+        self.freq_amp_mode = str(getattr(args, "freq_amp_mode", "linear")).lower()
         if self.use_freq_prior:
             freq_rank = int(getattr(args, "freq_rank", 8))
             freq_gain_init = float(getattr(args, "freq_gain_init", 0.0))
-            self.freq_prior = SpectralPrior2D(self.emb_ch, S, W, rank=freq_rank, gain_init=freq_gain_init, mode=self.freq_mode)
-        if not self.use_freq_prior:
+            self.freq_prior = SpectralPrior2D(self.emb_ch, S, W, rank=freq_rank, gain_init=freq_gain_init, mode=self.freq_amp_mode)
+        else:
             self.freq_prior = None
         if self.use_sh_prior:
             Lmax = int(getattr(args, "sh_Lmax", 6))
             sh_rank = int(getattr(args, "sh_rank", 8))
             sh_gain_init = float(getattr(args, "sh_gain_init", 0.0))
             self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, S, W, Lmax=Lmax, rank=sh_rank, gain_init=sh_gain_init)
-        if not self.use_sh_prior:
+        else:
             self.sh_prior = None
         self.pscan = PScan.apply
     def _project_to_square(self, h):
@@ -503,22 +543,50 @@ class ConvLRULayer(nn.Module):
         h_cat = torch.cat([hr, hi], dim=2)
         h_out = self.post_ifft_proj(h_cat.permute(0,2,1,3,4)).permute(0,2,1,3,4)
         return h_out
-    def convlru(self, x, last_hidden_in):
+    def _build_lambda_sequence_square(self, B, L, C, S, device, dtype, last_hidden_in, time_offset: int):
+        nu_s, theta_s, gamma_s = torch.exp(self.params_log_square).split((self.emb_ch, self.emb_ch, self.emb_ch))
+        if not self.use_dynamic_lambda:
+            lamb = torch.exp(torch.complex(-nu_s, theta_s))
+            L2 = L + 1 if last_hidden_in is not None else L
+            lamb_seq = lamb.view(1,1,C,S,1).expand(B, L2, C, S, 1).to(device=device, dtype=torch.cfloat)
+            return lamb_seq, gamma_s
+        dnu, dth = self.lambda_mod(L, t0=time_offset, device=device, dtype=nu_s.dtype)
+        nu_t = nu_s.view(1, C, S) + dnu.view(L, 1, 1)
+        th_t = theta_s.view(1, C, S) + dth.view(L, 1, 1)
+        lamb_t = torch.exp(torch.complex(-nu_t, th_t))
+        if last_hidden_in is not None:
+            lamb_t = torch.cat([lamb_t[:1, ...], lamb_t], dim=0)
+        lamb_seq = lamb_t.view(1, -1, C, S, 1).expand(B, -1, C, S, 1).to(device=device, dtype=torch.cfloat)
+        return lamb_seq, gamma_s
+    def _build_lambda_sequence_rank(self, B, L, C, R, device, dtype, last_hidden_in, time_offset: int):
+        nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch))
+        if not self.use_dynamic_lambda:
+            lamb = torch.exp(torch.complex(-nu_r, theta_r))
+            L2 = L + 1 if last_hidden_in is not None else L
+            lamb_seq = lamb.view(1,1,C,R,1).expand(B, L2, C, R, 1).to(device=device, dtype=torch.cfloat)
+            return lamb_seq, gamma_r
+        dnu, dth = self.lambda_mod(L, t0=time_offset, device=device, dtype=nu_r.dtype)
+        nu_t = nu_r.view(1, C, R) + dnu.view(L, 1, 1)
+        th_t = theta_r.view(1, C, R) + dth.view(L, 1, 1)
+        lamb_t = torch.exp(torch.complex(-nu_t, th_t))
+        if last_hidden_in is not None:
+            lamb_t = torch.cat([lamb_t[:1, ...], lamb_t], dim=0)
+        lamb_seq = lamb_t.view(1, -1, C, R, 1).expand(B, -1, C, R, 1).to(device=device, dtype=torch.cfloat)
+        return lamb_seq, gamma_r
+    def convlru(self, x, last_hidden_in, time_offset: int = 0):
         B, L, C, S, W = x.size()
+        device = x.device
         h = torch.fft.fft2(x.to(torch.cfloat), dim=(-2, -1), norm='ortho')
         h = self.proj_B(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
         if self.use_freq_prior:
             h = self.freq_prior(h)
         if S == W:
             nu_s, theta_s, gamma_s = torch.exp(self.params_log_square).split((self.emb_ch, self.emb_ch, self.emb_ch))
-            lamb_s = torch.exp(torch.complex(-nu_s, theta_s))
             h = h * gamma_s.reshape(1,1,C,S,1)
             if last_hidden_in is not None:
                 h = torch.concat([last_hidden_in[:, -1:], h], dim=1)
-                B2, L2 = B, L+1
-            if last_hidden_in is None:
-                B2, L2 = B, L
-            h = self.pscan(lamb_s.reshape(1,1,C,S,1).expand(B2, L2, C, S, 1), h)
+            lamb_seq, _ = self._build_lambda_sequence_square(B, L, C, S, device, h.dtype, last_hidden_in, time_offset)
+            h = self.pscan(lamb_seq, h)
             last_hidden_out = h[:, -1:]
             h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
@@ -526,19 +594,16 @@ class ConvLRULayer(nn.Module):
             h = self.layer_norm(h)
             if last_hidden_in is not None:
                 h = h[:, 1:]
-        if S != W:
+        else:
             nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch))
-            lamb_r = torch.exp(torch.complex(-nu_r, theta_r))
-            h = self._project_to_square(h)
-            h = h * gamma_r.reshape(1, 1, C, self.rank, 1)
+            z = self._project_to_square(h)
+            z = z * gamma_r.reshape(1, 1, C, self.rank, 1)
             if last_hidden_in is not None:
-                h = torch.concat([last_hidden_in[:, -1:], h], dim=1)
-                B2, L2 = B, L+1
-            if last_hidden_in is None:
-                B2, L2 = B, L
-            h = self.pscan(lamb_r.reshape(1,1,C,self.rank,1).expand(B2, L2, C, self.rank, 1), h)
-            last_hidden_out = h[:, -1:]
-            h = self._deproject_from_square(h)
+                z = torch.concat([last_hidden_in[:, -1:], z], dim=1)
+            lamb_seq, _ = self._build_lambda_sequence_rank(B, L, C, self.rank, device, z.dtype, last_hidden_in, time_offset)
+            z = self.pscan(lamb_seq, z)
+            last_hidden_out = z[:, -1:]
+            h = self._deproject_from_square(z)
             h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
@@ -550,11 +615,11 @@ class ConvLRULayer(nn.Module):
         if self.gate_conv is not None:
             gate = self.gate_conv(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
             x = (1 - gate) * x + gate * h
-        if self.gate_conv is None:
+        else:
             x = x + h
         return x, last_hidden_out
-    def forward(self, x, last_hidden_in):
-        x, last_hidden_out = self.convlru(x, last_hidden_in)
+    def forward(self, x, last_hidden_in, time_offset: int = 0):
+        x, last_hidden_out = self.convlru(x, last_hidden_in, time_offset=time_offset)
         return x, last_hidden_out
 
 class FeedForward(nn.Module):
