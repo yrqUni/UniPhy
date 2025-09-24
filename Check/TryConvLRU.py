@@ -9,6 +9,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../Model/ConvLRU"))
 from ModelConvLRU import ConvLRU
 from pscan import pscan_check
 
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.use_deterministic_algorithms(True)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 def set_seed(s=0):
     import random
     random.seed(s)
@@ -50,17 +55,10 @@ class ArgsBase:
         self.sh_rank = 8
         self.sh_gain_init = 0.0
         self.lru_rank = 32
-        self.dynamic_lambda = True
-        self.lambda_mix = 1.0
-        self.dyn_r_min = 0.80
-        self.dyn_r_max = 0.99
+        self.lambda_type = "exogenous"
 
-def build_args(name, dynamic_lambda=True, lambda_mix=1.0, dyn_r_min=0.80, dyn_r_max=0.99):
+def build_args(name):
     a = ArgsBase()
-    a.dynamic_lambda = bool(dynamic_lambda)
-    a.lambda_mix = float(lambda_mix)
-    a.dyn_r_min = float(dyn_r_min)
-    a.dyn_r_max = float(dyn_r_max)
     if name == "square_no_priors":
         a.input_size = (144, 144)
         a.dec_strategy = "pxsf"
@@ -167,20 +165,11 @@ def main():
     parser.add_argument("--L", type=int, default=12)
     parser.add_argument("--B", type=int, default=1)
     parser.add_argument("--chunks", type=int, nargs="+", default=[3,4,6])
-    parser.add_argument("--dynamic", action="store_true")
-    parser.add_argument("--lambda_mix", type=float, default=1.0)
-    parser.add_argument("--dyn_r_min", type=float, default=0.80)
-    parser.add_argument("--dyn_r_max", type=float, default=0.99)
     args_cli = parser.parse_args()
+
     names = ["square_no_priors", "rect_no_priors", "square_freq_linear"]
     for nm in names:
-        a = build_args(
-            nm,
-            dynamic_lambda=args_cli.dynamic,
-            lambda_mix=args_cli.lambda_mix,
-            dyn_r_min=args_cli.dyn_r_min,
-            dyn_r_max=args_cli.dyn_r_max
-        )
+        a = build_args(nm)
         run_case(
             nm, a, B=args_cli.B, L=args_cli.L,
             chunks=tuple(args_cli.chunks),
