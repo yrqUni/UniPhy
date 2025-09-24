@@ -36,8 +36,8 @@ from tqdm import tqdm
 
 class Args:
     def __init__(self):
-        self.input_size = (720, 1440)
-        self.input_ch = 26
+        self.input_size = (721, 1440)
+        self.input_ch = 30
         self.use_cbam = True
         self.use_gate = True
         self.use_freq_prior = True
@@ -48,29 +48,29 @@ class Args:
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
-        self.lru_rank = 64
-        self.emb_ch = 128
+        self.lru_rank = 128
+        self.emb_ch = 240
         self.convlru_num_blocks = 8
-        self.hidden_factor = (10, 10)
-        self.emb_hidden_ch = 152
+        self.hidden_factor = (7, 10)
+        self.emb_hidden_ch = 240
         self.emb_hidden_layers_num = 2
         self.emb_strategy = 'pxus'
-        self.ffn_hidden_ch = 152
+        self.ffn_hidden_ch = 240
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
-        self.out_ch = 26
+        self.out_ch = 30
         self.gen_factor = 1
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 9
+        self.train_data_n_frames = 13
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ''
-        self.train_batch_size = 2
-        self.eval_batch_size = 2
+        self.train_batch_size = 1
+        self.eval_batch_size = 1
         self.epochs = 1000
         self.log_path = './convlru_base/logs'
         self.ckpt_dir = './convlru_base/ckpt'
@@ -81,8 +81,8 @@ class Args:
         self.lr = 1e-4
         self.use_scheduler = False
         self.init_lr_scheduler = False
-        self.loss = 'l1' 
-        
+        self.loss = 'l1'
+
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = str(master_port)
@@ -283,6 +283,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         print(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
+
         logging.info(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
 
     if args.use_compile:
@@ -329,7 +330,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad()
-            data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
+            data = data.cuda(local_rank).to(torch.float32)[:, :, :, :, :]
             preds = model(data[:, :-1], 'p')
             preds = preds[:, 1:]
             target = data[:, 2:]
@@ -367,8 +368,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     num_workers=1, pin_memory=True, prefetch_factor=1)
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, 1:, :]
+                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, :, :]
                     out_gen_num = data[:, args.eval_data_n_frames//2:].shape[1] // args.gen_factor
+
                     preds = model(data[:, :args.eval_data_n_frames//2], 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
                     loss_eval = loss_fn(preds, data[:, args.eval_data_n_frames//2:])
                     tot_tensor = torch.tensor(loss_eval.item(), device=f'cuda:{local_rank}')
