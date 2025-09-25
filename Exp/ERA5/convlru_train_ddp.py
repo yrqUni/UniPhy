@@ -60,7 +60,6 @@ class Args:
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
         self.out_ch = 30
-        self.gen_factor = 1
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
         self.data_root = '/nfs/ERA5_data/data_norm'
@@ -108,7 +107,7 @@ MODEL_ARG_KEYS = [
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',
     'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
-    'out_ch','gen_factor', 'hidden_activation','output_activation',
+    'out_ch','hidden_activation','output_activation',
 ]
 
 def extract_model_args(args_obj):
@@ -275,7 +274,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for k, v in vars(args).items():
             logging.info(f"{k}: {v}")
         logging.info("======================================")
-
     model = ConvLRU(args)
     model = model.cuda(local_rank)
     loss_fn = latitude_weighted_l1 if args.loss == 'lat' else torch.nn.L1Loss()
@@ -283,13 +281,10 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         print(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
-
         logging.info(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
-
     if args.use_compile:
         model = torch.compile(model, mode="default")
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-
     train_dataset = ERA5_Dataset(
         input_dir=args.data_root, year_range=args.year_range,
         is_train=True, sample_len=args.train_data_n_frames,
@@ -303,7 +298,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     del train_dataset, train_sampler, train_dataloader
     gc.collect()
     torch.cuda.empty_cache()
-
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 0
     scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=len(list(range(start_epoch, args.epochs))))
@@ -314,7 +308,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     if not args.use_scheduler:
         for g in opt.param_groups:
             g['lr'] = args.lr
-
     for ep in range(start_epoch, args.epochs):
         train_dataset = ERA5_Dataset(
             input_dir=args.data_root, year_range=args.year_range,
@@ -331,7 +324,10 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             model.train()
             opt.zero_grad()
             data = data.cuda(local_rank).to(torch.float32)[:, :, :, :, :]
-            preds = model(data[:, :-1], 'p')
+            x = data[:, :-1]
+            B, L, C, H, W = x.shape
+            listT = torch.full((B, L), 6.0, device=x.device, dtype=x.dtype)
+            preds = model(x, 'p', listT=listT)
             preds = preds[:, 1:]
             target = data[:, 2:]
             loss = loss_fn(preds, target)
@@ -353,7 +349,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         gc.collect()
         torch.cuda.empty_cache()
         dist.barrier()
-
         if args.do_eval:
             model.eval()
             with torch.no_grad():
@@ -369,10 +364,14 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
                     data = data.cuda(local_rank).to(torch.float32)[:, :, :, :, :]
-                    out_gen_num = data[:, args.eval_data_n_frames//2:].shape[1] // args.gen_factor
-
-                    preds = model(data[:, :args.eval_data_n_frames//2], 'i', out_gen_num=out_gen_num, gen_factor=args.gen_factor)
-                    loss_eval = loss_fn(preds, data[:, args.eval_data_n_frames//2:])
+                    half = args.eval_data_n_frames // 2
+                    cond = data[:, :half]
+                    B, Lc, C, H, W = cond.shape
+                    listT_cond = torch.full((B, Lc), 6.0, device=cond.device, dtype=cond.dtype)
+                    out_gen_num = data.shape[1] - half
+                    listT_future = torch.full((B, out_gen_num), 6.0, device=cond.device, dtype=cond.dtype)
+                    preds = model(cond, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
+                    loss_eval = loss_fn(preds, data[:, half:])
                     tot_tensor = torch.tensor(loss_eval.item(), device=f'cuda:{local_rank}')
                     dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
                     avg_total = tot_tensor.item() / world_size
