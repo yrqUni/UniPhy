@@ -43,7 +43,6 @@ class ArgsBase:
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
         self.dec_strategy = 'pxsf'
-        self.gen_factor = 2
         self.hidden_activation = 'ReLU'
         self.output_activation = 'Identity'
         self.use_freq_prior = False
@@ -85,11 +84,15 @@ def count_params(model):
     return total, trainable
 
 @torch.no_grad()
-def forward_full_p(model, x):
-    return model(x, mode="p")
+def forward_full_p(model, x, listT=None):
+    return model(x, mode="p", listT=listT)
 
 @torch.no_grad()
-def forward_streaming_p_equiv(model, x, chunk):
+def forward_streaming_p_equiv(model, x, chunk, listT=None):
+    """
+    将 [B,L,...] 按 chunk 分块，在 embedding->convlru->decoder 级别流式前推，
+    并传入对应切片的 listT，验证与一次性 'p' 前向等价。
+    """
     B, L, C, H, W = x.shape
     em = model.embedding
     dm = model.decoder
@@ -100,16 +103,14 @@ def forward_streaming_p_equiv(model, x, chunk):
     while pos < L:
         n = min(chunk, L - pos)
         xe = em(x[:, pos:pos+n])
-        xe, last_hidden = m(xe, last_hidden_ins=last_hidden)
+        listT_slice = None
+        if listT is not None:
+            listT_slice = listT[:, pos:pos+n]  # [B, n]
+        xe, last_hidden = m(xe, last_hidden_ins=last_hidden, listT=listT_slice)
         yo = dm(xe)
         outs.append(yo)
         pos += n
     return torch.cat(outs, dim=1)
-
-@torch.no_grad()
-def forward_i_single_block(model, x):
-    B, L, C, H, W = x.shape
-    return model(x, mode="i", out_gen_num=1, gen_factor=L)
 
 def max_err(a, b):
     return float((a - b).abs().max().cpu())
@@ -135,24 +136,37 @@ def run_case(name, args, B=1, L=12, chunks=(3,4,6), atol=3e-6, rtol=1e-5, seeds=
     print("[params]", total, trainable)
     H, W = args.input_size
     dtype_real = torch.float32
+
     for sd in seeds:
         set_seed(sd)
         x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
-        y_full = forward_full_p(model, x)
-        y_i1 = forward_i_single_block(model, x)
-        e2, m2 = max_err(y_full, y_i1), mae(y_full, y_i1)
-        ok_i = torch.allclose(y_full, y_i1, rtol=rtol, atol=atol)
-        print(f"[p vs i(1-block)] seed={sd} max_err {e2:.3e} mae {m2:.3e} | tol(rtol={rtol:.2e}, atol={atol:.2e}) {'OK' if ok_i else 'FAIL'}")
-        assert ok_i, "p vs i(1-block) mismatch"
+
+        # ---- Δt: 这里选择全1；如需非均匀，可改成 rand 正数，比如：0.2~1.2
+        listT = torch.ones(B, L, device=device, dtype=dtype_real)
+
+        # --- baseline: 全序列一次性 'p'
+        y_full = forward_full_p(model, x, listT=listT)
+
+        # --- p vs streaming-p 等价性（严格校验）
         for ck in chunks:
-            y_stream = forward_streaming_p_equiv(model, x, chunk=ck)
+            y_stream = forward_streaming_p_equiv(model, x, chunk=ck, listT=listT)
             e1, m1 = max_err(y_full, y_stream), mae(y_full, y_stream)
             atol_eff, rtol_eff = effective_tol(y_full, L, atol, rtol)
             ok = torch.allclose(y_full, y_stream, rtol=rtol_eff, atol=atol_eff)
-            print(f"[p vs p-stream]   seed={sd} chunk={ck} max_err {e1:.3e} mae {m1:.3e} | tol(rtol={rtol_eff:.2e}, atol={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
+            print(f"[p vs p-stream] seed={sd} chunk={ck} max_err {e1:.3e} mae {m1:.3e} | tol(rtol={rtol_eff:.2e}, atol={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
             assert ok, f"p vs p-stream mismatch (chunk={ck}, seed={sd}, max_err={e1:.3e}, tol_used rtol={rtol_eff:.2e}, atol={atol_eff:.2e})"
+
+        # --- i 模式健壮性检查（不与 p 做等价性比较）
+        out_gen_num = 3
+        listT_future = torch.ones(B, out_gen_num, device=device, dtype=dtype_real)
+        y_i = model(x, mode="i", out_gen_num=out_gen_num, listT=listT, listT_future=listT_future)
+        assert y_i.shape == (B, out_gen_num, args.out_ch, H, W), f"i-mode output shape mismatch: got {tuple(y_i.shape)}"
+        assert torch.isfinite(y_i).all(), "i-mode produced NaN/Inf"
+        print(f"[i-mode] seed={sd} out_gen_num={out_gen_num} shape OK, finite OK")
+
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()

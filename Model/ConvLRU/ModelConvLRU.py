@@ -1,3 +1,4 @@
+# ModelConvLRU.py
 import torch
 import torch.nn as nn
 import math
@@ -230,30 +231,68 @@ class ConvLRU(nn.Module):
                     p.real.add_(mean); p.imag.add_(mean)
                 else:
                     p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*math.sqrt(2.)); p.add_(mean)
-    def forward(self, x, mode, out_gen_num=None, gen_factor=None):
+    @torch.no_grad()
+    def _default_dt_like(self, x, listT, fill_last=False, out_gen_num=None):
+        """
+        Create default Δt if None. For predict mode: ones of length L.
+        For generate mode (fill_last=True): if listT is not None, use last Δt for K steps (out_gen_num),
+        else use 1.0.
+        """
+        if not fill_last:
+            if listT is None:
+                return torch.ones(x.size(0), x.size(1), device=x.device, dtype=x.dtype)
+            return listT
+        # future dt
+        K = out_gen_num if out_gen_num is not None else 1
+        if listT is not None:
+            last = listT[:, -1].unsqueeze(1)  # [B,1]
+            return last.repeat(1, K)
+        return torch.ones(x.size(0), K, device=x.device, dtype=x.dtype)
+
+    def forward(self, x, mode, out_gen_num=None, listT=None, listT_future=None):
+        """
+        x: [B, L, C, H, W]
+        mode: 'p' (predict) or 'i' (incremental/generate)
+        listT: [B, L] Δt for input sequence; if None, defaults to ones.
+        listT_future: [B, out_gen_num] Δt for generation steps; if None, reuse last Δt of listT.
+        """
         assert mode in ['p', 'i']
         if mode == 'p':
+            listT_eff = self._default_dt_like(x, listT, fill_last=False)
             x = self.embedding(x)
-            x, _ = self.convlru_model(x, last_hidden_ins=None)
+            x, _ = self.convlru_model(x, last_hidden_ins=None, listT=listT_eff)
             x = self.decoder(x)
             x = self.out_activation(x)
             return x
-        if mode == 'i':
-            assert getattr(self.args, "input_ch", 1) == getattr(self.args, "out_ch", 1)
-            out = []
-            x = self.embedding(x)
-            x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=None)
-            x = self.decoder(x)
-            x = x[:, -gen_factor:]
-            x = self.out_activation(x)
-            out.append(x)
-            for _ in range(out_gen_num - 1):
-                x = self.embedding(x)
-                x, last_hidden_outs = self.convlru_model(x, last_hidden_ins=last_hidden_outs)
-                x = self.decoder(x)[:, -gen_factor:]
-                x = self.out_activation(x)
-                out.append(x)
-            return torch.concat(out, dim=1)
+
+        # mode == 'i'
+        assert getattr(self.args, "input_ch", 1) == getattr(self.args, "out_ch", 1)
+        assert out_gen_num is not None and out_gen_num >= 1
+        out = []
+
+        # 第一段：条件段（以输入驱动一次），得到初始隐藏态与首帧输出（取最后一帧）
+        listT_eff = self._default_dt_like(x, listT, fill_last=False)
+        x_emb = self.embedding(x)
+        x_hidden, last_hidden_outs = self.convlru_model(x_emb, last_hidden_ins=None, listT=listT_eff)
+        x_dec = self.decoder(x_hidden)
+        x_step = self.out_activation(x_dec[:, -1:])  # 只取最后1帧
+        out.append(x_step)
+
+        # 生成阶段：逐步自回归，每次只生成1步
+        if listT_future is None:
+            listT_future = self._default_dt_like(x, listT, fill_last=True, out_gen_num=out_gen_num)
+        B = x.size(0)
+        for t in range(out_gen_num - 1):
+            # 当前步的 Δt: [B,1]
+            dt_step = listT_future[:, t:t+1]
+            # 以上一帧作为输入
+            x_in = self.embedding(x_step)
+            x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt_step)
+            x_dec = self.decoder(x_hidden)
+            x_step = self.out_activation(x_dec[:, -1:])
+            out.append(x_step)
+
+        return torch.concat(out, dim=1)
 
 class Conv_hidden(nn.Module):
     def __init__(self, ch, hidden_size, activation_func, use_cbam=False):
@@ -409,11 +448,15 @@ class ConvLRUModel(nn.Module):
         self.args = args
         layers = getattr(args, "convlru_num_blocks", 1)
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
-    def forward(self, x, last_hidden_ins=None):
+    def forward(self, x, last_hidden_ins=None, listT=None):
+        """
+        x: [B, L, C, S, W] (already embedded)
+        listT: [B, L] Δt for this segment; may be [B,1] for generation step
+        """
         last_hidden_outs = []
         for idx, convlru_block in enumerate(self.convlru_blocks):
             h_in = last_hidden_ins[idx] if (last_hidden_ins is not None) else None
-            x, last_hidden_out = convlru_block(x, h_in)
+            x, last_hidden_out = convlru_block(x, h_in, listT=listT)
             last_hidden_outs.append(last_hidden_out)
         return x, last_hidden_outs
 
@@ -422,8 +465,8 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-    def forward(self, x, last_hidden_in):
-        x, last_hidden_out = self.lru_layer(x, last_hidden_in)
+    def forward(self, x, last_hidden_in, listT=None):
+        x, last_hidden_out = self.lru_layer(x, last_hidden_in, listT=listT)
         x = self.feed_forward(x)
         return x, last_hidden_out
 
@@ -526,39 +569,53 @@ class ConvLRULayer(nn.Module):
         h_out = self.post_ifft_proj(h_cat.permute(0,2,1,3,4)).permute(0,2,1,3,4)
         return h_out
 
-    def convlru(self, x, last_hidden_in):
+    def convlru(self, x, last_hidden_in, listT=None):
         B, L, C, S, W = x.size()
+        # Δt: [B,L] -> [B,L,1,1,1]
+        if listT is None:
+            dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
+        else:
+            dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
+
         h = torch.fft.fft2(x.to(torch.cfloat), dim=(-2, -1), norm='ortho')
         h = torch.einsum('blcsw,dc->blcsw', h, self.proj_W)
         if self.proj_b is not None:
             h = h + self.proj_b.view(1, 1, C, 1, 1)
         if self.use_freq_prior:
             h = self.freq_prior(h)
+
         if S == W:
-            nu_s, theta_s, gamma_s = torch.exp(self.params_log_square).split((self.emb_ch, self.emb_ch, self.emb_ch), dim=0)
+            nu_s, theta_s, _gamma_s = torch.exp(self.params_log_square).split((self.emb_ch, self.emb_ch, self.emb_ch), dim=0)
             nu0   = nu_s.view(1,1,C,S,1)
             th0   = theta_s.view(1,1,C,S,1)
-            gamma = gamma_s.view(1,1,C,S,1)
+
             if self.lambda_type == "static":
-                lamb = torch.exp(torch.complex(-nu0, th0)).expand(B, L, C, S, 1)
+                nu_t = torch.clamp(nu0 * dt, min=1e-6)
+                th_t = th0 * dt
             else:
-                phi = h.abs().mean(dim=-1, keepdim=True)
+                # exogenous: 计算 phi, 得到 dnu/dth，然后按 dt 缩放
+                phi = h.abs().mean(dim=-1, keepdim=True)  # [B,L,C,S,1]
                 phi_prev = torch.empty_like(phi)
                 phi_prev[:, 1:] = phi[:, :-1]
                 phi_prev[:, 0].zero_()
                 if (last_hidden_in is not None) and isinstance(last_hidden_in, tuple) and ('phi_last' in last_hidden_in[1]):
                     phi_prev[:, 0] = last_hidden_in[1]['phi_last']
-                z = phi_prev.squeeze(-1)
+                z = phi_prev.squeeze(-1)  # [B,L,C,S]
+
                 h1_nu = torch.einsum('blcs, csh -> blch', z, self.mod_nu_fc1_S).tanh()
                 dnu   = torch.einsum('blch, chs -> blcs', h1_nu, self.mod_nu_fc2_S).unsqueeze(-1)
                 h1_th = torch.einsum('blcs, csh -> blch', z, self.mod_th_fc1_S).tanh()
                 dth   = torch.einsum('blch, chs -> blcs', h1_th, self.mod_th_fc2_S).unsqueeze(-1)
-                dnu = self.delta_scale_nu * torch.tanh(dnu)
-                dth = self.delta_scale_th * torch.tanh(dth)
-                nu_t = nu0 + dnu
-                th_t = torch.remainder(th0 + dth, 2*math.pi)
-                lamb = torch.exp(torch.complex(-nu_t, th_t))
-            h = h * gamma
+
+                dnu = self.delta_scale_nu * torch.tanh(dnu) * dt
+                dth = self.delta_scale_th * torch.tanh(dth) * dt
+                nu_t = torch.clamp(nu0 * dt + dnu, min=1e-6)
+                th_t = torch.remainder(th0 * dt + dth, 2*math.pi)
+
+            lamb = torch.exp(torch.complex(-nu_t, th_t))               # [B,L,C,S,1]
+            gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
+            h = h * gamma_t
+
             if last_hidden_in is not None:
                 prev_state = last_hidden_in[0] if isinstance(last_hidden_in, tuple) else last_hidden_in
                 h = torch.concat([prev_state, h], dim=1)
@@ -566,6 +623,7 @@ class ConvLRULayer(nn.Module):
                 B2, L2 = B, L + 1
             else:
                 B2, L2 = B, L
+
             h = self.pscan(lamb[:, :L2], h)
             last_hidden_out = h[:, -1:]
             h = self._ifft_and_fuse(h)
@@ -576,34 +634,42 @@ class ConvLRULayer(nn.Module):
                 h = h[:, 1:]
             aux = {}
             if self.lambda_type == "exogenous":
-                aux['phi_last'] = phi[:, -1:].detach()
+                aux['phi_last'] = (h if 'phi' not in locals() else phi)[:, -1:].detach()
             last_hidden_pkg = (last_hidden_out, aux) if aux else last_hidden_out
+
         else:
-            nu_r, theta_r, gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch), dim=0)
+            # 低秩投影到方阵
+            nu_r, theta_r, _gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch), dim=0)
             nu0   = nu_r.view(1,1,C,self.rank,1)
             th0   = theta_r.view(1,1,C,self.rank,1)
-            gamma = gamma_r.view(1,1,C,self.rank,1)
-            z = self._project_to_square(h)
+
+            z = self._project_to_square(h)  # [B,L,C,R,W(=R)]
             if self.lambda_type == "static":
-                lamb = torch.exp(torch.complex(-nu0, th0)).expand(B, L, C, self.rank, 1)
+                nu_t = torch.clamp(nu0 * dt, min=1e-6)
+                th_t = th0 * dt
             else:
-                phi = z.abs().mean(dim=-1, keepdim=True)
+                phi = z.abs().mean(dim=-1, keepdim=True)  # [B,L,C,R,1]
                 phi_prev = torch.empty_like(phi)
                 phi_prev[:, 1:] = phi[:, :-1]
                 phi_prev[:, 0].zero_()
                 if (last_hidden_in is not None) and isinstance(last_hidden_in, tuple) and ('phi_last' in last_hidden_in[1]):
                     phi_prev[:, 0] = last_hidden_in[1]['phi_last']
-                zz = phi_prev.squeeze(-1)
+                zz = phi_prev.squeeze(-1)  # [B,L,C,R]
+
                 h1_nu = torch.einsum('blcr, crh -> blch', zz, self.mod_nu_fc1_R).tanh()
                 dnu   = torch.einsum('blch, chr -> blcr', h1_nu, self.mod_nu_fc2_R).unsqueeze(-1)
                 h1_th = torch.einsum('blcr, crh -> blch', zz, self.mod_th_fc1_R).tanh()
                 dth   = torch.einsum('blch, chr -> blcr', h1_th, self.mod_th_fc2_R).unsqueeze(-1)
-                dnu = self.delta_scale_nu * torch.tanh(dnu)
-                dth = self.delta_scale_th * torch.tanh(dth)
-                nu_t = nu0 + dnu
-                th_t = torch.remainder(th0 + dth, 2*math.pi)
-                lamb = torch.exp(torch.complex(-nu_t, th_t))
-            z = z * gamma
+
+                dnu = self.delta_scale_nu * torch.tanh(dnu) * dt
+                dth = self.delta_scale_th * torch.tanh(dth) * dt
+                nu_t = torch.clamp(nu0 * dt + dnu, min=1e-6)
+                th_t = torch.remainder(th0 * dt + dth, 2*math.pi)
+
+            lamb = torch.exp(torch.complex(-nu_t, th_t))               # [B,L,C,R,1]
+            gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
+
+            z = z * gamma_t
             if last_hidden_in is not None:
                 prev_state = last_hidden_in[0] if isinstance(last_hidden_in, tuple) else last_hidden_in
                 z = torch.concat([prev_state, z], dim=1)
@@ -611,6 +677,7 @@ class ConvLRULayer(nn.Module):
                 B2, L2 = B, L + 1
             else:
                 B2, L2 = B, L
+
             z = self.pscan(lamb[:, :L2], z)
             last_hidden_out = z[:, -1:]
             h = self._deproject_from_square(z)
@@ -622,8 +689,9 @@ class ConvLRULayer(nn.Module):
                 h = h[:, 1:]
             aux = {}
             if self.lambda_type == "exogenous":
-                aux['phi_last'] = phi[:, -1:].detach()
+                aux['phi_last'] = (z if 'phi' not in locals() else phi)[:, -1:].detach()
             last_hidden_pkg = (last_hidden_out, aux) if aux else last_hidden_out
+
         dummy_use = (self.params_log_square.sum().real + self.params_log_rank.sum().real + self.U_row.real.sum() + self.V_col.real.sum()) * 0.0
         h = h + dummy_use
         if self.gate_conv is not None:
@@ -633,8 +701,8 @@ class ConvLRULayer(nn.Module):
             x = x + h
         return x, last_hidden_pkg
 
-    def forward(self, x, last_hidden_in):
-        x, last_hidden_out = self.convlru(x, last_hidden_in)
+    def forward(self, x, last_hidden_in, listT=None):
+        x, last_hidden_out = self.convlru(x, last_hidden_in, listT=listT)
         return x, last_hidden_out
 
 class FeedForward(nn.Module):
