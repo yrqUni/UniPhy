@@ -65,7 +65,7 @@ class Args:
         self.output_activation = 'Tanh'
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 13
+        self.train_data_n_frames = 9
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ''
