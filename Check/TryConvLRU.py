@@ -57,7 +57,6 @@ class ArgsBase:
         self.lambda_mlp_hidden = 16
 
 def make_cfgs():
-    base = ArgsBase()
     cfgs = []
 
     a = ArgsBase()
@@ -156,7 +155,8 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
     last_hidden = None
     pos = 0
     for n in chunk_sizes:
-        if pos >= L: break
+        if pos >= L:
+            break
         n = min(n, L - pos)
         xe = em(x[:, pos:pos+n])
         listT_slice = listT[:, pos:pos+n] if listT is not None else None
@@ -221,14 +221,12 @@ def list_unused_parameters(model, x, listT, mode="p"):
         y = model(x, mode="i", out_gen_num=K, listT=listT, listT_future=listT_future)
         loss = y.sum()
     loss.backward()
-    name_map = {p: n for n, p in model.named_parameters() if p.requires_grad}
     unused = []
     for n, p in model.named_parameters():
         if p.requires_grad and p.grad is None:
             unused.append(n)
     return unused
 
-@torch.no_grad()
 def run_equivalence_and_unused(name, args, device, B=1, L=10):
     print(f"[case] {name}")
     model = ConvLRU(args).to(device)
