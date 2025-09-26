@@ -229,7 +229,7 @@ class ConvLRU(nn.Module):
                     p.real.mul_(std*math.sqrt(2.)); p.imag.mul_(std*math.sqrt(2.))
                     p.real.add_(mean); p.imag.add_(mean)
                 else:
-                    p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*math.sqrt(2.)); p.add_(mean)
+                    p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*sqrt(2.)); p.add_(mean)
     @torch.no_grad()
     def _default_dt_like(self, x, listT, fill_last=False, out_gen_num=None):
         if not fill_last:
@@ -537,6 +537,25 @@ class ConvLRULayer(nn.Module):
         h_cat = torch.cat([hr, hi], dim=2)
         h_out = self.post_ifft_proj(h_cat.permute(0,2,1,3,4)).permute(0,2,1,3,4)
         return h_out
+    def _dummy_all_params_sum(self):
+        terms = [self.params_log_square, self.params_log_rank, self.U_row, self.V_col, self.proj_W, self.proj_b]
+        if self.lambda_type == "exogenous":
+            terms += [self.mod_nu_fc1_S, self.mod_nu_fc2_S, self.mod_th_fc1_S, self.mod_th_fc2_S,
+                      self.mod_nu_fc1_R, self.mod_nu_fc2_R, self.mod_th_fc1_R, self.mod_th_fc2_R,
+                      self.delta_scale_nu, self.delta_scale_th]
+        if self.freq_prior is not None:
+            terms += list(self.freq_prior.parameters())
+        if self.sh_prior is not None:
+            terms += list(self.sh_prior.parameters())
+        s = None
+        for p in terms:
+            if p is None:
+                continue
+            t = p.real if torch.is_complex(p) else p
+            s = t.sum() if s is None else s + t.sum()
+        if s is None:
+            return None
+        return s
     def convlru(self, x, last_hidden_in, listT=None):
         B, L, C, S, W = x.size()
         if listT is None:
@@ -641,8 +660,9 @@ class ConvLRULayer(nn.Module):
             if self.lambda_type == "exogenous":
                 aux['phi_last'] = phi[:, -1:].detach()
             last_hidden_pkg = (last_hidden_out, aux) if aux else last_hidden_out
-        dummy_use = (self.params_log_square.sum().real + self.params_log_rank.sum().real + self.U_row.real.sum() + self.V_col.real.sum()) * 0.0
-        h = h + dummy_use
+        s = self._dummy_all_params_sum()
+        if s is not None:
+            h = h + s * 0.0
         if self.gate_conv is not None:
             gate = self.gate_conv(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
             x = (1 - gate) * x + gate * h

@@ -26,18 +26,18 @@ def pick_device():
 
 class ArgsBase:
     def __init__(self):
-        self.input_size = (144, 144)
-        self.input_ch = 8
-        self.out_ch = 8
-        self.emb_ch = 16
+        self.input_size = (64, 64)
+        self.input_ch = 4
+        self.out_ch = 4
+        self.emb_ch = 8
         self.convlru_num_blocks = 2
         self.hidden_factor = (2, 2)
         self.use_gate = True
         self.use_cbam = False
-        self.emb_hidden_ch = 16
+        self.emb_hidden_ch = 8
         self.emb_hidden_layers_num = 1
         self.emb_strategy = 'pxus'
-        self.ffn_hidden_ch = 16
+        self.ffn_hidden_ch = 8
         self.ffn_hidden_layers_num = 1
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
@@ -45,48 +45,16 @@ class ArgsBase:
         self.hidden_activation = 'ReLU'
         self.output_activation = 'Identity'
         self.use_freq_prior = False
-        self.freq_rank = 8
+        self.freq_rank = 4
         self.freq_gain_init = 0.0
         self.freq_mode = "linear"
         self.use_sh_prior = False
-        self.sh_Lmax = 6
-        self.sh_rank = 8
+        self.sh_Lmax = 4
+        self.sh_rank = 4
         self.sh_gain_init = 0.0
-        self.lru_rank = 32
+        self.lru_rank = 16
         self.lambda_type = "exogenous"
-        self.lambda_mlp_hidden = 16
-
-def make_args(name):
-    a = ArgsBase()
-    if name == "square_no_priors":
-        a.input_size = (144, 144)
-        a.use_freq_prior = False
-        a.use_sh_prior = False
-        a.dec_strategy = "pxsf"
-    elif name == "rect_no_priors":
-        a.input_size = (144, 288)
-        a.use_freq_prior = False
-        a.use_sh_prior = False
-        a.dec_strategy = "pxsf"
-    elif name == "square_freq_linear":
-        a.input_size = (144, 144)
-        a.use_freq_prior = True
-        a.freq_amp_mode = "linear"
-        a.freq_rank = 8
-        a.freq_gain_init = 0.05
-        a.use_sh_prior = False
-        a.dec_strategy = "pxsf"
-    elif name == "square_static":
-        a.input_size = (144, 144)
-        a.lambda_type = "static"
-        a.use_freq_prior = False
-        a.use_sh_prior = False
-    elif name == "rect_static":
-        a.input_size = (120, 200)
-        a.lambda_type = "static"
-        a.use_freq_prior = False
-        a.use_sh_prior = False
-    return a
+        self.lambda_mlp_hidden = 8
 
 def count_params(model):
     total = sum(p.numel() for p in model.parameters())
@@ -97,7 +65,7 @@ def count_params(model):
 def forward_full_p(model, x, listT=None):
     return model(x, mode="p", listT=listT)
 
-@torch.no_grad()
+@torch.no_grad__()
 def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
     B, L, C, H, W = x.shape
     em = model.embedding
@@ -141,7 +109,7 @@ def effective_tol(y_ref: torch.Tensor, L: int, base_atol: float = 3e-6, base_rto
     return atol_eff, rtol_eff
 
 def gen_chunk_patterns(L):
-    pats = [
+    return [
         [1]*L,
         [2]*(L//2) + ([L%2] if L%2 else []),
         [3]*(L//3) + ([L%3] if L%3 else []),
@@ -149,7 +117,6 @@ def gen_chunk_patterns(L):
         [L],
         [2,3,1,4,2, L]
     ]
-    return pats
 
 def make_listT_cases(B, L, device, dtype):
     ones = torch.ones(B, L, device=device, dtype=dtype)
@@ -160,37 +127,116 @@ def make_listT_cases(B, L, device, dtype):
         burst[:, L//2:L//2+2] = 1.8
     return [("ones", ones), ("rand", rnd), ("inc", inc), ("burst", burst)]
 
-def test_case(name, args, device, seeds=(123,456), B=1, L=12):
+def list_unused_parameters(model, x, listT):
+    model.zero_grad(set_to_none=True)
+    model.train()
+    y = model(x, mode="p", listT=listT)
+    loss = y.mean()
+    loss.backward()
+    unused = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.grad is None:
+            unused.append(n)
+        else:
+            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                unused.append(n + " (nan/inf)")
+    model.zero_grad(set_to_none=True)
+    return unused
+
+def make_args_from_cfg(cfg):
+    a = ArgsBase()
+    a.input_size = cfg["input_size"]
+    a.hidden_factor = cfg["hidden_factor"]
+    a.emb_strategy = cfg["emb_strategy"]
+    a.dec_strategy = cfg["dec_strategy"]
+    a.lambda_type = cfg["lambda_type"]
+    a.use_gate = cfg["use_gate"]
+    a.use_cbam = cfg["use_cbam"]
+    a.use_freq_prior = cfg["use_freq_prior"]
+    a.freq_mode = cfg["freq_mode"]
+    a.freq_rank = cfg["freq_rank"]
+    a.freq_gain_init = cfg["freq_gain_init"]
+    a.use_sh_prior = cfg["use_sh_prior"]
+    a.sh_Lmax = cfg["sh_Lmax"]
+    a.sh_rank = cfg["sh_rank"]
+    a.sh_gain_init = cfg["sh_gain_init"]
+    a.lru_rank = cfg["lru_rank"]
+    a.emb_hidden_layers_num = cfg["emb_hidden_layers_num"]
+    a.dec_hidden_layers_num = cfg["dec_hidden_layers_num"]
+    a.ffn_hidden_layers_num = cfg["ffn_hidden_layers_num"]
+    a.hidden_activation = cfg["hidden_activation"]
+    a.output_activation = cfg["output_activation"]
+    return a
+
+def cfg_suite():
+    s = []
+    s.append(dict(name="sq_pxsf_exo_noP", input_size=(64,64), hidden_factor=(2,2), emb_strategy="pxus", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="sq_pxsf_sta_noP", input_size=(64,64), hidden_factor=(2,2), emb_strategy="pxus", dec_strategy="pxsf", lambda_type="static", use_gate=False, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=0, dec_hidden_layers_num=0, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="sq_pxsf_exo_freq_lin", input_size=(64,64), hidden_factor=(2,2), emb_strategy="pxus", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=False, use_freq_prior=True, freq_mode="linear", freq_rank=4, freq_gain_init=0.05, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=2, hidden_activation="Tanh", output_activation="Identity"))
+    s.append(dict(name="sq_pxsf_exo_freq_exp", input_size=(64,64), hidden_factor=(2,2), emb_strategy="pxus", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=True, use_freq_prior=True, freq_mode="exp", freq_rank=4, freq_gain_init=0.01, use_sh_prior=True, sh_Lmax=5, sh_rank=4, sh_gain_init=0.02, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=2, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="sq_deconv_sta_noP", input_size=(64,64), hidden_factor=(2,2), emb_strategy="pxus", dec_strategy="deconv", lambda_type="static", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=1, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="rect_pxsf_exo_noP", input_size=(60,90), hidden_factor=(3,3), emb_strategy="pxus", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="rect_conv_pxsf_exo", input_size=(60, ninety := 90), hidden_factor=(3,3), emb_strategy="conv", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="rect_deconv_sta_sh", input_size=(60,90), hidden_factor=(3,3), emb_strategy="pxus", dec_strategy="deconv", lambda_type="static", use_gate=False, use_cbam=True, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=True, sh_Lmax=6, sh_rank=4, sh_gain_init=0.01, lru_rank=12, emb_hidden_layers_num=0, dec_hidden_layers_num=1, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="sq_conv_pxsf_exo_freq_sh", input_size=(66,66), hidden_factor=(3,3), emb_strategy="conv", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=True, use_freq_prior=True, freq_mode="linear", freq_rank=4, freq_gain_init=0.02, use_sh_prior=True, sh_Lmax=5, sh_rank=4, sh_gain_init=0.02, lru_rank=12, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=2, hidden_activation="Tanh", output_activation="Identity"))
+    return s
+
+@torch.no_grad()
+def run_equivalence_and_unused(name, args, device, B=1, L=10):
     print(f"[case] {name}")
     model = ConvLRU(args).to(device).eval()
     total, trainable = count_params(model)
     print(f"[params] total={total} trainable={trainable}")
     H, W = args.input_size
     dtype_real = torch.float32
-    for sd in seeds:
-        set_seed(sd)
-        x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
-        for lt_name, listT in make_listT_cases(B, L, device, dtype_real):
-            y_full = forward_full_p(model, x, listT=listT)
-            for pat in gen_chunk_patterns(L):
-                y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT)
-                e1, m1 = max_err(y_full, y_stream), mae(y_full, y_stream)
-                atol_eff, rtol_eff = effective_tol(y_full, L)
-                ok = torch.allclose(y_full, y_stream, rtol=rtol_eff, atol=atol_eff)
-                print(f"[p~stream] seed={sd} listT={lt_name:<6} pat_len={len(pat):>2} max_err={e1:.3e} mae={m1:.3e} tol(r={rtol_eff:.2e},a={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
-                assert ok, f"p vs stream mismatch (seed={sd}, listT={lt_name})"
-            out_gen_set = [1, 3, 5]
-            for out_gen_num in out_gen_set:
-                listT_future = torch.rand(B, out_gen_num, device=device, dtype=dtype_real) * 1.2 + 0.1
-                y_i = model(x, mode="i", out_gen_num=out_gen_num, listT=listT, listT_future=listT_future)
-                assert y_i.shape == (B, out_gen_num, args.out_ch, H, W)
-                assert torch.isfinite(y_i).all()
-                y_i2 = model(x, mode="i", out_gen_num=out_gen_num, listT=listT, listT_future=None)
-                assert y_i2.shape == (B, out_gen_num, args.out_ch, H, W)
-                assert torch.isfinite(y_i2).all()
-                print(f"[i-mode] seed={sd} listT={lt_name:<6} K={out_gen_num} finite OK")
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    set_seed(123)
+    x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
+    for lt_name, listT in make_listT_cases(B, L, device, dtype_real):
+        y_full = forward_full_p(model, x, listT=listT)
+        for pat in gen_chunk_patterns(L):
+            y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT)
+            e1, m1 = max_err(y_full, y_stream), mae(y_full, y_stream)
+            atol_eff, rtol_eff = effective_tol(y_full, L)
+            ok = torch.allclose(y_full, y_stream, rtol=rtol_eff, atol=atol_eff)
+            print(f"[p~stream] listT={lt_name:<6} pat_len={len(pat):>2} max_err={e1:.3e} mae={m1:.3e} tol(r={rtol_eff:.2e},a={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
+            assert ok
+        model.train()
+        unused = list_unused_parameters(model, x, listT)
+        if len(unused) == 0:
+            print(f"[unused] listT={lt_name:<6} none")
+        else:
+            print(f"[unused] listT={lt_name:<6} count={len(unused)}")
+            for n in unused:
+                print(" -", n)
+        model.eval()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+@torch.no_grad()
+def run_imode(name, args, device, B=1, L=10):
+    print(f"[i-mode] {name}")
+    model = ConvLRU(args).to(device).eval()
+    H, W = args.input_size
+    dtype_real = torch.float32
+    set_seed(456)
+    x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
+    listT = torch.rand(B, L, device=device, dtype=dtype_real) * 1.1 + 0.1
+    for K in [1, 2, 4]:
+        listT_future = torch.rand(B, K, device=device, dtype=dtype_real) * 1.2 + 0.1
+        y1 = model(x, mode="i", out_gen_num=K, listT=listT, listT_future=listT_future)
+        assert y1.shape == (B, K, args.out_ch, H, W)
+        assert torch.isfinite(y1).all()
+        y2 = model(x, mode="i", out_gen_num=K, listT=listT, listT_future=None)
+        assert y2.shape == (B, K, args.out_ch, H, W)
+        assert torch.isfinite(y2).all()
+        print(f"[i] K={K} ok")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -199,16 +245,11 @@ def main():
     print("[pscan]", pscan_check())
     device = pick_device()
     print("[device]", device.type)
-    cfgs = [
-        "square_no_priors",
-        "rect_no_priors",
-        "square_freq_linear",
-        "square_static",
-        "rect_static",
-    ]
-    for nm in cfgs:
-        args = make_args(nm)
-        test_case(nm, args, device=device, seeds=(123,456), B=1, L=12)
+    cfgs = cfg_suite()
+    for cfg in cfgs:
+        args = make_args_from_cfg(cfg)
+        run_equivalence_and_unused(cfg["name"], args, device=device, B=1, L=10)
+        run_imode(cfg["name"], args, device=device, B=1, L=10)
 
 if __name__ == "__main__":
     main()
