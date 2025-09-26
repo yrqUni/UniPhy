@@ -61,11 +61,11 @@ def count_params(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
-@torch.no_grad()
+@torch.no_grad
 def forward_full_p(model, x, listT=None):
     return model(x, mode="p", listT=listT)
 
-@torch.no_grad__()
+@torch.no_grad
 def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
     B, L, C, H, W = x.shape
     em = model.embedding
@@ -178,12 +178,12 @@ def cfg_suite():
     s.append(dict(name="sq_pxsf_exo_freq_exp", input_size=(64,64), hidden_factor=(2,2), emb_strategy="pxus", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=True, use_freq_prior=True, freq_mode="exp", freq_rank=4, freq_gain_init=0.01, use_sh_prior=True, sh_Lmax=5, sh_rank=4, sh_gain_init=0.02, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=2, hidden_activation="ReLU", output_activation="Identity"))
     s.append(dict(name="sq_deconv_sta_noP", input_size=(64,64), hidden_factor=(2,2), emb_strategy="pxus", dec_strategy="deconv", lambda_type="static", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=1, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
     s.append(dict(name="rect_pxsf_exo_noP", input_size=(60,90), hidden_factor=(3,3), emb_strategy="pxus", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
-    s.append(dict(name="rect_conv_pxsf_exo", input_size=(60, ninety := 90), hidden_factor=(3,3), emb_strategy="conv", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
+    s.append(dict(name="rect_conv_pxsf_exo", input_size=(60,90), hidden_factor=(3,3), emb_strategy="conv", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=False, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=False, sh_Lmax=4, sh_rank=4, sh_gain_init=0.0, lru_rank=16, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
     s.append(dict(name="rect_deconv_sta_sh", input_size=(60,90), hidden_factor=(3,3), emb_strategy="pxus", dec_strategy="deconv", lambda_type="static", use_gate=False, use_cbam=True, use_freq_prior=False, freq_mode="linear", freq_rank=4, freq_gain_init=0.0, use_sh_prior=True, sh_Lmax=6, sh_rank=4, sh_gain_init=0.01, lru_rank=12, emb_hidden_layers_num=0, dec_hidden_layers_num=1, ffn_hidden_layers_num=1, hidden_activation="ReLU", output_activation="Identity"))
     s.append(dict(name="sq_conv_pxsf_exo_freq_sh", input_size=(66,66), hidden_factor=(3,3), emb_strategy="conv", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=True, use_freq_prior=True, freq_mode="linear", freq_rank=4, freq_gain_init=0.02, use_sh_prior=True, sh_Lmax=5, sh_rank=4, sh_gain_init=0.02, lru_rank=12, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=2, hidden_activation="Tanh", output_activation="Identity"))
     return s
 
-@torch.no_grad()
+@torch.no_grad
 def run_equivalence_and_unused(name, args, device, B=1, L=10):
     print(f"[case] {name}")
     model = ConvLRU(args).to(device).eval()
@@ -217,7 +217,7 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-@torch.no_grad()
+@torch.no_grad
 def run_imode(name, args, device, B=1, L=10):
     print(f"[i-mode] {name}")
     model = ConvLRU(args).to(device).eval()
