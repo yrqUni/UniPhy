@@ -380,7 +380,7 @@ class Decoder(nn.Module):
         assert self.dec_strategy in ['deconv', 'pxsf']
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
-        out_ch_after_up = self.dec_hidden_ch if (self.dec_hidden_layers_num > 0 and self.dec_hidden_ch > 0) else self.emb_ch
+        out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
         if self.dec_strategy == "deconv":
             self.upsp = nn.ConvTranspose3d(in_channels=self.emb_ch, out_channels=out_ch_after_up, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW))
             deconv3d_bilinear_init_(self.upsp.weight)
@@ -453,23 +453,30 @@ class ConvLRULayer(nn.Module):
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         S, W = self.hidden_size
         self.rank = int(getattr(args, "lru_rank", min(S, W, 32)))
-        u1_s = torch.rand(self.emb_ch, S)
-        u2_s = torch.rand(self.emb_ch, S)
-        nu_s_log = torch.log(-0.5 * torch.log(u1_s * (self.r_max ** 2 - self.r_min ** 2) + self.r_min ** 2))
-        theta_s_log = torch.log(u2_s * torch.tensor(np.pi) * 2)
-        diag_lambda_s = torch.exp(torch.complex(-torch.exp(nu_s_log), torch.exp(theta_s_log)))
-        gamma_s_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda_s) ** 2))
-        self.params_log_square = nn.Parameter(torch.vstack((nu_s_log, theta_s_log, gamma_s_log)))
-        u1_r = torch.rand(self.emb_ch, self.rank)
-        u2_r = torch.rand(self.emb_ch, self.rank)
-        nu_r_log = torch.log(-0.5 * torch.log(u1_r * (self.r_max ** 2 - self.r_min ** 2) + self.r_min ** 2))
-        theta_r_log = torch.log(u2_r * torch.tensor(np.pi) * 2)
-        diag_lambda_r = torch.exp(torch.complex(-torch.exp(nu_r_log), torch.exp(theta_r_log)))
-        gamma_r_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda_r) ** 2))
-        self.params_log_rank = nn.Parameter(torch.vstack((nu_r_log, theta_r_log, gamma_r_log)))
-        self.U_row = nn.Parameter(torch.randn(self.emb_ch, S, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(S)))
-        self.V_col = nn.Parameter(torch.randn(self.emb_ch, W, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(W)))
+        self.is_square = (S == W)
         C = self.emb_ch
+        if self.is_square:
+            u1_s = torch.rand(C, S)
+            u2_s = torch.rand(C, S)
+            nu_s_log = torch.log(-0.5 * torch.log(u1_s * (self.r_max ** 2 - self.r_min ** 2) + self.r_min ** 2))
+            theta_s_log = torch.log(u2_s * torch.tensor(np.pi) * 2)
+            diag_lambda_s = torch.exp(torch.complex(-torch.exp(nu_s_log), torch.exp(theta_s_log)))
+            gamma_s_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda_s) ** 2))
+            self.params_log_square = nn.Parameter(torch.vstack((nu_s_log, theta_s_log, gamma_s_log)))
+            self.register_buffer("params_log_rank", torch.zeros(3, C, self.rank))
+            self.register_buffer("U_row", torch.zeros(C, S, self.rank, dtype=torch.cfloat))
+            self.register_buffer("V_col", torch.zeros(C, W, self.rank, dtype=torch.cfloat))
+        else:
+            u1_r = torch.rand(C, self.rank)
+            u2_r = torch.rand(C, self.rank)
+            nu_r_log = torch.log(-0.5 * torch.log(u1_r * (self.r_max ** 2 - self.r_min ** 2) + self.r_min ** 2))
+            theta_r_log = torch.log(u2_r * torch.tensor(np.pi) * 2)
+            diag_lambda_r = torch.exp(torch.complex(-torch.exp(nu_r_log), torch.exp(theta_r_log)))
+            gamma_r_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda_r) ** 2))
+            self.params_log_rank = nn.Parameter(torch.vstack((nu_r_log, theta_r_log, gamma_r_log)))
+            self.U_row = nn.Parameter(torch.randn(C, S, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(S)))
+            self.V_col = nn.Parameter(torch.randn(C, W, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(W)))
+            self.register_buffer("params_log_square", torch.zeros(3, C, S))
         self.proj_W = nn.Parameter(torch.randn(C, C, dtype=torch.cfloat) / math.sqrt(C))
         self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
         self.post_ifft_conv_real = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,3,3), padding=(0,1,1), bias=True)
@@ -500,24 +507,39 @@ class ConvLRULayer(nn.Module):
             self.delta_scale_nu = nn.Parameter(torch.tensor(0.1))
             self.delta_scale_th = nn.Parameter(torch.tensor(0.1))
             self.mod_hidden = int(getattr(self.args, "lambda_mlp_hidden", 16))
-            C = self.emb_ch
-            S, W = self.hidden_size
-            R = self.rank
-            self.mod_nu_fc1_S = nn.Parameter(torch.empty(C, S, self.mod_hidden))
-            self.mod_nu_fc2_S = nn.Parameter(torch.empty(C, self.mod_hidden, S))
-            self.mod_th_fc1_S = nn.Parameter(torch.empty(C, S, self.mod_hidden))
-            self.mod_th_fc2_S = nn.Parameter(torch.empty(C, self.mod_hidden, S))
-            self.mod_nu_fc1_R = nn.Parameter(torch.empty(C, R, self.mod_hidden))
-            self.mod_nu_fc2_R = nn.Parameter(torch.empty(C, self.mod_hidden, R))
-            self.mod_th_fc1_R = nn.Parameter(torch.empty(C, R, self.mod_hidden))
-            self.mod_th_fc2_R = nn.Parameter(torch.empty(C, self.mod_hidden, R))
-            for p in [self.mod_nu_fc1_S, self.mod_nu_fc2_S, self.mod_th_fc1_S, self.mod_th_fc2_S, self.mod_nu_fc1_R, self.mod_nu_fc2_R, self.mod_th_fc1_R, self.mod_th_fc2_R]:
-                nn.init.xavier_uniform_(p, gain=0.5)
+            if self.is_square:
+                self.mod_nu_fc1_S = nn.Parameter(torch.empty(C, S, self.mod_hidden))
+                self.mod_nu_fc2_S = nn.Parameter(torch.empty(C, self.mod_hidden, S))
+                self.mod_th_fc1_S = nn.Parameter(torch.empty(C, S, self.mod_hidden))
+                self.mod_th_fc2_S = nn.Parameter(torch.empty(C, self.mod_hidden, S))
+                for p in [self.mod_nu_fc1_S, self.mod_nu_fc2_S, self.mod_th_fc1_S, self.mod_th_fc2_S]:
+                    nn.init.xavier_uniform_(p, gain=0.5)
+                self.register_buffer("mod_nu_fc1_R", torch.zeros(1))
+                self.register_buffer("mod_nu_fc2_R", torch.zeros(1))
+                self.register_buffer("mod_th_fc1_R", torch.zeros(1))
+                self.register_buffer("mod_th_fc2_R", torch.zeros(1))
+            else:
+                self.mod_nu_fc1_R = nn.Parameter(torch.empty(C, self.rank, self.mod_hidden))
+                self.mod_nu_fc2_R = nn.Parameter(torch.empty(C, self.mod_hidden, self.rank))
+                self.mod_th_fc1_R = nn.Parameter(torch.empty(C, self.rank, self.mod_hidden))
+                self.mod_th_fc2_R = nn.Parameter(torch.empty(C, self.mod_hidden, self.rank))
+                for p in [self.mod_nu_fc1_R, self.mod_nu_fc2_R, self.mod_th_fc1_R, self.mod_th_fc2_R]:
+                    nn.init.xavier_uniform_(p, gain=0.5)
+                self.register_buffer("mod_nu_fc1_S", torch.zeros(1))
+                self.register_buffer("mod_nu_fc2_S", torch.zeros(1))
+                self.register_buffer("mod_th_fc1_S", torch.zeros(1))
+                self.register_buffer("mod_th_fc2_S", torch.zeros(1))
         else:
-            self.mod_nu_fc1_S = self.mod_nu_fc2_S = None
-            self.mod_th_fc1_S = self.mod_th_fc2_S = None
-            self.mod_nu_fc1_R = self.mod_nu_fc2_R = None
-            self.mod_th_fc1_R = self.mod_th_fc2_R = None
+            self.register_buffer("delta_scale_nu", torch.zeros(1))
+            self.register_buffer("delta_scale_th", torch.zeros(1))
+            self.register_buffer("mod_nu_fc1_S", torch.zeros(1))
+            self.register_buffer("mod_nu_fc2_S", torch.zeros(1))
+            self.register_buffer("mod_th_fc1_S", torch.zeros(1))
+            self.register_buffer("mod_th_fc2_S", torch.zeros(1))
+            self.register_buffer("mod_nu_fc1_R", torch.zeros(1))
+            self.register_buffer("mod_nu_fc2_R", torch.zeros(1))
+            self.register_buffer("mod_th_fc1_R", torch.zeros(1))
+            self.register_buffer("mod_th_fc2_R", torch.zeros(1))
         self.pscan = PScan.apply
     def _project_to_square(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
@@ -641,8 +663,6 @@ class ConvLRULayer(nn.Module):
             if self.lambda_type == "exogenous":
                 aux['phi_last'] = phi[:, -1:].detach()
             last_hidden_pkg = (last_hidden_out, aux) if aux else last_hidden_out
-        dummy_use = (self.params_log_square.sum().real + self.params_log_rank.sum().real + self.U_row.real.sum() + self.V_col.real.sum()) * 0.0
-        h = h + dummy_use
         if self.gate_conv is not None:
             gate = self.gate_conv(h.permute(0,2,1,3,4)).permute(0,2,1,3,4)
             x = (1 - gate) * x + gate * h
