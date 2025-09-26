@@ -229,7 +229,7 @@ class ConvLRU(nn.Module):
                     p.real.mul_(std*math.sqrt(2.)); p.imag.mul_(std*math.sqrt(2.))
                     p.real.add_(mean); p.imag.add_(mean)
                 else:
-                    p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*sqrt(2.)); p.add_(mean)
+                    p.uniform_(2*l-1, 2*u-1); p.erfinv_(); p.mul_(std*math.sqrt(2.)); p.add_(mean)
     @torch.no_grad()
     def _default_dt_like(self, x, listT, fill_last=False, out_gen_num=None):
         if not fill_last:

@@ -130,9 +130,10 @@ def make_listT_cases(B, L, device, dtype):
 def list_unused_parameters(model, x, listT):
     model.zero_grad(set_to_none=True)
     model.train()
-    y = model(x, mode="p", listT=listT)
-    loss = y.mean()
-    loss.backward()
+    with torch.enable_grad():
+        y = model(x, mode="p", listT=listT)
+        loss = y.mean()
+        loss.backward()
     unused = []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -183,7 +184,6 @@ def cfg_suite():
     s.append(dict(name="sq_conv_pxsf_exo_freq_sh", input_size=(66,66), hidden_factor=(3,3), emb_strategy="conv", dec_strategy="pxsf", lambda_type="exogenous", use_gate=True, use_cbam=True, use_freq_prior=True, freq_mode="linear", freq_rank=4, freq_gain_init=0.02, use_sh_prior=True, sh_Lmax=5, sh_rank=4, sh_gain_init=0.02, lru_rank=12, emb_hidden_layers_num=1, dec_hidden_layers_num=0, ffn_hidden_layers_num=2, hidden_activation="Tanh", output_activation="Identity"))
     return s
 
-@torch.no_grad
 def run_equivalence_and_unused(name, args, device, B=1, L=10):
     print(f"[case] {name}")
     model = ConvLRU(args).to(device).eval()
@@ -193,16 +193,19 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
     dtype_real = torch.float32
     set_seed(123)
     x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
+    # 等价性验证：无梯度
+    with torch.no_grad():
+        for lt_name, listT in make_listT_cases(B, L, device, dtype_real):
+            y_full = forward_full_p(model, x, listT=listT)
+            for pat in gen_chunk_patterns(L):
+                y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT)
+                e1, m1 = max_err(y_full, y_stream), mae(y_full, y_stream)
+                atol_eff, rtol_eff = effective_tol(y_full, L)
+                ok = torch.allclose(y_full, y_stream, rtol=rtol_eff, atol=atol_eff)
+                print(f"[p~stream] listT={lt_name:<6} pat_len={len(pat):>2} max_err={e1:.3e} mae={m1:.3e} tol(r={rtol_eff:.2e},a={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
+                assert ok
+    # 未用参数检查：打开梯度
     for lt_name, listT in make_listT_cases(B, L, device, dtype_real):
-        y_full = forward_full_p(model, x, listT=listT)
-        for pat in gen_chunk_patterns(L):
-            y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT)
-            e1, m1 = max_err(y_full, y_stream), mae(y_full, y_stream)
-            atol_eff, rtol_eff = effective_tol(y_full, L)
-            ok = torch.allclose(y_full, y_stream, rtol=rtol_eff, atol=atol_eff)
-            print(f"[p~stream] listT={lt_name:<6} pat_len={len(pat):>2} max_err={e1:.3e} mae={m1:.3e} tol(r={rtol_eff:.2e},a={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
-            assert ok
-        model.train()
         unused = list_unused_parameters(model, x, listT)
         if len(unused) == 0:
             print(f"[unused] listT={lt_name:<6} none")
@@ -210,7 +213,6 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
             print(f"[unused] listT={lt_name:<6} count={len(unused)}")
             for n in unused:
                 print(" -", n)
-        model.eval()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     del model
