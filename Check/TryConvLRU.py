@@ -47,13 +47,14 @@ class ArgsBase:
         self.use_freq_prior = False
         self.freq_rank = 8
         self.freq_gain_init = 0.0
-        self.freq_amp_mode = "linear"
+        self.freq_mode = "linear"
         self.use_sh_prior = False
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
         self.lru_rank = 32
         self.lambda_type = "exogenous"
+        self.lambda_mlp_hidden = 16
 
 def make_args(name):
     a = ArgsBase()

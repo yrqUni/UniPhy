@@ -49,6 +49,8 @@ class Args:
         self.sh_rank = 8
         self.sh_gain_init = 0.0
         self.lru_rank = 128
+        self.lambda_type = "exogenous"
+        self.lambda_mlp_hidden = 16
         self.emb_ch = 240
         self.convlru_num_blocks = 8
         self.hidden_factor = (7, 10)
@@ -59,6 +61,7 @@ class Args:
         self.ffn_hidden_layers_num = 2
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
+        self.dec_strategy = 'pxsf'
         self.out_ch = 30
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
@@ -102,7 +105,7 @@ def keep_latest_ckpts(ckpt_dir):
 MODEL_ARG_KEYS = [
     'input_size','input_ch','use_cbam','use_gate',
     'use_freq_prior','use_sh_prior','freq_rank','freq_gain_init',
-    'sh_Lmax','sh_rank','sh_gain_init','lru_rank','freq_mode',
+    'sh_Lmax','sh_rank','sh_gain_init','lru_rank','freq_mode','lambda_type','lambda_mlp_hidden',
     'emb_ch','convlru_num_blocks','hidden_factor',
     'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
     'ffn_hidden_ch','ffn_hidden_layers_num',
@@ -255,6 +258,36 @@ def latitude_weighted_l1(preds, targets):
     w = get_latitude_weights(H, device, dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
 
+_LRU_GATE_MEAN = {}
+
+def register_lru_gate_hooks(ddp_model, rank):
+    model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+    for name, module in model_to_hook.named_modules():
+        if name.endswith('lru_layer.gate_conv'):
+            tag = None
+            if 'convlru_blocks.' in name:
+                try:
+                    tag = int(name.split('convlru_blocks.')[1].split('.')[0])
+                except:
+                    tag = name
+            else:
+                tag = name
+            def _hook(mod, inp, out, tag_local=tag):
+                with torch.no_grad():
+                    m = out.mean().detach()
+                    _LRU_GATE_MEAN[tag_local] = float(m)
+            module.register_forward_hook(_hook)
+
+def format_gate_means():
+    if not _LRU_GATE_MEAN:
+        return "g=NA"
+    keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: (9999 if isinstance(k,int) else 9999, k)) if not all(isinstance(k,int) for k in _LRU_GATE_MEAN.keys()) else sorted(_LRU_GATE_MEAN.keys())
+    parts = []
+    for k in keys:
+        v = _LRU_GATE_MEAN[k]
+        parts.append(f"g[b{k}]={v:.4f}" if isinstance(k,int) else f"g[{k}]={v:.4f}")
+    return " ".join(parts)
+
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
     if rank == 0:
@@ -285,6 +318,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     if args.use_compile:
         model = torch.compile(model, mode="default")
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    register_lru_gate_hooks(model, rank)
     train_dataset = ERA5_Dataset(
         input_dir=args.data_root, year_range=args.year_range,
         is_train=True, sample_len=args.train_data_n_frames,
@@ -340,7 +374,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             avg_loss = loss_tensor.item() / world_size
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if args.use_scheduler else args.lr
-                message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LR: {current_lr:.6e}"
+                gate_str = format_gate_means()
+                message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {gate_str}"
                 train_dataloader_iter.set_description(message)
                 logging.info(message)
             if rank == 0 and (train_step % int(len(train_dataloader)*args.ckpt_step) == 0 or train_step == len(train_dataloader)):

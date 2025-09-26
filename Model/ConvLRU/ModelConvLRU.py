@@ -478,8 +478,8 @@ class ConvLRULayer(nn.Module):
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
         self.gate_conv = nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1,1,1), padding='same'), nn.Sigmoid()) if bool(getattr(args, "use_gate", False)) else None
         self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
-        self.use_sh_prior   = bool(getattr(args, "use_sh_prior", False))
-        self.freq_mode      = str(getattr(args, "freq_mode", getattr(args, "freq_amp_mode", "linear"))).lower()
+        self.use_sh_prior = bool(getattr(args, "use_sh_prior", False))
+        self.freq_mode = getattr(args, "freq_mode", "linear").lower()
         if self.use_freq_prior:
             freq_rank = int(getattr(args, "freq_rank", 8))
             freq_gain_init = float(getattr(args, "freq_gain_init", 0.0))
