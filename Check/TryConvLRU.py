@@ -58,7 +58,6 @@ class ArgsBase:
 
 def make_cfgs():
     cfgs = []
-
     a = ArgsBase()
     a.input_size = (144, 144)
     a.dec_strategy = "pxsf"
@@ -66,7 +65,6 @@ def make_cfgs():
     a.use_freq_prior = False
     a.use_sh_prior = False
     cfgs.append(("sq_pxsf_exo_noP", a))
-
     a = ArgsBase()
     a.input_size = (144, 144)
     a.dec_strategy = "pxsf"
@@ -74,7 +72,6 @@ def make_cfgs():
     a.use_freq_prior = False
     a.use_sh_prior = False
     cfgs.append(("sq_pxsf_sta_noP", a))
-
     a = ArgsBase()
     a.input_size = (144, 144)
     a.dec_strategy = "pxsf"
@@ -84,7 +81,6 @@ def make_cfgs():
     a.freq_gain_init = 0.05
     a.use_sh_prior = False
     cfgs.append(("sq_pxsf_exo_freq_lin", a))
-
     a = ArgsBase()
     a.input_size = (144, 144)
     a.dec_strategy = "pxsf"
@@ -94,7 +90,6 @@ def make_cfgs():
     a.freq_gain_init = 0.02
     a.use_sh_prior = True
     cfgs.append(("sq_pxsf_exo_freq_exp_sh", a))
-
     a = ArgsBase()
     a.input_size = (120, 200)
     a.dec_strategy = "pxsf"
@@ -102,7 +97,6 @@ def make_cfgs():
     a.use_freq_prior = False
     a.use_sh_prior = False
     cfgs.append(("rect_pxsf_exo_noP", a))
-
     a = ArgsBase()
     a.input_size = (120, 200)
     a.dec_strategy = "pxsf"
@@ -112,7 +106,6 @@ def make_cfgs():
     a.freq_gain_init = 0.03
     a.use_sh_prior = True
     cfgs.append(("rect_pxsf_sta_freq_sh", a))
-
     a = ArgsBase()
     a.input_size = (96, 96)
     a.dec_strategy = "deconv"
@@ -121,7 +114,6 @@ def make_cfgs():
     a.use_freq_prior = False
     a.use_sh_prior = False
     cfgs.append(("sq_deconv_sta_noP", a))
-
     a = ArgsBase()
     a.input_size = (96, 144)
     a.dec_strategy = "deconv"
@@ -133,7 +125,6 @@ def make_cfgs():
     a.use_sh_prior = True
     a.use_gate = False
     cfgs.append(("rect_deconv_exo_freq_sh_nogate", a))
-
     return cfgs
 
 def count_params(model):
@@ -249,7 +240,9 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
                 raise RuntimeError("p vs streaming mismatch")
         unused_p = list_unused_parameters(model, x, listT, mode="p")
         print(f"[unused-p] listT={lt_name:<6} {'none' if len(unused_p)==0 else ', '.join(unused_p[:8]) + (' ...' if len(unused_p)>8 else '')}")
-    unused_i = list_unused_parameters(model, x[:, : L//2], listT=lt_cases[0][1][:, : L//2], mode="i")
+    half = L // 2
+    listT_half = lt_cases[0][1][:, :half]
+    unused_i = list_unused_parameters(model, x[:, :half], listT=listT_half, mode="i")
     print(f"[unused-i] {'none' if len(unused_i)==0 else ', '.join(unused_i[:12]) + (' ...' if len(unused_i)>12 else '')}")
 
 def main():
