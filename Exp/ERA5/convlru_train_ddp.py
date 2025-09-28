@@ -45,83 +45,31 @@ class Args:
         self.out_ch = 30
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
-        self.emb_strategy = 'pxus'          # optional: 'pxus' | 'conv'
-        self.hidden_factor = (7, 10)
+        self.emb_strategy = 'pxus'          # 'pxus' | 'conv'
+        self.hidden_factor = (7, 12)
         self.emb_ch = 240
-        self.emb_hidden_ch = 240
+        self.emb_hidden_ch = 270
         self.emb_hidden_layers_num = 2
-        self.emb_in_kernel = 7
-        self.emb_use_cbam = False
-        self.emb_hidden_k3 = 3
-        self.emb_hidden_k1 = 1
-        self.emb_down_conv_kernel = 0
         self.convlru_num_blocks = 8
         self.use_cbam = True
+        self.ffn_hidden_ch = 270
+        self.ffn_hidden_layers_num = 2
         self.use_gate = True
         self.lru_rank = 128
-        self.lru_r_min = 0.8
-        self.lru_r_max = 0.99
-        self.use_layer_norm_lru = True
-        self.proj_use_bias = True
         self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
-        self.freq_mode = "linear"           # optional: 'linear' | 'exp'
+        self.freq_mode = "linear"           # 'linear' | 'exp'
         self.use_sh_prior = True
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
-        self.lambda_type = "exogenous"      # optional: 'static' | 'exogenous'
-        self.exo_mode = "mlp"               # optional: 'mlp' | 'affine'
+        self.lambda_type = "exogenous"      # 'static' | 'exogenous'
+        self.exo_mode = "mlp"               # 'mlp' | 'affine'
         self.lambda_mlp_hidden = 16
-        self.exo_delta_scale_nu = 0.1
-        self.exo_delta_scale_th = 0.1
-        self.post_ifft_kernel = 3
-        self.post_ifft_use_bias = True
-        self.ffn_hidden_ch = 240
-        self.ffn_hidden_layers_num = 2
-        self.ffn_in_kernel = 7
-        self.use_layer_norm_ffn = True
-        self.cbam_reduction = 16
-        self.cbam_spatial_kernel = 7
-        self.cbam_gate_enable = True
-        self.dec_strategy = 'pxsf'          # optional: 'pxsf' | 'deconv'
+        self.dec_strategy = 'pxsf'          # 'pxsf' | 'deconv'
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
-        self.dec_pre_kernel = 3
-        self.dec_deconv_kernel = 0
-        self.dec_deconv_stride = 0
-        self.dec_hidden_use_cbam = False
-        self.temporal_kernel = 1
-        self.temporal_stride = 1
-        self.temporal_dilation = 1
-        self.init_mean = 0.0
-        self.init_std = 0.02
-        self.init_lower = -0.04
-        self.init_upper = 0.04
-        self.data_root = '/nfs/ERA5_data/data_norm'
-        self.year_range = [2000, 2021]
-        self.train_data_n_frames = 9
-        self.eval_data_n_frames = 4
-        self.eval_sample_num = 1
-        self.ckpt = ''
-        self.train_batch_size = 1
-        self.eval_batch_size = 1
-        self.epochs = 1000
-        self.log_path = './convlru_base/logs'
-        self.ckpt_dir = './convlru_base/ckpt'
-        self.ckpt_step = 0.25
-        self.do_eval = False
-        self.use_tf32 = False
-        self.use_compile = False
-        self.lr = 1e-4
-        self.use_scheduler = False
-        self.init_lr_scheduler = False
-        self.loss = 'l1'
-        self.T = 6
-        self.use_amp = False
-        self.amp_dtype = 'fp16'             # optional: 'fp16' | 'bf16'
-        self.grad_clip = 0.0
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -146,19 +94,12 @@ def keep_latest_ckpts(ckpt_dir):
 MODEL_ARG_KEYS = [
     'input_size','input_ch','out_ch','hidden_activation','output_activation',
     'emb_strategy','hidden_factor','emb_ch','emb_hidden_ch','emb_hidden_layers_num',
-    'emb_in_kernel','emb_use_cbam','emb_hidden_k3','emb_hidden_k1','emb_down_conv_kernel',
-    'convlru_num_blocks','use_cbam','use_gate','lru_rank','lru_r_min','lru_r_max',
-    'use_layer_norm_lru','proj_use_bias',
+    'convlru_num_blocks','use_cbam','use_gate','lru_rank',
     'use_freq_prior','freq_rank','freq_gain_init','freq_mode',
     'use_sh_prior','sh_Lmax','sh_rank','sh_gain_init',
-    'lambda_type','exo_mode','lambda_mlp_hidden','exo_delta_scale_nu','exo_delta_scale_th',
-    'post_ifft_kernel','post_ifft_use_bias',
-    'ffn_hidden_ch','ffn_hidden_layers_num','ffn_in_kernel','use_layer_norm_ffn',
-    'cbam_reduction','cbam_spatial_kernel','cbam_gate_enable',
-    'dec_strategy','dec_hidden_ch','dec_hidden_layers_num','dec_pre_kernel',
-    'dec_deconv_kernel','dec_deconv_stride','dec_hidden_use_cbam',
-    'temporal_kernel','temporal_stride','temporal_dilation',
-    'init_mean','init_std','init_lower','init_upper',
+    'lambda_type','exo_mode','lambda_mlp_hidden',
+    'ffn_hidden_ch','ffn_hidden_layers_num',
+    'dec_strategy','dec_hidden_ch','dec_hidden_layers_num'
 ]
 
 def extract_model_args(args_obj):
