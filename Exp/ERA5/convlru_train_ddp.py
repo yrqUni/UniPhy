@@ -70,6 +70,30 @@ class Args:
         self.dec_strategy = 'pxsf'          # 'pxsf' | 'deconv'
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
+        self.data_root = '/nfs/ERA5_data/data_norm'
+        self.year_range = [2000, 2021]
+        self.train_data_n_frames = 18
+        self.eval_data_n_frames = 4
+        self.eval_sample_num = 1
+        self.ckpt = ''
+        self.train_batch_size = 1
+        self.eval_batch_size = 1
+        self.epochs = 1000
+        self.log_path = './convlru_base/logs'
+        self.ckpt_dir = './convlru_base/ckpt'
+        self.ckpt_step = 0.25
+        self.do_eval = False
+        self.use_tf32 = False
+        self.use_compile = False
+        self.lr = 1e-4
+        self.use_scheduler = False
+        self.init_lr_scheduler = False
+        self.loss = 'l1'                    # 'l1' | 'lat'
+        self.T = 6
+        self.use_amp = False
+        self.amp_dtype = 'fp16'             # 'fp16' | 'bf16'
+        self.grad_clip = 0.0
+        self.sample_k = 9
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -282,6 +306,31 @@ def make_listT_from_arg_T(B, L, device, dtype, T):
         return None
     return torch.full((B, L), float(T), device=device, dtype=dtype)
 
+def make_uniform_indices(L_eff, K):
+    if K == 1:
+        return np.array([0], dtype=int)
+    idx = np.linspace(0, L_eff - 1, num=K)
+    idx = np.round(idx).astype(int)
+    idx[0] = 0
+    idx[-1] = L_eff - 1
+    if np.unique(idx).size != idx.size:
+        idx = np.unique(idx)
+        if idx.size < K:
+            pad = K - idx.size
+            tail = np.clip(idx[-1] + np.arange(1, pad + 1), 0, L_eff - 1)
+            idx = np.concatenate([idx, tail])
+            idx = np.unique(idx)
+    return idx[:K]
+
+def build_dt_from_indices(idxs, base_T):
+    if len(idxs) == 0:
+        return []
+    dt = [float(base_T)]
+    for i in range(1, len(idxs)):
+        gap = int(idxs[i] - idxs[i - 1])
+        dt.append(float(base_T) * max(1, gap))
+    return dt
+
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
     if rank == 0:
@@ -357,15 +406,39 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             model.train()
             opt.zero_grad(set_to_none=True)
             data = data.cuda(local_rank, non_blocking=True).to(torch.float32)[:, :, :, :, :]
-            x = data[:, :-1]
-            B, L, C, H, W = x.shape
-            listT = make_listT_from_arg_T(B, L, x.device, x.dtype, args.T)
+            B_full, L_full, C, H, W = data.shape
+            L_eff = L_full - 1
+            if args.sample_k != -1 and args.sample_k > L_full:
+                print(f"[Error] sample_k={args.sample_k} > L={L_full}. Fallback to -1 (no sampling).")
+                logging.error(f"sample_k={args.sample_k} > L={L_full}. Fallback to -1.")
+                K = -1
+            else:
+                K = args.sample_k
+            if K == -1:
+                x = data[:, :L_eff]
+                B, L, _, _, _ = x.shape
+                listT_vals = [float(args.T)] * L
+                target = data[:, 1:L_eff+1]
+            else:
+                if K > L_eff:
+                    print(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1 (no sampling).")
+                    logging.error(f"sample_k={K} > effective L={L_eff}. Fallback to -1.")
+                    x = data[:, :L_eff]
+                    B, L, _, _, _ = x.shape
+                    listT_vals = [float(args.T)] * L
+                    target = data[:, 1:L_eff+1]
+                else:
+                    idxs = make_uniform_indices(L_eff, K)
+                    x = data[:, idxs]
+                    listT_vals = build_dt_from_indices(idxs, args.T)
+                    tgt_idxs = np.clip(idxs[1:] + 1, 1, L_full - 1)
+                    target = data[:, tgt_idxs]
+            listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(B_full, 1)
             use_amp = bool(args.use_amp)
             ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
             with ctx:
                 preds = model(x, 'p', listT=listT)
                 preds = preds[:, 1:]
-                target = data[:, 2:]
                 loss = loss_fn(preds, target)
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -417,15 +490,37 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
                     data = data.cuda(local_rank, non_blocking=True).to(torch.float32)[:, :, :, :, :]
+                    B_full, L_full, C, H, W = data.shape
                     half = args.eval_data_n_frames // 2
                     cond = data[:, :half]
-                    B, Lc, C, H, W = cond.shape
-                    listT_cond = make_listT_from_arg_T(B, Lc, cond.device, cond.dtype, args.T)
-                    out_gen_num = data.shape[1] - half
-                    listT_future = make_listT_from_arg_T(B, out_gen_num, cond.device, cond.dtype, args.T)
+                    if args.sample_k != -1 and args.sample_k > cond.shape[1]:
+                        print(f"[Error] sample_k={args.sample_k} > L={cond.shape[1]} in eval. Fallback to -1.")
+                        logging.error(f"sample_k={args.sample_k} > L={cond.shape[1]} in eval. Fallback to -1.")
+                        K_eval = -1
+                    else:
+                        K_eval = args.sample_k
+                    if K_eval == -1:
+                        cond_eff = cond
+                        Bc, Lc, _, _, _ = cond_eff.shape
+                        listT_cond_vals = [float(args.T)] * Lc
+                    else:
+                        Lc_eff = cond.shape[1]
+                        if K_eval > Lc_eff:
+                            print(f"[Error] sample_k={K_eval} > L={Lc_eff} in eval. Fallback to -1.")
+                            logging.error(f"sample_k={K_eval} > L={Lc_eff} in eval. Fallback to -1.")
+                            cond_eff = cond
+                            Bc, Lc, _, _, _ = cond_eff.shape
+                            listT_cond_vals = [float(args.T)] * Lc
+                        else:
+                            idxs_c = make_uniform_indices(Lc_eff, K_eval)
+                            cond_eff = cond[:, idxs_c]
+                            listT_cond_vals = build_dt_from_indices(idxs_c, args.T)
+                    listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(B_full, 1)
+                    out_gen_num = data.shape[1] - cond_eff.shape[1]
+                    listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
                     with torch.cuda.amp.autocast(enabled=bool(args.use_amp), dtype=amp_dtype):
-                        preds = model(cond, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
-                        loss_eval = loss_fn(preds, data[:, half:])
+                        preds = model(cond_eff, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
+                        loss_eval = loss_fn(preds, data[:, cond_eff.shape[1]:cond_eff.shape[1]+out_gen_num])
                     tot_tensor = loss_eval.detach()
                     dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
                     avg_total = (tot_tensor / world_size).item()
@@ -434,7 +529,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                         if isinstance(eval_dataloader_iter, tqdm):
                             eval_dataloader_iter.set_description(message)
                         logging.info(message)
-                    del data, cond, preds, loss_eval, tot_tensor
+                    del data, cond, cond_eff, preds, loss_eval, tot_tensor, listT_cond, listT_future
                     gc.collect(); torch.cuda.empty_cache()
                 del eval_dataset, eval_sampler, eval_dataloader, eval_dataloader_iter
                 gc.collect()
