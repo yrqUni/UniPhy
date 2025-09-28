@@ -72,7 +72,7 @@ class Args:
         self.dec_hidden_layers_num = 0
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 18
+        self.train_data_n_frames = 9
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ''
@@ -93,12 +93,17 @@ class Args:
         self.use_amp = False
         self.amp_dtype = 'fp16'             # 'fp16' | 'bf16'
         self.grad_clip = 0.0
-        self.sample_k = 9
+        self.sample_k = -1
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = str(master_port)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=1800)
+    )
     torch.cuda.set_device(local_rank)
 
 def cleanup_ddp():
@@ -306,21 +311,14 @@ def make_listT_from_arg_T(B, L, device, dtype, T):
         return None
     return torch.full((B, L), float(T), device=device, dtype=dtype)
 
-def make_uniform_indices(L_eff, K):
+def make_random_indices(L_eff, K):
+    if K <= 0:
+        return np.array([], dtype=int)
     if K == 1:
         return np.array([0], dtype=int)
-    idx = np.linspace(0, L_eff - 1, num=K)
-    idx = np.round(idx).astype(int)
-    idx[0] = 0
-    idx[-1] = L_eff - 1
-    if np.unique(idx).size != idx.size:
-        idx = np.unique(idx)
-        if idx.size < K:
-            pad = K - idx.size
-            tail = np.clip(idx[-1] + np.arange(1, pad + 1), 0, L_eff - 1)
-            idx = np.concatenate([idx, tail])
-            idx = np.unique(idx)
-    return idx[:K]
+    idx = np.random.choice(L_eff, size=K, replace=False)
+    idx.sort()
+    return idx
 
 def build_dt_from_indices(idxs, base_T):
     if len(idxs) == 0:
@@ -367,7 +365,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         is_train=True, sample_len=args.train_data_n_frames,
         eval_sample=args.eval_sample_num, max_cache_size=5,
         rank=dist.get_rank(), gpus=dist.get_world_size())
-    tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False)
+    tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False, drop_last=True)
     tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size,
                             num_workers=1, pin_memory=True, prefetch_factor=1)
     len_train_dataloader = len(tmp_loader)
@@ -396,7 +394,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             is_train=True, sample_len=args.train_data_n_frames,
             eval_sample=args.eval_sample_num, max_cache_size=5,
             rank=dist.get_rank(), gpus=dist.get_world_size())
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
         train_dataloader = DataLoader(
             train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
             num_workers=2, pin_memory=True, prefetch_factor=2, persistent_workers=False)
@@ -428,7 +426,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     listT_vals = [float(args.T)] * L
                     target = data[:, 1:L_eff+1]
                 else:
-                    idxs = make_uniform_indices(L_eff, K)
+                    idxs = make_random_indices(L_eff, K)
                     x = data[:, idxs]
                     listT_vals = build_dt_from_indices(idxs, args.T)
                     tgt_idxs = np.clip(idxs[1:] + 1, 1, L_full - 1)
@@ -483,7 +481,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     is_train=False, sample_len=args.eval_data_n_frames,
                     eval_sample=args.eval_sample_num, max_cache_size=5,
                     rank=dist.get_rank(), gpus=dist.get_world_size())
-                eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False)
+                eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False, drop_last=True)
                 eval_dataloader = DataLoader(
                     eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size,
                     num_workers=1, pin_memory=True, prefetch_factor=1)
@@ -512,7 +510,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                             Bc, Lc, _, _, _ = cond_eff.shape
                             listT_cond_vals = [float(args.T)] * Lc
                         else:
-                            idxs_c = make_uniform_indices(Lc_eff, K_eval)
+                            idxs_c = make_random_indices(Lc_eff, K_eval)
                             cond_eff = cond[:, idxs_c]
                             listT_cond_vals = build_dt_from_indices(idxs_c, args.T)
                     listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(B_full, 1)
