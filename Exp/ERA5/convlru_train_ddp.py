@@ -416,7 +416,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 x = data[:, :L_eff]
                 B, L, _, _, _ = x.shape
                 listT_vals = [float(args.T)] * L
-                target = data[:, 1:L_eff+1]
+                target = data[:, 2:L_eff+1]  # fixed alignment with preds[:,1:]
             else:
                 if K > L_eff:
                     print(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1 (no sampling).")
@@ -424,7 +424,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     x = data[:, :L_eff]
                     B, L, _, _, _ = x.shape
                     listT_vals = [float(args.T)] * L
-                    target = data[:, 1:L_eff+1]
+                    target = data[:, 2:L_eff+1]  # fixed alignment with preds[:,1:]
                 else:
                     idxs = make_random_indices(L_eff, K)
                     x = data[:, idxs]
