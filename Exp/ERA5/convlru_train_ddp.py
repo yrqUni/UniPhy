@@ -84,6 +84,7 @@ class Args:
         self.use_scheduler = False
         self.init_lr_scheduler = False
         self.loss = 'l1'
+        self.T = 6
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -288,6 +289,11 @@ def format_gate_means():
         parts.append(f"g[b{k}]={v:.4f}" if isinstance(k,int) else f"g[{k}]={v:.4f}")
     return " ".join(parts)
 
+def make_listT_from_arg_T(B, L, device, dtype, T):
+    if T is None or T < 0:
+        return None
+    return torch.full((B, L), float(T), device=device, dtype=dtype)
+
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
     if rank == 0:
@@ -360,7 +366,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             data = data.cuda(local_rank).to(torch.float32)[:, :, :, :, :]
             x = data[:, :-1]
             B, L, C, H, W = x.shape
-            listT = torch.full((B, L), 6.0, device=x.device, dtype=x.dtype)
+            listT = make_listT_from_arg_T(B, L, x.device, x.dtype, args.T)
             preds = model(x, 'p', listT=listT)
             preds = preds[:, 1:]
             target = data[:, 2:]
@@ -375,7 +381,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if args.use_scheduler else args.lr
                 gate_str = format_gate_means()
-                message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {gate_str}"
+                t_str = f"T={args.T}"
+                message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {t_str} - {gate_str}"
                 train_dataloader_iter.set_description(message)
                 logging.info(message)
             if rank == 0 and (train_step % int(len(train_dataloader)*args.ckpt_step) == 0 or train_step == len(train_dataloader)):
@@ -402,9 +409,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     half = args.eval_data_n_frames // 2
                     cond = data[:, :half]
                     B, Lc, C, H, W = cond.shape
-                    listT_cond = torch.full((B, Lc), 6.0, device=cond.device, dtype=cond.dtype)
+                    listT_cond = make_listT_from_arg_T(B, Lc, cond.device, cond.dtype, args.T)
                     out_gen_num = data.shape[1] - half
-                    listT_future = torch.full((B, out_gen_num), 6.0, device=cond.device, dtype=cond.dtype)
+                    listT_future = make_listT_from_arg_T(B, out_gen_num, cond.device, cond.dtype, args.T)
                     preds = model(cond, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
                     loss_eval = loss_fn(preds, data[:, half:])
                     tot_tensor = torch.tensor(loss_eval.item(), device=f'cuda:{local_rank}')
