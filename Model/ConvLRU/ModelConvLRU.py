@@ -516,6 +516,39 @@ class ConvLRULayer(nn.Module):
             self.exo_affine_a = None
             self.exo_affine_b = None
         self.pscan = PScan.apply
+        def _freeze_attr(name: str):
+            p = getattr(self, name, None)
+            if isinstance(p, torch.nn.Parameter):
+                p.requires_grad_(False)
+        S_is_square = (S == W)
+        if S_is_square:
+            for n in ["params_log_rank", "U_row", "V_col"]:
+                _freeze_attr(n)
+        else:
+            _freeze_attr("params_log_square")
+        if self.lambda_type == "static":
+            for n in [
+                "mod_nu_fc1_S","mod_nu_fc2_S","mod_th_fc1_S","mod_th_fc2_S",
+                "mod_nu_fc1_R","mod_nu_fc2_R","mod_th_fc1_R","mod_th_fc2_R",
+                "exo_affine_a","exo_affine_b",
+            ]:
+                _freeze_attr(n)
+        else:
+            if self.exo_mode == "affine":
+                for n in [
+                    "mod_nu_fc1_S","mod_nu_fc2_S","mod_th_fc1_S","mod_th_fc2_S",
+                    "mod_nu_fc1_R","mod_nu_fc2_R","mod_th_fc1_R","mod_th_fc2_R",
+                ]:
+                    _freeze_attr(n)
+            else:
+                for n in ["exo_affine_a","exo_affine_b"]:
+                    _freeze_attr(n)
+                if S_is_square:
+                    for n in ["mod_nu_fc1_R","mod_nu_fc2_R","mod_th_fc1_R","mod_th_fc2_R"]:
+                        _freeze_attr(n)
+                else:
+                    for n in ["mod_nu_fc1_S","mod_nu_fc2_S","mod_th_fc1_S","mod_th_fc2_S"]:
+                        _freeze_attr(n)
     def _project_to_square(self, h):
         t = torch.einsum('blcsw,csr->blcrw', h, self.U_row.conj())
         z = torch.einsum('blcrw,cwp->blcrp', t, self.V_col)

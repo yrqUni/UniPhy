@@ -116,14 +116,14 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
     return torch.cat(outs, dim=1)
 
 def max_err(a, b):
-    return float((a - b).abs().max().cpu())
+    return float((a - b).abs().max().detach().cpu())
 
 def mae(a, b):
-    return float((a - b).abs().mean().cpu())
+    return float((a - b).abs().mean().detach().cpu())
 
 def effective_tol(y_ref: torch.Tensor, L: int, base_atol: float = 3e-6, base_rtol: float = 1e-5, k_abs: float = 64.0, k_rel: float = 64.0):
     eps = np.finfo(np.float32).eps
-    mag = float(y_ref.abs().max().cpu()) + 1.0
+    mag = float(y_ref.abs().max().detach().cpu()) + 1.0
     growth = max(1.0, math.log2(L + 1))
     atol_eff = max(base_atol, k_abs * eps * mag * growth)
     rtol_eff = max(base_rtol, k_rel * eps * growth)
@@ -151,6 +151,51 @@ def make_listT_cases(B, L, device, dtype, include_none=True):
         burst[:, L//2:L//2+2] = 1.8
     cases += [("ones", ones), ("rand", rnd), ("inc", inc), ("burst", burst)]
     return cases
+
+def expected_unused_name(name: str, args, hidden_hw_equal: bool) -> bool:
+    if hidden_hw_equal:
+        if any(name.endswith(suf) for suf in (
+            "lru_layer.params_log_rank",
+            "lru_layer.U_row",
+            "lru_layer.V_col",
+            "lru_layer.mod_nu_fc1_R",
+            "lru_layer.mod_nu_fc2_R",
+            "lru_layer.mod_th_fc1_R",
+            "lru_layer.mod_th_fc2_R",
+        )):
+            return True
+    else:
+        if any(name.endswith(suf) for suf in (
+            "lru_layer.params_log_square",
+            "lru_layer.mod_nu_fc1_S",
+            "lru_layer.mod_nu_fc2_S",
+            "lru_layer.mod_th_fc1_S",
+            "lru_layer.mod_th_fc2_S",
+        )):
+            return True
+    if args.lambda_type != "exogenous":
+        if any(s in name for s in (
+            "lru_layer.mod_nu_fc1_",
+            "lru_layer.mod_nu_fc2_",
+            "lru_layer.mod_th_fc1_",
+            "lru_layer.mod_th_fc2_",
+            "lru_layer.exo_affine_a",
+            "lru_layer.exo_affine_b",
+        )):
+            return True
+    else:
+        if args.exo_mode != "affine":
+            if any(name.endswith(suf) for suf in ("lru_layer.exo_affine_a", "lru_layer.exo_affine_b")):
+                return True
+        if args.exo_mode == "affine":
+            if any(name.endswith(suf) for suf in (
+                "lru_layer.mod_nu_fc1_S","lru_layer.mod_nu_fc2_S",
+                "lru_layer.mod_th_fc1_S","lru_layer.mod_th_fc2_S",
+                "lru_layer.mod_nu_fc1_R","lru_layer.mod_nu_fc2_R",
+                "lru_layer.mod_th_fc1_R","lru_layer.mod_th_fc2_R",
+            )):
+                return True
+    return False
 
 def list_unused_parameters(model, x, listT, mode="p"):
     model.train()
@@ -192,6 +237,9 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
     total, trainable = count_params(model)
     print(f"[params] total={total} trainable={trainable}")
     H, W = args.input_size
+    hidden_H = model.embedding.input_downsp_shape[1]
+    hidden_W = model.embedding.input_downsp_shape[2]
+    hidden_equal = (hidden_H == hidden_W)
     dtype_real = torch.float32
     set_seed(2024)
     x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
@@ -206,16 +254,27 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
             print(f"[p~stream] listT={lt_name:<6} pat_len={len(pat):>2} max_err={e1:.3e} mae={m1:.3e} tol(r={rtol_eff:.2e},a={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
             if not ok:
                 raise RuntimeError("p vs streaming mismatch")
-        unused_p = list_unused_parameters(model, x, listT, mode="p")
-        print(f"[unused-p] listT={lt_name:<6} {'none' if len(unused_p)==0 else ', '.join(unused_p[:8]) + (' ...' if len(unused_p)>8 else '')}")
+        unused_p_all = list_unused_parameters(model, x, listT, mode="p")
+        expected_p = [n for n in unused_p_all if expected_unused_name(n, args, hidden_equal)]
+        unexpected_p = [n for n in unused_p_all if n not in expected_p]
+        if len(unexpected_p) == 0:
+            tag = "none" if len(expected_p) == 0 else ", ".join(expected_p[:8]) + (" ..." if len(expected_p) > 8 else "")
+            print(f"[unused-p] listT={lt_name:<6} {tag}")
+        else:
+            print(f"[unused-p] listT={lt_name:<6} UNEXPECTED: {', '.join(unexpected_p)}")
+            raise RuntimeError("Unexpected unused parameters in mode='p'")
     half = L // 2
     first_case_listT = lt_cases[0][1]
-    if first_case_listT is None:
-        listT_half = None
+    listT_half = None if first_case_listT is None else first_case_listT[:, :half]
+    unused_i_all = list_unused_parameters(model, x[:, :half], listT=listT_half, mode="i")
+    expected_i = [n for n in unused_i_all if expected_unused_name(n, args, hidden_equal)]
+    unexpected_i = [n for n in unused_i_all if n not in expected_i]
+    if len(unexpected_i) == 0:
+        tag = "none" if len(expected_i) == 0 else ", ".join(expected_i[:12]) + (" ..." if len(expected_i) > 12 else "")
+        print(f"[unused-i] {tag}")
     else:
-        listT_half = first_case_listT[:, :half]
-    unused_i = list_unused_parameters(model, x[:, :half], listT=listT_half, mode="i")
-    print(f"[unused-i] {'none' if len(unused_i)==0 else ', '.join(unused_i[:12]) + (' ...' if len(unused_i)>12 else '')}")
+        print(f"[unused-i] UNEXPECTED: {', '.join(unexpected_i)}")
+        raise RuntimeError("Unexpected unused parameters in mode='i'")
     if args.lambda_type == "static":
         err_k = test_semigroup_static_with_listT(model, H, W, B=B, L=L, k=3, dtype=dtype_real, device=device)
         print(f"[static-semi] k=3 max_err={err_k:.3e}")
