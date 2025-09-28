@@ -568,7 +568,7 @@ class ConvLRULayer(nn.Module):
                 lam1 = torch.exp(torch.complex(-nu0, th0))
                 if listT is None:
                     ones = torch.ones(B, L, device=x.device, dtype=x.dtype)
-                    lamb = lam1
+                    lamb = lam1.expand(B, L, C, S, 1)
                     x_in = self._apply_static_dt_scaling(h, lam1, ones)
                 else:
                     lamb = lam1.pow(dt)
@@ -635,7 +635,7 @@ class ConvLRULayer(nn.Module):
                 lam1 = torch.exp(torch.complex(-nu0, th0))
                 if listT is None:
                     ones = torch.ones(B, L, device=x.device, dtype=x.dtype)
-                    lamb = lam1
+                    lamb = lam1.expand(B, L, C, self.rank, 1)
                     x_in = self._apply_static_dt_scaling(z, lam1, ones)
                 else:
                     lamb = lam1.pow(dt)
