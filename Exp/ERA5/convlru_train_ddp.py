@@ -377,7 +377,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         is_train=True, sample_len=args.train_data_n_frames,
         eval_sample=args.eval_sample_num, max_cache_size=5,
         rank=dist.get_rank(), gpus=dist.get_world_size())
-    tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=True)
+    tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False)
     tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size,
                             num_workers=1, pin_memory=True, prefetch_factor=1)
     len_train_dataloader = len(tmp_loader)
@@ -406,7 +406,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             is_train=True, sample_len=args.train_data_n_frames,
             eval_sample=args.eval_sample_num, max_cache_size=5,
             rank=dist.get_rank(), gpus=dist.get_world_size())
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
         train_dataloader = DataLoader(
             train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
             num_workers=2, pin_memory=True, prefetch_factor=2, persistent_workers=False)
