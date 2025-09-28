@@ -600,26 +600,28 @@ class ConvLRULayer(nn.Module):
                 lamb = torch.exp(torch.complex(-nu_t, th_t))
                 gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
                 x_in = h * gamma_t
+            added_dummy = False
             if last_hidden_in is not None:
                 prev_state = last_hidden_in[0] if isinstance(last_hidden_in, tuple) else last_hidden_in
                 x_in = torch.concat([prev_state, x_in], dim=1)
                 lamb = torch.concat([lamb[:, :1], lamb], dim=1)
-                L2 = L + 1
             else:
-                L2 = L
-            if L2 == 1:
-                zero_prev = torch.zeros_like(x_in[:, :1])
-                x_in = torch.cat([zero_prev, x_in], dim=1)
-                lamb = torch.cat([lamb[:, :1], lamb], dim=1)
-                L2 = 2
+                if L == 1:
+                    zero_prev = torch.zeros_like(x_in[:, :1])
+                    x_in = torch.cat([zero_prev, x_in], dim=1)
+                    lamb = torch.cat([lamb[:, :1], lamb], dim=1)
+                    added_dummy = True
+            L2 = x_in.size(1)
             h = self.pscan(lamb[:, :L2], x_in)
+            if added_dummy:
+                h = h[:, 1:]
+            if last_hidden_in is not None:
+                h = h[:, 1:]
             last_hidden_out = h[:, -1:]
             h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
             h = self.layer_norm(h)
-            if last_hidden_in is not None:
-                h = h[:, 1:]
             aux = {}
             if self.lambda_type == "exogenous":
                 aux['phi_last'] = phi[:, -1:].detach()
@@ -665,27 +667,29 @@ class ConvLRULayer(nn.Module):
                 lamb = torch.exp(torch.complex(-nu_t, th_t))
                 gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
                 x_in = z * gamma_t
+            added_dummy = False
             if last_hidden_in is not None:
                 prev_state = last_hidden_in[0] if isinstance(last_hidden_in, tuple) else last_hidden_in
                 x_in = torch.concat([prev_state, x_in], dim=1)
                 lamb = torch.concat([lamb[:, :1], lamb], dim=1)
-                L2 = L + 1
             else:
-                L2 = L
-            if L2 == 1:
-                zero_prev = torch.zeros_like(x_in[:, :1])
-                x_in = torch.cat([zero_prev, x_in], dim=1)
-                lamb = torch.cat([lamb[:, :1], lamb], dim=1)
-                L2 = 2
+                if L == 1:
+                    zero_prev = torch.zeros_like(x_in[:, :1])
+                    x_in = torch.cat([zero_prev, x_in], dim=1)
+                    lamb = torch.cat([lamb[:, :1], lamb], dim=1)
+                    added_dummy = True
+            L2 = x_in.size(1)
             z = self.pscan(lamb[:, :L2], x_in)
+            if added_dummy:
+                z = z[:, 1:]
+            if last_hidden_in is not None:
+                z = z[:, 1:]
             last_hidden_out = z[:, -1:]
             h = self._deproject_from_square(z)
             h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
             h = self.layer_norm(h)
-            if last_hidden_in is not None:
-                h = h[:, 1:]
             aux = {}
             if self.lambda_type == "exogenous":
                 aux['phi_last'] = phi[:, -1:].detach()
