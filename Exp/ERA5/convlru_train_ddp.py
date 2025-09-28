@@ -45,7 +45,7 @@ class Args:
         self.out_ch = 30
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
-        self.emb_strategy = 'pxus'          # 可选: 'pxus' | 'conv'
+        self.emb_strategy = 'pxus'          # optional: 'pxus' | 'conv'
         self.hidden_factor = (7, 10)
         self.emb_ch = 240
         self.emb_hidden_ch = 240
@@ -66,13 +66,13 @@ class Args:
         self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
-        self.freq_mode = "linear"           # 可选: 'linear' | 'exp'
+        self.freq_mode = "linear"           # optional: 'linear' | 'exp'
         self.use_sh_prior = True
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
-        self.lambda_type = "exogenous"      # 可选: 'static' | 'exogenous'
-        self.exo_mode = "mlp"               # 可选: 'mlp' | 'affine'
+        self.lambda_type = "exogenous"      # optional: 'static' | 'exogenous'
+        self.exo_mode = "mlp"               # optional: 'mlp' | 'affine'
         self.lambda_mlp_hidden = 16
         self.exo_delta_scale_nu = 0.1
         self.exo_delta_scale_th = 0.1
@@ -85,7 +85,7 @@ class Args:
         self.cbam_reduction = 16
         self.cbam_spatial_kernel = 7
         self.cbam_gate_enable = True
-        self.dec_strategy = 'pxsf'          # 可选: 'pxsf' | 'deconv'
+        self.dec_strategy = 'pxsf'          # optional: 'pxsf' | 'deconv'
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
         self.dec_pre_kernel = 3
@@ -120,7 +120,7 @@ class Args:
         self.loss = 'l1'
         self.T = 6
         self.use_amp = False
-        self.amp_dtype = 'fp16'             # 可选: 'fp16' | 'bf16'
+        self.amp_dtype = 'fp16'             # optional: 'fp16' | 'bf16'
         self.grad_clip = 0.0
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
@@ -503,6 +503,10 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
 
 if __name__ == "__main__":
     args = Args()
+    if bool(args.use_amp):
+        print("[Warning] AMP is disabled by policy. Forcing use_amp=False.")
+        logging.warning("AMP is disabled by policy. Forcing use_amp=False.")
+        args.use_amp = False
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
