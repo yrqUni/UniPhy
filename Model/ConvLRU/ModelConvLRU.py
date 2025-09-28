@@ -567,14 +567,11 @@ class ConvLRULayer(nn.Module):
             if self.lambda_type == "static":
                 lam1 = torch.exp(torch.complex(-nu0, th0))
                 if listT is None:
-                    nu_t = torch.clamp(nu0, min=1e-6)
-                    th_t = th0
-                    lamb = torch.exp(torch.complex(-nu_t, th_t))
-                    gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
-                    x_in = h * gamma_t
+                    ones = torch.ones(B, L, device=x.device, dtype=x.dtype)
+                    lamb = lam1
+                    x_in = self._apply_static_dt_scaling(h, lam1, ones)
                 else:
                     lamb = lam1.pow(dt)
-                    gamma_t = torch.sqrt(torch.clamp(1.0 - (lamb.abs() ** 2), min=1e-12))
                     x_in = self._apply_static_dt_scaling(h, lam1, listT)
             else:
                 phi = h.abs().mean(dim=-1, keepdim=True)
@@ -610,6 +607,11 @@ class ConvLRULayer(nn.Module):
                 L2 = L + 1
             else:
                 L2 = L
+            if L2 == 1:
+                zero_prev = torch.zeros_like(x_in[:, :1])
+                x_in = torch.cat([zero_prev, x_in], dim=1)
+                lamb = torch.cat([lamb[:, :1], lamb], dim=1)
+                L2 = 2
             h = self.pscan(lamb[:, :L2], x_in)
             last_hidden_out = h[:, -1:]
             h = self._ifft_and_fuse(h)
@@ -630,14 +632,11 @@ class ConvLRULayer(nn.Module):
             if self.lambda_type == "static":
                 lam1 = torch.exp(torch.complex(-nu0, th0))
                 if listT is None:
-                    nu_t = torch.clamp(nu0, min=1e-6)
-                    th_t = th0
-                    lamb = torch.exp(torch.complex(-nu_t, th_t))
-                    gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
-                    x_in = z * gamma_t
+                    ones = torch.ones(B, L, device=x.device, dtype=x.dtype)
+                    lamb = lam1
+                    x_in = self._apply_static_dt_scaling(z, lam1, ones)
                 else:
                     lamb = lam1.pow(dt)
-                    gamma_t = torch.sqrt(torch.clamp(1.0 - (lamb.abs() ** 2), min=1e-12))
                     x_in = self._apply_static_dt_scaling(z, lam1, listT)
             else:
                 phi = z.abs().mean(dim=-1, keepdim=True)
@@ -673,6 +672,11 @@ class ConvLRULayer(nn.Module):
                 L2 = L + 1
             else:
                 L2 = L
+            if L2 == 1:
+                zero_prev = torch.zeros_like(x_in[:, :1])
+                x_in = torch.cat([zero_prev, x_in], dim=1)
+                lamb = torch.cat([lamb[:, :1], lamb], dim=1)
+                L2 = 2
             z = self.pscan(lamb[:, :L2], x_in)
             last_hidden_out = z[:, -1:]
             h = self._deproject_from_square(z)
