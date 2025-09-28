@@ -11,17 +11,21 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-def set_random_seed(seed):
+def set_random_seed(seed, deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
 
-set_random_seed(1017)
+set_random_seed(1017, deterministic=False)
 
 sys.path.append('/nfs/ConvLRU/Model/ConvLRU')
 sys.path.append('/nfs/ConvLRU/Exp/ERA5')
@@ -36,35 +40,90 @@ from tqdm import tqdm
 
 class Args:
     def __init__(self):
+        # 数据/尺寸
         self.input_size = (721, 1440)
         self.input_ch = 30
-        self.use_cbam = True
-        self.use_gate = True
+        self.out_ch = 30
+
+        # 激活
+        self.hidden_activation = 'Tanh'
+        self.output_activation = 'Tanh'
+
+        # 嵌入(下采样)
+        self.emb_strategy = 'pxus'          # 'pxus' | 'conv'
+        self.hidden_factor = (7, 10)        # (rH, rW)
+        self.emb_ch = 240
+        self.emb_hidden_ch = 240
+        self.emb_hidden_layers_num = 2
+        self.emb_in_kernel = 7              # (1, k, k)
+        self.emb_use_cbam = False           # 中间残差块是否用CBAM
+        self.emb_hidden_k3 = 3              # Conv_hidden里的(1, k3, k3)
+        self.emb_hidden_k1 = 1              # Conv_hidden里的(1, k1, k1)
+        self.emb_down_conv_kernel = 0       # 0=随rH,rW设置；>0时强制(1,k,k)；仅emb_strategy='conv'时有效
+
+        # ConvLRU主干
+        self.convlru_num_blocks = 8
+        self.use_cbam = True                # FeedForward分支是否用CBAM
+        self.use_gate = True                # LRU输出与残差的门控
+        self.lru_rank = 128                 # 低秩维度(非方阵投影)
+        self.lru_r_min = 0.8
+        self.lru_r_max = 0.99
+        self.use_layer_norm_lru = True
+        self.proj_use_bias = True
+
+        # 频谱/球谐先验
         self.use_freq_prior = True
-        self.use_sh_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
-        self.freq_mode = "linear"
+        self.freq_mode = "linear"           # 'linear' | 'exp'
+        self.use_sh_prior = True
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
-        self.lru_rank = 128
-        self.lambda_type = "exogenous"
+
+        # λ 动态/外源
+        self.lambda_type = "exogenous"      # 'static' | 'exogenous'
+        self.exo_mode = "mlp"               # 'mlp' | 'affine'
         self.lambda_mlp_hidden = 16
-        self.emb_ch = 240
-        self.convlru_num_blocks = 8
-        self.hidden_factor = (7, 10)
-        self.emb_hidden_ch = 240
-        self.emb_hidden_layers_num = 2
-        self.emb_strategy = 'pxus'
+        self.exo_delta_scale_nu = 0.1
+        self.exo_delta_scale_th = 0.1
+
+        # IFFT后融合
+        self.post_ifft_kernel = 3           # (1, k, k)
+        self.post_ifft_use_bias = True
+
+        # FFN分支
         self.ffn_hidden_ch = 240
         self.ffn_hidden_layers_num = 2
+        self.ffn_in_kernel = 7              # (1, k, k)
+        self.use_layer_norm_ffn = True
+
+        # CBAM细节
+        self.cbam_reduction = 16
+        self.cbam_spatial_kernel = 7
+        self.cbam_gate_enable = True
+
+        # 解码(上采样)
+        self.dec_strategy = 'pxsf'          # 'pxsf' | 'deconv'
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
-        self.dec_strategy = 'pxsf'
-        self.out_ch = 30
-        self.hidden_activation = 'Tanh'
-        self.output_activation = 'Tanh'
+        self.dec_pre_kernel = 3             # pxsf时(1,k,k)
+        self.dec_deconv_kernel = 0          # 0=随rH,rW；>0时(1,k,k)
+        self.dec_deconv_stride = 0          # 0=随rH,rW；>0时(1,s,s)
+        self.dec_hidden_use_cbam = False
+
+        # 3D卷积时间维(统一)
+        self.temporal_kernel = 1
+        self.temporal_stride = 1
+        self.temporal_dilation = 1
+
+        # 初始化(截断正态)
+        self.init_mean = 0.0
+        self.init_std = 0.02
+        self.init_lower = -0.04
+        self.init_upper = 0.04
+
+        # 训练
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 9
@@ -85,6 +144,9 @@ class Args:
         self.init_lr_scheduler = False
         self.loss = 'l1'
         self.T = 6
+        self.use_amp = False
+        self.amp_dtype = 'fp16'
+        self.grad_clip = 0.0
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -101,17 +163,38 @@ def keep_latest_ckpts(ckpt_dir):
         return
     ckpt_files.sort(key=os.path.getmtime, reverse=True)
     for file_path in ckpt_files[3:]:
-        os.remove(file_path)
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
 
 MODEL_ARG_KEYS = [
-    'input_size','input_ch','use_cbam','use_gate',
-    'use_freq_prior','use_sh_prior','freq_rank','freq_gain_init',
-    'sh_Lmax','sh_rank','sh_gain_init','lru_rank','freq_mode','lambda_type','lambda_mlp_hidden',
-    'emb_ch','convlru_num_blocks','hidden_factor',
-    'emb_hidden_ch','emb_hidden_layers_num','emb_strategy',
-    'ffn_hidden_ch','ffn_hidden_layers_num',
-    'dec_hidden_ch','dec_hidden_layers_num','dec_strategy',
-    'out_ch','hidden_activation','output_activation',
+    # 数据/尺寸/激活
+    'input_size','input_ch','out_ch','hidden_activation','output_activation',
+    # 嵌入
+    'emb_strategy','hidden_factor','emb_ch','emb_hidden_ch','emb_hidden_layers_num',
+    'emb_in_kernel','emb_use_cbam','emb_hidden_k3','emb_hidden_k1','emb_down_conv_kernel',
+    # ConvLRU主干
+    'convlru_num_blocks','use_cbam','use_gate','lru_rank','lru_r_min','lru_r_max',
+    'use_layer_norm_lru','proj_use_bias',
+    # 频谱/球谐
+    'use_freq_prior','freq_rank','freq_gain_init','freq_mode',
+    'use_sh_prior','sh_Lmax','sh_rank','sh_gain_init',
+    # λ 动态/外源
+    'lambda_type','exo_mode','lambda_mlp_hidden','exo_delta_scale_nu','exo_delta_scale_th',
+    # IFFT后融合
+    'post_ifft_kernel','post_ifft_use_bias',
+    # FFN
+    'ffn_hidden_ch','ffn_hidden_layers_num','ffn_in_kernel','use_layer_norm_ffn',
+    # CBAM细节
+    'cbam_reduction','cbam_spatial_kernel','cbam_gate_enable',
+    # 解码
+    'dec_strategy','dec_hidden_ch','dec_hidden_layers_num','dec_pre_kernel',
+    'dec_deconv_kernel','dec_deconv_stride','dec_hidden_use_cbam',
+    # 3D卷积时间维
+    'temporal_kernel','temporal_stride','temporal_dilation',
+    # 初始化
+    'init_mean','init_std','init_lower','init_upper',
 ]
 
 def extract_model_args(args_obj):
@@ -155,7 +238,7 @@ def load_model_args_from_ckpt(ckpt_path, map_location='cpu'):
 def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     state = {
-        'model': model.state_dict(),
+        'model': (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
         'optimizer': opt.state_dict(),
         'epoch': epoch,
         'step': step,
@@ -282,7 +365,7 @@ def register_lru_gate_hooks(ddp_model, rank):
 def format_gate_means():
     if not _LRU_GATE_MEAN:
         return "g=NA"
-    keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: (9999 if isinstance(k,int) else 9999, k)) if not all(isinstance(k,int) for k in _LRU_GATE_MEAN.keys()) else sorted(_LRU_GATE_MEAN.keys())
+    keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: (0, k) if isinstance(k, int) else (1, str(k)))
     parts = []
     for k in keys:
         v = _LRU_GATE_MEAN[k]
@@ -302,95 +385,144 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
+
     if args.ckpt and os.path.isfile(args.ckpt):
         ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f'cuda:{local_rank}')
         if ckpt_model_args:
             print("[Args] applying model args from ckpt before building model.")
             logging.info("[Args] applying model args from ckpt before building model.")
             apply_model_args(args, ckpt_model_args, verbose=True)
+
     if rank == 0:
         logging.info("==== Training Arguments (Updated) ====")
         for k, v in vars(args).items():
             logging.info(f"{k}: {v}")
         logging.info("======================================")
+
     model = ConvLRU(args)
     model = model.cuda(local_rank)
+
     loss_fn = latitude_weighted_l1 if args.loss == 'lat' else torch.nn.L1Loss()
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         print(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
         logging.info(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
+
     if args.use_compile:
         model = torch.compile(model, mode="default")
+
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     register_lru_gate_hooks(model, rank)
-    train_dataset = ERA5_Dataset(
+
+    tmp_dataset = ERA5_Dataset(
         input_dir=args.data_root, year_range=args.year_range,
         is_train=True, sample_len=args.train_data_n_frames,
         eval_sample=args.eval_sample_num, max_cache_size=5,
         rank=dist.get_rank(), gpus=dist.get_world_size())
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
-    train_dataloader = DataLoader(
-        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
-        num_workers=1, pin_memory=True, prefetch_factor=1)
-    len_train_dataloader = len(train_dataloader)
-    del train_dataset, train_sampler, train_dataloader
+    tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=True)
+    tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size,
+                            num_workers=1, pin_memory=True, prefetch_factor=1)
+    len_train_dataloader = len(tmp_loader)
+    del tmp_dataset, tmp_sampler, tmp_loader
     gc.collect()
     torch.cuda.empty_cache()
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    scaler = None
+    amp_dtype = torch.float16 if str(args.amp_dtype).lower() == 'fp16' else torch.bfloat16
+    if args.use_amp and amp_dtype == torch.float16:
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+
     start_epoch = 0
-    scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=len(list(range(start_epoch, args.epochs))))
+    scheduler = None
+    if args.use_scheduler:
+        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=args.epochs)
+
     if args.ckpt and os.path.isfile(args.ckpt):
         start_epoch, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f'cuda:{local_rank}', args=args, restore_model_args=False)
+
     if args.init_lr_scheduler and args.use_scheduler:
-        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=len(list(range(start_epoch, args.epochs))))
+        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=args.epochs-start_epoch)
+
     if not args.use_scheduler:
         for g in opt.param_groups:
             g['lr'] = args.lr
+
     for ep in range(start_epoch, args.epochs):
         train_dataset = ERA5_Dataset(
             input_dir=args.data_root, year_range=args.year_range,
             is_train=True, sample_len=args.train_data_n_frames,
             eval_sample=args.eval_sample_num, max_cache_size=5,
             rank=dist.get_rank(), gpus=dist.get_world_size())
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
         train_dataloader = DataLoader(
             train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
-            num_workers=1, pin_memory=True, prefetch_factor=2)
+            num_workers=2, pin_memory=True, prefetch_factor=2, persistent_workers=False)
         train_sampler.set_epoch(ep)
         train_dataloader_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}/{args.epochs} - Start") if rank == 0 else train_dataloader
+
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
-            opt.zero_grad()
-            data = data.cuda(local_rank).to(torch.float32)[:, :, :, :, :]
+            opt.zero_grad(set_to_none=True)
+
+            data = data.cuda(local_rank, non_blocking=True).to(torch.float32)[:, :, :, :, :]
             x = data[:, :-1]
             B, L, C, H, W = x.shape
             listT = make_listT_from_arg_T(B, L, x.device, x.dtype, args.T)
-            preds = model(x, 'p', listT=listT)
-            preds = preds[:, 1:]
-            target = data[:, 2:]
-            loss = loss_fn(preds, target)
-            loss.backward()
-            opt.step()
-            if args.use_scheduler:
+
+            use_amp = bool(args.use_amp)
+            ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
+            with ctx:
+                preds = model(x, 'p', listT=listT)
+                preds = preds[:, 1:]
+                target = data[:, 2:]
+                loss = loss_fn(preds, target)
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                opt.step()
+
+            if args.use_scheduler and scheduler is not None:
                 scheduler.step()
-            loss_tensor = torch.tensor(loss.detach().item(), device=f'cuda:{local_rank}')
+
+            loss_tensor = loss.detach()
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            avg_loss = loss_tensor.item() / world_size
+            avg_loss = (loss_tensor / world_size).item()
+
             if rank == 0:
-                current_lr = scheduler.get_last_lr()[0] if args.use_scheduler else args.lr
+                current_lr = scheduler.get_last_lr()[0] if args.use_scheduler and scheduler is not None else opt.param_groups[0]['lr']
                 gate_str = format_gate_means()
                 t_str = f"T={args.T}"
                 message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {t_str} - {gate_str}"
-                train_dataloader_iter.set_description(message)
+                if isinstance(train_dataloader_iter, tqdm):
+                    train_dataloader_iter.set_description(message)
                 logging.info(message)
-            if rank == 0 and (train_step % int(len(train_dataloader)*args.ckpt_step) == 0 or train_step == len(train_dataloader)):
-                save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler if args.use_scheduler else None)
+
+            if rank == 0 and (train_step % max(1, int(len(train_dataloader)*args.ckpt_step)) == 0 or train_step == len(train_dataloader)):
+                save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler if (args.use_scheduler and scheduler is not None) else None)
+
+            del data, x, preds, target, loss, loss_tensor
+            if (train_step % 16) == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
         del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
         gc.collect()
         torch.cuda.empty_cache()
         dist.barrier()
+
         if args.do_eval:
             model.eval()
             with torch.no_grad():
@@ -404,27 +536,34 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size,
                     num_workers=1, pin_memory=True, prefetch_factor=1)
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
+
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                    data = data.cuda(local_rank).to(torch.float32)[:, :, :, :, :]
+                    data = data.cuda(local_rank, non_blocking=True).to(torch.float32)[:, :, :, :, :]
                     half = args.eval_data_n_frames // 2
                     cond = data[:, :half]
                     B, Lc, C, H, W = cond.shape
                     listT_cond = make_listT_from_arg_T(B, Lc, cond.device, cond.dtype, args.T)
                     out_gen_num = data.shape[1] - half
                     listT_future = make_listT_from_arg_T(B, out_gen_num, cond.device, cond.dtype, args.T)
-                    preds = model(cond, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
-                    loss_eval = loss_fn(preds, data[:, half:])
-                    tot_tensor = torch.tensor(loss_eval.item(), device=f'cuda:{local_rank}')
+                    with torch.cuda.amp.autocast(enabled=bool(args.use_amp), dtype=amp_dtype):
+                        preds = model(cond, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
+                        loss_eval = loss_fn(preds, data[:, half:])
+                    tot_tensor = loss_eval.detach()
                     dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
-                    avg_total = tot_tensor.item() / world_size
+                    avg_total = (tot_tensor / world_size).item()
                     if rank == 0:
                         message = f"Eval step {eval_step} - Total: {avg_total:.6f}"
-                        eval_dataloader_iter.set_description(message)
+                        if isinstance(eval_dataloader_iter, tqdm):
+                            eval_dataloader_iter.set_description(message)
                         logging.info(message)
+                    del data, cond, preds, loss_eval, tot_tensor
+                    gc.collect(); torch.cuda.empty_cache()
+
                 del eval_dataset, eval_sampler, eval_dataloader, eval_dataloader_iter
                 gc.collect()
                 torch.cuda.empty_cache()
                 dist.barrier()
+
     cleanup_ddp()
 
 if __name__ == "__main__":
