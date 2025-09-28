@@ -55,25 +55,28 @@ class ArgsBase:
         self.lru_rank = 32
         self.lambda_type = "exogenous"
         self.lambda_mlp_hidden = 16
+        self.exo_mode = "mlp"
 
 def make_cfgs():
     cfgs = []
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.use_freq_prior=False; a.use_sh_prior=False
-    cfgs.append(("sq_pxsf_exo_noP", a))
+    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=False; a.use_sh_prior=False
+    cfgs.append(("sq_pxsf_exo_mlp_noP", a))
+    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="affine"; a.use_freq_prior=False; a.use_sh_prior=False
+    cfgs.append(("sq_pxsf_exo_affine_noP", a))
     a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="static"; a.use_freq_prior=False; a.use_sh_prior=False
     cfgs.append(("sq_pxsf_sta_noP", a))
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.05; a.use_sh_prior=False
-    cfgs.append(("sq_pxsf_exo_freq_lin", a))
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.use_freq_prior=True; a.freq_mode="exp"; a.freq_gain_init=0.02; a.use_sh_prior=True
-    cfgs.append(("sq_pxsf_exo_freq_exp_sh", a))
-    a = ArgsBase(); a.input_size=(120,200); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.use_freq_prior=False; a.use_sh_prior=False
-    cfgs.append(("rect_pxsf_exo_noP", a))
+    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.05; a.use_sh_prior=False
+    cfgs.append(("sq_pxsf_exo_mlp_freq_lin", a))
+    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=True; a.freq_mode="exp"; a.freq_gain_init=0.02; a.use_sh_prior=True
+    cfgs.append(("sq_pxsf_exo_mlp_freq_exp_sh", a))
+    a = ArgsBase(); a.input_size=(120,200); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="affine"; a.use_freq_prior=False; a.use_sh_prior=False
+    cfgs.append(("rect_pxsf_exo_affine_noP", a))
     a = ArgsBase(); a.input_size=(120,200); a.dec_strategy="pxsf"; a.lambda_type="static"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.03; a.use_sh_prior=True
     cfgs.append(("rect_pxsf_sta_freq_sh", a))
     a = ArgsBase(); a.input_size=(96,96); a.dec_strategy="deconv"; a.dec_hidden_layers_num=0; a.lambda_type="static"; a.use_freq_prior=False; a.use_sh_prior=False
     cfgs.append(("sq_deconv_sta_noP", a))
-    a = ArgsBase(); a.input_size=(96,144); a.dec_strategy="deconv"; a.dec_hidden_layers_num=0; a.lambda_type="exogenous"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.05; a.use_sh_prior=True; a.use_gate=False
-    cfgs.append(("rect_deconv_exo_freq_sh_nogate", a))
+    a = ArgsBase(); a.input_size=(96,144); a.dec_strategy="deconv"; a.dec_hidden_layers_num=0; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.05; a.use_sh_prior=True; a.use_gate=False
+    cfgs.append(("rect_deconv_exo_mlp_freq_sh_nogate", a))
     return cfgs
 
 def count_params(model):
@@ -136,7 +139,7 @@ def gen_chunk_patterns(L):
         [2,3,1,4,2, L]
     ]
 
-def make_listT_cases(B, L, device, dtype, include_none=False):
+def make_listT_cases(B, L, device, dtype, include_none=True):
     cases = []
     if include_none:
         cases.append(("none", None))
@@ -192,8 +195,7 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
     dtype_real = torch.float32
     set_seed(2024)
     x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
-    include_none = (args.lambda_type == "static")
-    lt_cases = make_listT_cases(B, L, device, dtype_real, include_none=include_none)
+    lt_cases = make_listT_cases(B, L, device, dtype_real, include_none=True)
     for lt_name, listT in lt_cases:
         y_full = forward_full_p(model.eval(), x, listT=listT)
         for pat in gen_chunk_patterns(L):
@@ -207,7 +209,11 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
         unused_p = list_unused_parameters(model, x, listT, mode="p")
         print(f"[unused-p] listT={lt_name:<6} {'none' if len(unused_p)==0 else ', '.join(unused_p[:8]) + (' ...' if len(unused_p)>8 else '')}")
     half = L // 2
-    listT_half = lt_cases[0][1][:, :half] if lt_cases[0][1] is not None else torch.ones(B, half, device=device, dtype=dtype_real)
+    first_case_listT = lt_cases[0][1]
+    if first_case_listT is None:
+        listT_half = None
+    else:
+        listT_half = first_case_listT[:, :half]
     unused_i = list_unused_parameters(model, x[:, :half], listT=listT_half, mode="i")
     print(f"[unused-i] {'none' if len(unused_i)==0 else ', '.join(unused_i[:12]) + (' ...' if len(unused_i)>12 else '')}")
     if args.lambda_type == "static":
