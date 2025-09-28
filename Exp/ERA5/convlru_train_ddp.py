@@ -48,11 +48,11 @@ class Args:
         self.emb_strategy = 'pxus'          # 'pxus' | 'conv'
         self.hidden_factor = (7, 12)
         self.emb_ch = 240
-        self.emb_hidden_ch = 270
+        self.emb_hidden_ch = 240
         self.emb_hidden_layers_num = 2
         self.convlru_num_blocks = 8
         self.use_cbam = True
-        self.ffn_hidden_ch = 270
+        self.ffn_hidden_ch = 240
         self.ffn_hidden_layers_num = 2
         self.use_gate = True
         self.lru_rank = 128
