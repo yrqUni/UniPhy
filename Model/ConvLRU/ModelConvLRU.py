@@ -555,7 +555,7 @@ class ConvLRULayer(nn.Module):
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
         h = torch.fft.fft2(x.to(torch.cfloat), dim=(-2, -1), norm='ortho')
-        h = torch.einsum('blcsw,dc->blcsw', h, self.proj_W)
+        h = torch.einsum('blcsw,co->blosw', h, self.proj_W)
         if self.proj_b is not None:
             h = h + self.proj_b.view(1, 1, C, 1, 1)
         if self.use_freq_prior:
