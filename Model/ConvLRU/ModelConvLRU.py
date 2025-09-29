@@ -691,28 +691,29 @@ class ConvLRULayer(nn.Module):
     def _project_to_square(self, h):
         B, L, C, S, W = h.shape
         Uc = self.U_row.conj()
-        h_blwc = h.permute(0, 1, 4, 2, 3).reshape(B * L * W, C, S)
-        t_blwcr = torch.matmul(h_blwc, Uc)
-        t = t_blwcr.view(B, L, W, C, self.rank).permute(0, 1, 3, 4, 2)
+        h_mat = h.permute(0, 1, 2, 4, 3).contiguous().view(B * L * C * W, S)
+        U_rep = Uc.unsqueeze(0).repeat(B * L * W, 1, 1, 1).view(B * L * W * C, S, self.rank)
+        t_mat = torch.bmm(h_mat.unsqueeze(1), U_rep).squeeze(1)
+        t = t_mat.view(B, L, C, W, self.rank).permute(0, 1, 2, 4, 3).contiguous()
         V = self.V_col
-        t_mat = t.reshape(B * L * C, self.rank, W)
-        V_rep = V.view(1, C, W, self.rank).expand(B * L, C, W, self.rank).reshape(B * L * C, W, self.rank)
-        z_mat = torch.bmm(t_mat, V_rep)
+        t_w = t.view(B * L * C * self.rank, W)
+        V_rep = V.unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(B, L, self.rank, 1, 1).reshape(B * L * self.rank * C, W, self.rank)
+        z_mat = torch.bmm(t_w.unsqueeze(1), V_rep).squeeze(1)
         z = z_mat.view(B, L, C, self.rank, self.rank)
         return z
 
     def _deproject_from_square(self, z):
         B, L, C, R, _ = z.shape
         Vt = self.V_col.conj().transpose(1, 2)
-        z_mat = z.view(B * L * C, R, R)
-        Vt_rep = Vt.view(1, C, R, self.hidden_size[1]).expand(B * L, C, R, self.hidden_size[1]).reshape(B * L * C, R, self.hidden_size[1])
-        t_mat = torch.bmm(z_mat, Vt_rep)
-        t = t_mat.view(B, L, C, R, self.hidden_size[1])
+        z_flat = z.view(B * L * C * R, R)
+        Vt_rep = Vt.unsqueeze(0).unsqueeze(0).unsqueeze(2).repeat(B, L, R, 1, 1).reshape(B * L * R * C, R, self.hidden_size[1])
+        t_w = torch.bmm(z_flat.unsqueeze(1), Vt_rep).squeeze(1)
+        t = t_w.view(B, L, C, R, self.hidden_size[1])
         U = self.U_row
-        U_rep = U.view(1, C, self.hidden_size[0], R).expand(B * L, C, self.hidden_size[0], R).reshape(B * L * C, self.hidden_size[0], R)
-        t_blc = t.view(B * L * C, R, self.hidden_size[1])
-        h_sw = torch.bmm(U_rep, t_blc)
-        h = h_sw.view(B, L, C, self.hidden_size[0], self.hidden_size[1])
+        t_vec = t.permute(0, 1, 2, 4, 3).contiguous().view(B * L * C * self.hidden_size[1], R, 1)
+        U_rep = U.unsqueeze(0).repeat(B * L * self.hidden_size[1], 1, 1, 1).view(B * L * self.hidden_size[1] * C, self.hidden_size[0], R)
+        h_sw = torch.bmm(U_rep, t_vec).squeeze(-1)
+        h = h_sw.view(B, L, C, self.hidden_size[1], self.hidden_size[0]).permute(0, 1, 2, 4, 3).contiguous()
         return h
 
     def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
