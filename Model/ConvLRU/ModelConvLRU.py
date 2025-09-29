@@ -691,28 +691,32 @@ class ConvLRULayer(nn.Module):
     def _project_to_square(self, h):
         B, L, C, S, W = h.shape
         Uc = self.U_row.conj()
-        h_mat = h.permute(0, 1, 2, 4, 3).contiguous().view(B * L * C * W, S)
-        U_rep = Uc.unsqueeze(0).repeat(B * L * W, 1, 1, 1).view(B * L * W * C, S, self.rank)
-        t_mat = torch.bmm(h_mat.unsqueeze(1), U_rep).squeeze(1)
-        t = t_mat.view(B, L, C, W, self.rank).permute(0, 1, 2, 4, 3).contiguous()
+        h_flat = h.permute(0, 1, 2, 4, 3).contiguous().view(B * L * C * W, S)
+        idx_c = torch.arange(C, device=h.device).repeat_interleave(W).repeat(L * B)
+        U_sel = Uc[idx_c]
+        t_flat = torch.bmm(h_flat.unsqueeze(1), U_sel).squeeze(1)
+        t = t_flat.view(B, L, C, W, self.rank).permute(0, 1, 2, 4, 3).contiguous()
         V = self.V_col
-        t_w = t.view(B * L * C * self.rank, W)
-        V_rep = V.unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(B, L, self.rank, 1, 1).reshape(B * L * self.rank * C, W, self.rank)
-        z_mat = torch.bmm(t_w.unsqueeze(1), V_rep).squeeze(1)
-        z = z_mat.view(B, L, C, self.rank, self.rank)
+        t_w = t.permute(0, 1, 2, 3, 4).contiguous().view(B * L * C * self.rank, W)
+        idx_c2 = torch.arange(C, device=h.device).repeat_interleave(self.rank).repeat(L * B)
+        V_sel = V[idx_c2]
+        z_flat = torch.bmm(t_w.unsqueeze(1), V_sel).squeeze(1)
+        z = z_flat.view(B, L, C, self.rank, self.rank)
         return z
 
     def _deproject_from_square(self, z):
         B, L, C, R, _ = z.shape
         Vt = self.V_col.conj().transpose(1, 2)
         z_flat = z.view(B * L * C * R, R)
-        Vt_rep = Vt.unsqueeze(0).unsqueeze(0).unsqueeze(2).repeat(B, L, R, 1, 1).reshape(B * L * R * C, R, self.hidden_size[1])
-        t_w = torch.bmm(z_flat.unsqueeze(1), Vt_rep).squeeze(1)
+        idx_c = torch.arange(C, device=z.device).repeat_interleave(R).repeat(L * B)
+        Vt_sel = Vt[idx_c]
+        t_w = torch.bmm(z_flat.unsqueeze(1), Vt_sel).squeeze(1)
         t = t_w.view(B, L, C, R, self.hidden_size[1])
         U = self.U_row
-        t_vec = t.permute(0, 1, 2, 4, 3).contiguous().view(B * L * C * self.hidden_size[1], R, 1)
-        U_rep = U.unsqueeze(0).repeat(B * L * self.hidden_size[1], 1, 1, 1).view(B * L * self.hidden_size[1] * C, self.hidden_size[0], R)
-        h_sw = torch.bmm(U_rep, t_vec).squeeze(-1)
+        t_vec = t.permute(0, 1, 2, 4, 3).contiguous().view(B * L * C * self.hidden_size[1], R)
+        idx_c2 = torch.arange(C, device=z.device).repeat_interleave(self.hidden_size[1]).repeat(L * B)
+        U_sel = U[idx_c2]
+        h_sw = torch.bmm(U_sel, t_vec.unsqueeze(-1)).squeeze(-1)
         h = h_sw.view(B, L, C, self.hidden_size[1], self.hidden_size[0]).permute(0, 1, 2, 4, 3).contiguous()
         return h
 
@@ -783,7 +787,6 @@ class ConvLRULayer(nn.Module):
                     dth = self.delta_scale_th * torch.tanh(a * z.unsqueeze(-1) + b) * dt
                 else:
                     BL = B * L
-                    Hm = self.mod_hidden
                     z_blc = z.view(BL, C, S)
                     W1n = self.mod_nu_fc1_S.unsqueeze(0).expand(BL, -1, -1, -1)
                     h1n = torch.matmul(z_blc.unsqueeze(2), W1n).squeeze(2)
