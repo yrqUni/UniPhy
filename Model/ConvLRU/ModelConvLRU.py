@@ -246,9 +246,7 @@ class ConvLRU(nn.Module):
             "params_log",
             "freq_prior.",
             "sh_prior.",
-            "post_ifft_conv_real",
-            "post_ifft_conv_imag",
-            "post_ifft_proj",
+            "post_ifft_fuse",
         ]
         skip_suffix = (
             ".U_row",
@@ -607,9 +605,7 @@ class ConvLRULayer(nn.Module):
         C = self.emb_ch
         self.proj_W = nn.Parameter(torch.randn(C, C, dtype=torch.cfloat) / math.sqrt(C))
         self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
-        self.post_ifft_conv_real = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=True)
-        self.post_ifft_conv_imag = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=True)
-        self.post_ifft_proj = nn.Conv3d(in_channels=self.emb_ch * 2, out_channels=self.emb_ch, kernel_size=(1, 1, 1), padding="same", bias=True)
+        self.post_ifft_fuse = nn.Conv3d(self.emb_ch * 2, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=True)
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
         self.gate_conv = (
             nn.Sequential(nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"), nn.Sigmoid())
@@ -722,24 +718,29 @@ class ConvLRULayer(nn.Module):
                         _freeze_attr(n)
 
     def _project_to_square(self, h):
-        t = torch.einsum("blcsw,csr->blcrw", h, self.U_row.conj())
-        z = torch.einsum("blcrw,cwp->blcrp", t, self.V_col)
+        B, L, C, S, W = h.shape
+        h_sw = h.permute(0, 1, 2, 4, 3)
+        t = torch.matmul(h_sw, self.U_row.conj())
+        t = t.permute(0, 1, 2, 4, 3)
+        z = torch.matmul(t, self.V_col)
         return z
 
     def _deproject_from_square(self, z):
         Vt = self.V_col.conj().transpose(1, 2)
-        t = torch.einsum("blcrp,crw->blcrw", z, Vt)
-        h = torch.einsum("blcrw,csr->blcsw", t, self.U_row)
+        t = torch.matmul(z, Vt)
+        t_rw = t.permute(0, 1, 2, 4, 3)
+        h_ws = torch.matmul(t_rw, self.U_row)
+        h = h_ws.permute(0, 1, 2, 4, 3)
         return h
 
     def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
         h_spatial = torch.fft.ifft2(h_complex, dim=(-2, -1), norm="ortho")
         hr = h_spatial.real
         hi = h_spatial.imag
-        hr = self.post_ifft_conv_real(hr.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-        hi = self.post_ifft_conv_imag(hi.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-        h_cat = torch.cat([hr, hi], dim=2)
-        h_out = self.post_ifft_proj(h_cat.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+        hr = hr.permute(0, 2, 1, 3, 4)
+        hi = hi.permute(0, 2, 1, 3, 4)
+        h_cat = torch.cat([hr, hi], dim=1)
+        h_out = self.post_ifft_fuse(h_cat).permute(0, 2, 1, 3, 4)
         return h_out
 
     def _apply_static_dt_scaling(self, h, lam1, dt):
@@ -764,7 +765,10 @@ class ConvLRULayer(nn.Module):
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
         h = torch.fft.fft2(x.to(torch.cfloat), dim=(-2, -1), norm="ortho")
-        h = torch.einsum("blcsw,co->blosw", h, self.proj_W)
+        BL = B * L * S * W
+        h2 = h.view(BL, C)
+        h2 = h2 @ self.proj_W
+        h = h2.view(B, L, C, S, W)
         if self.proj_b is not None:
             h = h + self.proj_b.view(1, 1, C, 1, 1)
         if self.use_freq_prior:
@@ -823,7 +827,9 @@ class ConvLRULayer(nn.Module):
                     lamb = torch.cat([lamb[:, :1], lamb], dim=1)
                     added_dummy = True
             L2 = x_in.size(1)
-            h = self.pscan(lamb[:, :L2], x_in)
+            lamb = lamb[:, :L2].contiguous()
+            x_in = x_in.contiguous()
+            h = self.pscan(lamb, x_in)
             if added_dummy:
                 h = h[:, 1:]
             if last_hidden_in is not None:
@@ -892,7 +898,9 @@ class ConvLRULayer(nn.Module):
                     lamb = torch.cat([lamb[:, :1], lamb], dim=1)
                     added_dummy = True
             L2 = x_in.size(1)
-            z = self.pscan(lamb[:, :L2], x_in)
+            lamb = lamb[:, :L2].contiguous()
+            x_in = x_in.contiguous()
+            z = self.pscan(lamb, x_in)
             if added_dummy:
                 z = z[:, 1:]
             if last_hidden_in is not None:
