@@ -13,6 +13,7 @@ torch.backends.cudnn.allow_tf32 = False
 torch.use_deterministic_algorithms(True)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
+
 def set_seed(s=0):
     import random
     random.seed(s)
@@ -21,8 +22,10 @@ def set_seed(s=0):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
+
 def pick_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class ArgsBase:
     def __init__(self):
@@ -36,14 +39,14 @@ class ArgsBase:
         self.use_cbam = False
         self.emb_hidden_ch = 16
         self.emb_hidden_layers_num = 1
-        self.emb_strategy = 'pxus'
+        self.emb_strategy = "pxus"
         self.ffn_hidden_ch = 16
         self.ffn_hidden_layers_num = 1
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
-        self.dec_strategy = 'pxsf'
-        self.hidden_activation = 'ReLU'
-        self.output_activation = 'Identity'
+        self.dec_strategy = "pxsf"
+        self.hidden_activation = "ReLU"
+        self.output_activation = "Identity"
         self.use_freq_prior = False
         self.freq_rank = 8
         self.freq_gain_init = 0.0
@@ -57,36 +60,40 @@ class ArgsBase:
         self.lambda_mlp_hidden = 16
         self.exo_mode = "mlp"
 
+
 def make_cfgs():
     cfgs = []
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=False; a.use_sh_prior=False
+    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = False; a.use_sh_prior = False
     cfgs.append(("sq_pxsf_exo_mlp_noP", a))
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="affine"; a.use_freq_prior=False; a.use_sh_prior=False
+    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "affine"; a.use_freq_prior = False; a.use_sh_prior = False
     cfgs.append(("sq_pxsf_exo_affine_noP", a))
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="static"; a.use_freq_prior=False; a.use_sh_prior=False
+    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "static"; a.use_freq_prior = False; a.use_sh_prior = False
     cfgs.append(("sq_pxsf_sta_noP", a))
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.05; a.use_sh_prior=False
+    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = True; a.freq_mode = "linear"; a.freq_gain_init = 0.05; a.use_sh_prior = False
     cfgs.append(("sq_pxsf_exo_mlp_freq_lin", a))
-    a = ArgsBase(); a.input_size=(144,144); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=True; a.freq_mode="exp"; a.freq_gain_init=0.02; a.use_sh_prior=True
+    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = True; a.freq_mode = "exp"; a.freq_gain_init = 0.02; a.use_sh_prior = True
     cfgs.append(("sq_pxsf_exo_mlp_freq_exp_sh", a))
-    a = ArgsBase(); a.input_size=(120,200); a.dec_strategy="pxsf"; a.lambda_type="exogenous"; a.exo_mode="affine"; a.use_freq_prior=False; a.use_sh_prior=False
+    a = ArgsBase(); a.input_size = (120, 200); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "affine"; a.use_freq_prior = False; a.use_sh_prior = False
     cfgs.append(("rect_pxsf_exo_affine_noP", a))
-    a = ArgsBase(); a.input_size=(120,200); a.dec_strategy="pxsf"; a.lambda_type="static"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.03; a.use_sh_prior=True
+    a = ArgsBase(); a.input_size = (120, 200); a.dec_strategy = "pxsf"; a.lambda_type = "static"; a.use_freq_prior = True; a.freq_mode = "linear"; a.freq_gain_init = 0.03; a.use_sh_prior = True
     cfgs.append(("rect_pxsf_sta_freq_sh", a))
-    a = ArgsBase(); a.input_size=(96,96); a.dec_strategy="deconv"; a.dec_hidden_layers_num=0; a.lambda_type="static"; a.use_freq_prior=False; a.use_sh_prior=False
+    a = ArgsBase(); a.input_size = (96, 96); a.dec_strategy = "deconv"; a.dec_hidden_layers_num = 0; a.lambda_type = "static"; a.use_freq_prior = False; a.use_sh_prior = False
     cfgs.append(("sq_deconv_sta_noP", a))
-    a = ArgsBase(); a.input_size=(96,144); a.dec_strategy="deconv"; a.dec_hidden_layers_num=0; a.lambda_type="exogenous"; a.exo_mode="mlp"; a.use_freq_prior=True; a.freq_mode="linear"; a.freq_gain_init=0.05; a.use_sh_prior=True; a.use_gate=False
+    a = ArgsBase(); a.input_size = (96, 144); a.dec_strategy = "deconv"; a.dec_hidden_layers_num = 0; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = True; a.freq_mode = "linear"; a.freq_gain_init = 0.05; a.use_sh_prior = True; a.use_gate = False
     cfgs.append(("rect_deconv_exo_mlp_freq_sh_nogate", a))
     return cfgs
+
 
 def count_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
+
 @torch.no_grad()
 def forward_full_p(model, x, listT=None):
     return model(x, mode="p", listT=listT)
+
 
 @torch.no_grad()
 def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
@@ -101,8 +108,8 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
         if pos >= L:
             break
         n = min(n, L - pos)
-        xe = em(x[:, pos:pos+n])
-        listT_slice = listT[:, pos:pos+n] if listT is not None else None
+        xe = em(x[:, pos : pos + n])
+        listT_slice = listT[:, pos : pos + n] if listT is not None else None
         xe, last_hidden = m(xe, last_hidden_ins=last_hidden, listT=listT_slice)
         yo = dm(xe)
         outs.append(yo)
@@ -115,11 +122,14 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
         outs.append(yo)
     return torch.cat(outs, dim=1)
 
+
 def max_err(a, b):
     return float((a - b).abs().max().detach().cpu())
 
+
 def mae(a, b):
     return float((a - b).abs().mean().detach().cpu())
+
 
 def effective_tol(y_ref: torch.Tensor, L: int, base_atol: float = 3e-6, base_rtol: float = 1e-5, k_abs: float = 64.0, k_rel: float = 64.0):
     eps = np.finfo(np.float32).eps
@@ -129,15 +139,17 @@ def effective_tol(y_ref: torch.Tensor, L: int, base_atol: float = 3e-6, base_rto
     rtol_eff = max(base_rtol, k_rel * eps * growth)
     return atol_eff, rtol_eff
 
+
 def gen_chunk_patterns(L):
     return [
-        [1]*L,
-        [2]*(L//2) + ([L%2] if L%2 else []),
-        [3]*(L//3) + ([L%3] if L%3 else []),
-        [4]*(L//4) + ([L%4] if L%4 else []),
+        [1] * L,
+        [2] * (L // 2) + ([L % 2] if L % 2 else []),
+        [3] * (L // 3) + ([L % 3] if L % 3 else []),
+        [4] * (L // 4) + ([L % 4] if L % 4 else []),
         [L],
-        [2,3,1,4,2, L]
+        [2, 3, 1, 4, 2, L],
     ]
+
 
 def make_listT_cases(B, L, device, dtype, include_none=True):
     cases = []
@@ -145,12 +157,13 @@ def make_listT_cases(B, L, device, dtype, include_none=True):
         cases.append(("none", None))
     ones = torch.ones(B, L, device=device, dtype=dtype)
     rnd = torch.rand(B, L, device=device, dtype=dtype) * 1.1 + 0.1
-    inc = torch.linspace(0.2, 1.6, steps=L, device=device, dtype=dtype).unsqueeze(0).repeat(B,1)
+    inc = torch.linspace(0.2, 1.6, steps=L, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1)
     burst = torch.ones(B, L, device=device, dtype=dtype) * 0.5
     if L >= 4:
-        burst[:, L//2:L//2+2] = 1.8
+        burst[:, L // 2 : L // 2 + 2] = 1.8
     cases += [("ones", ones), ("rand", rnd), ("inc", inc), ("burst", burst)]
     return cases
+
 
 def expected_unused_name(name: str, args, hidden_hw_equal: bool) -> bool:
     if hidden_hw_equal:
@@ -197,6 +210,7 @@ def expected_unused_name(name: str, args, hidden_hw_equal: bool) -> bool:
                 return True
     return False
 
+
 def list_unused_parameters(model, x, listT, mode="p"):
     model.train()
     for p in model.parameters():
@@ -218,6 +232,7 @@ def list_unused_parameters(model, x, listT, mode="p"):
             unused.append(n)
     return unused
 
+
 def test_semigroup_static_with_listT(model, H, W, B=1, L=6, k=3, dtype=torch.float32, device="cpu"):
     model.eval()
     x_const = torch.randn(B, L, model.args.input_ch, H, W, device=device, dtype=dtype)
@@ -231,6 +246,7 @@ def test_semigroup_static_with_listT(model, H, W, B=1, L=6, k=3, dtype=torch.flo
     e = max_err(y_ref, y_k)
     return e
 
+
 def run_equivalence_and_unused(name, args, device, B=1, L=10):
     print(f"[case] {name}")
     model = ConvLRU(args).to(device)
@@ -239,7 +255,7 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
     H, W = args.input_size
     hidden_H = model.embedding.input_downsp_shape[1]
     hidden_W = model.embedding.input_downsp_shape[2]
-    hidden_equal = (hidden_H == hidden_W)
+    hidden_equal = hidden_H == hidden_W
     dtype_real = torch.float32
     set_seed(2024)
     x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
@@ -279,6 +295,7 @@ def run_equivalence_and_unused(name, args, device, B=1, L=10):
         err_k = test_semigroup_static_with_listT(model, H, W, B=B, L=L, k=3, dtype=dtype_real, device=device)
         print(f"[static-semi] k=3 max_err={err_k:.3e}")
 
+
 def main():
     print("[pscan]", pscan_check())
     device = pick_device()
@@ -286,6 +303,7 @@ def main():
     cfgs = make_cfgs()
     for name, args in cfgs:
         run_equivalence_and_unused(name, args, device=device, B=1, L=10)
+
 
 if __name__ == "__main__":
     main()
