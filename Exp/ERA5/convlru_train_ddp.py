@@ -72,7 +72,7 @@ class Args:
         self.dec_hidden_layers_num = 0
         self.data_root = '/nfs/ERA5_data/data_norm'
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 9
+        self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ''
@@ -93,7 +93,7 @@ class Args:
         self.use_amp = False
         self.amp_dtype = 'fp16'             # 'fp16' | 'bf16'
         self.grad_clip = 0.0
-        self.sample_k = -1
+        self.sample_k = 9
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -363,7 +363,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     tmp_dataset = ERA5_Dataset(
         input_dir=args.data_root, year_range=args.year_range,
         is_train=True, sample_len=args.train_data_n_frames,
-        eval_sample=args.eval_sample_num, max_cache_size=5,
+        eval_sample=args.eval_sample_num, max_cache_size=8,
         rank=dist.get_rank(), gpus=dist.get_world_size())
     tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False, drop_last=True)
     tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size,
@@ -392,12 +392,12 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         train_dataset = ERA5_Dataset(
             input_dir=args.data_root, year_range=args.year_range,
             is_train=True, sample_len=args.train_data_n_frames,
-            eval_sample=args.eval_sample_num, max_cache_size=5,
+            eval_sample=args.eval_sample_num, max_cache_size=8,
             rank=dist.get_rank(), gpus=dist.get_world_size())
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
         train_dataloader = DataLoader(
             train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
-            num_workers=2, pin_memory=True, prefetch_factor=2, persistent_workers=False)
+            num_workers=1, pin_memory=True, prefetch_factor=1, persistent_workers=False)
         train_sampler.set_epoch(ep)
         train_dataloader_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}/{args.epochs} - Start") if rank == 0 else train_dataloader
         for train_step, data in enumerate(train_dataloader_iter, start=1):
@@ -479,7 +479,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 eval_dataset = ERA5_Dataset(
                     input_dir=args.data_root, year_range=args.year_range,
                     is_train=False, sample_len=args.eval_data_n_frames,
-                    eval_sample=args.eval_sample_num, max_cache_size=5,
+                    eval_sample=args.eval_sample_num, max_cache_size=8,
                     rank=dist.get_rank(), gpus=dist.get_world_size())
                 eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False, drop_last=True)
                 eval_dataloader = DataLoader(
