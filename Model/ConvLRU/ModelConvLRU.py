@@ -237,7 +237,8 @@ class ConvLRU(nn.Module):
             "params_log",
             "freq_prior.",
             "sh_prior.",
-            "post_ifft_fuse",
+            "post_ifft_dw",
+            "post_ifft_pw",
         ]
         skip_suffix = (
             ".U_row",
@@ -709,13 +710,17 @@ class ConvLRULayer(nn.Module):
         return y
 
     def _apply_static_dt_scaling(self, h, lam1, dt, nu0=None):
-        lamk = lam1.pow(dt.view(dt.size(0), dt.size(1), 1, 1, 1))
+        if dt.dim() == 2:
+            dt5 = dt.view(dt.size(0), dt.size(1), 1, 1, 1)
+        else:
+            dt5 = dt
+        lamk = lam1.pow(dt5)
         if nu0 is None:
             gamma1 = torch.sqrt(torch.clamp(1.0 - (lam1.abs() ** 2), min=1e-12))
             gammak = torch.sqrt(torch.clamp(1.0 - (lamk.abs() ** 2), min=1e-12))
         else:
             gamma1 = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu0.real), min=1e-12))
-            gammak = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * (nu0.real * dt)), min=1e-12))
+            gammak = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * (nu0.real * dt5)), min=1e-12))
         num = 1.0 - lamk
         den = 1.0 - lam1
         eps = 1e-8
