@@ -691,12 +691,12 @@ class ConvLRULayer(nn.Module):
     def _project_to_square(self, h):
         Uc = self.U_row.conj()
         t = torch.einsum("blcsw,csr->blcrw", h, Uc)
-        z = torch.einsum("blcrw,cwr->blcrr", t, self.V_col)
+        z = torch.einsum("blcrw,cwk->blcrk", t, self.V_col)
         return z
 
     def _deproject_from_square(self, z):
         Vt = self.V_col.conj().transpose(1, 2)
-        t = torch.einsum("blcrr,crw->blcrw", z, Vt)
+        t = torch.einsum("blcrk,crw->blcrw", z, Vt)
         h = torch.einsum("blcrw,csr->blcsw", t, self.U_row)
         return h
 
