@@ -422,7 +422,7 @@ class Embedding(nn.Module):
             )
             self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.activation = _act(getattr(args, "hidden_activation", "ReLU"))
-        self.layer_norm = nn.LayerNorm([self.emb_ch, *self.hidden_size])
+        self.layer_norm = nn.LayerNorm([*self.hidden_size])
 
     def forward(self, x):
         x = x.permute(0, 2, 1, 3, 4)
@@ -460,6 +460,8 @@ class Decoder(nn.Module):
         self.dec_strategy = getattr(args, "dec_strategy", "pxsf")
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
+        if self.dec_hidden_layers_num != 0:
+            self.dec_hidden_ch = getattr(args, "dec_hidden_ch", self.emb_ch)
         out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
         if self.dec_strategy == "deconv":
             self.upsp = nn.ConvTranspose3d(
@@ -565,14 +567,14 @@ class ConvLRULayer(nn.Module):
         theta_s_log = torch.log(u2_s * (2 * torch.tensor(np.pi)))
         diag_lambda_s = torch.exp(torch.complex(-torch.exp(nu_s_log), torch.exp(theta_s_log)))
         gamma_s_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda_s) ** 2))
-        self.params_log_square = nn.Parameter(torch.vstack((nu_s_log, theta_s_log, gamma_s_log)))
+        self.params_log_square = nn.Parameter(torch.stack([nu_s_log, theta_s_log, gamma_s_log], dim=0))
         u1_r = torch.rand(self.emb_ch, self.rank)
         u2_r = torch.rand(self.emb_ch, self.rank)
         nu_r_log = torch.log(-0.5 * torch.log(u1_r * (self.r_max**2 - self.r_min**2) + self.r_min**2))
         theta_r_log = torch.log(u2_r * (2 * torch.tensor(np.pi)))
         diag_lambda_r = torch.exp(torch.complex(-torch.exp(nu_r_log), torch.exp(theta_r_log)))
         gamma_r_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda_r) ** 2))
-        self.params_log_rank = nn.Parameter(torch.vstack((nu_r_log, theta_r_log, gamma_r_log)))
+        self.params_log_rank = nn.Parameter(torch.stack([nu_r_log, theta_r_log, gamma_r_log], dim=0))
         self.U_row = nn.Parameter(torch.randn(self.emb_ch, S, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(S)))
         self.V_col = nn.Parameter(torch.randn(self.emb_ch, W, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(W)))
         C = self.emb_ch
@@ -739,7 +741,7 @@ class ConvLRULayer(nn.Module):
         eps = 1e-8
         den_safe = torch.where(den.abs() < eps, den + eps, den)
         scale = (gamma1 / gammak) * (num / den_safe)
-        is_one = (dt == 1) if not dt.dtype.is_floating_point else (dt == 1.0)
+        is_one = (dt == dt.new_tensor(1))
         if is_one.any():
             mask = is_one.view(h.size(0), h.size(1), 1, 1, 1)
             scale = torch.where(mask, torch.ones_like(scale, dtype=scale.dtype), scale)
@@ -760,7 +762,9 @@ class ConvLRULayer(nn.Module):
         if self.use_freq_prior:
             h = self.freq_prior(h)
         if S == W:
-            nu_s, theta_s, _gamma_s = torch.exp(self.params_log_square).split((self.emb_ch, self.emb_ch, self.emb_ch), dim=0)
+            nu_s_log, theta_s_log, gamma_s_log = self.params_log_square.unbind(dim=0)
+            nu_s = torch.exp(nu_s_log)
+            theta_s = torch.exp(theta_s_log)
             nu0 = nu_s.view(1, 1, C, S, 1)
             th0 = theta_s.view(1, 1, C, S, 1)
             if self.lambda_type == "static":
@@ -830,7 +834,9 @@ class ConvLRULayer(nn.Module):
                 aux["phi_last"] = phi[:, -1:].detach()
             last_hidden_pkg = (last_hidden_out, aux) if aux else last_hidden_out
         else:
-            nu_r, theta_r, _gamma_r = torch.exp(self.params_log_rank).split((self.emb_ch, self.emb_ch, self.emb_ch), dim=0)
+            nu_r_log, theta_r_log, gamma_r_log = self.params_log_rank.unbind(dim=0)
+            nu_r = torch.exp(nu_r_log)
+            theta_r = torch.exp(theta_r_log)
             nu0 = nu_r.view(1, 1, C, self.rank, 1)
             th0 = theta_r.view(1, 1, C, self.rank, 1)
             zq = self._project_to_square(h)
