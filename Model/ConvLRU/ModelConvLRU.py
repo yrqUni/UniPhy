@@ -753,7 +753,7 @@ class ConvLRULayer(nn.Module):
             if self.lambda_type == "static":
                 lam1 = torch.exp(torch.complex(-nu0, th0))
                 if listT is None:
-                    ones = torch.ones(B, L, device=h.device, dtype=h.dtype)
+                    ones = torch.ones(B, L, device=x.device, dtype=x.dtype)
                     lamb = lam1.expand(B, L, C, S, 1)
                     x_in = self._apply_static_dt_scaling(h, lam1, ones, nu0=nu0)
                 else:
@@ -824,7 +824,7 @@ class ConvLRULayer(nn.Module):
             if self.lambda_type == "static":
                 lam1 = torch.exp(torch.complex(-nu0, th0))
                 if listT is None:
-                    ones = torch.ones(B, L, device=h.device, dtype=h.dtype)
+                    ones = torch.ones(B, L, device=x.device, dtype=x.dtype)
                     lamb = lam1.expand(B, L, C, self.rank, 1)
                     x_in = self._apply_static_dt_scaling(zq, lam1, ones, nu0=nu0)
                 else:
