@@ -45,29 +45,29 @@ class Args:
         self.out_ch = 30
         self.hidden_activation = 'Tanh'
         self.output_activation = 'Tanh'
-        self.emb_strategy = 'pxus'          # 'pxus' | 'conv'
+        self.emb_strategy = 'pxus'
         self.hidden_factor = (7, 12)
-        self.emb_ch = 120
-        self.emb_hidden_ch = 150
+        self.emb_ch = 180
+        self.emb_hidden_ch = 210
         self.emb_hidden_layers_num = 2
-        self.convlru_num_blocks = 8
+        self.convlru_num_blocks = 10
         self.use_cbam = True
-        self.ffn_hidden_ch = 150
+        self.ffn_hidden_ch = 210
         self.ffn_hidden_layers_num = 2
         self.use_gate = True
         self.lru_rank = 128
         self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
-        self.freq_mode = "linear"           # 'linear' | 'exp'
+        self.freq_mode = "linear"
         self.use_sh_prior = True
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
-        self.lambda_type = "exogenous"      # 'static' | 'exogenous'
-        self.exo_mode = "mlp"               # 'mlp' | 'affine'
+        self.lambda_type = "exogenous"
+        self.exo_mode = "mlp"
         self.lambda_mlp_hidden = 16
-        self.dec_strategy = 'pxsf'          # 'pxsf' | 'deconv'
+        self.dec_strategy = 'pxsf'
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
         self.data_root = '/nfs/ERA5_data/data_norm'
@@ -88,10 +88,10 @@ class Args:
         self.lr = 1e-4
         self.use_scheduler = False
         self.init_lr_scheduler = False
-        self.loss = 'l1'                    # 'l1' | 'lat'
+        self.loss = 'l1'
         self.T = 6
         self.use_amp = False
-        self.amp_dtype = 'fp16'             # 'fp16' | 'bf16'
+        self.amp_dtype = 'fp16'
         self.grad_clip = 0.0
         self.sample_k = 9
 
@@ -246,9 +246,9 @@ def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu', args=No
     logging.info(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
     return epoch, step
 
-def setup_logging(args):
+def setup_logging(args, rank=0):
     os.makedirs(args.log_path, exist_ok=True)
-    log_filename = os.path.join(args.log_path, f'training_log_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    log_filename = os.path.join(args.log_path, f'training_log_r{rank}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
     logging.basicConfig(
         filename=log_filename,
         level=logging.INFO,
@@ -306,7 +306,6 @@ def format_gate_means():
         parts.append(f"g[b{k}]={v:.4f}" if isinstance(k,int) else f"g[{k}]={v:.4f}")
     return " ".join(parts)
 
-
 def make_listT_from_arg_T(B, L, device, dtype, T):
     if T is None or T < 0:
         return None
@@ -332,8 +331,7 @@ def build_dt_from_indices(idxs, base_T):
 
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
-    if rank == 0:
-        setup_logging(args)
+    setup_logging(args, rank)
     if args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -404,7 +402,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad(set_to_none=True)
-            # data = data.cuda(local_rank, non_blocking=True).to(torch.float32)[:, :, :, :, :]
             B_full, L_full, C, H, W = data.shape
             L_eff = L_full - 1
             if args.sample_k != -1 and args.sample_k > L_full:
@@ -417,7 +414,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 x = data[:, :L_eff].cuda(local_rank, non_blocking=True).to(torch.float32)
                 B, L, _, _, _ = x.shape
                 listT_vals = [float(args.T)] * L
-                target = data[:, 2:L_eff+1].cuda(local_rank, non_blocking=True).to(torch.float32)  # Alignment with preds[:,1:] (for preds[:,:] use data[:,1:L_eff+1])
+                target = data[:, 2:L_eff+1].cuda(local_rank, non_blocking=True).to(torch.float32)
             else:
                 if K > L_eff:
                     print(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1 (no sampling).")
@@ -425,7 +422,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     x = data[:, :L_eff].cuda(local_rank, non_blocking=True).to(torch.float32)
                     B, L, _, _, _ = x.shape
                     listT_vals = [float(args.T)] * L
-                    target = data[:, 2:L_eff+1].cuda(local_rank, non_blocking=True).to(torch.float32)  # Alignment with preds[:,1:] (for preds[:,:] use data[:,1:L_eff+1])
+                    target = data[:, 2:L_eff+1].cuda(local_rank, non_blocking=True).to(torch.float32)
                 else:
                     idxs = make_random_indices(L_eff, K)
                     x = data[:, idxs].cuda(local_rank, non_blocking=True).to(torch.float32)
@@ -435,12 +432,12 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             del data
             gc.collect()
             torch.cuda.empty_cache()
-            listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(B_full, 1)
+            listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
             use_amp = bool(args.use_amp)
             ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
             with ctx:
                 preds = model(x, 'p', listT=listT)
-                preds = preds[:, 1:] # Align with target
+                preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -462,14 +459,20 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if args.use_scheduler and scheduler is not None else opt.param_groups[0]['lr']
                 gate_str = format_gate_means()
-                t_str = f"T={args.T}"
+                if K == -1:
+                    t_str = f"T={args.T} (fixed)"
+                else:
+                    t_min = min(listT_vals) if len(listT_vals) > 0 else float('nan')
+                    t_max = max(listT_vals) if len(listT_vals) > 0 else float('nan')
+                    t_mean = (sum(listT_vals) / len(listT_vals)) if len(listT_vals) > 0 else float('nan')
+                    t_str = f"T[min/mean/max]={t_min:.2f}/{t_mean:.2f}/{t_max:.2f} (K={K})"
                 message = f"Epoch {ep+1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {t_str} - {gate_str}"
                 if isinstance(train_dataloader_iter, tqdm):
                     train_dataloader_iter.set_description(message)
                 logging.info(message)
             if rank == 0 and (train_step % max(1, int(len(train_dataloader)*args.ckpt_step)) == 0 or train_step == len(train_dataloader)):
                 save_ckpt(model, opt, ep+1, train_step, avg_loss, args, scheduler if (args.use_scheduler and scheduler is not None) else None)
-            del x, preds, target, loss, loss_tensor
+            del x, preds, target, loss, loss_tensor, listT
             gc.collect()
             torch.cuda.empty_cache()
         del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
@@ -490,7 +493,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     num_workers=1, pin_memory=True, prefetch_factor=1)
                 eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep+1}/{args.epochs}") if rank == 0 else eval_dataloader
                 for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                    # data = data.cuda(local_rank, non_blocking=True).to(torch.float32)[:, :, :, :, :]
                     B_full, L_full, C, H, W = data.shape
                     half = args.eval_data_n_frames // 2
                     cond = data[:, :half].cuda(local_rank, non_blocking=True).to(torch.float32)
@@ -516,7 +518,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                             idxs_c = make_random_indices(Lc_eff, K_eval)
                             cond_eff = cond[:, idxs_c]
                             listT_cond_vals = build_dt_from_indices(idxs_c, args.T)
-                    listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(B_full, 1)
+                    listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(cond_eff.size(0), 1)
                     out_gen_num = data.shape[1] - cond_eff.shape[1]
                     listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
                     target = data[:, cond_eff.shape[1]:cond_eff.shape[1]+out_gen_num].cuda(local_rank, non_blocking=True).to(torch.float32)
@@ -525,13 +527,19 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     torch.cuda.empty_cache()
                     with torch.cuda.amp.autocast(enabled=bool(args.use_amp), dtype=amp_dtype):
                         preds = model(cond_eff, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
-                        loss_eval = loss_fn(preds,
-                                            target)
+                        loss_eval = loss_fn(preds, target)
                     tot_tensor = loss_eval.detach()
                     dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
                     avg_total = (tot_tensor / world_size).item()
                     if rank == 0:
-                        message = f"Eval step {eval_step} - Total: {avg_total:.6f}"
+                        if K_eval == -1:
+                            t_str_eval = f"T={args.T} (fixed)"
+                        else:
+                            t_min = min(listT_cond_vals) if len(listT_cond_vals) > 0 else float('nan')
+                            t_max = max(listT_cond_vals) if len(listT_cond_vals) > 0 else float('nan')
+                            t_mean = (sum(listT_cond_vals) / len(listT_cond_vals)) if len(listT_cond_vals) > 0 else float('nan')
+                            t_str_eval = f"T[min/mean/max]={t_min:.2f}/{t_mean:.2f}/{t_max:.2f} (K={K_eval})"
+                        message = f"Eval step {eval_step} - Total: {avg_total:.6f} - {t_str_eval}"
                         if isinstance(eval_dataloader_iter, tqdm):
                             eval_dataloader_iter.set_description(message)
                         logging.info(message)
