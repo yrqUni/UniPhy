@@ -669,3 +669,4 @@ if __name__ == "__main__":
     master_addr = os.environ.get('MASTER_ADDR', '127.0.0.1')
     master_port = os.environ.get('MASTER_PORT', '12355')
     run_ddp(rank, world_size, local_rank, master_addr, master_port, args)
+
