@@ -79,7 +79,7 @@ class Args:
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = 'e18_s1140_l0.014857.pth'
+        self.ckpt = 'e46_s855_l0.012388.pth'
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 76
@@ -89,14 +89,14 @@ class Args:
         self.do_eval = False
         self.use_tf32 = False
         self.use_compile = False
-        self.lr = 5e-5
-        self.use_scheduler = True
-        self.init_lr_scheduler = True
+        self.lr = 1e-5
+        self.use_scheduler = False
+        self.init_lr_scheduler = False
         self.loss = 'lat'
         self.T = 1
         self.use_amp = False
         self.amp_dtype = 'fp16'
-        self.grad_clip = 0.0
+        self.grad_clip = 0.30
         self.sample_k = 9
         self.use_wandb = True
         self.wandb_project = "ERA5"
@@ -336,6 +336,21 @@ def format_gate_means():
     return " ".join(parts)
 
 
+def get_grad_stats(model):
+    total_norm_sq = 0.0
+    max_abs = 0.0
+    param_count = 0
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        param_count += 1
+        param_norm = p.grad.data.norm(2)
+        total_norm_sq += param_norm.item() ** 2
+        max_abs = max(max_abs, p.grad.data.abs().max().item())
+    total_norm = total_norm_sq ** 0.5 if param_count > 0 else 0.0
+    return float(total_norm), float(max_abs), param_count
+
+
 def make_listT_from_arg_T(B, L, device, dtype, T):
     if T is None or T < 0:
         return None
@@ -454,7 +469,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             if args.sample_k != -1 and args.sample_k > L_full:
                 if rank == 0:
                     print(f"[Error] sample_k={args.sample_k} > L={L_full}. Fallback to -1 (no sampling).")
-                    logging.error(f"sample_k={args.sample_k} > L={L_full}. Fallback to -1.")
+                    logging.error(f"[Error] sample_k={args.sample_k} > L={L_full}. Fallback to -1.")
                 K = -1
             else:
                 K = args.sample_k
@@ -467,7 +482,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 if K > L_eff:
                     if rank == 0:
                         print(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1 (no sampling).")
-                        logging.error(f"sample_k={K} > effective L={L_eff}. Fallback to -1.")
+                        logging.error(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1.")
                     x = data[:, :L_eff].cuda(local_rank, non_blocking=True).to(torch.float32)
                     B, L, _, _, _ = x.shape
                     listT_vals = [float(args.T)] * L
@@ -488,17 +503,23 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 preds = model(x, 'p', listT=listT)
                 preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
+            grad_norm = None
+            grad_max = None
             if scaler is not None:
                 scaler.scale(loss).backward()
                 if args.grad_clip and args.grad_clip > 0:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if rank == 0:
+                    grad_norm, grad_max, _ = get_grad_stats(model)
                 scaler.step(opt)
                 scaler.update()
             else:
                 loss.backward()
                 if args.grad_clip and args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if rank == 0:
+                    grad_norm, grad_max, _ = get_grad_stats(model)
                 opt.step()
             if args.use_scheduler and scheduler is not None:
                 scheduler.step()
@@ -508,6 +529,10 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if args.use_scheduler and scheduler is not None else opt.param_groups[0]['lr']
                 gate_str = format_gate_means()
+                if grad_norm is not None and grad_max is not None:
+                    grad_str = f" |grad|={grad_norm:.4e}, gmax={grad_max:.4e}"
+                else:
+                    grad_str = " |grad|=NA, gmax=NA"
                 if K == -1:
                     t_min = t_max = t_mean = float(args.T)
                     t_str = f"T={args.T} (fixed)"
@@ -516,7 +541,11 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     t_max = max(listT_vals) if len(listT_vals) > 0 else float('nan')
                     t_mean = (sum(listT_vals) / len(listT_vals)) if len(listT_vals) > 0 else float('nan')
                     t_str = f"T[min/mean/max]={t_min:.2f}/{t_mean:.2f}/{t_max:.2f} (K={K})"
-                message = f"Epoch {ep + 1}/{args.epochs} - Step {train_step} - Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {t_str} - {gate_str}"
+                message = (
+                    f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
+                    f"- Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- {gate_str}{grad_str}"
+                )
                 if isinstance(train_dataloader_iter, tqdm):
                     train_dataloader_iter.set_description(message)
                 logging.info(message)
@@ -538,6 +567,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                         "train/T_max": t_max,
                         "train/K": K,
                     }
+                    if grad_norm is not None and grad_max is not None:
+                        log_dict["train/grad_norm"] = grad_norm
+                        log_dict["train/grad_max"] = grad_max
                     log_dict.update(gate_logs)
                     wandb.log(log_dict, step=global_step)
             if rank == 0 and (train_step % max(1, int(len(train_dataloader) * args.ckpt_step)) == 0 or train_step == len(train_dataloader)):
@@ -563,7 +595,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     if args.sample_k != -1 and args.sample_k > cond.shape[1]:
                         if rank == 0:
                             print(f"[Error] sample_k={args.sample_k} > L={cond.shape[1]} in eval. Fallback to -1.")
-                            logging.error(f"sample_k={args.sample_k} > L={cond.shape[1]} in eval. Fallback to -1.")
+                            logging.error(f"[Error] sample_k={args.sample_k} > L={cond.shape[1]} in eval. Fallback to -1.")
                         K_eval = -1
                     else:
                         K_eval = args.sample_k
@@ -576,7 +608,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                         if K_eval > Lc_eff:
                             if rank == 0:
                                 print(f"[Error] sample_k={K_eval} > L={Lc_eff} in eval. Fallback to -1.")
-                                logging.error(f"sample_k={K_eval} > L={Lc_eff} in eval. Fallback to -1.")
+                                logging.error(f"[Error] sample_k={K_eval} > L={Lc_eff} in eval. Fallback to -1.")
                             cond_eff = cond
                             Bc, Lc, _, _, _ = cond_eff.shape
                             listT_cond_vals = [float(args.T)] * Lc
