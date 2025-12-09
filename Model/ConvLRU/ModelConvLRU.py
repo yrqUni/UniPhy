@@ -232,7 +232,6 @@ class ConvLRU(nn.Module):
         assert all(pscan_check())
 
     def truncated_normal_init(self, mean=0, std=0.02, lower=-0.04, upper=0.04):
-        # Align skip list with .BAK
         skip_contains = [
             "layer_norm",
             "params_log",
@@ -332,7 +331,6 @@ class Conv_hidden(nn.Module):
         super().__init__()
         self.ch = ch
         self.use_cbam = bool(use_cbam)
-        # Align to .BAK: standard conv (no groups) and padding="same"
         self.conv3 = nn.Conv3d(self.ch, self.ch, kernel_size=(1, 3, 3), padding="same")
         self.activation3 = _act(activation_func)
         self.conv1 = nn.Conv3d(self.ch, self.ch, kernel_size=(1, 1, 1), padding="same")
@@ -563,7 +561,6 @@ class ConvLRULayer(nn.Module):
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         S, W = self.hidden_size
         self.rank = int(getattr(args, "lru_rank", min(S, W, 32)))
-        # params for lambda
         u1_s = torch.rand(self.emb_ch, S)
         u2_s = torch.rand(self.emb_ch, S)
         nu_s_log = torch.log(-0.5 * torch.log(u1_s * (self.r_max**2 - self.r_min**2) + self.r_min**2))
@@ -578,7 +575,6 @@ class ConvLRULayer(nn.Module):
         diag_lambda_r = torch.exp(torch.complex(-torch.exp(nu_r_log), torch.exp(theta_r_log)))
         gamma_r_log = torch.log(torch.sqrt(1 - torch.abs(diag_lambda_r) ** 2))
         self.params_log_rank = nn.Parameter(torch.stack([nu_r_log, theta_r_log, gamma_r_log], dim=0))
-        # projection and post-IFFT heads (align with .BAK)
         self.U_row = nn.Parameter(torch.randn(self.emb_ch, S, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(S)))
         self.V_col = nn.Parameter(torch.randn(self.emb_ch, W, self.rank, dtype=torch.cfloat) * (1.0 / math.sqrt(W)))
         C = self.emb_ch
@@ -694,7 +690,6 @@ class ConvLRULayer(nn.Module):
                     for n in ["mod_nu_fc1_S", "mod_nu_fc2_S", "mod_th_fc1_S", "mod_th_fc2_S"]:
                         _freeze_attr(n)
 
-    # ---- BAK-style project/deproject (explicit bmm with indexing) ----
     def _project_to_square(self, h):
         B, L, C, S, W = h.shape
         Uc = self.U_row.conj()
@@ -728,7 +723,6 @@ class ConvLRULayer(nn.Module):
         return h
 
     def _ifft_and_fuse(self, h_complex: torch.Tensor) -> torch.Tensor:
-        # BAK-style: separate conv on real/imag then 1x1 project
         h_spatial = torch.fft.ifft2(h_complex, dim=(-2, -1), norm="ortho")
         hr = h_spatial.real
         hi = h_spatial.imag
@@ -738,7 +732,6 @@ class ConvLRULayer(nn.Module):
         h_out = self.post_ifft_proj(h_cat.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         return h_out
 
-    # BAK-style static dt scaling (no nu0 path)
     def _apply_static_dt_scaling(self, h, lam1, dt):
         lamk = lam1.pow(dt.view(dt.size(0), dt.size(1), 1, 1, 1))
         gamma1 = torch.sqrt(torch.clamp(1.0 - (lam1.abs() ** 2), min=1e-12))
@@ -760,7 +753,6 @@ class ConvLRULayer(nn.Module):
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
-        # FFT and channel projection (BAK-style permute+matmul)
         h = torch.fft.fft2(x.to(torch.cfloat), dim=(-2, -1), norm="ortho")
         h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S * W, C)
         h_proj = torch.matmul(h_perm, self.proj_W)
@@ -836,7 +828,6 @@ class ConvLRULayer(nn.Module):
             h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
-            # BAK-style: LayerNorm on h BEFORE residual/gate
             h = self.layer_norm(h)
             aux = {}
             if self.lambda_type == "exogenous":
@@ -911,13 +902,11 @@ class ConvLRULayer(nn.Module):
             h = self._ifft_and_fuse(h)
             if self.use_sh_prior:
                 h = self.sh_prior(h)
-            # BAK-style: LayerNorm on h BEFORE residual/gate
             h = self.layer_norm(h)
             aux = {}
             if self.lambda_type == "exogenous":
                 aux["phi_last"] = phi[:, -1:].detach()
             last_hidden_pkg = (last_hidden_out, aux) if aux else last_hidden_out
-        # Gate/Residual AFTER LayerNorm (BAK)
         if self.gate_conv is not None:
             gate = self.gate_conv(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             x = (1 - gate) * x + gate * h
