@@ -89,33 +89,42 @@ class PScan(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A_in, X_in):
         L = X_in.size(1)
-        if L == npo2(L):
-            A = A_in.clone()
-            X = X_in.clone()
+        dtype_orig = X_in.dtype
+        if dtype_orig == torch.float16 or dtype_orig == torch.bfloat16:
+            calc_dtype = torch.float32
+        elif dtype_orig == torch.complex32:
+            calc_dtype = torch.complex64
         else:
-            A = pad_npo2(A_in)
-            X = pad_npo2(X_in)
+            calc_dtype = dtype_orig
+        if L == npo2(L):
+            A = A_in.clone().to(dtype=calc_dtype).contiguous()
+            X = X_in.clone().to(dtype=calc_dtype).contiguous()
+        else:
+            A = pad_npo2(A_in).to(dtype=calc_dtype).contiguous()
+            X = pad_npo2(X_in).to(dtype=calc_dtype).contiguous()
         PScan.pscan(A, X)
         ctx.save_for_backward(A_in, X)
-        return X[:, :L]
+        ctx.calc_dtype = calc_dtype
+        return X[:, :L].to(dtype=dtype_orig)
 
     @staticmethod
     def backward(ctx, grad_output_in):
         A_in, H_pad = ctx.saved_tensors
+        calc_dtype = ctx.calc_dtype
         L = grad_output_in.size(1)
         if L == npo2(L):
-            grad_output = grad_output_in.clone()
-            A_pad = A_in.clone()
+            grad_output = grad_output_in.clone().to(dtype=calc_dtype).contiguous()
+            A_pad = A_in.clone().to(dtype=calc_dtype).contiguous()
         else:
-            grad_output = pad_npo2(grad_output_in)
-            A_pad = pad_npo2(A_in)
+            grad_output = pad_npo2(grad_output_in).to(dtype=calc_dtype).contiguous()
+            A_pad = pad_npo2(A_in).to(dtype=calc_dtype).contiguous()
         A_shift = F.pad(A_pad[:, 1:], (0, 0, 0, 0, 0, 0, 0, 1))
         PScan.pscan_rev(A_shift.conj(), grad_output)
         gradX = grad_output[:, :L]
         gradA_full = torch.zeros_like(A_pad)
         gradA_full[:, 1:, :, :, 0] = (H_pad[:, :-1].conj() * grad_output[:, 1:]).sum(dim=-1)
         gradA = gradA_full[:, :L]
-        return gradA, gradX
+        return gradA.to(dtype=A_in.dtype), gradX.to(dtype=A_in.dtype)
 
 pscan = PScan.apply
 
@@ -130,27 +139,26 @@ def serial_scan(A, X):
                 H[b, l] = A[b, l] * H[b, l - 1].clone() + X[b, l].clone()
     return H
 
-def pscan_check(batch_size=2, seq_length=13, channels=8, state_dim=16):
-    # assert pscan_check(), "PScan check failed (real dtype)"
-    torch.manual_seed(0)
-    A_tensor = torch.rand(batch_size, seq_length, channels, state_dim, 1, dtype=torch.float64)
-    A1 = torch.nn.Parameter(A_tensor.clone())
-    A2 = torch.nn.Parameter(A_tensor.clone())
-    X1 = torch.rand(batch_size, seq_length, channels, state_dim, state_dim, dtype=torch.float64, requires_grad=True)
-    X2 = X1.clone().detach().requires_grad_(True)
-    H_gt = torch.rand(batch_size, seq_length, channels, state_dim, state_dim, dtype=torch.float64)
-    loss_fn = torch.nn.MSELoss()
-    H_pscan = PScan.apply(A1, X1)
-    loss_pscan = loss_fn(H_pscan, H_gt)
-    loss_pscan.backward()
-    H_serial = serial_scan(A2, X2)
-    loss_serial = loss_fn(H_serial, H_gt)
-    loss_serial.backward()
-    fwd_ok = torch.allclose(H_pscan, H_serial, rtol=1e-5, atol=1e-7)
-    gradA_ok = torch.allclose(A1.grad, A2.grad, rtol=1e-5, atol=1e-7)
-    gradX_ok = torch.allclose(X1.grad, X2.grad, rtol=1e-5, atol=1e-7)
-    import gc
-    del A_tensor, A1, A2, X1, X2, H_gt, H_pscan, H_serial, loss_pscan, loss_serial, loss_fn
-    gc.collect()
-    torch.cuda.empty_cache()
-    return (fwd_ok, gradA_ok and gradX_ok)
+def pscan_check(batch_size=2, seq_length=13, channels=4, state_dim=8, device='cuda'):
+    if not torch.cuda.is_available():
+        device = 'cpu'
+    print(f"Running PScan Check on {device}...")
+    dtype = torch.complex128
+    A = torch.randn(batch_size, seq_length, channels, state_dim, 1, device=device, dtype=dtype, requires_grad=True)
+    X = torch.randn(batch_size, seq_length, channels, state_dim, state_dim, device=device, dtype=dtype, requires_grad=True)
+    H_pscan = pscan(A, X)
+    H_serial = serial_scan(A, X)
+    fwd_diff = (H_pscan - H_serial).abs().max()
+    print(f"Forward Max Diff: {fwd_diff:.2e}")
+    if fwd_diff > 1e-10:
+        return False
+    from torch.autograd import gradcheck
+    A_small = torch.randn(1, 5, 2, 2, 1, device=device, dtype=dtype, requires_grad=True)
+    X_small = torch.randn(1, 5, 2, 2, 2, device=device, dtype=dtype, requires_grad=True)
+    if gradcheck(pscan, (A_small, X_small), eps=1e-6, atol=1e-4, rtol=1e-3):
+        print("✅ Backward (Gradient) check passed!")
+        return True
+    return False
+
+if __name__ == "__main__":
+    pscan_check()

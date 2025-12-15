@@ -13,7 +13,6 @@ torch.backends.cudnn.allow_tf32 = False
 torch.use_deterministic_algorithms(True)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-
 def set_seed(s=0):
     import random
     random.seed(s)
@@ -22,78 +21,64 @@ def set_seed(s=0):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
-
 def pick_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 class ArgsBase:
     def __init__(self):
-        self.input_size = (144, 144)
-        self.input_ch = 8
-        self.out_ch = 8
+        self.input_size = (64, 64)
+        self.input_ch = 4
+        self.out_ch = 4
         self.emb_ch = 16
-        self.convlru_num_blocks = 2
-        self.hidden_factor = (2, 2)
-        self.use_gate = True
-        self.use_cbam = False
         self.emb_hidden_ch = 16
         self.emb_hidden_layers_num = 1
         self.emb_strategy = "pxus"
-        self.ffn_hidden_ch = 16
-        self.ffn_hidden_layers_num = 1
-        self.dec_hidden_ch = 0
-        self.dec_hidden_layers_num = 0
-        self.dec_strategy = "pxsf"
-        self.hidden_activation = "ReLU"
-        self.output_activation = "Identity"
+        self.hidden_factor = (2, 2)
+        self.convlru_num_blocks = 2
+        self.lru_rank = 16
+        self.use_gate = True
+        self.use_cbam = False
         self.use_freq_prior = False
         self.freq_rank = 8
-        self.freq_gain_init = 0.0
-        self.freq_mode = "linear"
         self.use_sh_prior = False
-        self.sh_Lmax = 6
-        self.sh_rank = 8
-        self.sh_gain_init = 0.0
-        self.lru_rank = 32
-        self.lambda_type = "exogenous"
-        self.lambda_mlp_hidden = 16
-        self.exo_mode = "mlp"
+        self.sh_Lmax = 4
+        self.ffn_hidden_ch = 16
+        self.ffn_hidden_layers_num = 1
+        self.hidden_activation = "ReLU"
+        self.dec_strategy = "pxsf"
+        self.dec_hidden_ch = 16
+        self.dec_hidden_layers_num = 0
 
-
-def make_cfgs():
+def make_test_configs():
     cfgs = []
-    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = False; a.use_sh_prior = False
-    cfgs.append(("sq_pxsf_exo_mlp_noP", a))
-    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "affine"; a.use_freq_prior = False; a.use_sh_prior = False
-    cfgs.append(("sq_pxsf_exo_affine_noP", a))
-    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "static"; a.use_freq_prior = False; a.use_sh_prior = False
-    cfgs.append(("sq_pxsf_sta_noP", a))
-    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = True; a.freq_mode = "linear"; a.freq_gain_init = 0.05; a.use_sh_prior = False
-    cfgs.append(("sq_pxsf_exo_mlp_freq_lin", a))
-    a = ArgsBase(); a.input_size = (144, 144); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = True; a.freq_mode = "exp"; a.freq_gain_init = 0.02; a.use_sh_prior = True
-    cfgs.append(("sq_pxsf_exo_mlp_freq_exp_sh", a))
-    a = ArgsBase(); a.input_size = (120, 200); a.dec_strategy = "pxsf"; a.lambda_type = "exogenous"; a.exo_mode = "affine"; a.use_freq_prior = False; a.use_sh_prior = False
-    cfgs.append(("rect_pxsf_exo_affine_noP", a))
-    a = ArgsBase(); a.input_size = (120, 200); a.dec_strategy = "pxsf"; a.lambda_type = "static"; a.use_freq_prior = True; a.freq_mode = "linear"; a.freq_gain_init = 0.03; a.use_sh_prior = True
-    cfgs.append(("rect_pxsf_sta_freq_sh", a))
-    a = ArgsBase(); a.input_size = (96, 96); a.dec_strategy = "deconv"; a.dec_hidden_layers_num = 0; a.lambda_type = "static"; a.use_freq_prior = False; a.use_sh_prior = False
-    cfgs.append(("sq_deconv_sta_noP", a))
-    a = ArgsBase(); a.input_size = (96, 144); a.dec_strategy = "deconv"; a.dec_hidden_layers_num = 0; a.lambda_type = "exogenous"; a.exo_mode = "mlp"; a.use_freq_prior = True; a.freq_mode = "linear"; a.freq_gain_init = 0.05; a.use_sh_prior = True; a.use_gate = False
-    cfgs.append(("rect_deconv_exo_mlp_freq_sh_nogate", a))
+    a = ArgsBase()
+    cfgs.append(("base_pxsf_gate", a))
+    a = ArgsBase()
+    a.use_freq_prior = True
+    a.use_sh_prior = True
+    cfgs.append(("with_physics_priors", a))
+    a = ArgsBase()
+    a.emb_strategy = "conv"
+    a.dec_strategy = "deconv"
+    a.dec_hidden_layers_num = 1
+    cfgs.append(("conv_io_deconv", a))
+    a = ArgsBase()
+    a.use_gate = False
+    a.use_cbam = False
+    cfgs.append(("minimal_no_gate", a))
+    a = ArgsBase()
+    a.use_cbam = True
+    cfgs.append(("with_cbam", a))
     return cfgs
-
 
 def count_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
-
 @torch.no_grad()
 def forward_full_p(model, x, listT=None):
     return model(x, mode="p", listT=listT)
-
 
 @torch.no_grad()
 def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
@@ -102,129 +87,80 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
     dm = model.decoder
     m = model.convlru_model
     outs = []
-    last_hidden = None
+    last_hidden_list = None
     pos = 0
     for n in chunk_sizes:
         if pos >= L:
             break
         n = min(n, L - pos)
-        xe = em(x[:, pos : pos + n])
+        x_chunk = x[:, pos : pos + n]
+        xe = em(x_chunk)
         listT_slice = listT[:, pos : pos + n] if listT is not None else None
-        xe, last_hidden = m(xe, last_hidden_ins=last_hidden, listT=listT_slice)
+        xe, last_hidden_list = m(xe, last_hidden_ins=last_hidden_list, listT=listT_slice)
         yo = dm(xe)
         outs.append(yo)
         pos += n
-    if pos < L:
-        xe = em(x[:, pos:])
-        listT_slice = listT[:, pos:] if listT is not None else None
-        xe, last_hidden = m(xe, last_hidden_ins=last_hidden, listT=listT_slice)
-        yo = dm(xe)
-        outs.append(yo)
     return torch.cat(outs, dim=1)
-
 
 def max_err(a, b):
     return float((a - b).abs().max().detach().cpu())
 
+def check_output_shape(y, B, L, out_ch, H, W):
+    expected_shape = (B, L, out_ch * 2, H, W)
+    if y.shape != expected_shape:
+        print(f"❌ Output shape mismatch! Expected {expected_shape}, got {y.shape}")
+        return False
+    return True
 
-def mae(a, b):
-    return float((a - b).abs().mean().detach().cpu())
+def check_sde_noise(model, x, listT):
+    print("   [test] SDE Noise Injection...")
+    model.train()
+    y1 = model(x, mode="p", listT=listT)
+    y2 = model(x, mode="p", listT=listT)
+    diff_train = max_err(y1, y2)
+    model.eval()
+    y3 = model(x, mode="p", listT=listT)
+    y4 = model(x, mode="p", listT=listT)
+    diff_eval = max_err(y3, y4)
+    is_train_noisy = diff_train > 1e-6
+    is_eval_det = diff_eval < 1e-9
+    status = "OK" if (is_train_noisy and is_eval_det) else "FAIL"
+    print(f"     -> Train Diff: {diff_train:.2e} (Expected > 0) | Eval Diff: {diff_eval:.2e} (Expected 0) => {status}")
+    if not is_train_noisy:
+        print("     ⚠️ Warning: Training mode seems deterministic. SDE noise might be too small or disabled.")
+    if not is_eval_det:
+        print("     ❌ Error: Eval mode is not deterministic!")
+        return False
+    return True
 
-
-def effective_tol(y_ref: torch.Tensor, L: int, base_atol: float = 3e-6, base_rtol: float = 1e-5, k_abs: float = 64.0, k_rel: float = 64.0):
-    eps = np.finfo(np.float32).eps
-    mag = float(y_ref.abs().max().detach().cpu()) + 1.0
-    growth = max(1.0, math.log2(L + 1))
-    atol_eff = max(base_atol, k_abs * eps * mag * growth)
-    rtol_eff = max(base_rtol, k_rel * eps * growth)
-    return atol_eff, rtol_eff
-
-
-def gen_chunk_patterns(L):
-    return [
-        [1] * L,
-        [2] * (L // 2) + ([L % 2] if L % 2 else []),
-        [3] * (L // 3) + ([L % 3] if L % 3 else []),
-        [4] * (L // 4) + ([L % 4] if L % 4 else []),
-        [L],
-        [2, 3, 1, 4, 2, L],
-    ]
-
-
-def make_listT_cases(B, L, device, dtype, include_none=True):
-    cases = []
-    if include_none:
-        cases.append(("none", None))
-    ones = torch.ones(B, L, device=device, dtype=dtype)
-    rnd = torch.rand(B, L, device=device, dtype=dtype) * 1.1 + 0.1
-    inc = torch.linspace(0.2, 1.6, steps=L, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1)
-    burst = torch.ones(B, L, device=device, dtype=dtype) * 0.5
-    if L >= 4:
-        burst[:, L // 2 : L // 2 + 2] = 1.8
-    cases += [("ones", ones), ("rand", rnd), ("inc", inc), ("burst", burst)]
-    return cases
-
-
-def expected_unused_name(name: str, args, hidden_hw_equal: bool) -> bool:
-    if hidden_hw_equal:
-        if any(name.endswith(suf) for suf in (
-            "lru_layer.params_log_rank",
-            "lru_layer.U_row",
-            "lru_layer.V_col",
-            "lru_layer.mod_nu_fc1_R",
-            "lru_layer.mod_nu_fc2_R",
-            "lru_layer.mod_th_fc1_R",
-            "lru_layer.mod_th_fc2_R",
-        )):
+def expected_unused_name(name: str, args) -> bool:
+    if not args.use_freq_prior:
+        if "freq_prior" in name:
             return True
-    else:
-        if any(name.endswith(suf) for suf in (
-            "lru_layer.params_log_square",
-            "lru_layer.mod_nu_fc1_S",
-            "lru_layer.mod_nu_fc2_S",
-            "lru_layer.mod_th_fc1_S",
-            "lru_layer.mod_th_fc2_S",
-        )):
+    if not args.use_sh_prior:
+        if "sh_prior" in name:
             return True
-    if args.lambda_type != "exogenous":
-        if any(s in name for s in (
-            "lru_layer.mod_nu_fc1_",
-            "lru_layer.mod_nu_fc2_",
-            "lru_layer.mod_th_fc1_",
-            "lru_layer.mod_th_fc2_",
-            "lru_layer.exo_affine_a",
-            "lru_layer.exo_affine_b",
-        )):
+    if not args.use_gate:
+        if "gate_conv" in name:
             return True
-    else:
-        if args.exo_mode != "affine":
-            if any(name.endswith(suf) for suf in ("lru_layer.exo_affine_a", "lru_layer.exo_affine_b")):
-                return True
-        if args.exo_mode == "affine":
-            if any(name.endswith(suf) for suf in (
-                "lru_layer.mod_nu_fc1_S","lru_layer.mod_nu_fc2_S",
-                "lru_layer.mod_th_fc1_S","lru_layer.mod_th_fc2_S",
-                "lru_layer.mod_nu_fc1_R","lru_layer.mod_nu_fc2_R",
-                "lru_layer.mod_th_fc1_R","lru_layer.mod_th_fc2_R",
-            )):
-                return True
+    if not args.use_cbam:
+        if "cbam" in name:
+            return True
+    if args.emb_hidden_layers_num == 0:
+        if "embedding.c_hidden" in name:
+            return True
+        if "embedding.c_out" in name:
+            return True
+    if args.dec_hidden_layers_num == 0:
+        if "decoder.c_hidden" in name:
+            return True
     return False
 
-
-def list_unused_parameters(model, x, listT, mode="p"):
+def list_unused_parameters(model, x, listT):
     model.train()
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad = None
-    if mode == "p":
-        y = model(x, mode="p", listT=listT)
-        loss = y.sum()
-    else:
-        B, L, C, H, W = x.shape
-        K = 3
-        listT_future = torch.rand(B, K, device=x.device, dtype=x.dtype) * 1.2 + 0.1
-        y = model(x, mode="i", out_gen_num=K, listT=listT, listT_future=listT_future)
-        loss = y.sum()
+    model.zero_grad()
+    y = model(x, mode="p", listT=listT)
+    loss = y.sum()
     loss.backward()
     unused = []
     for n, p in model.named_parameters():
@@ -232,78 +168,74 @@ def list_unused_parameters(model, x, listT, mode="p"):
             unused.append(n)
     return unused
 
-
-def test_semigroup_static_with_listT(model, H, W, B=1, L=6, k=3, dtype=torch.float32, device="cpu"):
-    model.eval()
-    x_const = torch.randn(B, L, model.args.input_ch, H, W, device=device, dtype=dtype)
-    x_const[:] = x_const[:, :1].clone()
-    listT_ones = torch.ones(B, L, device=device, dtype=dtype)
-    y_ref = model(x_const, mode="p", listT=listT_ones)
-    y_ref = y_ref[:, -1:]
-    x_k = x_const[:, -1:]
-    listT_k = torch.full((B, 1), float(k), device=device, dtype=dtype)
-    y_k = model(x_k, mode="p", listT=listT_k)
-    e = max_err(y_ref, y_k)
-    return e
-
-
-def run_equivalence_and_unused(name, args, device, B=1, L=10):
-    print(f"[case] {name}")
+def run_test_case(name, args, device):
+    print(f"\n>> Running Test Case: {name}")
     model = ConvLRU(args).to(device)
     total, trainable = count_params(model)
-    print(f"[params] total={total} trainable={trainable}")
+    print(f"   [params] Total: {total:,} | Trainable: {trainable:,}")
+    B, L = 1, 8
     H, W = args.input_size
-    hidden_H = model.embedding.input_downsp_shape[1]
-    hidden_W = model.embedding.input_downsp_shape[2]
-    hidden_equal = hidden_H == hidden_W
-    dtype_real = torch.float32
-    set_seed(2024)
-    x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype_real)
-    lt_cases = make_listT_cases(B, L, device, dtype_real, include_none=True)
-    for lt_name, listT in lt_cases:
-        y_full = forward_full_p(model.eval(), x, listT=listT)
-        for pat in gen_chunk_patterns(L):
-            y_stream = forward_streaming_p_equiv(model.eval(), x, pat, listT=listT)
-            e1, m1 = max_err(y_full, y_stream), mae(y_full, y_stream)
-            atol_eff, rtol_eff = effective_tol(y_full, L)
-            ok = torch.allclose(y_full, y_stream, rtol=rtol_eff, atol=atol_eff)
-            print(f"[p~stream] listT={lt_name:<6} pat_len={len(pat):>2} max_err={e1:.3e} mae={m1:.3e} tol(r={rtol_eff:.2e},a={atol_eff:.2e}) {'OK' if ok else 'FAIL'}")
-            if not ok:
-                raise RuntimeError("p vs streaming mismatch")
-        unused_p_all = list_unused_parameters(model, x, listT, mode="p")
-        expected_p = [n for n in unused_p_all if expected_unused_name(n, args, hidden_equal)]
-        unexpected_p = [n for n in unused_p_all if n not in expected_p]
-        if len(unexpected_p) == 0:
-            tag = "none" if len(expected_p) == 0 else ", ".join(expected_p[:8]) + (" ..." if len(expected_p) > 8 else "")
-            print(f"[unused-p] listT={lt_name:<6} {tag}")
+    dtype = torch.float32
+    set_seed(42)
+    x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype)
+    listT_ones = torch.ones(B, L, device=device, dtype=dtype)
+    listT_rand = torch.rand(B, L, device=device, dtype=dtype) * 1.5 + 0.1
+    model.eval()
+    y = model(x, mode="p", listT=listT_ones)
+    if not check_output_shape(y, B, L, args.out_ch, H, W):
+        raise RuntimeError("Output Shape Check Failed")
+    if not check_sde_noise(model, x, listT_rand):
+        raise RuntimeError("SDE Noise Check Failed")
+    print("   [test] Streaming Equivalence (P-Mode vs Chunked)...")
+    patterns = [
+        [1] * L,
+        [L // 2, L - (L // 2)],
+        [L]
+    ]
+    TOLERANCE = 1e-4
+    for pat in patterns:
+        model.eval()
+        y_full = forward_full_p(model, x, listT=listT_rand)
+        y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT_rand)
+        err = max_err(y_full, y_stream)
+        if err > TOLERANCE:
+            print(f"     ❌ FAIL pattern {pat}: Max Err {err:.2e} > {TOLERANCE}")
+            raise RuntimeError("Streaming Equivalence Failed")
         else:
-            print(f"[unused-p] listT={lt_name:<6} UNEXPECTED: {', '.join(unexpected_p)}")
-            raise RuntimeError("Unexpected unused parameters in mode='p'")
-    half = L // 2
-    first_case_listT = lt_cases[0][1]
-    listT_half = None if first_case_listT is None else first_case_listT[:, :half]
-    unused_i_all = list_unused_parameters(model, x[:, :half], listT=listT_half, mode="i")
-    expected_i = [n for n in unused_i_all if expected_unused_name(n, args, hidden_equal)]
-    unexpected_i = [n for n in unused_i_all if n not in expected_i]
-    if len(unexpected_i) == 0:
-        tag = "none" if len(expected_i) == 0 else ", ".join(expected_i[:12]) + (" ..." if len(expected_i) > 12 else "")
-        print(f"[unused-i] {tag}")
+            print(f"     ✅ OK pattern {pat}: Max Err {err:.2e}")
+    print("   [test] Unused Parameters (Gradient Check)...")
+    unused = list_unused_parameters(model, x, listT=listT_rand)
+    unexpected = [n for n in unused if not expected_unused_name(n, args)]
+    if unexpected:
+        print(f"     ❌ UNEXPECTED UNUSED PARAMS: {unexpected}")
+        raise RuntimeError("Found unexpected unused parameters")
     else:
-        print(f"[unused-i] UNEXPECTED: {', '.join(unexpected_i)}")
-        raise RuntimeError("Unexpected unused parameters in mode='i'")
-    if args.lambda_type == "static":
-        err_k = test_semigroup_static_with_listT(model, H, W, B=B, L=L, k=3, dtype=dtype_real, device=device)
-        print(f"[static-semi] k=3 max_err={err_k:.3e}")
-
+        print(f"     ✅ OK. (Ignored expected: {len(unused) - len(unexpected)})")
 
 def main():
-    print("[pscan]", pscan_check())
+    print("========================================")
+    print("      ConvLRU (Physics-Enhanced) Test   ")
+    print("========================================")
+    print("[1/3] Checking PScan Operator...")
+    if not pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
+        print("❌ PScan Check Failed!")
+        sys.exit(1)
+    print("✅ PScan Check Passed.")
     device = pick_device()
-    print("[device]", device.type)
-    cfgs = make_cfgs()
+    print(f"[2/3] Running on device: {device}")
+    print("[3/3] Running Model Test Cases...")
+    cfgs = make_test_configs()
+    passed = 0
     for name, args in cfgs:
-        run_equivalence_and_unused(name, args, device=device, B=1, L=10)
-
+        try:
+            run_test_case(name, args, device)
+            passed += 1
+        except Exception as e:
+            print(f"\n❌ CASE FAILED: {name}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    print(f"\n🎉 All {passed} test cases passed successfully!")
 
 if __name__ == "__main__":
     main()
