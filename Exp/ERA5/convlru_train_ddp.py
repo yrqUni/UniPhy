@@ -79,7 +79,7 @@ class Args:
         self.ckpt = ''
         self.train_batch_size = 1
         self.eval_batch_size = 1
-        self.epochs = 76
+        self.epochs = 128
         self.log_path = './convlru_base/logs'
         self.ckpt_dir = './convlru_base/ckpt'
         self.ckpt_step = 0.25
@@ -89,7 +89,7 @@ class Args:
         self.lr = 1e-5
         self.use_scheduler = False
         self.init_lr_scheduler = False
-        self.loss = 'lat'
+        self.loss = 'nll'
         self.T = 6
         self.use_amp = False
         self.amp_dtype = 'fp16'
@@ -274,10 +274,26 @@ def get_latitude_weights(H, device, dtype):
     _LAT_WEIGHT_CACHE[key] = w
     return w
 
-def latitude_weighted_l1(preds, targets):
-    B, T, C, H, W = preds.shape
+def gaussian_nll_loss_weighted(preds, targets):
+    B, L, C2, H, W = preds.shape
+    C = C2 // 2
+    mu = preds[:, :, :C]
+    sigma = preds[:, :, C:]
     device = preds.device
     dtype = preds.dtype
+    w = get_latitude_weights(H, device, dtype).view(1, 1, 1, H, 1)
+    var = sigma.pow(2)
+    nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
+    weighted_nll = (nll * w).mean()
+    return weighted_nll
+
+def latitude_weighted_l1(preds, targets):
+    B, T, C_pred, H, W = preds.shape
+    B, T, C_gt, H, W = targets.shape
+    device = preds.device
+    dtype = preds.dtype
+    if C_pred == 2 * C_gt:
+        preds = preds[:, :, :C_gt]
     w = get_latitude_weights(H, device, dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
 
@@ -286,19 +302,14 @@ _LRU_GATE_MEAN = {}
 def register_lru_gate_hooks(ddp_model, rank):
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
     for name, module in model_to_hook.named_modules():
-        if name.endswith('lru_layer.gate_conv'):
-            if 'convlru_blocks.' in name:
-                try:
-                    tag = int(name.split('convlru_blocks.')[1].split('.')[0])
-                except Exception:
-                    tag = name
-            else:
-                tag = name
-            def _hook(mod, inp, out, tag_local=tag):
-                with torch.no_grad():
-                    m = out.mean().detach()
-                    _LRU_GATE_MEAN[tag_local] = float(m)
-            module.register_forward_hook(_hook)
+        if name.endswith('gate_conv') and isinstance(module, torch.nn.Sequential):
+             sigmoid_layer = module[-1]
+             if isinstance(sigmoid_layer, torch.nn.Sigmoid):
+                def _hook(mod, inp, out, tag_local=name):
+                    with torch.no_grad():
+                        m = out.mean().detach()
+                        _LRU_GATE_MEAN[tag_local] = float(m)
+                sigmoid_layer.register_forward_hook(_hook)
 
 def format_gate_means():
     if not _LRU_GATE_MEAN:
@@ -390,18 +401,20 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         logging.info("======================================")
     model = ConvLRU(args)
     model = model.cuda(local_rank)
-    loss_fn = latitude_weighted_l1 if args.loss == 'lat' else torch.nn.L1Loss()
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    if rank == 0:
-        print(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
-        logging.info(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
+    if args.loss == 'nll':
+        loss_fn = gaussian_nll_loss_weighted
+        if rank == 0:
+            logging.info("Using Gaussian NLL Loss (Probabilistic Training)")
+    elif args.loss == 'lat':
+        loss_fn = latitude_weighted_l1
+    else:
+        loss_fn = torch.nn.L1Loss()
     if args.use_compile:
         model = torch.compile(model, mode="default")
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     register_lru_gate_hooks(model, rank)
     setup_wandb(rank, args, model)
-    tmp_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
+    tmp_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
     tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False, drop_last=True)
     tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1)
     len_train_dataloader = len(tmp_loader)
