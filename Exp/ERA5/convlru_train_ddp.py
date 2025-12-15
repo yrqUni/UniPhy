@@ -9,7 +9,6 @@ import logging
 import datetime
 import warnings
 import wandb
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -45,51 +44,63 @@ class Args:
         self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
-        self.data_root = '/nfs/ERA5_data/data_norm'
+        self.hidden_activation = 'Tanh'
+        self.output_activation = 'Tanh'
+        self.emb_strategy = 'pxus'
+        self.hidden_factor = (7, 12)
         self.emb_ch = 90
         self.emb_hidden_ch = 120
         self.emb_hidden_layers_num = 2
-        self.emb_strategy = 'pxus'
-        self.hidden_factor = (7, 12)
         self.convlru_num_blocks = 6
-        self.lru_rank = 32
-        self.use_gate = True
         self.use_cbam = True
-        self.use_freq_prior = True
-        self.freq_rank = 8
-        self.use_sh_prior = True
-        self.sh_Lmax = 6
         self.ffn_hidden_ch = 120
         self.ffn_hidden_layers_num = 2
-        self.hidden_activation = 'Tanh'
+        self.use_gate = True
+        self.lru_rank = 32
+        self.use_freq_prior = True
+        self.freq_rank = 8
+        self.freq_gain_init = 0.0
+        self.freq_mode = "linear"
+        self.use_sh_prior = True
+        self.sh_Lmax = 6
+        self.sh_rank = 8
+        self.sh_gain_init = 0.0
+        self.lambda_type = "exogenous"
+        self.exo_mode = "mlp"
+        self.lambda_mlp_hidden = 16
         self.dec_strategy = 'pxsf'
         self.dec_hidden_ch = 0
-        self.loss = 'nll'
-        self.epochs = 76
-        self.train_batch_size = 1
-        self.eval_batch_size = 1
-        self.lr = 1e-5
-        self.grad_clip = 0.30
-        self.use_amp = False
-        self.amp_dtype = 'fp16'
-        self.use_compile = False
-        self.T = 1
+        self.dec_hidden_layers_num = 0
+        self.data_root = '/nfs/ERA5_data/data_norm'
+        self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
-        self.sample_k = 9
-        self.ckpt = 'e46_s855_l0.012388.pth'
-        self.ckpt_dir = './convlru_base/ckpt'
+        self.eval_sample_num = 1
+        self.ckpt = ''
+        self.train_batch_size = 1
+        self.eval_batch_size = 1
+        self.epochs = 76
         self.log_path = './convlru_base/logs'
+        self.ckpt_dir = './convlru_base/ckpt'
         self.ckpt_step = 0.25
         self.do_eval = False
+        self.use_tf32 = False
+        self.use_compile = False
+        self.lr = 1e-5
+        self.use_scheduler = False
+        self.init_lr_scheduler = False
+        self.loss = 'lat'
+        self.T = 6
+        self.use_amp = False
+        self.amp_dtype = 'fp16'
+        self.grad_clip = 0.30
+        self.sample_k = 9
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
         self.wandb_run_name = self.ckpt
-        self.wandb_group = "v2.0.0-Physics"
+        self.wandb_group = "v2.1.0"
         self.wandb_mode = "online"
-        self.use_scheduler = False
-        self.init_lr_scheduler = False
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -111,6 +122,138 @@ def keep_latest_ckpts(ckpt_dir):
         except Exception:
             pass
 
+MODEL_ARG_KEYS = [
+    'input_size', 'input_ch', 'out_ch', 'hidden_activation', 'output_activation',
+    'emb_strategy', 'hidden_factor', 'emb_ch', 'emb_hidden_ch', 'emb_hidden_layers_num',
+    'convlru_num_blocks', 'use_cbam', 'use_gate', 'lru_rank',
+    'use_freq_prior', 'freq_rank', 'freq_gain_init', 'freq_mode',
+    'use_sh_prior', 'sh_Lmax', 'sh_rank', 'sh_gain_init',
+    'lambda_type', 'exo_mode', 'lambda_mlp_hidden',
+    'ffn_hidden_ch', 'ffn_hidden_layers_num',
+    'dec_strategy', 'dec_hidden_ch', 'dec_hidden_layers_num'
+]
+
+def extract_model_args(args_obj):
+    return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
+
+def apply_model_args(args_obj, model_args_dict, verbose=True):
+    if not model_args_dict:
+        return
+    for k, v in model_args_dict.items():
+        if hasattr(args_obj, k):
+            old = getattr(args_obj, k)
+            if verbose and old != v:
+                msg = f"[Args] restore '{k}': {old} -> {v}"
+                print(msg)
+                if dist.get_rank() == 0:
+                    logging.info(msg)
+            setattr(args_obj, k, v)
+
+def load_model_args_from_ckpt(ckpt_path, map_location='cpu'):
+    if not os.path.isfile(ckpt_path):
+        print(f"[Args] ckpt not found: {ckpt_path}")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            logging.warning(f"[Args] ckpt not found: {ckpt_path}")
+        return None
+    ckpt = torch.load(ckpt_path, map_location=map_location)
+    model_args = ckpt.get('model_args', None)
+    if model_args is None:
+        args_all = ckpt.get('args_all', None)
+        if isinstance(args_all, dict):
+            model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
+    for k in ['model', 'optimizer', 'scheduler']:
+        if k in ckpt:
+            del ckpt[k]
+    del ckpt
+    gc.collect()
+    torch.cuda.empty_cache()
+    if not model_args:
+        print(f"[Args] Warning: no model_args found in ckpt, using code defaults.")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            logging.warning(f"[Args] no model_args found in ckpt, using code defaults.")
+        return None
+    return model_args
+
+def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    state = {
+        'model': (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+        'optimizer': opt.state_dict(),
+        'epoch': epoch,
+        'step': step,
+        'loss': float(loss),
+        'args_all': dict(vars(args)),
+        'model_args': extract_model_args(args),
+    }
+    if scheduler is not None:
+        state['scheduler'] = scheduler.state_dict()
+    ckpt_path = os.path.join(args.ckpt_dir, f'e{epoch}_s{step}_l{state["loss"]:.6f}.pth')
+    torch.save(state, ckpt_path)
+    keep_latest_ckpts(args.ckpt_dir)
+    del state
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def get_prefix(keys):
+    if not keys:
+        return ''
+    key = keys[0]
+    if key.startswith('module._orig_mod.'):
+        return 'module._orig_mod.'
+    if key.startswith('module.'):
+        return 'module.'
+    return ''
+
+def adapt_state_dict_keys(state_dict, model):
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(state_dict.keys())
+    ckpt_prefix = get_prefix(ckpt_keys)
+    model_prefix = get_prefix(model_keys)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_k = k
+        if ckpt_prefix != '':
+            new_k = k[len(ckpt_prefix):]
+        if model_prefix != '':
+            new_k = model_prefix + new_k
+        new_state_dict[new_k] = v
+    return new_state_dict
+
+def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu', args=None, restore_model_args=False):
+    if not os.path.isfile(ckpt_path):
+        print(f"No checkpoint Found")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            logging.warning(f"No checkpoint Found at {ckpt_path}")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return 0, 0
+    checkpoint = torch.load(ckpt_path, map_location=map_location)
+    if restore_model_args and args is not None:
+        model_args = checkpoint.get('model_args', None)
+        if model_args is None:
+            args_all = checkpoint.get('args_all', None)
+            if isinstance(args_all, dict):
+                model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
+        apply_model_args(args, model_args, verbose=True)
+    state_dict = adapt_state_dict_keys(checkpoint['model'], model)
+    model.load_state_dict(state_dict, strict=False)
+    opt.load_state_dict(checkpoint['optimizer'])
+    if scheduler is not None and 'scheduler' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    epoch = checkpoint.get('epoch', 0)
+    step = checkpoint.get('step', 0)
+    del state_dict
+    for k in ['model', 'optimizer', 'scheduler']:
+        if k in checkpoint:
+            del checkpoint[k]
+    del checkpoint
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
+    if dist.is_initialized() and dist.get_rank() == 0:
+        logging.info(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
+    return epoch, step
+
 def setup_logging(args):
     if not dist.is_initialized() or dist.get_rank() != 0:
         return
@@ -131,46 +274,41 @@ def get_latitude_weights(H, device, dtype):
     _LAT_WEIGHT_CACHE[key] = w
     return w
 
-def gaussian_nll_loss_weighted(preds, targets):
-    B, L, C2, H, W = preds.shape
-    C = C2 // 2
-    mu = preds[:, :, :C]
-    sigma = preds[:, :, C:]
-    device = preds.device
-    dtype = preds.dtype
-    w = get_latitude_weights(H, device, dtype).view(1, 1, 1, H, 1)
-    var = sigma.pow(2)
-    nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
-    weighted_nll = (nll * w).mean()
-    return weighted_nll
-
 def latitude_weighted_l1(preds, targets):
-    B, L, C2, H, W = preds.shape
-    C = C2 // 2
-    mu = preds[:, :, :C]
+    B, T, C, H, W = preds.shape
     device = preds.device
     dtype = preds.dtype
     w = get_latitude_weights(H, device, dtype).view(1, 1, 1, H, 1)
-    return ((mu - targets).abs() * w).mean()
+    return ((preds - targets).abs() * w).mean()
 
 _LRU_GATE_MEAN = {}
 
 def register_lru_gate_hooks(ddp_model, rank):
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
     for name, module in model_to_hook.named_modules():
-        if name.endswith('gate_conv') and isinstance(module, torch.nn.Sequential):
-             sigmoid_layer = module[-1]
-             if isinstance(sigmoid_layer, torch.nn.Sigmoid):
-                def _hook(mod, inp, out, tag_local=name):
-                    with torch.no_grad():
-                        m = out.mean().detach()
-                        _LRU_GATE_MEAN[tag_local] = float(m)
-                sigmoid_layer.register_forward_hook(_hook)
+        if name.endswith('lru_layer.gate_conv'):
+            if 'convlru_blocks.' in name:
+                try:
+                    tag = int(name.split('convlru_blocks.')[1].split('.')[0])
+                except Exception:
+                    tag = name
+            else:
+                tag = name
+            def _hook(mod, inp, out, tag_local=tag):
+                with torch.no_grad():
+                    m = out.mean().detach()
+                    _LRU_GATE_MEAN[tag_local] = float(m)
+            module.register_forward_hook(_hook)
 
 def format_gate_means():
     if not _LRU_GATE_MEAN:
         return "g=NA"
-    return f"g_mean={np.mean(list(_LRU_GATE_MEAN.values())):.4f}"
+    keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: (0, k) if isinstance(k, int) else (1, str(k)))
+    parts = []
+    for k in keys:
+        v = _LRU_GATE_MEAN[k]
+        parts.append(f"g[b{k}]={v:.4f}" if isinstance(k, int) else f"g[{k}]={v:.4f}")
+    return " ".join(parts)
 
 def get_grad_stats(model):
     total_norm_sq = 0.0
@@ -192,14 +330,17 @@ def make_listT_from_arg_T(B, L, device, dtype, T):
     return torch.full((B, L), float(T), device=device, dtype=dtype)
 
 def make_random_indices(L_eff, K):
-    if K <= 0: return np.array([], dtype=int)
-    if K == 1: return np.array([0], dtype=int)
+    if K <= 0:
+        return np.array([], dtype=int)
+    if K == 1:
+        return np.array([0], dtype=int)
     idx = np.random.choice(L_eff, size=K, replace=False)
     idx.sort()
     return idx
 
 def build_dt_from_indices(idxs, base_T):
-    if len(idxs) == 0: return []
+    if len(idxs) == 0:
+        return []
     dt = [float(base_T)]
     for i in range(1, len(idxs)):
         gap = int(idxs[i] - idxs[i - 1])
@@ -227,159 +368,268 @@ def setup_wandb(rank, args, model):
     else:
         wandb.watch(model, log="all", log_freq=100)
 
-MODEL_ARG_KEYS = [
-    'input_size', 'input_ch', 'out_ch', 'hidden_activation', 
-    'emb_strategy', 'hidden_factor', 'emb_ch', 'emb_hidden_ch', 'emb_hidden_layers_num',
-    'convlru_num_blocks', 'use_cbam', 'use_gate', 'lru_rank',
-    'use_freq_prior', 'freq_rank', 'use_sh_prior', 'sh_Lmax',
-    'ffn_hidden_ch', 'ffn_hidden_layers_num',
-    'dec_strategy', 'dec_hidden_ch'
-]
-
-def extract_model_args(args_obj):
-    return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
-
-def apply_model_args(args_obj, model_args_dict, verbose=True):
-    if not model_args_dict: return
-    for k, v in model_args_dict.items():
-        if hasattr(args_obj, k):
-            old = getattr(args_obj, k)
-            if verbose and old != v:
-                msg = f"[Args] restore '{k}': {old} -> {v}"
-                print(msg)
-                if dist.get_rank() == 0: logging.info(msg)
-            setattr(args_obj, k, v)
-
-def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu', args=None, restore_model_args=False):
-    if not os.path.isfile(ckpt_path):
-        return 0, 0
-    checkpoint = torch.load(ckpt_path, map_location=map_location)
-    if restore_model_args and args is not None:
-        model_args = checkpoint.get('model_args', None)
-        if model_args: apply_model_args(args, model_args)
-    state_dict = checkpoint['model']
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('module.') and not isinstance(model, DDP):
-            new_state_dict[k[7:]] = v
-        else:
-            new_state_dict[k] = v
-    model.load_state_dict(new_state_dict, strict=False)
-    opt.load_state_dict(checkpoint['optimizer'])
-    if scheduler and 'scheduler' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler'])
-    epoch = checkpoint.get('epoch', 0)
-    step = checkpoint.get('step', 0)
-    print(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
-    return epoch, step
-
-def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    state = {
-        'model': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
-        'optimizer': opt.state_dict(),
-        'epoch': epoch,
-        'step': step,
-        'loss': float(loss),
-        'args_all': dict(vars(args)),
-        'model_args': extract_model_args(args),
-    }
-    if scheduler: state['scheduler'] = scheduler.state_dict()
-    ckpt_path = os.path.join(args.ckpt_dir, f'e{epoch}_s{step}_l{loss:.6f}.pth')
-    torch.save(state, ckpt_path)
-    keep_latest_ckpts(args.ckpt_dir)
-
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
-    if rank == 0: setup_logging(args)
+    if rank == 0:
+        setup_logging(args)
     if args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    model = ConvLRU(args).cuda(local_rank)
-    if args.loss == 'nll':
-        loss_fn = gaussian_nll_loss_weighted
-        if rank == 0: logging.info("Using Gaussian NLL Loss (Probabilistic Training)")
-    elif args.loss == 'lat':
-        loss_fn = latitude_weighted_l1
-    else:
-        loss_fn = torch.nn.L1Loss()
+        torch.set_float32_matmul_precision('high')
+    if args.ckpt and os.path.isfile(args.ckpt):
+        ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f'cuda:{local_rank}')
+        if ckpt_model_args:
+            print("[Args] applying model args from ckpt before building model.")
+            if rank == 0:
+                logging.info("[Args] applying model args from ckpt before building model.")
+            apply_model_args(args, ckpt_model_args, verbose=True)
+    if rank == 0:
+        logging.info("==== Training Arguments (Updated) ====")
+        for k, v in vars(args).items():
+            logging.info(f"{k}: {v}")
+        logging.info("======================================")
+    model = ConvLRU(args)
+    model = model.cuda(local_rank)
+    loss_fn = latitude_weighted_l1 if args.loss == 'lat' else torch.nn.L1Loss()
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if rank == 0:
+        print(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
+        logging.info(f"[params] Total: {total_params:,}, Trainable: {trainable_params:,}")
     if args.use_compile:
-        model = torch.compile(model)
+        model = torch.compile(model, mode="default")
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     register_lru_gate_hooks(model, rank)
     setup_wandb(rank, args, model)
-    train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, max_cache_size=8, rank=rank, gpus=world_size)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True)
-    len_loader = len(train_dataloader)
+    tmp_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
+    tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False, drop_last=True)
+    tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1)
+    len_train_dataloader = len(tmp_loader)
+    del tmp_dataset, tmp_sampler, tmp_loader
+    gc.collect()
+    torch.cuda.empty_cache()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
+    scaler = None
+    amp_dtype = torch.float16 if str(args.amp_dtype).lower() == 'fp16' else torch.bfloat16
+    if args.use_amp and amp_dtype == torch.float16:
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
     start_epoch = 0
-    if args.ckpt:
-        start_epoch, _ = load_ckpt(model, opt, args.ckpt, map_location=f'cuda:{local_rank}', args=args)
+    scheduler = None
+    if args.use_scheduler:
+        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=args.epochs)
+    if args.ckpt and os.path.isfile(args.ckpt):
+        start_epoch, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f'cuda:{local_rank}', args=args, restore_model_args=False)
+    if args.init_lr_scheduler and args.use_scheduler:
+        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=args.epochs - start_epoch)
+    if not args.use_scheduler:
+        for g in opt.param_groups:
+            g['lr'] = args.lr
     for ep in range(start_epoch, args.epochs):
+        train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
+        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1, persistent_workers=False)
         train_sampler.set_epoch(ep)
-        loader_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}") if rank == 0 else train_dataloader
-        for step, data in enumerate(loader_iter, start=1):
+        train_dataloader_iter = tqdm(train_dataloader, desc=f"Epoch {ep + 1}/{args.epochs} - Start") if rank == 0 else train_dataloader
+        for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad(set_to_none=True)
             B_full, L_full, C, H, W = data.shape
             L_eff = L_full - 1
-            if args.sample_k > 0 and args.sample_k <= L_eff:
-                idxs = make_random_indices(L_eff, args.sample_k)
-                x = data[:, idxs].cuda(local_rank, non_blocking=True).float()
-                listT_vals = build_dt_from_indices(idxs, args.T)
-                tgt_idxs = np.clip(idxs[1:] + 1, 1, L_full - 1)
-                target = data[:, tgt_idxs].cuda(local_rank, non_blocking=True).float()
+            if args.sample_k != -1 and args.sample_k > L_full:
+                if rank == 0:
+                    print(f"[Error] sample_k={args.sample_k} > L={L_full}. Fallback to -1 (no sampling).")
+                    logging.error(f"[Error] sample_k={args.sample_k} > L={L_full}. Fallback to -1.")
+                K = -1
             else:
-                x = data[:, :L_eff].cuda(local_rank, non_blocking=True).float()
-                target = data[:, 1:].cuda(local_rank, non_blocking=True).float()
-                listT_vals = [float(args.T)] * x.size(1)
-            listT = torch.tensor(listT_vals, device=x.device).view(1, -1).repeat(x.size(0), 1)
-            with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=torch.float16 if args.amp_dtype=='fp16' else torch.bfloat16):
-                preds = model(x, mode='p', listT=listT)
+                K = args.sample_k
+            if K == -1:
+                x = data[:, :L_eff].cuda(local_rank, non_blocking=True).to(torch.float32)
+                B, L, _, _, _ = x.shape
+                listT_vals = [float(args.T)] * L
+                target = data[:, 2:L_eff + 1].cuda(local_rank, non_blocking=True).to(torch.float32)
+            else:
+                if K > L_eff:
+                    if rank == 0:
+                        print(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1 (no sampling).")
+                        logging.error(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1.")
+                    x = data[:, :L_eff].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    B, L, _, _, _ = x.shape
+                    listT_vals = [float(args.T)] * L
+                    target = data[:, 2:L_eff + 1].cuda(local_rank, non_blocking=True).to(torch.float32)
+                else:
+                    idxs = make_random_indices(L_eff, K)
+                    x = data[:, idxs].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    listT_vals = build_dt_from_indices(idxs, args.T)
+                    tgt_idxs = np.clip(idxs[1:] + 1, 1, L_full - 1)
+                    target = data[:, tgt_idxs].cuda(local_rank, non_blocking=True).to(torch.float32)
+            del data
+            gc.collect()
+            torch.cuda.empty_cache()
+            listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
+            use_amp = bool(args.use_amp)
+            ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
+            with ctx:
+                preds = model(x, 'p', listT=listT)
                 preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
-            scaler.scale(loss).backward()
-            if args.grad_clip:
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = None
+            grad_max = None
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if rank == 0:
+                    grad_norm, grad_max, _ = get_grad_stats(model)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if rank == 0:
+                    grad_norm, grad_max, _ = get_grad_stats(model)
+                opt.step()
+            if args.use_scheduler and scheduler is not None:
+                scheduler.step()
+            loss_tensor = loss.detach()
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = (loss_tensor / world_size).item()
             if rank == 0:
-                gnorm, gmax, _ = get_grad_stats(model)
-            scaler.step(opt)
-            scaler.update()
-            loss_val = loss.detach()
-            dist.all_reduce(loss_val)
-            avg_loss = (loss_val / world_size).item()
-            if rank == 0:
-                global_step = ep * len_loader + step
-                wandb_dict = {
-                    "train/loss": avg_loss,
-                    "train/epoch": ep + 1,
-                    "train/grad_norm": gnorm,
-                    "train/grad_max": gmax,
-                    "train/lr": opt.param_groups[0]['lr']
-                }
-                if hasattr(model.module.convlru_model.convlru_blocks[0].lru_layer, 'forcing_scale'):
-                    fs = model.module.convlru_model.convlru_blocks[0].lru_layer.forcing_scale.item()
-                    nl = model.module.convlru_model.convlru_blocks[0].lru_layer.noise_level.item()
-                    wandb_dict["phys/forcing_scale"] = fs
-                    wandb_dict["phys/noise_level"] = nl
-                if args.use_wandb:
-                    wandb.log(wandb_dict, step=global_step)
-                loader_iter.set_description(f"Ep {ep+1} Loss {avg_loss:.4f} {format_gate_means()}")
-            if rank == 0 and step % int(len_loader * args.ckpt_step) == 0:
-                save_ckpt(model, opt, ep+1, step, avg_loss, args)
+                current_lr = scheduler.get_last_lr()[0] if args.use_scheduler and scheduler is not None else opt.param_groups[0]['lr']
+                gate_str = format_gate_means()
+                if grad_norm is not None and grad_max is not None:
+                    grad_str = f" |grad|={grad_norm:.4e}, gmax={grad_max:.4e}"
+                else:
+                    grad_str = " |grad|=NA, gmax=NA"
+                if K == -1:
+                    t_min = t_max = t_mean = float(args.T)
+                    t_str = f"T={args.T} (fixed)"
+                else:
+                    t_min = min(listT_vals) if len(listT_vals) > 0 else float('nan')
+                    t_max = max(listT_vals) if len(listT_vals) > 0 else float('nan')
+                    t_mean = (sum(listT_vals) / len(listT_vals)) if len(listT_vals) > 0 else float('nan')
+                    t_str = f"T[min/mean/max]={t_min:.2f}/{t_mean:.2f}/{t_max:.2f} (K={K})"
+                message = (
+                    f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
+                    f"- Total: {avg_loss:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- {gate_str}{grad_str}"
+                )
+                if isinstance(train_dataloader_iter, tqdm):
+                    train_dataloader_iter.set_description(message)
+                logging.info(message)
+                if getattr(args, "use_wandb", False):
+                    global_step = ep * len_train_dataloader + train_step
+                    gate_logs = {}
+                    for gk, gv in _LRU_GATE_MEAN.items():
+                        if isinstance(gk, int):
+                            gate_logs[f"train/gate/block{gk}"] = gv
+                        else:
+                            gate_logs[f"train/gate/{gk}"] = gv
+                    log_dict = {
+                        "train/epoch": ep + 1,
+                        "train/step": global_step,
+                        "train/loss": avg_loss,
+                        "train/lr": current_lr,
+                        "train/T_min": t_min,
+                        "train/T_mean": t_mean,
+                        "train/T_max": t_max,
+                        "train/K": K,
+                    }
+                    if grad_norm is not None and grad_max is not None:
+                        log_dict["train/grad_norm"] = grad_norm
+                        log_dict["train/grad_max"] = grad_max
+                    log_dict.update(gate_logs)
+                    wandb.log(log_dict, step=global_step)
+            if rank == 0 and (train_step % max(1, int(len(train_dataloader) * args.ckpt_step)) == 0 or train_step == len(train_dataloader)):
+                save_ckpt(model, opt, ep + 1, train_step, avg_loss, args, scheduler if (args.use_scheduler and scheduler is not None) else None)
+            del x, preds, target, loss, loss_tensor, listT
+            gc.collect()
+            torch.cuda.empty_cache()
+        del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.barrier()
         if args.do_eval:
-            pass
-    if rank == 0 and args.use_wandb:
+            model.eval()
+            with torch.no_grad():
+                eval_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=False, sample_len=args.eval_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
+                eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False, drop_last=True)
+                eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1)
+                eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep + 1}/{args.epochs}") if rank == 0 else eval_dataloader
+                for eval_step, data in enumerate(eval_dataloader_iter, start=1):
+                    B_full, L_full, C, H, W = data.shape
+                    half = args.eval_data_n_frames // 2
+                    cond = data[:, :half].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    if args.sample_k != -1 and args.sample_k > cond.shape[1]:
+                        if rank == 0:
+                            print(f"[Error] sample_k={args.sample_k} > L={cond.shape[1]} in eval. Fallback to -1.")
+                            logging.error(f"[Error] sample_k={args.sample_k} > L={cond.shape[1]} in eval. Fallback to -1.")
+                        K_eval = -1
+                    else:
+                        K_eval = args.sample_k
+                    if K_eval == -1:
+                        cond_eff = cond
+                        Bc, Lc, _, _, _ = cond_eff.shape
+                        listT_cond_vals = [float(args.T)] * Lc
+                    else:
+                        Lc_eff = cond.shape[1]
+                        if K_eval > Lc_eff:
+                            if rank == 0:
+                                print(f"[Error] sample_k={K_eval} > L={Lc_eff} in eval. Fallback to -1.")
+                                logging.error(f"[Error] sample_k={K_eval} > L={Lc_eff} in eval. Fallback to -1.")
+                            cond_eff = cond
+                            Bc, Lc, _, _, _ = cond_eff.shape
+                            listT_cond_vals = [float(args.T)] * Lc
+                        else:
+                            idxs_c = make_random_indices(Lc_eff, K_eval)
+                            cond_eff = cond[:, idxs_c]
+                            listT_cond_vals = build_dt_from_indices(idxs_c, args.T)
+                    listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(cond_eff.size(0), 1)
+                    out_gen_num = data.shape[1] - cond_eff.shape[1]
+                    listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
+                    target = data[:, cond_eff.shape[1]:cond_eff.shape[1] + out_gen_num].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    del data
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    with torch.cuda.amp.autocast(enabled=bool(args.use_amp), dtype=amp_dtype):
+                        preds = model(cond_eff, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
+                        loss_eval = loss_fn(preds, target)
+                    tot_tensor = loss_eval.detach()
+                    dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
+                    avg_total = (tot_tensor / world_size).item()
+                    if rank == 0:
+                        if K_eval == -1:
+                            t_min = t_max = t_mean = float(args.T)
+                            t_str_eval = f"T={args.T} (fixed)"
+                        else:
+                            t_min = min(listT_cond_vals) if len(listT_cond_vals) > 0 else float('nan')
+                            t_max = max(listT_cond_vals) if len(listT_cond_vals) > 0 else float('nan')
+                            t_mean = (sum(listT_cond_vals) / len(listT_cond_vals)) if len(listT_cond_vals) > 0 else float('nan')
+                            t_str_eval = f"T[min/mean/max]={t_min:.2f}/{t_mean:.2f}/{t_max:.2f} (K={K_eval})"
+                        message = f"Eval step {eval_step} - Total: {avg_total:.6f} - {t_str_eval}"
+                        if isinstance(eval_dataloader_iter, tqdm):
+                            eval_dataloader_iter.set_description(message)
+                        logging.info(message)
+                        if getattr(args, "use_wandb", False):
+                            step_id = (ep + 1) * len_train_dataloader
+                            wandb.log({"eval/total_loss": avg_total, "eval/epoch": ep + 1}, step=step_id)
+                    del target, cond, cond_eff, preds, loss_eval, tot_tensor, listT_cond, listT_future
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                del eval_dataset, eval_sampler, eval_dataloader, eval_dataloader_iter
+                gc.collect()
+                torch.cuda.empty_cache()
+                dist.barrier()
+    if rank == 0 and getattr(args, "use_wandb", False):
         wandb.finish()
     cleanup_ddp()
 
 if __name__ == "__main__":
     args = Args()
-    if args.use_amp:
-        print("[Warning] AMP forced off for stability.")
+    if bool(args.use_amp):
+        print("[Warning] AMP is disabled by policy. Forcing use_amp=False.")
+        logging.warning("AMP is disabled by policy. Forcing use_amp=False.")
         args.use_amp = False
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
