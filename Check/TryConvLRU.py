@@ -48,36 +48,45 @@ class ArgsBase:
         self.dec_strategy = "pxsf"
         self.dec_hidden_ch = 16
         self.dec_hidden_layers_num = 0
+        # [NEW] Static features channel count
         self.static_ch = 0
 
 def make_test_configs():
     cfgs = []
+    
+    # Case 1: Standard Base
     a = ArgsBase()
     cfgs.append(("base_pxsf_gate", a))
     
+    # Case 2: Physics Priors (FNO + SH)
     a = ArgsBase()
     a.use_freq_prior = True
     a.use_sh_prior = True
     cfgs.append(("with_physics_priors", a))
     
+    # Case 3: Static Features (FiLM)
     a = ArgsBase()
-    a.static_ch = 3
+    a.static_ch = 3 # e.g., LSM, Orography, Lat/Lon
     cfgs.append(("with_static_features", a))
     
+    # Case 4: Conv Downsample + Deconv Upsample
     a = ArgsBase()
     a.emb_strategy = "conv"
     a.dec_strategy = "deconv"
     a.dec_hidden_layers_num = 1
     cfgs.append(("conv_io_deconv", a))
     
+    # Case 5: Minimal (No Gate, No CBAM)
     a = ArgsBase()
     a.use_gate = False
     a.use_cbam = False
     cfgs.append(("minimal_no_gate", a))
     
+    # Case 6: CBAM Attention
     a = ArgsBase()
     a.use_cbam = True
     cfgs.append(("with_cbam", a))
+    
     return cfgs
 
 def count_params(model):
@@ -91,6 +100,10 @@ def forward_full_p(model, x, listT=None, static_feats=None):
 
 @torch.no_grad()
 def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None, static_feats=None):
+    """
+    Simulates streaming by chunking the time dimension.
+    Manually calls embedding -> core -> decoder to verify state passing.
+    """
     B, L, C, H, W = x.shape
     em = model.embedding
     dm = model.decoder
@@ -98,17 +111,27 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None, static_feats=No
     outs = []
     last_hidden_list = None
     pos = 0
+    
     for n in chunk_sizes:
         if pos >= L:
             break
         n = min(n, L - pos)
         x_chunk = x[:, pos : pos + n]
-        xe = em(x_chunk, static_feats=static_feats)
+        
+        # [UPDATE] Embedding now returns (x, cond) due to FiLM
+        xe, cond = em(x_chunk, static_feats=static_feats)
+        
         listT_slice = listT[:, pos : pos + n] if listT is not None else None
-        xe, last_hidden_list = m(xe, last_hidden_ins=last_hidden_list, listT=listT_slice)
-        yo = dm(xe)
+        
+        # [UPDATE] Core model accepts cond
+        xe, last_hidden_list = m(xe, last_hidden_ins=last_hidden_list, listT=listT_slice, cond=cond)
+        
+        # [UPDATE] Decoder accepts cond
+        yo = dm(xe, cond=cond)
+        
         outs.append(yo)
         pos += n
+        
     return torch.cat(outs, dim=1)
 
 def max_err(a, b):
@@ -127,14 +150,18 @@ def check_sde_noise(model, x, listT, static_feats=None):
     y1 = model(x, mode="p", listT=listT, static_feats=static_feats)
     y2 = model(x, mode="p", listT=listT, static_feats=static_feats)
     diff_train = max_err(y1, y2)
+    
     model.eval()
     y3 = model(x, mode="p", listT=listT, static_feats=static_feats)
     y4 = model(x, mode="p", listT=listT, static_feats=static_feats)
     diff_eval = max_err(y3, y4)
+    
     is_train_noisy = diff_train > 1e-6
     is_eval_det = diff_eval < 1e-9
+    
     status = "OK" if (is_train_noisy and is_eval_det) else "FAIL"
     print(f"     -> Train Diff: {diff_train:.2e} (Expected > 0) | Eval Diff: {diff_eval:.2e} (Expected 0) => {status}")
+    
     if not is_train_noisy:
         print("     ⚠️ Warning: Training mode seems deterministic. SDE noise might be too small or disabled.")
     if not is_eval_det:
@@ -143,24 +170,18 @@ def check_sde_noise(model, x, listT, static_feats=None):
     return True
 
 def expected_unused_name(name: str, args) -> bool:
-    if not args.use_freq_prior:
-        if "freq_prior" in name:
-            return True
-    if not args.use_sh_prior:
-        if "sh_prior" in name:
-            return True
-    if not args.use_gate:
-        if "gate_conv" in name:
-            return True
-    if not args.use_cbam:
-        if "cbam" in name:
-            return True
-    if args.emb_hidden_layers_num == 0:
-        if "embedding.c_hidden" in name:
-            return True
-    if args.dec_hidden_layers_num == 0:
-        if "decoder.c_hidden" in name:
-            return True
+    if not args.use_freq_prior and "freq_prior" in name:
+        return True
+    if not args.use_sh_prior and "sh_prior" in name:
+        return True
+    if not args.use_gate and "gate_conv" in name:
+        return True
+    if not args.use_cbam and "cbam" in name:
+        return True
+    # If static_ch is 0, static_embed params in Embedding should be unused (if they exist)
+    # But usually conditional code won't create them.
+    # However, GatedConvBlock cond_proj might exist if not handled carefully? 
+    # Our code handles initialization conditionally, so they shouldn't exist if unused.
     return False
 
 def list_unused_parameters(model, x, listT, static_feats=None):
@@ -180,22 +201,35 @@ def run_test_case(name, args, device):
     model = ConvLRU(args).to(device)
     total, trainable = count_params(model)
     print(f"   [params] Total: {total:,} | Trainable: {trainable:,}")
+    
     B, L = 1, 8
     H, W = args.input_size
     dtype = torch.float32
     set_seed(42)
+    
     x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype)
+    
+    # [NEW] Generate static features if needed
     static_feats = None
     if args.static_ch > 0:
         static_feats = torch.randn(B, args.static_ch, H, W, device=device, dtype=dtype)
+        print(f"   [input] Using Static Features: {static_feats.shape}")
+        
     listT_ones = torch.ones(B, L, device=device, dtype=dtype)
     listT_rand = torch.rand(B, L, device=device, dtype=dtype) * 1.5 + 0.1
+    
     model.eval()
+    
+    # 1. Shape Check
     y = model(x, mode="p", listT=listT_ones, static_feats=static_feats)
     if not check_output_shape(y, B, L, args.out_ch, H, W):
         raise RuntimeError("Output Shape Check Failed")
+        
+    # 2. SDE Noise Check
     if not check_sde_noise(model, x, listT_rand, static_feats=static_feats):
         raise RuntimeError("SDE Noise Check Failed")
+        
+    # 3. Streaming Equivalence Check
     print("   [test] Streaming Equivalence (P-Mode vs Chunked)...")
     patterns = [
         [1] * L,
@@ -208,14 +242,18 @@ def run_test_case(name, args, device):
         y_full = forward_full_p(model, x, listT=listT_rand, static_feats=static_feats)
         y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT_rand, static_feats=static_feats)
         err = max_err(y_full, y_stream)
+        
         if err > TOLERANCE:
             print(f"     ❌ FAIL pattern {pat}: Max Err {err:.2e} > {TOLERANCE}")
             raise RuntimeError("Streaming Equivalence Failed")
         else:
             print(f"     ✅ OK pattern {pat}: Max Err {err:.2e}")
+            
+    # 4. Unused Params Check
     print("   [test] Unused Parameters (Gradient Check)...")
     unused = list_unused_parameters(model, x, listT=listT_rand, static_feats=static_feats)
     unexpected = [n for n in unused if not expected_unused_name(n, args)]
+    
     if unexpected:
         print(f"     ❌ UNEXPECTED UNUSED PARAMS: {unexpected}")
         raise RuntimeError("Found unexpected unused parameters")
@@ -226,16 +264,20 @@ def main():
     print("========================================")
     print("      ConvLRU (Modern Arch) Test        ")
     print("========================================")
+    
     print("[1/3] Checking PScan Operator...")
     if not pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
         print("❌ PScan Check Failed!")
         sys.exit(1)
     print("✅ PScan Check Passed.")
+    
     device = pick_device()
     print(f"[2/3] Running on device: {device}")
+    
     print("[3/3] Running Model Test Cases...")
     cfgs = make_test_configs()
     passed = 0
+    
     for name, args in cfgs:
         try:
             run_test_case(name, args, device)
@@ -245,6 +287,7 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(1)
+            
     print(f"\n🎉 All {passed} test cases passed successfully!")
 
 if __name__ == "__main__":

@@ -200,34 +200,72 @@ class CBAM2DPerStep(nn.Module):
         return x
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, channels, hidden_size, use_cbam=False):
+    """
+    Enhanced GatedConvBlock with FiLM (Feature-wise Linear Modulation).
+    Can accept static_emb to modulate the normalization layer (Scale & Shift).
+    """
+    def __init__(self, channels, hidden_size, use_cbam=False, cond_channels=None):
         super().__init__()
         self.use_cbam = use_cbam
+        
+        # Large Kernel Depthwise Conv
         self.dw_conv = nn.Conv3d(channels, channels, kernel_size=(1, 7, 7), padding="same", groups=channels)
         self.norm = nn.LayerNorm([*hidden_size])
+        
+        # FiLM Projection Layer (Conditional Normalization)
+        # If cond_channels is provided (static feat dim), we project it to 2*channels (gamma, beta)
+        self.cond_channels = cond_channels
+        if self.cond_channels is not None and self.cond_channels > 0:
+            self.cond_proj = nn.Conv3d(self.cond_channels, channels * 2, kernel_size=1)
+        else:
+            self.cond_proj = None
+
         self.pw_conv_in = nn.Conv3d(channels, channels * 2, kernel_size=1)
         self.act = nn.SiLU()
         self.pw_conv_out = nn.Conv3d(channels, channels, kernel_size=1)
+        
         if self.use_cbam:
             self.cbam = CBAM2DPerStep(channels, reduction=16)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         residual = x
         x = self.dw_conv(x)
-        x = self.norm(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+        x = x.permute(0, 2, 1, 3, 4) # B, L, C, H, W
+        x = self.norm(x)
+        x = x.permute(0, 2, 1, 3, 4) # B, C, L, H, W
+        
+        # === FiLM: Condition with static features ===
+        if self.cond_proj is not None and cond is not None:
+            # cond is [B, C_cond, H, W], we need to broadcast to [B, C_cond, 1, H, W]
+            # but usually it's passed as [B, C_cond, 1, H, W] or broadcastable
+            if cond.dim() == 4:
+                cond_in = cond.unsqueeze(2) 
+            else:
+                cond_in = cond
+            
+            # Project to gamma, beta
+            affine = self.cond_proj(cond_in) 
+            gamma, beta = torch.chunk(affine, 2, dim=1)
+            # Apply FiLM: x = x * (1 + gamma) + beta
+            x = x * (1 + gamma) + beta
+        # ============================================
+
         x = self.pw_conv_in(x)
         x, gate = torch.chunk(x, 2, dim=1)
         x = self.act(x) * gate
+        
         if self.use_cbam:
             x = self.cbam(x)
+            
         x = self.pw_conv_out(x)
         return residual + x
 
-def pixel_unshuffle_hw_3d(x, rH: int, rW: int):
-    N, C, D, H, W = x.shape
-    x = x.view(N, C, D, H // rH, rH, W // rW, rW)
-    x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
-    x = x.view(N, C * rH * rW, D, H // rH, W // rW)
+def pixel_shuffle_hw_3d(x, rH: int, rW: int):
+    N, C_mul, D, H, W = x.shape
+    C = C_mul // (rH * rW)
+    x = x.view(N, C, rH, rW, D, H, W)
+    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
+    x = x.view(N, C, D, H * rH, W * rW)
     return x
 
 class Embedding(nn.Module):
@@ -238,36 +276,40 @@ class Embedding(nn.Module):
         self.emb_ch = getattr(args, "emb_ch", 32)
         self.emb_hidden_ch = getattr(args, "emb_hidden_ch", 32)
         self.emb_hidden_layers_num = getattr(args, "emb_hidden_layers_num", 0)
-        self.down_strategy = getattr(args, "emb_strategy", "pxus")
         self.static_ch = int(getattr(args, "static_ch", 0))
+        
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
-        if self.down_strategy == "conv":
-            self.downsp = nn.Conv3d(
-                self.input_ch,
-                self.input_ch,
-                kernel_size=(1, self.rH, self.rW),
-                stride=(1, self.rH, self.rW),
-            )
-            with torch.no_grad():
-                _, C, _, H, W = self.downsp(torch.zeros(1, self.input_ch, 1, *self.input_size)).size()
-                self.input_downsp_shape = (C, H, W)
-            in_ch_after_down = self.input_downsp_shape[0]
-        else:
-            Hd = self.input_size[0] // self.rH
-            Wd = self.input_size[1] // self.rW
-            Cd = self.input_ch * self.rH * self.rW
-            self.input_downsp_shape = (Cd, Hd, Wd)
-            in_ch_after_down = Cd
-        self.hidden_size = (self.input_downsp_shape[1], self.input_downsp_shape[2])
+        
+        # === Upgrade: Overlapping Patch Embedding ===
+        # Using Convolution with kernel_size > stride for overlap
+        # Padding calculation: (kernel - stride) / 2 approx.
+        # Kernel: (1, rH+2, rW+2), Stride: (1, rH, rW), Padding: (0, 1, 1)
+        self.patch_embed = nn.Conv3d(
+            self.input_ch,
+            self.emb_hidden_ch, # Project directly to hidden
+            kernel_size=(1, self.rH + 2, self.rW + 2),
+            stride=(1, self.rH, self.rW),
+            padding=(0, 1, 1)
+        )
+        
+        # Calculate shapes based on stride (rH, rW)
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.input_ch, 1, *self.input_size)
+            # We use patch_embed to determine shape
+            out_dummy = self.patch_embed(dummy)
+            _, C_hidden, _, H, W = out_dummy.shape
+            self.input_downsp_shape = (self.emb_ch, H, W) # Final shape after projection
+        
+        self.hidden_size = (H, W)
+        
+        # Static feature embedding (downsampled to match latent)
         if self.static_ch > 0:
-            self.static_downsp = nn.Conv2d(
-                self.static_ch,
-                self.emb_ch,
-                kernel_size=(self.rH, self.rW),
-                stride=(self.rH, self.rW)
+            self.static_embed = nn.Sequential(
+                nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=(self.rH+2, self.rW+2), stride=(self.rH, self.rW), padding=(1, 1)),
+                nn.SiLU()
             )
-        self.c_in = nn.Conv3d(in_ch_after_down, self.emb_hidden_ch, kernel_size=(1, 7, 7), padding="same")
+            
         if self.emb_hidden_layers_num > 0:
             self.c_hidden = nn.ModuleList(
                 [
@@ -275,44 +317,45 @@ class Embedding(nn.Module):
                         self.emb_hidden_ch,
                         self.hidden_size,
                         use_cbam=False,
+                        cond_channels=self.emb_ch if self.static_ch > 0 else None
                     )
                     for _ in range(self.emb_hidden_layers_num)
                 ]
             )
         else:
             self.c_hidden = None
-        self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
+            
+        self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
 
     def forward(self, x, static_feats=None):
+        # Input x: [B, L, C, H, W] -> permute to [B, C, L, H, W]
         x = x.permute(0, 2, 1, 3, 4)
-        if self.down_strategy == "conv":
-            x = self.downsp(x)
-        else:
-            x = pixel_unshuffle_hw_3d(x, self.rH, self.rW)
-        x = self.c_in(x)
+        
+        # Overlapping Patch Embedding
+        x = self.patch_embed(x) # -> [B, emb_hidden, L, H', W']
         x = self.activation(x)
+        
+        # Process Static Features
+        cond = None
+        if self.static_ch > 0 and static_feats is not None:
+            # static_feats: [B, K, H, W]
+            cond = self.static_embed(static_feats) # -> [B, emb_ch, H', W']
+            # cond will be passed to GatedConvBlocks for FiLM
+        
         if self.c_hidden is not None:
             for layer in self.c_hidden:
-                x = layer(x)
+                x = layer(x, cond=cond)
+                
         x = self.c_out(x)
         
-        if self.static_ch > 0 and static_feats is not None:
-            s = self.static_downsp(static_feats)
-            x = x + s.unsqueeze(2)
-            
-        x = x.permute(0, 2, 1, 3, 4)
+        # Output Norm
+        x = x.permute(0, 2, 1, 3, 4) # [B, L, C, H, W]
         x = self.layer_norm(x)
-        return x
-
-def pixel_shuffle_hw_3d(x, rH: int, rW: int):
-    N, C_mul, D, H, W = x.shape
-    C = C_mul // (rH * rW)
-    x = x.view(N, C, rH, rW, D, H, W)
-    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
-    x = x.view(N, C, D, H * rH, W * rW)
-    return x
+        x = x.permute(0, 2, 1, 3, 4) # [B, C, L, H, W]
+        
+        return x, cond
 
 class Decoder(nn.Module):
     def __init__(self, args, input_downsp_shape):
@@ -321,6 +364,7 @@ class Decoder(nn.Module):
         self.emb_ch = getattr(args, "emb_ch", 32)
         self.dec_hidden_ch = getattr(args, "dec_hidden_ch", 0)
         self.dec_hidden_layers_num = getattr(args, "dec_hidden_layers_num", 0)
+        self.static_ch = int(getattr(args, "static_ch", 0))
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.dec_strategy = getattr(args, "dec_strategy", "pxsf")
         hf = getattr(args, "hidden_factor", (2, 2))
@@ -328,6 +372,7 @@ class Decoder(nn.Module):
         if self.dec_hidden_layers_num != 0:
             self.dec_hidden_ch = getattr(args, "dec_hidden_ch", self.emb_ch)
         out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
+        
         if self.dec_strategy == "deconv":
             self.upsp = nn.ConvTranspose3d(
                 in_channels=self.emb_ch,
@@ -359,17 +404,17 @@ class Decoder(nn.Module):
                         out_ch_after_up,
                         (H, W),
                         use_cbam=False,
+                        cond_channels=self.emb_ch if self.static_ch > 0 else None
                     )
                     for _ in range(self.dec_hidden_layers_num)
                 ]
             )
-            self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch * 2, kernel_size=(1, 1, 1), padding="same")
         else:
             self.c_hidden = None
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch * 2, kernel_size=(1, 1, 1), padding="same")
         self.activation = nn.SiLU()
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         x = x.permute(0, 2, 1, 3, 4)
         if self.dec_strategy == "deconv":
             x = self.upsp(x)
@@ -377,9 +422,15 @@ class Decoder(nn.Module):
             x = self.pre_shuffle_conv(x)
             x = pixel_shuffle_hw_3d(x, self.rH, self.rW)
         x = self.activation(x)
+        
+        # Note: If we upsample, cond (low res) might not match size.
+        # For Decoder, we typically skip FiLM unless we upsample cond too.
+        # Here we skip FiLM in Decoder for simplicity unless cond is handled.
+        # Assuming cond is low-res, we won't pass it to high-res decoder blocks for now.
+        
         if self.c_hidden is not None:
             for layer in self.c_hidden:
-                x = layer(x)
+                x = layer(x, cond=None) 
         x = self.c_out(x)
         mu, log_sigma = torch.chunk(x, 2, dim=1)
         sigma = F.softplus(log_sigma) + 1e-6
@@ -392,11 +443,11 @@ class ConvLRUModel(nn.Module):
         layers = getattr(args, "convlru_num_blocks", 1)
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
 
-    def forward(self, x, last_hidden_ins=None, listT=None):
+    def forward(self, x, last_hidden_ins=None, listT=None, cond=None):
         last_hidden_outs = []
         for idx, convlru_block in enumerate(self.convlru_blocks):
             h_in = last_hidden_ins[idx] if (last_hidden_ins is not None) else None
-            x, last_hidden_out = convlru_block(x, h_in, listT=listT)
+            x, last_hidden_out = convlru_block(x, h_in, listT=listT, cond=cond)
             last_hidden_outs.append(last_hidden_out)
         return x, last_hidden_outs
 
@@ -406,9 +457,10 @@ class ConvLRUBlock(nn.Module):
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
 
-    def forward(self, x, last_hidden_in, listT=None):
+    def forward(self, x, last_hidden_in, listT=None, cond=None):
         x, last_hidden_out = self.lru_layer(x, last_hidden_in, listT=listT)
-        x = self.feed_forward(x)
+        # Pass static condition (FiLM) to FeedForward
+        x = self.feed_forward(x, cond=cond)
         return x, last_hidden_out
 
 class ConvLRULayer(nn.Module):
@@ -550,20 +602,27 @@ class FeedForward(nn.Module):
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.layers_num = getattr(args, "ffn_hidden_layers_num", 1)
         self.use_cbam = bool(getattr(args, "use_cbam", False))
+        self.static_ch = int(getattr(args, "static_ch", 0))
+        
         self.c_in = nn.Conv3d(self.emb_ch, self.ffn_hidden_ch, kernel_size=(1, 1, 1), padding="same")
         self.blocks = nn.ModuleList([
-            GatedConvBlock(self.ffn_hidden_ch, self.hidden_size, use_cbam=self.use_cbam)
+            GatedConvBlock(
+                self.ffn_hidden_ch, 
+                self.hidden_size, 
+                use_cbam=self.use_cbam,
+                cond_channels=self.emb_ch if self.static_ch > 0 else None
+            )
             for _ in range(self.layers_num)
         ])
         self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.act = nn.SiLU()
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         residual = x
         x = self.c_in(x.permute(0, 2, 1, 3, 4))
         x = self.act(x)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, cond=cond)
         x = self.c_out(x)
         x = x.permute(0, 2, 1, 3, 4)
         return residual + x
@@ -587,23 +646,30 @@ class ConvLRU(nn.Module):
                     nn.init.xavier_uniform_(p)
 
     def forward(self, x, mode="p", out_gen_num=None, listT=None, listT_future=None, static_feats=None):
+        # x is [B, L, C, H, W]
+        # static_feats is [B, K, H, W]
+        
         if mode == "p":
-            x = self.embedding(x, static_feats=static_feats)
-            x, _ = self.convlru_model(x, listT=listT)
-            return self.decoder(x)
+            x, cond = self.embedding(x, static_feats=static_feats)
+            x, _ = self.convlru_model(x, listT=listT, cond=cond)
+            return self.decoder(x, cond=cond)
+            
         out = []
-        x_emb = self.embedding(x, static_feats=static_feats)
-        x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT)
-        x_dec = self.decoder(x_hidden)
+        x_emb, cond = self.embedding(x, static_feats=static_feats)
+        x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT, cond=cond)
+        x_dec = self.decoder(x_hidden, cond=cond)
+        
         x_step_dist = x_dec[:, -1:]
         x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
         out.append(x_step_dist)
+        
         for t in range(out_gen_num - 1):
             dt = listT_future[:, t:t+1] if listT_future is not None else torch.ones_like(listT[:, 0:1])
-            x_in = self.embedding(x_step_mean, static_feats=static_feats)
-            x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt)
-            x_dec = self.decoder(x_hidden)
+            x_in, _ = self.embedding(x_step_mean, static_feats=static_feats)
+            x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
+            x_dec = self.decoder(x_hidden, cond=cond)
             x_step_dist = x_dec[:, -1:]
             x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
             out.append(x_step_dist)
+            
         return torch.concat(out, dim=1)
