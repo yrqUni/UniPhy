@@ -200,20 +200,12 @@ class CBAM2DPerStep(nn.Module):
         return x
 
 class GatedConvBlock(nn.Module):
-    """
-    Enhanced GatedConvBlock with FiLM (Feature-wise Linear Modulation).
-    Can accept static_emb to modulate the normalization layer (Scale & Shift).
-    """
     def __init__(self, channels, hidden_size, use_cbam=False, cond_channels=None):
         super().__init__()
         self.use_cbam = use_cbam
-        
-        # Large Kernel Depthwise Conv
         self.dw_conv = nn.Conv3d(channels, channels, kernel_size=(1, 7, 7), padding="same", groups=channels)
         self.norm = nn.LayerNorm([*hidden_size])
         
-        # FiLM Projection Layer (Conditional Normalization)
-        # If cond_channels is provided (static feat dim), we project it to 2*channels (gamma, beta)
         self.cond_channels = cond_channels
         if self.cond_channels is not None and self.cond_channels > 0:
             self.cond_proj = nn.Conv3d(self.cond_channels, channels * 2, kernel_size=1)
@@ -230,25 +222,18 @@ class GatedConvBlock(nn.Module):
     def forward(self, x, cond=None):
         residual = x
         x = self.dw_conv(x)
-        x = x.permute(0, 2, 1, 3, 4) # B, L, C, H, W
+        x = x.permute(0, 2, 1, 3, 4)
         x = self.norm(x)
-        x = x.permute(0, 2, 1, 3, 4) # B, C, L, H, W
+        x = x.permute(0, 2, 1, 3, 4)
         
-        # === FiLM: Condition with static features ===
         if self.cond_proj is not None and cond is not None:
-            # cond is [B, C_cond, H, W], we need to broadcast to [B, C_cond, 1, H, W]
-            # but usually it's passed as [B, C_cond, 1, H, W] or broadcastable
             if cond.dim() == 4:
-                cond_in = cond.unsqueeze(2) 
+                cond_in = cond.unsqueeze(2)
             else:
                 cond_in = cond
-            
-            # Project to gamma, beta
-            affine = self.cond_proj(cond_in) 
+            affine = self.cond_proj(cond_in)
             gamma, beta = torch.chunk(affine, 2, dim=1)
-            # Apply FiLM: x = x * (1 + gamma) + beta
             x = x * (1 + gamma) + beta
-        # ============================================
 
         x = self.pw_conv_in(x)
         x, gate = torch.chunk(x, 2, dim=1)
@@ -260,12 +245,11 @@ class GatedConvBlock(nn.Module):
         x = self.pw_conv_out(x)
         return residual + x
 
-def pixel_shuffle_hw_3d(x, rH: int, rW: int):
-    N, C_mul, D, H, W = x.shape
-    C = C_mul // (rH * rW)
-    x = x.view(N, C, rH, rW, D, H, W)
-    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
-    x = x.view(N, C, D, H * rH, W * rW)
+def pixel_unshuffle_hw_3d(x, rH: int, rW: int):
+    N, C, D, H, W = x.shape
+    x = x.view(N, C, D, H // rH, rH, W // rW, rW)
+    x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
+    x = x.view(N, C * rH * rW, D, H // rH, W // rW)
     return x
 
 class Embedding(nn.Module):
@@ -281,29 +265,22 @@ class Embedding(nn.Module):
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
         
-        # === Upgrade: Overlapping Patch Embedding ===
-        # Using Convolution with kernel_size > stride for overlap
-        # Padding calculation: (kernel - stride) / 2 approx.
-        # Kernel: (1, rH+2, rW+2), Stride: (1, rH, rW), Padding: (0, 1, 1)
         self.patch_embed = nn.Conv3d(
             self.input_ch,
-            self.emb_hidden_ch, # Project directly to hidden
+            self.emb_hidden_ch,
             kernel_size=(1, self.rH + 2, self.rW + 2),
             stride=(1, self.rH, self.rW),
             padding=(0, 1, 1)
         )
         
-        # Calculate shapes based on stride (rH, rW)
         with torch.no_grad():
             dummy = torch.zeros(1, self.input_ch, 1, *self.input_size)
-            # We use patch_embed to determine shape
             out_dummy = self.patch_embed(dummy)
             _, C_hidden, _, H, W = out_dummy.shape
-            self.input_downsp_shape = (self.emb_ch, H, W) # Final shape after projection
+            self.input_downsp_shape = (self.emb_ch, H, W)
         
         self.hidden_size = (H, W)
         
-        # Static feature embedding (downsampled to match latent)
         if self.static_ch > 0:
             self.static_embed = nn.Sequential(
                 nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=(self.rH+2, self.rW+2), stride=(self.rH, self.rW), padding=(1, 1)),
@@ -330,31 +307,23 @@ class Embedding(nn.Module):
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
 
     def forward(self, x, static_feats=None):
-        # Input x: [B, L, C, H, W] -> permute to [B, C, L, H, W]
         x = x.permute(0, 2, 1, 3, 4)
-        
-        # Overlapping Patch Embedding
-        x = self.patch_embed(x) # -> [B, emb_hidden, L, H', W']
+        x = self.patch_embed(x)
         x = self.activation(x)
         
-        # Process Static Features
         cond = None
         if self.static_ch > 0 and static_feats is not None:
-            # static_feats: [B, K, H, W]
-            cond = self.static_embed(static_feats) # -> [B, emb_ch, H', W']
-            # cond will be passed to GatedConvBlocks for FiLM
+            cond = self.static_embed(static_feats)
         
         if self.c_hidden is not None:
             for layer in self.c_hidden:
                 x = layer(x, cond=cond)
                 
         x = self.c_out(x)
-        
-        # Output Norm
-        x = x.permute(0, 2, 1, 3, 4) # [B, L, C, H, W]
+        x = x.permute(0, 2, 1, 3, 4)
         x = self.layer_norm(x)
-        x = x.permute(0, 2, 1, 3, 4) # [B, C, L, H, W]
-        
+        # [FIX] Do NOT permute back to [B, C, L, H, W]. 
+        # ConvLRU expects [B, L, C, H, W].
         return x, cond
 
 class Decoder(nn.Module):
@@ -423,14 +392,9 @@ class Decoder(nn.Module):
             x = pixel_shuffle_hw_3d(x, self.rH, self.rW)
         x = self.activation(x)
         
-        # Note: If we upsample, cond (low res) might not match size.
-        # For Decoder, we typically skip FiLM unless we upsample cond too.
-        # Here we skip FiLM in Decoder for simplicity unless cond is handled.
-        # Assuming cond is low-res, we won't pass it to high-res decoder blocks for now.
-        
         if self.c_hidden is not None:
             for layer in self.c_hidden:
-                x = layer(x, cond=None) 
+                x = layer(x, cond=None)
         x = self.c_out(x)
         mu, log_sigma = torch.chunk(x, 2, dim=1)
         sigma = F.softplus(log_sigma) + 1e-6
@@ -459,7 +423,6 @@ class ConvLRUBlock(nn.Module):
 
     def forward(self, x, last_hidden_in, listT=None, cond=None):
         x, last_hidden_out = self.lru_layer(x, last_hidden_in, listT=listT)
-        # Pass static condition (FiLM) to FeedForward
         x = self.feed_forward(x, cond=cond)
         return x, last_hidden_out
 
@@ -646,23 +609,17 @@ class ConvLRU(nn.Module):
                     nn.init.xavier_uniform_(p)
 
     def forward(self, x, mode="p", out_gen_num=None, listT=None, listT_future=None, static_feats=None):
-        # x is [B, L, C, H, W]
-        # static_feats is [B, K, H, W]
-        
         if mode == "p":
             x, cond = self.embedding(x, static_feats=static_feats)
             x, _ = self.convlru_model(x, listT=listT, cond=cond)
             return self.decoder(x, cond=cond)
-            
         out = []
         x_emb, cond = self.embedding(x, static_feats=static_feats)
         x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT, cond=cond)
         x_dec = self.decoder(x_hidden, cond=cond)
-        
         x_step_dist = x_dec[:, -1:]
         x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
         out.append(x_step_dist)
-        
         for t in range(out_gen_num - 1):
             dt = listT_future[:, t:t+1] if listT_future is not None else torch.ones_like(listT[:, 0:1])
             x_in, _ = self.embedding(x_step_mean, static_feats=static_feats)
@@ -671,5 +628,4 @@ class ConvLRU(nn.Module):
             x_step_dist = x_dec[:, -1:]
             x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
             out.append(x_step_dist)
-            
         return torch.concat(out, dim=1)
