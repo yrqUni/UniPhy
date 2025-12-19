@@ -44,7 +44,7 @@ class Args:
         self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
-        self.static_ch = 0
+        self.static_ch = 6  # Changed from 0 to 6
         self.hidden_activation = 'SiLU'
         self.output_activation = 'Tanh'
         self.emb_strategy = 'pxus'
@@ -394,6 +394,20 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
+        
+    # --- Load Static Features ---
+    static_pt_path = '/nfs/ConvLRU/Exp/ERA5/static_feats.pt'
+    static_data_cpu = None
+    if args.static_ch > 0:
+        if os.path.isfile(static_pt_path):
+            if rank == 0:
+                logging.info(f"Loading static features from {static_pt_path}")
+                print(f"Loading static features from {static_pt_path}")
+            static_data_cpu = torch.load(static_pt_path, map_location='cpu')
+        else:
+            raise FileNotFoundError(f"Static features enabled (ch={args.static_ch}) but {static_pt_path} not found!")
+    # ----------------------------
+
     if args.ckpt and os.path.isfile(args.ckpt):
         ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f'cuda:{local_rank}')
         if ckpt_model_args:
@@ -486,9 +500,13 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             gc.collect()
             torch.cuda.empty_cache()
             listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
+            
+            # [STATIC FEATURES INJECTION]
             static_feats = None
-            if args.static_ch > 0:
-                static_feats = torch.zeros(x.size(0), args.static_ch, H, W, device=x.device, dtype=x.dtype)
+            if args.static_ch > 0 and static_data_cpu is not None:
+                static_gpu = static_data_cpu.to(device=x.device, dtype=x.dtype, non_blocking=True)
+                static_feats = static_gpu.unsqueeze(0).repeat(x.size(0), 1, 1, 1)
+                
             use_amp = bool(args.use_amp)
             ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
             with ctx:
@@ -599,9 +617,13 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     out_gen_num = data.shape[1] - cond_eff.shape[1]
                     listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
                     target = data[:, cond_eff.shape[1]:cond_eff.shape[1] + out_gen_num].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    
+                    # [STATIC FEATURES INJECTION FOR EVAL]
                     static_feats = None
-                    if args.static_ch > 0:
-                        static_feats = torch.zeros(cond_eff.size(0), args.static_ch, H, W, device=cond_eff.device, dtype=cond_eff.dtype)
+                    if args.static_ch > 0 and static_data_cpu is not None:
+                        static_gpu = static_data_cpu.to(device=cond_eff.device, dtype=cond_eff.dtype, non_blocking=True)
+                        static_feats = static_gpu.unsqueeze(0).repeat(cond_eff.size(0), 1, 1, 1)
+                    
                     del data
                     gc.collect()
                     torch.cuda.empty_cache()
