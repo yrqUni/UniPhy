@@ -44,7 +44,7 @@ class ArgsBase:
         self.sh_Lmax = 4
         self.ffn_hidden_ch = 16
         self.ffn_hidden_layers_num = 1
-        self.hidden_activation = "ReLU"
+        self.hidden_activation = "Tanh"
         self.dec_strategy = "pxsf"
         self.dec_hidden_ch = 16
         self.dec_hidden_layers_num = 0
@@ -134,26 +134,14 @@ def check_sde_noise(model, x, listT):
     return True
 
 def expected_unused_name(name: str, args) -> bool:
-    if not args.use_freq_prior:
-        if "freq_prior" in name:
-            return True
-    if not args.use_sh_prior:
-        if "sh_prior" in name:
-            return True
-    if not args.use_gate:
-        if "gate_conv" in name:
-            return True
-    if not args.use_cbam:
-        if "cbam" in name:
-            return True
-    if args.emb_hidden_layers_num == 0:
-        if "embedding.c_hidden" in name:
-            return True
-        if "embedding.c_out" in name:
-            return True
-    if args.dec_hidden_layers_num == 0:
-        if "decoder.c_hidden" in name:
-            return True
+    if not args.use_freq_prior and "freq_prior" in name:
+        return True
+    if not args.use_sh_prior and "sh_prior" in name:
+        return True
+    if not args.use_gate and "gate_conv" in name:
+        return True
+    if not args.use_cbam and "cbam" in name:
+        return True
     return False
 
 def list_unused_parameters(model, x, listT):
@@ -214,7 +202,7 @@ def run_test_case(name, args, device):
 
 def main():
     print("========================================")
-    print("      ConvLRU (Physics-Enhanced) Test   ")
+    print("      ConvLRU (Modern Arch) Test        ")
     print("========================================")
     print("[1/3] Checking PScan Operator...")
     if not pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
