@@ -44,6 +44,7 @@ class Args:
         self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
+        self.static_ch = 0
         self.hidden_activation = 'SiLU'
         self.output_activation = 'Tanh'
         self.emb_strategy = 'pxus'
@@ -95,7 +96,6 @@ class Args:
         self.amp_dtype = 'fp16'
         self.grad_clip = 0.30
         self.sample_k = 9
-        self.static_ch = 0
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
@@ -421,8 +421,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     register_lru_gate_hooks(model, rank)
     setup_wandb(rank, args, model)
-    train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
-    tmp_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
+    tmp_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
+    tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False, drop_last=True)
     tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1)
     len_train_dataloader = len(tmp_loader)
     del tmp_dataset, tmp_sampler, tmp_loader
@@ -445,9 +445,12 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         for g in opt.param_groups:
             g['lr'] = args.lr
     for ep in range(start_epoch, args.epochs):
+        train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
+        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1, persistent_workers=False)
         train_sampler.set_epoch(ep)
-        loader_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}") if rank == 0 else train_dataloader
-        for step, data in enumerate(loader_iter, start=1):
+        train_dataloader_iter = tqdm(train_dataloader, desc=f"Epoch {ep + 1}/{args.epochs} - Start") if rank == 0 else train_dataloader
+        for train_step, data in enumerate(train_dataloader_iter, start=1):
             model.train()
             opt.zero_grad(set_to_none=True)
             B_full, L_full, C, H, W = data.shape
@@ -483,80 +486,147 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             gc.collect()
             torch.cuda.empty_cache()
             listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
+            static_feats = None
+            if args.static_ch > 0:
+                static_feats = torch.zeros(x.size(0), args.static_ch, H, W, device=x.device, dtype=x.dtype)
             use_amp = bool(args.use_amp)
             ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
-            static_feats = None
             with ctx:
                 preds = model(x, mode='p', listT=listT, static_feats=static_feats)
                 preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
                 with torch.no_grad():
                     metric_l1 = latitude_weighted_l1(preds.detach(), target)
-            scaler.scale(loss).backward()
-            if args.grad_clip:
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = None
+            grad_max = None
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if rank == 0:
+                    grad_norm, grad_max, _ = get_grad_stats(model)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if rank == 0:
+                    grad_norm, grad_max, _ = get_grad_stats(model)
+                opt.step()
+            if args.use_scheduler and scheduler is not None:
+                scheduler.step()
+            loss_tensor = loss.detach()
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = (loss_tensor / world_size).item()
+            l1_tensor = metric_l1.detach()
+            dist.all_reduce(l1_tensor, op=dist.ReduceOp.SUM)
+            avg_l1 = (l1_tensor / world_size).item()
             if rank == 0:
-                gnorm, gmax, _ = get_grad_stats(model)
-            scaler.step(opt)
-            scaler.update()
-            loss_val = loss.detach()
-            dist.all_reduce(loss_val)
-            avg_loss = (loss_val / world_size).item()
-            l1_val = metric_l1.detach()
-            dist.all_reduce(l1_val)
-            avg_l1 = (l1_val / world_size).item()
-            if rank == 0:
-                global_step = ep * len_loader + step
-                wandb_dict = {
-                    "train/loss_nll": avg_loss,
-                    "train/loss_l1": avg_l1,
-                    "train/epoch": ep + 1,
-                    "train/grad_norm": gnorm,
-                    "train/grad_max": gmax,
-                    "train/lr": opt.param_groups[0]['lr']
-                }
-                if hasattr(model.module.convlru_model.convlru_blocks[0].lru_layer, 'forcing_scale'):
-                    fs = model.module.convlru_model.convlru_blocks[0].lru_layer.forcing_scale.item()
-                    nl = model.module.convlru_model.convlru_blocks[0].lru_layer.noise_level.item()
-                    wandb_dict["phys/forcing_scale"] = fs
-                    wandb_dict["phys/noise_level"] = nl
-                if args.use_wandb: wandb.log(wandb_dict, step=global_step)
-                loader_iter.set_description(f"Ep {ep+1} NLL {avg_loss:.4f} L1 {avg_l1:.4f}")
-            if rank == 0 and step % int(len_loader * args.ckpt_step) == 0:
-                save_ckpt(model, opt, ep+1, step, avg_loss, args)
+                current_lr = scheduler.get_last_lr()[0] if args.use_scheduler and scheduler is not None else opt.param_groups[0]['lr']
+                gate_str = format_gate_means()
+                if grad_norm is not None:
+                    grad_str = f" |grad|={grad_norm:.4e}"
+                else:
+                    grad_str = " |grad|=NA"
+                if K == -1:
+                    t_str = f"T={args.T}"
+                else:
+                    t_mean = (sum(listT_vals) / len(listT_vals)) if len(listT_vals) > 0 else 0
+                    t_str = f"T~{t_mean:.2f}(K={K})"
+                message = (
+                    f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
+                    f"- NLL: {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- {gate_str}{grad_str}"
+                )
+                if isinstance(train_dataloader_iter, tqdm):
+                    train_dataloader_iter.set_description(message)
+                logging.info(message)
+                if getattr(args, "use_wandb", False):
+                    global_step = ep * len_train_dataloader + train_step
+                    log_dict = {
+                        "train/epoch": ep + 1,
+                        "train/step": global_step,
+                        "train/loss_nll": avg_loss,
+                        "train/loss_l1": avg_l1,
+                        "train/lr": current_lr,
+                        "train/K": K,
+                    }
+                    if grad_norm is not None:
+                        log_dict["train/grad_norm"] = grad_norm
+                        log_dict["train/grad_max"] = grad_max
+                    if hasattr(model.module.convlru_model.convlru_blocks[0].lru_layer, 'forcing_scale'):
+                        fs = model.module.convlru_model.convlru_blocks[0].lru_layer.forcing_scale.item()
+                        nl = model.module.convlru_model.convlru_blocks[0].lru_layer.noise_level.item()
+                        log_dict["phys/forcing_scale"] = fs
+                        log_dict["phys/noise_level"] = nl
+                    wandb.log(log_dict, step=global_step)
+            if rank == 0 and (train_step % max(1, int(len(train_dataloader) * args.ckpt_step)) == 0 or train_step == len(train_dataloader)):
+                save_ckpt(model, opt, ep + 1, train_step, avg_loss, args, scheduler if (args.use_scheduler and scheduler is not None) else None)
+            del x, preds, target, loss, loss_tensor, listT, static_feats
+            gc.collect()
+            torch.cuda.empty_cache()
+        del train_dataset, train_sampler, train_dataloader, train_dataloader_iter
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.barrier()
         if args.do_eval:
-            if rank == 0:
+            model.eval()
+            with torch.no_grad():
                 eval_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=False, sample_len=args.eval_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
                 eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False, drop_last=True)
                 eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1)
-                eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep + 1}/{args.epochs}")
-                model.eval()
-                with torch.no_grad():
-                    for eval_step, data in enumerate(eval_dataloader_iter, start=1):
-                        B_full, L_full, C, H, W = data.shape
-                        half = args.eval_data_n_frames // 2
-                        cond = data[:, :half].cuda(local_rank, non_blocking=True).to(torch.float32)
-                        K_eval = args.sample_k if (args.sample_k != -1 and args.sample_k <= cond.shape[1]) else -1
-                        if K_eval == -1:
-                            cond_eff = cond
-                            Bc, Lc, _, _, _ = cond_eff.shape
-                            listT_cond_vals = [float(args.T)] * Lc
-                        else:
-                            Lc_eff = cond.shape[1]
-                            idxs_c = make_random_indices(Lc_eff, K_eval)
-                            cond_eff = cond[:, idxs_c]
-                            listT_cond_vals = build_dt_from_indices(idxs_c, args.T)
-                        listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(cond_eff.size(0), 1)
-                        out_gen_num = data.shape[1] - cond_eff.shape[1]
-                        listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
-                        target = data[:, cond_eff.shape[1]:cond_eff.shape[1] + out_gen_num].cuda(local_rank, non_blocking=True).float()
-                        static_feats = None
+                eval_dataloader_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep + 1}/{args.epochs}") if rank == 0 else eval_dataloader
+                for eval_step, data in enumerate(eval_dataloader_iter, start=1):
+                    B_full, L_full, C, H, W = data.shape
+                    half = args.eval_data_n_frames // 2
+                    cond_data = data[:, :half].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    if args.sample_k != -1 and args.sample_k <= cond_data.shape[1]:
+                        K_eval = args.sample_k
+                    else:
+                        K_eval = -1
+                    if K_eval == -1:
+                        cond_eff = cond_data
+                        Bc, Lc, _, _, _ = cond_eff.shape
+                        listT_cond_vals = [float(args.T)] * Lc
+                    else:
+                        Lc_eff = cond_data.shape[1]
+                        idxs_c = make_random_indices(Lc_eff, K_eval)
+                        cond_eff = cond_data[:, idxs_c]
+                        listT_cond_vals = build_dt_from_indices(idxs_c, args.T)
+                    listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(cond_eff.size(0), 1)
+                    out_gen_num = data.shape[1] - cond_eff.shape[1]
+                    listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
+                    target = data[:, cond_eff.shape[1]:cond_eff.shape[1] + out_gen_num].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    static_feats = None
+                    if args.static_ch > 0:
+                        static_feats = torch.zeros(cond_eff.size(0), args.static_ch, H, W, device=cond_eff.device, dtype=cond_eff.dtype)
+                    del data
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    with torch.cuda.amp.autocast(enabled=bool(args.use_amp), dtype=amp_dtype):
                         preds = model(cond_eff, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future, static_feats=static_feats)
                         loss_eval = latitude_weighted_l1(preds, target)
-                        if args.use_wandb:
-                            wandb.log({"eval/l1_loss": loss_eval.item()}, step=global_step)
-    if rank == 0 and args.use_wandb:
+                    tot_tensor = loss_eval.detach()
+                    dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
+                    avg_total = (tot_tensor / world_size).item()
+                    if rank == 0:
+                        message = f"Eval step {eval_step} - L1: {avg_total:.6f}"
+                        if isinstance(eval_dataloader_iter, tqdm):
+                            eval_dataloader_iter.set_description(message)
+                        logging.info(message)
+                        if getattr(args, "use_wandb", False):
+                            step_id = (ep + 1) * len_train_dataloader
+                            wandb.log({"eval/l1_loss": avg_total, "eval/epoch": ep + 1}, step=step_id)
+                    del target, cond_data, cond_eff, preds, loss_eval, tot_tensor, listT_cond, listT_future, static_feats
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                del eval_dataset, eval_sampler, eval_dataloader, eval_dataloader_iter
+                gc.collect()
+                torch.cuda.empty_cache()
+                dist.barrier()
+    if rank == 0 and getattr(args, "use_wandb", False):
         wandb.finish()
     cleanup_ddp()
 
