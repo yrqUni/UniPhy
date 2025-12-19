@@ -44,7 +44,7 @@ class Args:
         self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
-        self.static_ch = 6  # Changed from 0 to 6
+        self.static_ch = 6
         self.hidden_activation = 'SiLU'
         self.output_activation = 'Tanh'
         self.emb_strategy = 'pxus'
@@ -394,8 +394,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
-        
-    # --- Load Static Features ---
     static_pt_path = '/nfs/ConvLRU/Exp/ERA5/static_feats.pt'
     static_data_cpu = None
     if args.static_ch > 0:
@@ -406,8 +404,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             static_data_cpu = torch.load(static_pt_path, map_location='cpu')
         else:
             raise FileNotFoundError(f"Static features enabled (ch={args.static_ch}) but {static_pt_path} not found!")
-    # ----------------------------
-
     if args.ckpt and os.path.isfile(args.ckpt):
         ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f'cuda:{local_rank}')
         if ckpt_model_args:
@@ -500,13 +496,10 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             gc.collect()
             torch.cuda.empty_cache()
             listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
-            
-            # [STATIC FEATURES INJECTION]
             static_feats = None
             if args.static_ch > 0 and static_data_cpu is not None:
                 static_gpu = static_data_cpu.to(device=x.device, dtype=x.dtype, non_blocking=True)
                 static_feats = static_gpu.unsqueeze(0).repeat(x.size(0), 1, 1, 1)
-                
             use_amp = bool(args.use_amp)
             ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
             with ctx:
@@ -549,10 +542,20 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 else:
                     grad_str = " |grad|=NA"
                 if K == -1:
+                    current_T_mean = float(args.T)
+                    current_T_min = float(args.T)
+                    current_T_max = float(args.T)
                     t_str = f"T={args.T}"
                 else:
-                    t_mean = (sum(listT_vals) / len(listT_vals)) if len(listT_vals) > 0 else 0
-                    t_str = f"T~{t_mean:.2f}(K={K})"
+                    if len(listT_vals) > 0:
+                        current_T_mean = sum(listT_vals) / len(listT_vals)
+                        current_T_min = min(listT_vals)
+                        current_T_max = max(listT_vals)
+                    else:
+                        current_T_mean = 0.0
+                        current_T_min = 0.0
+                        current_T_max = 0.0
+                    t_str = f"T~{current_T_mean:.2f}({current_T_min:.1f}-{current_T_max:.1f})"
                 message = (
                     f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
                     f"- NLL: {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
@@ -570,10 +573,16 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                         "train/loss_l1": avg_l1,
                         "train/lr": current_lr,
                         "train/K": K,
+                        "train/T_mean": current_T_mean,
+                        "train/T_min": current_T_min,
+                        "train/T_max": current_T_max,
                     }
                     if grad_norm is not None:
                         log_dict["train/grad_norm"] = grad_norm
                         log_dict["train/grad_max"] = grad_max
+                    for k, v in _LRU_GATE_MEAN.items():
+                        g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
+                        log_dict[g_key] = v
                     if hasattr(model.module.convlru_model.convlru_blocks[0].lru_layer, 'forcing_scale'):
                         fs = model.module.convlru_model.convlru_blocks[0].lru_layer.forcing_scale.item()
                         nl = model.module.convlru_model.convlru_blocks[0].lru_layer.noise_level.item()
@@ -617,13 +626,10 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     out_gen_num = data.shape[1] - cond_eff.shape[1]
                     listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
                     target = data[:, cond_eff.shape[1]:cond_eff.shape[1] + out_gen_num].cuda(local_rank, non_blocking=True).to(torch.float32)
-                    
-                    # [STATIC FEATURES INJECTION FOR EVAL]
                     static_feats = None
                     if args.static_ch > 0 and static_data_cpu is not None:
                         static_gpu = static_data_cpu.to(device=cond_eff.device, dtype=cond_eff.dtype, non_blocking=True)
                         static_feats = static_gpu.unsqueeze(0).repeat(cond_eff.size(0), 1, 1, 1)
-                    
                     del data
                     gc.collect()
                     torch.cuda.empty_cache()

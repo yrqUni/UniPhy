@@ -4,10 +4,12 @@ import math
 import torch
 import numpy as np
 
+# Adjust path to find the Model
 sys.path.append(os.path.join(os.path.dirname(__file__), "../Model/ConvLRU"))
 from ModelConvLRU import ConvLRU
 from pscan import pscan_check
 
+# Determinism settings
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.use_deterministic_algorithms(True)
@@ -134,6 +136,39 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None, static_feats=No
         
     return torch.cat(outs, dim=1)
 
+def check_autoregressive_generation(model, x, listT, static_feats=None, out_gen_num=4):
+    """
+    Tests the Autoregressive/Inference branch (mode != 'p').
+    This ensures the 'else' block in ConvLRU.forward works correctly.
+    """
+    print(f"   [test] Autoregressive Generation (Gen {out_gen_num} frames)...")
+    model.eval()
+    
+    B, L, C, H, W = x.shape
+    # We use the full 'x' as context, and predict 'out_gen_num' future frames
+    
+    # Fake future time intervals
+    listT_future = torch.ones(B, out_gen_num, device=x.device, dtype=x.dtype)
+    
+    try:
+        y_gen = model(x, mode="i", out_gen_num=out_gen_num, listT=listT, listT_future=listT_future, static_feats=static_feats)
+    except Exception as e:
+        print(f"     ❌ Autoregressive forward failed!")
+        raise e
+
+    # Check Output Shape
+    # Expected: [B, out_gen_num, out_ch*2, H, W]
+    # Note: ConvLRU.forward logic accumulates [next_step, next_step...]. 
+    # Usually it returns `out_gen_num` frames.
+    
+    expected_shape = (B, out_gen_num, model.args.out_ch * 2, H, W)
+    if y_gen.shape != expected_shape:
+        print(f"     ❌ Gen Shape mismatch! Expected {expected_shape}, got {y_gen.shape}")
+        return False
+        
+    print(f"     ✅ OK. Output shape: {y_gen.shape}")
+    return True
+
 def max_err(a, b):
     return float((a - b).abs().max().detach().cpu())
 
@@ -178,10 +213,8 @@ def expected_unused_name(name: str, args) -> bool:
         return True
     if not args.use_cbam and "cbam" in name:
         return True
-    # If static_ch is 0, static_embed params in Embedding should be unused (if they exist)
-    # But usually conditional code won't create them.
-    # However, GatedConvBlock cond_proj might exist if not handled carefully? 
-    # Our code handles initialization conditionally, so they shouldn't exist if unused.
+    # If static_ch is 0, static_embed params should not exist or be unused
+    # Our Model code initializes them conditionally, so they shouldn't exist if ch=0.
     return False
 
 def list_unused_parameters(model, x, listT, static_feats=None):
@@ -220,7 +253,7 @@ def run_test_case(name, args, device):
     
     model.eval()
     
-    # 1. Shape Check
+    # 1. Parallel Mode Shape Check
     y = model(x, mode="p", listT=listT_ones, static_feats=static_feats)
     if not check_output_shape(y, B, L, args.out_ch, H, W):
         raise RuntimeError("Output Shape Check Failed")
@@ -229,7 +262,7 @@ def run_test_case(name, args, device):
     if not check_sde_noise(model, x, listT_rand, static_feats=static_feats):
         raise RuntimeError("SDE Noise Check Failed")
         
-    # 3. Streaming Equivalence Check
+    # 3. Streaming Equivalence Check (Internal State Passing)
     print("   [test] Streaming Equivalence (P-Mode vs Chunked)...")
     patterns = [
         [1] * L,
@@ -248,8 +281,13 @@ def run_test_case(name, args, device):
             raise RuntimeError("Streaming Equivalence Failed")
         else:
             print(f"     ✅ OK pattern {pat}: Max Err {err:.2e}")
+
+    # 4. Autoregressive Generation Check (New)
+    # This specifically checks the 'else' branch in forward(), loops, and listT_future
+    if not check_autoregressive_generation(model, x, listT_rand, static_feats=static_feats, out_gen_num=4):
+        raise RuntimeError("Autoregressive Generation Failed")
             
-    # 4. Unused Params Check
+    # 5. Unused Params Check (Gradient Check)
     print("   [test] Unused Parameters (Gradient Check)...")
     unused = list_unused_parameters(model, x, listT=listT_rand, static_feats=static_feats)
     unexpected = [n for n in unused if not expected_unused_name(n, args)]
