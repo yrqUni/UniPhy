@@ -44,7 +44,7 @@ class Args:
         self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
-        self.hidden_activation = 'Tanh'
+        self.hidden_activation = 'SiLU'
         self.output_activation = 'Tanh'
         self.emb_strategy = 'pxus'
         self.hidden_factor = (7, 12)
@@ -95,6 +95,7 @@ class Args:
         self.amp_dtype = 'fp16'
         self.grad_clip = 0.30
         self.sample_k = 9
+        self.static_ch = 0
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
@@ -121,6 +122,139 @@ def keep_latest_ckpts(ckpt_dir):
             os.remove(file_path)
         except Exception:
             pass
+
+MODEL_ARG_KEYS = [
+    'input_size', 'input_ch', 'out_ch', 'hidden_activation', 'output_activation',
+    'emb_strategy', 'hidden_factor', 'emb_ch', 'emb_hidden_ch', 'emb_hidden_layers_num',
+    'convlru_num_blocks', 'use_cbam', 'use_gate', 'lru_rank',
+    'use_freq_prior', 'freq_rank', 'freq_gain_init', 'freq_mode',
+    'use_sh_prior', 'sh_Lmax', 'sh_rank', 'sh_gain_init',
+    'lambda_type', 'exo_mode', 'lambda_mlp_hidden',
+    'ffn_hidden_ch', 'ffn_hidden_layers_num',
+    'dec_strategy', 'dec_hidden_ch', 'dec_hidden_layers_num',
+    'static_ch'
+]
+
+def extract_model_args(args_obj):
+    return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
+
+def apply_model_args(args_obj, model_args_dict, verbose=True):
+    if not model_args_dict:
+        return
+    for k, v in model_args_dict.items():
+        if hasattr(args_obj, k):
+            old = getattr(args_obj, k)
+            if verbose and old != v:
+                msg = f"[Args] restore '{k}': {old} -> {v}"
+                print(msg)
+                if dist.get_rank() == 0:
+                    logging.info(msg)
+            setattr(args_obj, k, v)
+
+def load_model_args_from_ckpt(ckpt_path, map_location='cpu'):
+    if not os.path.isfile(ckpt_path):
+        print(f"[Args] ckpt not found: {ckpt_path}")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            logging.warning(f"[Args] ckpt not found: {ckpt_path}")
+        return None
+    ckpt = torch.load(ckpt_path, map_location=map_location)
+    model_args = ckpt.get('model_args', None)
+    if model_args is None:
+        args_all = ckpt.get('args_all', None)
+        if isinstance(args_all, dict):
+            model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
+    for k in ['model', 'optimizer', 'scheduler']:
+        if k in ckpt:
+            del ckpt[k]
+    del ckpt
+    gc.collect()
+    torch.cuda.empty_cache()
+    if not model_args:
+        print(f"[Args] Warning: no model_args found in ckpt, using code defaults.")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            logging.warning(f"[Args] no model_args found in ckpt, using code defaults.")
+        return None
+    return model_args
+
+def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    state = {
+        'model': (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+        'optimizer': opt.state_dict(),
+        'epoch': epoch,
+        'step': step,
+        'loss': float(loss),
+        'args_all': dict(vars(args)),
+        'model_args': extract_model_args(args),
+    }
+    if scheduler is not None:
+        state['scheduler'] = scheduler.state_dict()
+    ckpt_path = os.path.join(args.ckpt_dir, f'e{epoch}_s{step}_l{state["loss"]:.6f}.pth')
+    torch.save(state, ckpt_path)
+    keep_latest_ckpts(args.ckpt_dir)
+    del state
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def get_prefix(keys):
+    if not keys:
+        return ''
+    key = keys[0]
+    if key.startswith('module._orig_mod.'):
+        return 'module._orig_mod.'
+    if key.startswith('module.'):
+        return 'module.'
+    return ''
+
+def adapt_state_dict_keys(state_dict, model):
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(state_dict.keys())
+    ckpt_prefix = get_prefix(ckpt_keys)
+    model_prefix = get_prefix(model_keys)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_k = k
+        if ckpt_prefix != '':
+            new_k = k[len(ckpt_prefix):]
+        if model_prefix != '':
+            new_k = model_prefix + new_k
+        new_state_dict[new_k] = v
+    return new_state_dict
+
+def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu', args=None, restore_model_args=False):
+    if not os.path.isfile(ckpt_path):
+        print(f"No checkpoint Found")
+        if dist.is_initialized() and dist.get_rank() == 0:
+            logging.warning(f"No checkpoint Found at {ckpt_path}")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return 0, 0
+    checkpoint = torch.load(ckpt_path, map_location=map_location)
+    if restore_model_args and args is not None:
+        model_args = checkpoint.get('model_args', None)
+        if model_args is None:
+            args_all = checkpoint.get('args_all', None)
+            if isinstance(args_all, dict):
+                model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
+        apply_model_args(args, model_args, verbose=True)
+    state_dict = adapt_state_dict_keys(checkpoint['model'], model)
+    model.load_state_dict(state_dict, strict=False)
+    opt.load_state_dict(checkpoint['optimizer'])
+    if scheduler is not None and 'scheduler' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    epoch = checkpoint.get('epoch', 0)
+    step = checkpoint.get('step', 0)
+    del state_dict
+    for k in ['model', 'optimizer', 'scheduler']:
+        if k in checkpoint:
+            del checkpoint[k]
+    del checkpoint
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
+    if dist.is_initialized() and dist.get_rank() == 0:
+        logging.info(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
+    return epoch, step
 
 def setup_logging(args):
     if not dist.is_initialized() or dist.get_rank() != 0:
@@ -178,7 +312,7 @@ def register_lru_gate_hooks(ddp_model, rank):
                     tag = name
             else:
                 tag = name
-            def _hook(mod, inp, out, tag_local=name):
+            def _hook(mod, inp, out, tag_local=tag):
                 with torch.no_grad():
                     m = out.mean().detach()
                     _LRU_GATE_MEAN[tag_local] = float(m)
@@ -252,79 +386,32 @@ def setup_wandb(rank, args, model):
     else:
         wandb.watch(model, log="all", log_freq=100)
 
-MODEL_ARG_KEYS = [
-    'input_size', 'input_ch', 'out_ch', 'hidden_activation', 
-    'emb_strategy', 'hidden_factor', 'emb_ch', 'emb_hidden_ch', 'emb_hidden_layers_num',
-    'convlru_num_blocks', 'use_cbam', 'use_gate', 'lru_rank',
-    'use_freq_prior', 'freq_rank', 'use_sh_prior', 'sh_Lmax',
-    'ffn_hidden_ch', 'ffn_hidden_layers_num',
-    'dec_strategy', 'dec_hidden_ch'
-]
-
-def extract_model_args(args_obj):
-    return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
-
-def apply_model_args(args_obj, model_args_dict, verbose=True):
-    if not model_args_dict: return
-    for k, v in model_args_dict.items():
-        if hasattr(args_obj, k):
-            old = getattr(args_obj, k)
-            if verbose and old != v:
-                msg = f"[Args] restore '{k}': {old} -> {v}"
-                print(msg)
-                if dist.get_rank() == 0: logging.info(msg)
-            setattr(args_obj, k, v)
-
-def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location='cpu', args=None, restore_model_args=False):
-    if not os.path.isfile(ckpt_path):
-        return 0, 0
-    checkpoint = torch.load(ckpt_path, map_location=map_location)
-    if restore_model_args and args is not None:
-        model_args = checkpoint.get('model_args', None)
-        if model_args: apply_model_args(args, model_args)
-    state_dict = checkpoint['model']
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('module.') and not isinstance(model, DDP):
-            new_state_dict[k[7:]] = v
-        else:
-            new_state_dict[k] = v
-    model.load_state_dict(new_state_dict, strict=False)
-    opt.load_state_dict(checkpoint['optimizer'])
-    if scheduler and 'scheduler' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler'])
-    epoch = checkpoint.get('epoch', 0)
-    step = checkpoint.get('step', 0)
-    print(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
-    return epoch, step
-
-def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    state = {
-        'model': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
-        'optimizer': opt.state_dict(),
-        'epoch': epoch,
-        'step': step,
-        'loss': float(loss),
-        'args_all': dict(vars(args)),
-        'model_args': extract_model_args(args),
-    }
-    if scheduler: state['scheduler'] = scheduler.state_dict()
-    ckpt_path = os.path.join(args.ckpt_dir, f'e{epoch}_s{step}_l{loss:.6f}.pth')
-    torch.save(state, ckpt_path)
-    keep_latest_ckpts(args.ckpt_dir)
-
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
-    if rank == 0: setup_logging(args)
+    if rank == 0:
+        setup_logging(args)
     if args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
-    model = ConvLRU(args).cuda(local_rank)
+    if args.ckpt and os.path.isfile(args.ckpt):
+        ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f'cuda:{local_rank}')
+        if ckpt_model_args:
+            print("[Args] applying model args from ckpt before building model.")
+            if rank == 0:
+                logging.info("[Args] applying model args from ckpt before building model.")
+            apply_model_args(args, ckpt_model_args, verbose=True)
+    if rank == 0:
+        logging.info("==== Training Arguments (Updated) ====")
+        for k, v in vars(args).items():
+            logging.info(f"{k}: {v}")
+        logging.info("======================================")
+    model = ConvLRU(args)
+    model = model.cuda(local_rank)
     if args.loss == 'nll':
         loss_fn = gaussian_nll_loss_weighted
-        if rank == 0: logging.info("Using Gaussian NLL Loss (Probabilistic Training)")
+        if rank == 0:
+            logging.info("Using Gaussian NLL Loss (Probabilistic Training)")
     elif args.loss == 'lat':
         loss_fn = latitude_weighted_l1
     else:
@@ -334,15 +421,29 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     register_lru_gate_hooks(model, rank)
     setup_wandb(rank, args, model)
-    train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, max_cache_size=8, rank=rank, gpus=world_size)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True)
-    len_loader = len(train_dataloader)
+    train_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
+    tmp_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
+    tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1)
+    len_train_dataloader = len(tmp_loader)
+    del tmp_dataset, tmp_sampler, tmp_loader
+    gc.collect()
+    torch.cuda.empty_cache()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
+    scaler = None
+    amp_dtype = torch.float16 if str(args.amp_dtype).lower() == 'fp16' else torch.bfloat16
+    if args.use_amp and amp_dtype == torch.float16:
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
     start_epoch = 0
-    if args.ckpt:
-        start_epoch, _ = load_ckpt(model, opt, args.ckpt, map_location=f'cuda:{local_rank}', args=args)
+    scheduler = None
+    if args.use_scheduler:
+        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=args.epochs)
+    if args.ckpt and os.path.isfile(args.ckpt):
+        start_epoch, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f'cuda:{local_rank}', args=args, restore_model_args=False)
+    if args.init_lr_scheduler and args.use_scheduler:
+        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len_train_dataloader, epochs=args.epochs - start_epoch)
+    if not args.use_scheduler:
+        for g in opt.param_groups:
+            g['lr'] = args.lr
     for ep in range(start_epoch, args.epochs):
         train_sampler.set_epoch(ep)
         loader_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}") if rank == 0 else train_dataloader
@@ -351,27 +452,46 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             opt.zero_grad(set_to_none=True)
             B_full, L_full, C, H, W = data.shape
             L_eff = L_full - 1
-            if args.sample_k > 0 and args.sample_k <= L_eff:
-                idxs = make_random_indices(L_eff, args.sample_k)
-                x = data[:, idxs].cuda(local_rank, non_blocking=True).float()
-                listT_vals = build_dt_from_indices(idxs, args.T)
-                tgt_idxs = np.clip(idxs[1:] + 1, 1, L_full - 1)
-                target = data[:, tgt_idxs].cuda(local_rank, non_blocking=True).float()
+            if args.sample_k != -1 and args.sample_k > L_full:
+                if rank == 0:
+                    print(f"[Error] sample_k={args.sample_k} > L={L_full}. Fallback to -1 (no sampling).")
+                    logging.error(f"[Error] sample_k={args.sample_k} > L={L_full}. Fallback to -1.")
+                K = -1
             else:
-                x = data[:, :L_eff].cuda(local_rank, non_blocking=True).float()
-                target = data[:, 1:].cuda(local_rank, non_blocking=True).float()
-                listT_vals = [float(args.T)] * x.size(1)
-            listT = torch.tensor(listT_vals, device=x.device).view(1, -1).repeat(x.size(0), 1)
-            with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=torch.float16 if args.amp_dtype=='fp16' else torch.bfloat16):
-                preds = model(x, mode='p', listT=listT)
+                K = args.sample_k
+            if K == -1:
+                x = data[:, :L_eff].cuda(local_rank, non_blocking=True).to(torch.float32)
+                B, L, _, _, _ = x.shape
+                listT_vals = [float(args.T)] * L
+                target = data[:, 2:L_eff + 1].cuda(local_rank, non_blocking=True).to(torch.float32)
+            else:
+                if K > L_eff:
+                    if rank == 0:
+                        print(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1 (no sampling).")
+                        logging.error(f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1.")
+                    x = data[:, :L_eff].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    B, L, _, _, _ = x.shape
+                    listT_vals = [float(args.T)] * L
+                    target = data[:, 2:L_eff + 1].cuda(local_rank, non_blocking=True).to(torch.float32)
+                else:
+                    idxs = make_random_indices(L_eff, K)
+                    x = data[:, idxs].cuda(local_rank, non_blocking=True).to(torch.float32)
+                    listT_vals = build_dt_from_indices(idxs, args.T)
+                    tgt_idxs = np.clip(idxs[1:] + 1, 1, L_full - 1)
+                    target = data[:, tgt_idxs].cuda(local_rank, non_blocking=True).to(torch.float32)
+            del data
+            gc.collect()
+            torch.cuda.empty_cache()
+            listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
+            use_amp = bool(args.use_amp)
+            ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
+            static_feats = None
+            with ctx:
+                preds = model(x, mode='p', listT=listT, static_feats=static_feats)
                 preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
-                
-                # [FIX]: Monitor L1 loss (Mean Absolute Error) explicitly
-                # Detach preds to ensure no gradient leak
                 with torch.no_grad():
                     metric_l1 = latitude_weighted_l1(preds.detach(), target)
-
             scaler.scale(loss).backward()
             if args.grad_clip:
                 scaler.unscale_(opt)
@@ -380,17 +500,12 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 gnorm, gmax, _ = get_grad_stats(model)
             scaler.step(opt)
             scaler.update()
-            
-            # Aggregate NLL Loss
             loss_val = loss.detach()
             dist.all_reduce(loss_val)
             avg_loss = (loss_val / world_size).item()
-            
-            # [FIX]: Aggregate L1 Loss for Monitoring
             l1_val = metric_l1.detach()
             dist.all_reduce(l1_val)
             avg_l1 = (l1_val / world_size).item()
-            
             if rank == 0:
                 global_step = ep * len_loader + step
                 wandb_dict = {
@@ -408,7 +523,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     wandb_dict["phys/noise_level"] = nl
                 if args.use_wandb: wandb.log(wandb_dict, step=global_step)
                 loader_iter.set_description(f"Ep {ep+1} NLL {avg_loss:.4f} L1 {avg_l1:.4f}")
-            
             if rank == 0 and step % int(len_loader * args.ckpt_step) == 0:
                 save_ckpt(model, opt, ep+1, step, avg_loss, args)
         if args.do_eval:
@@ -433,11 +547,12 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                             idxs_c = make_random_indices(Lc_eff, K_eval)
                             cond_eff = cond[:, idxs_c]
                             listT_cond_vals = build_dt_from_indices(idxs_c, args.T)
-                        listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device).view(1, -1).repeat(cond_eff.size(0), 1)
+                        listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(cond_eff.size(0), 1)
                         out_gen_num = data.shape[1] - cond_eff.shape[1]
                         listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, args.T)
                         target = data[:, cond_eff.shape[1]:cond_eff.shape[1] + out_gen_num].cuda(local_rank, non_blocking=True).float()
-                        preds = model(cond_eff, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future)
+                        static_feats = None
+                        preds = model(cond_eff, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future, static_feats=static_feats)
                         loss_eval = latitude_weighted_l1(preds, target)
                         if args.use_wandb:
                             wandb.log({"eval/l1_loss": loss_eval.item()}, step=global_step)
@@ -447,8 +562,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
 
 if __name__ == "__main__":
     args = Args()
-    if args.use_amp:
-        print("[Warning] AMP forced off for stability.")
+    if bool(args.use_amp):
+        print("[Warning] AMP is disabled by policy. Forcing use_amp=False.")
+        logging.warning("AMP is disabled by policy. Forcing use_amp=False.")
         args.use_amp = False
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])

@@ -156,7 +156,7 @@ def pscan_check(batch_size=2, seq_length=13, channels=4, state_dim=8, device='cu
     A_small = torch.randn(1, 5, 2, 2, 1, device=device, dtype=dtype, requires_grad=True)
     X_small = torch.randn(1, 5, 2, 2, 2, device=device, dtype=dtype, requires_grad=True)
     if gradcheck(pscan, (A_small, X_small), eps=1e-6, atol=1e-4, rtol=1e-3):
-        print("✅ Backward (Gradient) check passed!")
+        print("Backward (Gradient) check passed!")
         return True
     return False
 
