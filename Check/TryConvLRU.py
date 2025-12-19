@@ -44,28 +44,37 @@ class ArgsBase:
         self.sh_Lmax = 4
         self.ffn_hidden_ch = 16
         self.ffn_hidden_layers_num = 1
-        self.hidden_activation = "Tanh"
+        self.hidden_activation = "SiLU"
         self.dec_strategy = "pxsf"
         self.dec_hidden_ch = 16
         self.dec_hidden_layers_num = 0
+        self.static_ch = 0
 
 def make_test_configs():
     cfgs = []
     a = ArgsBase()
     cfgs.append(("base_pxsf_gate", a))
+    
     a = ArgsBase()
     a.use_freq_prior = True
     a.use_sh_prior = True
     cfgs.append(("with_physics_priors", a))
+    
+    a = ArgsBase()
+    a.static_ch = 3
+    cfgs.append(("with_static_features", a))
+    
     a = ArgsBase()
     a.emb_strategy = "conv"
     a.dec_strategy = "deconv"
     a.dec_hidden_layers_num = 1
     cfgs.append(("conv_io_deconv", a))
+    
     a = ArgsBase()
     a.use_gate = False
     a.use_cbam = False
     cfgs.append(("minimal_no_gate", a))
+    
     a = ArgsBase()
     a.use_cbam = True
     cfgs.append(("with_cbam", a))
@@ -77,11 +86,11 @@ def count_params(model):
     return total, trainable
 
 @torch.no_grad()
-def forward_full_p(model, x, listT=None):
-    return model(x, mode="p", listT=listT)
+def forward_full_p(model, x, listT=None, static_feats=None):
+    return model(x, mode="p", listT=listT, static_feats=static_feats)
 
 @torch.no_grad()
-def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
+def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None, static_feats=None):
     B, L, C, H, W = x.shape
     em = model.embedding
     dm = model.decoder
@@ -94,7 +103,7 @@ def forward_streaming_p_equiv(model, x, chunk_sizes, listT=None):
             break
         n = min(n, L - pos)
         x_chunk = x[:, pos : pos + n]
-        xe = em(x_chunk)
+        xe = em(x_chunk, static_feats=static_feats)
         listT_slice = listT[:, pos : pos + n] if listT is not None else None
         xe, last_hidden_list = m(xe, last_hidden_ins=last_hidden_list, listT=listT_slice)
         yo = dm(xe)
@@ -112,15 +121,15 @@ def check_output_shape(y, B, L, out_ch, H, W):
         return False
     return True
 
-def check_sde_noise(model, x, listT):
+def check_sde_noise(model, x, listT, static_feats=None):
     print("   [test] SDE Noise Injection...")
     model.train()
-    y1 = model(x, mode="p", listT=listT)
-    y2 = model(x, mode="p", listT=listT)
+    y1 = model(x, mode="p", listT=listT, static_feats=static_feats)
+    y2 = model(x, mode="p", listT=listT, static_feats=static_feats)
     diff_train = max_err(y1, y2)
     model.eval()
-    y3 = model(x, mode="p", listT=listT)
-    y4 = model(x, mode="p", listT=listT)
+    y3 = model(x, mode="p", listT=listT, static_feats=static_feats)
+    y4 = model(x, mode="p", listT=listT, static_feats=static_feats)
     diff_eval = max_err(y3, y4)
     is_train_noisy = diff_train > 1e-6
     is_eval_det = diff_eval < 1e-9
@@ -134,20 +143,30 @@ def check_sde_noise(model, x, listT):
     return True
 
 def expected_unused_name(name: str, args) -> bool:
-    if not args.use_freq_prior and "freq_prior" in name:
-        return True
-    if not args.use_sh_prior and "sh_prior" in name:
-        return True
-    if not args.use_gate and "gate_conv" in name:
-        return True
-    if not args.use_cbam and "cbam" in name:
-        return True
+    if not args.use_freq_prior:
+        if "freq_prior" in name:
+            return True
+    if not args.use_sh_prior:
+        if "sh_prior" in name:
+            return True
+    if not args.use_gate:
+        if "gate_conv" in name:
+            return True
+    if not args.use_cbam:
+        if "cbam" in name:
+            return True
+    if args.emb_hidden_layers_num == 0:
+        if "embedding.c_hidden" in name:
+            return True
+    if args.dec_hidden_layers_num == 0:
+        if "decoder.c_hidden" in name:
+            return True
     return False
 
-def list_unused_parameters(model, x, listT):
+def list_unused_parameters(model, x, listT, static_feats=None):
     model.train()
     model.zero_grad()
-    y = model(x, mode="p", listT=listT)
+    y = model(x, mode="p", listT=listT, static_feats=static_feats)
     loss = y.sum()
     loss.backward()
     unused = []
@@ -166,13 +185,16 @@ def run_test_case(name, args, device):
     dtype = torch.float32
     set_seed(42)
     x = torch.randn(B, L, args.input_ch, H, W, device=device, dtype=dtype)
+    static_feats = None
+    if args.static_ch > 0:
+        static_feats = torch.randn(B, args.static_ch, H, W, device=device, dtype=dtype)
     listT_ones = torch.ones(B, L, device=device, dtype=dtype)
     listT_rand = torch.rand(B, L, device=device, dtype=dtype) * 1.5 + 0.1
     model.eval()
-    y = model(x, mode="p", listT=listT_ones)
+    y = model(x, mode="p", listT=listT_ones, static_feats=static_feats)
     if not check_output_shape(y, B, L, args.out_ch, H, W):
         raise RuntimeError("Output Shape Check Failed")
-    if not check_sde_noise(model, x, listT_rand):
+    if not check_sde_noise(model, x, listT_rand, static_feats=static_feats):
         raise RuntimeError("SDE Noise Check Failed")
     print("   [test] Streaming Equivalence (P-Mode vs Chunked)...")
     patterns = [
@@ -183,8 +205,8 @@ def run_test_case(name, args, device):
     TOLERANCE = 1e-4
     for pat in patterns:
         model.eval()
-        y_full = forward_full_p(model, x, listT=listT_rand)
-        y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT_rand)
+        y_full = forward_full_p(model, x, listT=listT_rand, static_feats=static_feats)
+        y_stream = forward_streaming_p_equiv(model, x, pat, listT=listT_rand, static_feats=static_feats)
         err = max_err(y_full, y_stream)
         if err > TOLERANCE:
             print(f"     ❌ FAIL pattern {pat}: Max Err {err:.2e} > {TOLERANCE}")
@@ -192,7 +214,7 @@ def run_test_case(name, args, device):
         else:
             print(f"     ✅ OK pattern {pat}: Max Err {err:.2e}")
     print("   [test] Unused Parameters (Gradient Check)...")
-    unused = list_unused_parameters(model, x, listT=listT_rand)
+    unused = list_unused_parameters(model, x, listT=listT_rand, static_feats=static_feats)
     unexpected = [n for n in unused if not expected_unused_name(n, args)]
     if unexpected:
         print(f"     ❌ UNEXPECTED UNUSED PARAMS: {unexpected}")
