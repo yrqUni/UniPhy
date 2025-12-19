@@ -322,9 +322,15 @@ class Embedding(nn.Module):
         x = self.c_out(x)
         x = x.permute(0, 2, 1, 3, 4)
         x = self.layer_norm(x)
-        # [FIX] Do NOT permute back to [B, C, L, H, W]. 
-        # ConvLRU expects [B, L, C, H, W].
         return x, cond
+
+def pixel_shuffle_hw_3d(x, rH: int, rW: int):
+    N, C_mul, D, H, W = x.shape
+    C = C_mul // (rH * rW)
+    x = x.view(N, C, rH, rW, D, H, W)
+    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
+    x = x.view(N, C, D, H * rH, W * rW)
+    return x
 
 class Decoder(nn.Module):
     def __init__(self, args, input_downsp_shape):
@@ -364,6 +370,7 @@ class Decoder(nn.Module):
             with torch.no_grad():
                 if self.pre_shuffle_conv.bias is not None:
                     self.pre_shuffle_conv.bias.zero_()
+        
         if self.dec_hidden_layers_num != 0:
             H = self.hidden_size[0] * self.rH
             W = self.hidden_size[1] * self.rW
@@ -380,7 +387,9 @@ class Decoder(nn.Module):
             )
         else:
             self.c_hidden = None
-            self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch * 2, kernel_size=(1, 1, 1), padding="same")
+        
+        # [FIX] Define c_out unconditionally
+        self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch * 2, kernel_size=(1, 1, 1), padding="same")
         self.activation = nn.SiLU()
 
     def forward(self, x, cond=None):
