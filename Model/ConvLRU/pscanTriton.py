@@ -116,7 +116,7 @@ class PScanTriton(torch.autograd.Function):
         dA = dX * Y_prev.conj()
         return dA, dX
 
-pscan = PScan.apply
+pscan = PScanTriton.apply
 
 def pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
     if not torch.cuda.is_available():
