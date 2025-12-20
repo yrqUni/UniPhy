@@ -1,12 +1,11 @@
 import os
 import sys
-import math
 import torch
 import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../Model/ConvLRU"))
 from ModelConvLRU import ConvLRU
-from pscan import pscan_check
+import pscanTriton as pscan_triton as pscan_check
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
