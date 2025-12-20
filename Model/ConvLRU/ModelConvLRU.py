@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pscanTriton import PScanTriton as PScan
+from pscanTriton import pscan 
 
 def _kaiming_like_(tensor):
     nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
@@ -428,7 +428,6 @@ class ConvLRULayer(nn.Module):
                 nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
                 nn.Sigmoid()
             )
-        self.pscan = PScan.apply
 
     def _apply_forcing(self, x, dt):
         ctx = x.mean(dim=(-2, -1))
@@ -497,7 +496,7 @@ class ConvLRULayer(nn.Module):
                 x_in = torch.cat([zero_prev, x_in], dim=1)
                 lamb = torch.cat([lamb[:, :1], lamb], dim=1)
         L2 = x_in.size(1)
-        z_out = self.pscan(lamb[:, :L2], x_in.contiguous())
+        z_out = pscan(lamb[:, :L2], x_in.contiguous())
         if last_hidden_in is not None or (last_hidden_in is None and L == 1):
             z_out = z_out[:, 1:]
         last_hidden_out = z_out[:, -1:]
