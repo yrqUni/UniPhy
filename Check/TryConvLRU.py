@@ -169,51 +169,35 @@ def test_consistency():
     with torch.no_grad():
         # 1. Parallel Mode
         out_p = model(x, mode='p', listT=listT, static_feats=static)
-        # Output is predicted dist for next steps. 
-        # Typically x[t] -> predicts x[t+1]
         
-        # 2. Inference Mode (Autoregressive loop internally in model)
-        # We need to test if manually feeding steps matches p-mode
-        # The model.forward(mode='i') provided implements specific rollout logic
-        # Let's test the specific 'i' mode path in the code
-        
-        # In the provided code, mode='i' uses the whole sequence x as context to generate future
-        # To test equivalence, we treat x[:, :1] as context and generate L-1 frames
-        
+        # 2. Inference Mode Test (Internal Shape Check)
         start_frame = x[:, 0:1]
         future_T = torch.ones(B, L-1, device=device)
-        
-        # This will run the loop in forward()
         out_i = model(start_frame, mode='i', out_gen_num=L, listT=listT[:, 0:1], listT_future=future_T, static_feats=static)
-        
-        # Note: out_p contains predictions for t=1..L based on x=0..L-1
-        # out_i contains predictions where step 0 is the start frame, and 1..L are generated
-        # Comparing them exactly is tricky because 'i' mode feeds its OWN output back, 
-        # whereas 'p' mode uses Ground Truth x.
-        # To strictly verify, we check shape and graph execution.
         
         shape_match = (out_p.shape == out_i.shape)
         print_status("Inference Shape Match", shape_match, f"{out_p.shape} vs {out_i.shape}")
         
-        # Strict Numerical Equivalence Test: Manual Teacher Forcing
-        # We manually call internal components step-by-step
+        # 3. Strict Numerical Equivalence Test: Manual Step-by-Step
         h_ins = None
         outputs = []
         
-        emb, _ = model.embedding(x, static_feats=static) # [B, C, L, H, W]
-        # Permute for block processing [B, L, C, H, W]
-        emb = emb.permute(0, 2, 1, 3, 4)
+        # [FIX] model.embedding already returns [B, L, C, H, W], no permute needed
+        emb, _ = model.embedding(x, static_feats=static) 
         
+        # We need conditional embeddings for the blocks/decoder
+        _, cond_emb = model.embedding(x, static_feats=static)
+
         for t in range(L):
             curr_x = emb[:, t:t+1] # [B, 1, C, H, W]
             curr_T = listT[:, t:t+1]
             
             # Pass through UNet/Blocks
-            # Note: This is internal logic simulation
-            curr_feat, h_ins = model.convlru_model(curr_x, last_hidden_ins=h_ins, listT=curr_T, cond=model.embedding(x, static)[1])
+            # Using internal call to simulate streaming
+            curr_feat, h_ins = model.convlru_model(curr_x, last_hidden_ins=h_ins, listT=curr_T, cond=cond_emb)
             
             # Decoder
-            res = model.decoder(curr_feat, cond=model.embedding(x, static)[1])
+            res = model.decoder(curr_feat, cond=cond_emb)
             outputs.append(res)
             
         out_stepwise = torch.cat(outputs, dim=1)
