@@ -511,7 +511,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                 preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
                 with torch.no_grad():
-                    metric_l1 = latitude_weighted_l1(preds.detach(), target)
+                    metric_l1 = torch.nn.L1Loss()(preds.detach(), target)
             grad_norm = None
             grad_max = None
             if scaler is not None:
@@ -645,7 +645,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     torch.cuda.empty_cache()
                     with torch.cuda.amp.autocast(enabled=bool(args.use_amp), dtype=amp_dtype):
                         preds = model(cond_eff, mode="i", out_gen_num=out_gen_num, listT=listT_cond, listT_future=listT_future, static_feats=static_feats)
-                        loss_eval = latitude_weighted_l1(preds, target)
+                        loss_eval = torch.nn.L1Loss()(preds, target)
                     tot_tensor = loss_eval.detach()
                     dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
                     avg_total = (tot_tensor / world_size).item()
