@@ -101,10 +101,16 @@ class SpectralConv2d(nn.Module):
     def forward(self, x):
         B, L, C, H, W = x.shape
         out_ft = torch.zeros(B, L, self.out_channels, H, W, device=x.device, dtype=torch.cfloat)
-        out_ft[:, :, :, :self.modes1, :self.modes2] = \
-            self._complex_mul2d(x[:, :, :, :self.modes1, :self.modes2], self.weights1)
-        out_ft[:, :, :, -self.modes1:, :self.modes2] = \
-            self._complex_mul2d(x[:, :, :, -self.modes1:, :self.modes2], self.weights2)
+        eff_m1 = min(H, self.modes1)
+        eff_m2 = min(W, self.modes2)
+        w1 = self.weights1[:, :, :eff_m1, :eff_m2]
+        out_ft[:, :, :, :eff_m1, :eff_m2] = self._complex_mul2d(x[:, :, :, :eff_m1, :eff_m2], w1)
+        if H > self.modes1 or W > self.modes2:
+             eff_m1_neg = min(H, self.modes1)
+             eff_m2_pos = min(W, self.modes2)
+             x_slice = x[:, :, :, -eff_m1_neg:, :eff_m2_pos]
+             w2 = self.weights2[:, :, :eff_m1_neg, :eff_m2_pos]
+             out_ft[:, :, :, -eff_m1_neg:, :eff_m2_pos] = self._complex_mul2d(x_slice, w2)
         return out_ft
 
 class SphericalHarmonicsPrior(nn.Module):
@@ -664,7 +670,6 @@ class ConvLRUModel(nn.Module):
         else:
             skips = []
             last_hidden_outs = []
-            # Split last_hidden_ins into encoder and decoder states
             if last_hidden_ins is not None:
                 num_down = len(self.down_blocks)
                 h_in_down = last_hidden_ins[:num_down]
@@ -672,7 +677,6 @@ class ConvLRUModel(nn.Module):
             else:
                 h_in_down = [None] * len(self.down_blocks)
                 h_in_up = [None] * len(self.up_blocks)
-
             for idx, block in enumerate(self.down_blocks):
                 h_in = h_in_down[idx]
                 curr_cond = cond
@@ -687,7 +691,6 @@ class ConvLRUModel(nn.Module):
                     x_s = x.permute(0, 2, 1, 3, 4)
                     x_s = F.avg_pool3d(x_s, kernel_size=(1, 2, 2), stride=(1, 2, 2))
                     x = x_s.permute(0, 2, 1, 3, 4).contiguous()
-            
             for idx, block in enumerate(self.up_blocks):
                 x_s = x.permute(0, 2, 1, 3, 4)
                 x_s = self.upsample(x_s)
@@ -700,11 +703,9 @@ class ConvLRUModel(nn.Module):
                     target_size = x.shape[-2:]
                     if cond.shape[-2:] != target_size:
                         curr_cond = F.interpolate(cond, size=target_size, mode='bilinear', align_corners=False)
-                
                 h_in = h_in_up[idx]
                 x, last_hidden_out = block(x, h_in, listT=listT, cond=curr_cond)
                 last_hidden_outs.append(last_hidden_out)
-
             return x, last_hidden_outs
 
 class Embedding(nn.Module):
