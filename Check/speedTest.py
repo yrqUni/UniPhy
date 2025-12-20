@@ -7,9 +7,9 @@ import pandas as pd
 import gc
 
 try:
-    import pscan as pscan_naive
-    import pscanCUDA as pscan_cuda
-    import pscanTriton as pscan_triton
+    from pscanTriton import pscan as pscan_triton
+    from pscanCUDA import pscan as pscan_cuda
+    from pscanTorch import pscan as pscan_naive
 except ImportError:
     sys.exit(1)
 
