@@ -82,19 +82,19 @@ def check_correctness():
     A, X = get_input(L)
     
     try:
-        y_base = pscan_naive.pscan(A, X)
+        y_base = pscan_naive(A, X)
         loss_base = y_base.sum().abs()
         loss_base.backward()
         grad_base = A.grad.clone()
         A.grad = None; X.grad = None
 
-        y_cuda = pscan_cuda.pscan(A, X)
+        y_cuda = pscan_cuda(A, X)
         loss_cuda = y_cuda.sum().abs()
         loss_cuda.backward()
         grad_cuda = A.grad.clone()
         A.grad = None; X.grad = None
         
-        y_triton = pscan_triton.pscan(A, X)
+        y_triton = pscan_triton(A, X)
         loss_triton = y_triton.sum().abs()
         loss_triton.backward()
         grad_triton = A.grad.clone()
