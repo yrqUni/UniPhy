@@ -432,7 +432,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         loss_fn = torch.nn.L1Loss()
     if args.use_compile:
         model = torch.compile(model, mode="default")
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     register_lru_gate_hooks(model, rank)
     setup_wandb(rank, args, model)
     tmp_dataset = ERA5_Dataset(input_dir=args.data_root, year_range=args.year_range, is_train=True, sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num, max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size())
