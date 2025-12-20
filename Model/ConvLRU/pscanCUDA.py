@@ -229,8 +229,8 @@ def pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
     
     print(f"Checking CUDA PScan with 5D Input (L={seq_length})...")
     
-    A = torch.randn(batch_size, seq_length, channels, state_dim device=device, dtype=dtype, requires_grad=True)
-    X = torch.randn(batch_size, seq_length, channels, state_dim device=device, dtype=dtype, requires_grad=True)
+    A = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
+    X = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
     
     try:
         Y_cuda = pscan(A, X)
@@ -239,7 +239,7 @@ def pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
         return False
     
     Y_serial = torch.zeros_like(X)
-    h = torch.zeros(batch_size, channels, state_dim device=device, dtype=dtype)
+    h = torch.zeros(batch_size, channels, state_dim, device=device, dtype=dtype)
     
     for t in range(seq_length):
         h = A[:, t] * h + X[:, t]
