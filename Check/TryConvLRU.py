@@ -5,7 +5,7 @@ import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../Model/ConvLRU"))
 from ModelConvLRU import ConvLRU
-import pscanTriton as pscan_triton as pscan_check
+from pscanTriton as pscan_triton as pscan_check
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
