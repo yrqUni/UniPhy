@@ -346,7 +346,7 @@ class ConvLRULayer(nn.Module):
     def _fft_impl(self, x):
         B, L, C, S, W = x.shape
         pad_size = S // 4
-        x_reshaped = x.view(B * L, C, S, W)
+        x_reshaped = x.reshape(B * L, C, S, W)
         x_pad = F.pad(x_reshaped, (0, 0, pad_size, pad_size), mode='reflect')
         x_pad = x_pad.view(B, L, C, S + 2 * pad_size, W)
         h = torch.fft.fft2(x_pad.to(torch.cfloat), dim=(-2, -1), norm="ortho")
@@ -665,21 +665,31 @@ class ConvLRUModel(nn.Module):
             last_hidden_outs = []
             for idx, block in enumerate(self.down_blocks):
                 h_in = last_hidden_ins[idx] if (last_hidden_ins is not None) else None
-                x, last_hidden_out = block(x, h_in, listT=listT, cond=cond)
+                curr_cond = cond
+                if cond is not None:
+                    target_size = x.shape[-2:]
+                    if cond.shape[-2:] != target_size:
+                        curr_cond = F.interpolate(cond, size=target_size, mode='bilinear', align_corners=False)
+                x, last_hidden_out = block(x, h_in, listT=listT, cond=curr_cond)
                 last_hidden_outs.append(last_hidden_out)
                 if idx < len(self.down_blocks) - 1:
                     skips.append(x)
                     x_s = x.permute(0, 2, 1, 3, 4)
                     x_s = F.avg_pool3d(x_s, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-                    x = x_s.permute(0, 2, 1, 3, 4)
+                    x = x_s.permute(0, 2, 1, 3, 4).contiguous()
             for idx, block in enumerate(self.up_blocks):
                 x_s = x.permute(0, 2, 1, 3, 4)
                 x_s = self.upsample(x_s)
-                x = x_s.permute(0, 2, 1, 3, 4)
+                x = x_s.permute(0, 2, 1, 3, 4).contiguous()
                 skip = skips.pop()
                 x = torch.cat([x, skip], dim=2)
-                x = self.fusion(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-                x, _ = block(x, None, listT=listT, cond=cond)
+                x = self.fusion(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
+                curr_cond = cond
+                if cond is not None:
+                    target_size = x.shape[-2:]
+                    if cond.shape[-2:] != target_size:
+                        curr_cond = F.interpolate(cond, size=target_size, mode='bilinear', align_corners=False)
+                x, _ = block(x, None, listT=listT, cond=curr_cond)
             return x, last_hidden_outs
 
 class Embedding(nn.Module):
@@ -789,4 +799,3 @@ class ConvLRU(nn.Module):
                 x_step_mean = x_step_dist
             out.append(x_step_dist)
         return torch.concat(out, dim=1)
-    
