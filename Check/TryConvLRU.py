@@ -174,7 +174,7 @@ def test_flash_fft_fallback():
 if __name__ == "__main__":
     print(f"Running Tests on: {get_device()}")
     print("\n=== 0. Kernel Check ===")
-    if pscan_check(batch_size=2, seq_length=16, channels=4, height=8, width=8):
+    if pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
         print_status("PScan Kernel", True)
     else:
         print_status("PScan Kernel", False)
