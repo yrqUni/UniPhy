@@ -4,9 +4,7 @@ import triton.language as tl
 
 @triton.jit
 def complex_mul(ar, ai, br, bi):
-    cr = ar * br - ai * bi
-    ci = ar * bi + ai * br
-    return cr, ci
+    return ar * br - ai * bi, ar * bi + ai * br
 
 @triton.jit
 def scan_combine(ar, ai, xr, xi, br, bi, yr, yi):
@@ -64,8 +62,8 @@ class PScanTriton(torch.autograd.Function):
         BLOCK_SIZE = next_power_of_2(L)
         BLOCK_SIZE = max(BLOCK_SIZE, 16)
         
-        if BLOCK_SIZE > 8192:
-             raise ValueError(f"Sequence length L={L} is too large for this single-pass Triton PScan kernel.")
+        if BLOCK_SIZE > 16384:
+             raise ValueError(f"Sequence length L={L} exceeds Triton block limits.")
 
         grid = (num_sequences,)
         stride_batch = A_real.stride(0)
@@ -85,6 +83,7 @@ class PScanTriton(torch.autograd.Function):
     def backward(ctx, grad_output):
         A, Y = ctx.saved_tensors
         A_conj = A.conj()
+        
         grad_output_rev = grad_output.flip(1)
         A_conj_rev = A_conj.flip(1)
         
