@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pscanTriton import pscan
+from pscan import PScan, pscan
 
 def _kaiming_like_(tensor):
     nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
@@ -220,7 +220,6 @@ class GatedConvBlock(nn.Module):
             self.cbam = CBAM2DPerStep(channels, reduction=16)
 
     def forward(self, x, cond=None):
-        # x is [B, C, L, H, W]
         residual = x
         x = self.dw_conv(x)
         x = x.permute(0, 2, 1, 3, 4)
@@ -229,7 +228,7 @@ class GatedConvBlock(nn.Module):
         
         if self.cond_proj is not None and cond is not None:
             if cond.dim() == 4:
-                cond_in = cond.unsqueeze(2) # [B, C, 1, H, W]
+                cond_in = cond.unsqueeze(2)
             else:
                 cond_in = cond
             affine = self.cond_proj(cond_in)
@@ -308,7 +307,6 @@ class Embedding(nn.Module):
         self.layer_norm = nn.LayerNorm([*self.hidden_size])
 
     def forward(self, x, static_feats=None):
-        # x: [B, L, C, H, W] -> permute -> [B, C, L, H, W]
         x = x.permute(0, 2, 1, 3, 4)
         x = self.patch_embed(x)
         x = self.activation(x)
@@ -322,7 +320,6 @@ class Embedding(nn.Module):
                 x = layer(x, cond=cond)
                 
         x = self.c_out(x)
-        # x back to [B, L, C, H, W]
         x = x.permute(0, 2, 1, 3, 4)
         x = self.layer_norm(x)
         return x, cond
@@ -395,7 +392,6 @@ class Decoder(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, x, cond=None):
-        # x: [B, L, C, H, W] -> permute -> [B, C, L, H, W]
         x = x.permute(0, 2, 1, 3, 4)
         if self.dec_strategy == "deconv":
             x = self.upsp(x)
@@ -410,7 +406,6 @@ class Decoder(nn.Module):
         x = self.c_out(x)
         mu, log_sigma = torch.chunk(x, 2, dim=1)
         sigma = F.softplus(log_sigma) + 1e-6
-        # Return [B, L, 2*Out, H, W]
         return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4)
 
 class ConvLRUModel(nn.Module):
@@ -421,7 +416,6 @@ class ConvLRUModel(nn.Module):
         self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, input_downsp_shape) for _ in range(layers)])
 
     def forward(self, x, last_hidden_ins=None, listT=None, cond=None):
-        # x is [B, L, C, H, W]
         last_hidden_outs = []
         for idx, convlru_block in enumerate(self.convlru_blocks):
             h_in = last_hidden_ins[idx] if (last_hidden_ins is not None) else None
@@ -484,9 +478,8 @@ class ConvLRULayer(nn.Module):
         self.pscan = pscan
 
     def _apply_forcing(self, x, dt):
-        # x: [B, L, C, S, W]
-        ctx = x.mean(dim=(-2, -1)) # [B, L, C]
-        dt_feat = dt.view(x.size(0), x.size(1), 1) # [B, L, 1]
+        ctx = x.mean(dim=(-2, -1))
+        dt_feat = dt.view(x.size(0), x.size(1), 1)
         inp = torch.cat([ctx, dt_feat], dim=-1)
         mod = self.forcing_mlp(inp)
         mod = mod.view(x.size(0), x.size(1), self.emb_ch, self.rank, 2)
@@ -527,9 +520,9 @@ class ConvLRULayer(nn.Module):
             h = h + self.freq_prior(h)
             
         Uc = self.U_row.conj()
-        t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc) # [B, L, C, W, R]
-        t = t.permute(0, 1, 2, 4, 3) # [B, L, C, R, W]
-        zq = torch.matmul(t, self.V_col) # [B, L, C, R, R]
+        t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
+        t = t.permute(0, 1, 2, 4, 3)
+        zq = torch.matmul(t, self.V_col)
         
         nu_log, theta_log = self.params_log_base.unbind(dim=0)
         disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
@@ -563,8 +556,6 @@ class ConvLRULayer(nn.Module):
                 lamb = torch.cat([lamb[:, :1], lamb], dim=1)
         
         L2 = x_in.size(1)
-        # [FIX] Broadcast lamb (A) to match x_in (X) shape for pscan
-        # lamb: [B, L, C, R, 1] -> [B, L, C, R, R]
         lamb_in = lamb[:, :L2].expand_as(x_in)
         z_out = self.pscan(lamb_in.contiguous(), x_in.contiguous())
         
@@ -620,7 +611,6 @@ class FeedForward(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x, cond=None):
-        # x: [B, L, C, H, W]
         residual = x
         x = self.c_in(x.permute(0, 2, 1, 3, 4))
         x = self.act(x)
