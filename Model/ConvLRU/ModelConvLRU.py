@@ -639,16 +639,17 @@ class ConvLRUModel(nn.Module):
             self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
         else:
             curr_H, curr_W = H, W
+            encoder_res = []
             for i in range(layers):
                 self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
+                encoder_res.append((curr_H, curr_W))
                 if i < layers - 1:
                     self.skip_convs.append(nn.Identity())
                     curr_H //= 2
                     curr_W //= 2
-            for i in range(layers - 1):
-                self.up_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
-                curr_H *= 2
-                curr_W *= 2
+            for i in range(layers - 2, -1, -1):
+                h_up, w_up = encoder_res[i]
+                self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
             self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear', align_corners=False)
             self.fusion = nn.Conv3d(C*2, C, 1)
 
