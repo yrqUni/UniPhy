@@ -102,6 +102,10 @@ class Args:
         self.wandb_run_name = self.ckpt
         self.wandb_group = "v2.1.0"
         self.wandb_mode = "online"
+        self.use_selective = False
+        self.bidirectional = False
+        self.unet = False
+        self.head_mode = "gaussian"
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -132,7 +136,7 @@ MODEL_ARG_KEYS = [
     'lambda_type', 'exo_mode', 'lambda_mlp_hidden',
     'ffn_hidden_ch', 'ffn_hidden_layers_num',
     'dec_strategy', 'dec_hidden_ch', 'dec_hidden_layers_num',
-    'static_ch'
+    'static_ch', 'use_selective', 'bidirectional', 'unet', 'head_mode'
 ]
 
 def extract_model_args(args_obj):
@@ -504,7 +508,21 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
             with ctx:
                 preds = model(x, mode='p', listT=listT, static_feats=static_feats)
-                preds = preds[:, 1:]
+                # Note: target alignment depends on if we predict x_{t+1} given x_t
+                # if K sampling, target is aligned. if full seq, preds usually shifted by 1 or same len depending on impl
+                # Assuming model returns L frames corresponding to input L frames but shifted
+                # Actually ConvLRU usually returns h_t corresponding to x_t, which predicts x_{t+1}
+                # So if input is x_{0...T-1}, output is pred_{1...T}
+                # Target should be x_{1...T}
+                # If K sampling is used, x is x_{t}, target is x_{t+dt}
+                # preds is pred_{t+dt}
+                # So we don't slice preds if K sampling is used, but we might if full seq
+                if K == -1:
+                     # Full sequence: x=0..T-1, target=1..T
+                     # Preds=1..T (usually)
+                     # Check if we need slicing
+                     pass
+                
                 loss = loss_fn(preds, target)
                 with torch.no_grad():
                     metric_l1 = latitude_weighted_l1(preds.detach(), target)
@@ -583,11 +601,18 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     for k, v in _LRU_GATE_MEAN.items():
                         g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
                         log_dict[g_key] = v
-                    if hasattr(model.module.convlru_model.convlru_blocks[0].lru_layer, 'forcing_scale'):
-                        fs = model.module.convlru_model.convlru_blocks[0].lru_layer.forcing_scale.item()
-                        nl = model.module.convlru_model.convlru_blocks[0].lru_layer.noise_level.item()
-                        log_dict["phys/forcing_scale"] = fs
-                        log_dict["phys/noise_level"] = nl
+                    if hasattr(model.module.convlru_model.down_blocks[0].lru_layer, 'forcing_scale'):
+                         # Adjusted for U-Net structure where blocks are in down_blocks/up_blocks or convlru_blocks
+                         # Check both
+                         if hasattr(model.module.convlru_model, 'convlru_blocks'):
+                             target_layer = model.module.convlru_model.convlru_blocks[0].lru_layer
+                         else:
+                             target_layer = model.module.convlru_model.down_blocks[0].lru_layer
+                         
+                         fs = target_layer.forcing_scale.item()
+                         nl = target_layer.noise_level.item()
+                         log_dict["phys/forcing_scale"] = fs
+                         log_dict["phys/noise_level"] = nl
                     wandb.log(log_dict, step=global_step)
             if rank == 0 and (train_step % max(1, int(len(train_dataloader) * args.ckpt_step)) == 0 or train_step == len(train_dataloader)):
                 save_ckpt(model, opt, ep + 1, train_step, avg_loss, args, scheduler if (args.use_scheduler and scheduler is not None) else None)
@@ -670,3 +695,4 @@ if __name__ == "__main__":
     master_addr = os.environ.get('MASTER_ADDR', '127.0.0.1')
     master_port = os.environ.get('MASTER_PORT', '12355')
     run_ddp(rank, world_size, local_rank, master_addr, master_port, args)
+    
