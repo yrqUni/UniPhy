@@ -30,7 +30,7 @@ __global__ void pscan_forward_kernel(
     const float* __restrict__ A_real, const float* __restrict__ A_imag,
     const float* __restrict__ X_real, const float* __restrict__ X_imag,
     float* __restrict__ Y_real, float* __restrict__ Y_imag,
-    int B, int C, int S, int L
+    int L
 ) {
     extern __shared__ float shared_mem[];
     float* s_ar = shared_mem;
@@ -42,8 +42,7 @@ __global__ void pscan_forward_kernel(
     int lane_id = tid % 32;
     int warp_id = tid / 32;
     int seq_idx = blockIdx.x;
-    int stride = L;
-    int base_offset = seq_idx * stride;
+    int base_offset = seq_idx * L;
 
     float ar = (tid < L) ? A_real[base_offset + tid] : 1.0f;
     float ai = (tid < L) ? A_imag[base_offset + tid] : 0.0f;
@@ -123,18 +122,16 @@ void pscan_forward_cuda(
 ) {
     int num_seqs = A_real.size(0);
     int L = A_real.size(1);
-    float* ar_ptr = A_real.data_ptr<float>();
-    float* ai_ptr = A_imag.data_ptr<float>();
-    float* xr_ptr = X_real.data_ptr<float>();
-    float* xi_ptr = X_imag.data_ptr<float>();
-    float* yr_ptr = Y_real.data_ptr<float>();
-    float* yi_ptr = Y_imag.data_ptr<float>();
+    
     int threads = 1024;
     int blocks = num_seqs;
     int shared_mem_size = 4 * 32 * sizeof(float);
+    
     pscan_forward_kernel<<<blocks, threads, shared_mem_size>>>(
-        ar_ptr, ai_ptr, xr_ptr, xi_ptr, yr_ptr, yi_ptr,
-        0, 0, 0, L
+        A_real.data_ptr<float>(), A_imag.data_ptr<float>(),
+        X_real.data_ptr<float>(), X_imag.data_ptr<float>(),
+        Y_real.data_ptr<float>(), Y_imag.data_ptr<float>(),
+        L
     );
 }
 """
@@ -149,7 +146,7 @@ void pscan_forward_cuda(
 
 try:
     pscan_ext = load_inline(
-        name='pscan_cuda_ext_final',
+        name='pscan_cuda_ext_v5',
         cpp_sources=cpp_source,
         cuda_sources=cuda_source,
         functions=['pscan_forward_cuda'],
@@ -162,23 +159,34 @@ except Exception as e:
 class PScanCUDA(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
-        if A.size(1) > 1024:
-            raise ValueError("PScanCUDA currently only supports sequence length L <= 1024.")
+        input_shape = A.shape
+        L = input_shape[1]
+        
+        if L > 1024:
+            raise ValueError(f"CUDA implementation limited to L<=1024, got {L}")
         if pscan_ext is None:
             raise RuntimeError("CUDA extension not loaded.")
-        B, L, C, S = A.shape
-        N = B * C * S
-        A_flat = A.permute(0, 2, 3, 1).reshape(N, L).contiguous()
-        X_flat = X.permute(0, 2, 3, 1).reshape(N, L).contiguous()
+
+        A_in = A.transpose(1, -1).contiguous()
+        X_in = X.transpose(1, -1).contiguous()
+        
+        A_flat = A_in.view(-1, L)
+        X_flat = X_in.view(-1, L)
+        
         A_real = A_flat.real.contiguous()
         A_imag = A_flat.imag.contiguous()
         X_real = X_flat.real.contiguous()
         X_imag = X_flat.imag.contiguous()
+        
         Y_real = torch.empty_like(X_real)
         Y_imag = torch.empty_like(X_imag)
+        
         pscan_ext.pscan_forward_cuda(A_real, A_imag, X_real, X_imag, Y_real, Y_imag)
+        
         Y_flat = torch.complex(Y_real, Y_imag)
-        Y = Y_flat.view(B, C, S, L).permute(0, 3, 1, 2)
+        Y = Y_flat.view(*A_in.shape)
+        Y = Y.transpose(1, -1)
+        
         ctx.save_for_backward(A, Y)
         return Y
 
@@ -186,42 +194,63 @@ class PScanCUDA(torch.autograd.Function):
     def backward(ctx, grad_output):
         A, Y = ctx.saved_tensors
         A_conj = A.conj()
+        
         grad_output_rev = grad_output.flip(1)
         A_conj_rev = A_conj.flip(1)
+        
+        slices_start = [slice(None)] * A.ndim
+        slices_start[1] = slice(0, 1)
+        slices_end = [slice(None)] * A.ndim
+        slices_end[1] = slice(None, -1)
+        
         A_rev_shifted = torch.cat([
-            torch.zeros_like(A_conj_rev[:, :1]), 
-            A_conj_rev[:, :-1]
+            torch.zeros_like(A_conj_rev[tuple(slices_start)]), 
+            A_conj_rev[tuple(slices_end)]
         ], dim=1)
+        
         dX_rev = PScanCUDA.apply(A_rev_shifted, grad_output_rev)
         dX = dX_rev.flip(1)
+        
         Y_prev = torch.cat([
-            torch.zeros_like(Y[:, :1]), 
-            Y[:, :-1]
+            torch.zeros_like(Y[tuple(slices_start)]), 
+            Y[tuple(slices_end)]
         ], dim=1)
+        
         dA = dX * Y_prev.conj()
         return dA, dX
 
 pscan = PScanCUDA.apply
 
-def pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
+def pscan_check(batch_size=2, seq_length=16, channels=4, height=4, width=4):
     if not torch.cuda.is_available():
         return True
     device = 'cuda'
     dtype = torch.complex64
-    A = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
-    X = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
+    
+    print(f"Checking CUDA PScan with 5D Input (L={seq_length})...")
+    
+    A = torch.randn(batch_size, seq_length, channels, height, width, device=device, dtype=dtype, requires_grad=True)
+    X = torch.randn(batch_size, seq_length, channels, height, width, device=device, dtype=dtype, requires_grad=True)
+    
     try:
         Y_cuda = pscan(A, X)
-    except Exception:
+    except Exception as e:
+        print(f"CUDA Run Failed: {e}")
         return False
+    
     Y_serial = torch.zeros_like(X)
-    h = torch.zeros(batch_size, channels, state_dim, device=device, dtype=dtype)
+    h = torch.zeros(batch_size, channels, height, width, device=device, dtype=dtype)
+    
     for t in range(seq_length):
         h = A[:, t] * h + X[:, t]
         Y_serial[:, t] = h
+        
     max_diff = (Y_cuda - Y_serial).abs().max().item()
     if max_diff > 1e-4:
+        print(f"Mismatch: {max_diff}")
         return False
+        
     loss = Y_cuda.sum().abs()
     loss.backward()
+    print("✅ PScan Check Passed.")
     return True
