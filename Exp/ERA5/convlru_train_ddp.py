@@ -102,10 +102,10 @@ class Args:
         self.wandb_run_name = self.ckpt
         self.wandb_group = "v2.1.0"
         self.wandb_mode = "online"
-        self.use_selective = False
-        self.bidirectional = False
-        self.unet = False
-        self.head_mode = "gaussian"
+        self.use_selective = True
+        self.bidirectional = True
+        self.unet = True
+        self.head_mode = "diffusion"
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
@@ -562,7 +562,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     t_str = f"T~{current_T_mean:.2f}({current_T_min:.1f}-{current_T_max:.1f})"
                 message = (
                     f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
-                    f"- NLL: {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- AvgLoss: {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
                     f"- {gate_str}{grad_str}"
                 )
                 if isinstance(train_dataloader_iter, tqdm):
