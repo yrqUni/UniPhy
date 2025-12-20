@@ -121,7 +121,7 @@ def main():
     
     for L in SEQLENS:
         if L <= NAIVE_MAX_L:
-            res = measure_perf(pscan_naive.pscan, L, "Naive")
+            res = measure_perf(pscan_naive, L, "Naive")
             if "Error" not in res:
                 res["Model"] = "PyTorch"
                 res["L"] = L
@@ -133,7 +133,7 @@ def main():
             base_time = None
 
         if L <= CUDA_MAX_L:
-            res = measure_perf(pscan_cuda.pscan, L, "CUDA")
+            res = measure_perf(pscan_cuda, L, "CUDA")
             if "Error" not in res:
                 res["Model"] = "CUDA"
                 res["L"] = L
@@ -141,7 +141,7 @@ def main():
                     res["Speedup"] = f"{base_time / res['Total (ms)']:.1f}x"
                 results.append(res)
 
-        res = measure_perf(pscan_triton.pscan, L, "Triton")
+        res = measure_perf(pscan_triton, L, "Triton")
         if "Error" not in res:
             res["Model"] = "Triton"
             res["L"] = L
