@@ -372,7 +372,8 @@ class ConvLRULayer(nn.Module):
         if self.proj_b is not None:
             h = h + self.proj_b.view(1, 1, C, 1, 1)
         h_spatial = torch.fft.ifft2(h, dim=(-2, -1), norm="ortho")
-        h_spatial = h_spatial[..., pad_size:-pad_size, :]
+        if pad_size > 0:
+            h_spatial = h_spatial[..., pad_size:-pad_size, :]
         h = torch.fft.fft2(h_spatial, dim=(-2, -1), norm="ortho")
         if self.freq_prior:
             h = h + self.freq_prior(h)
