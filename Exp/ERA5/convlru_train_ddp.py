@@ -508,21 +508,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype)
             with ctx:
                 preds = model(x, mode='p', listT=listT, static_feats=static_feats)
-                # Note: target alignment depends on if we predict x_{t+1} given x_t
-                # if K sampling, target is aligned. if full seq, preds usually shifted by 1 or same len depending on impl
-                # Assuming model returns L frames corresponding to input L frames but shifted
-                # Actually ConvLRU usually returns h_t corresponding to x_t, which predicts x_{t+1}
-                # So if input is x_{0...T-1}, output is pred_{1...T}
-                # Target should be x_{1...T}
-                # If K sampling is used, x is x_{t}, target is x_{t+dt}
-                # preds is pred_{t+dt}
-                # So we don't slice preds if K sampling is used, but we might if full seq
-                if K == -1:
-                     # Full sequence: x=0..T-1, target=1..T
-                     # Preds=1..T (usually)
-                     # Check if we need slicing
-                     pass
-                
+                preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
                 with torch.no_grad():
                     metric_l1 = latitude_weighted_l1(preds.detach(), target)
@@ -601,14 +587,13 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     for k, v in _LRU_GATE_MEAN.items():
                         g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
                         log_dict[g_key] = v
-                    if hasattr(model.module.convlru_model.down_blocks[0].lru_layer, 'forcing_scale'):
-                         # Adjusted for U-Net structure where blocks are in down_blocks/up_blocks or convlru_blocks
-                         # Check both
-                         if hasattr(model.module.convlru_model, 'convlru_blocks'):
-                             target_layer = model.module.convlru_model.convlru_blocks[0].lru_layer
-                         else:
-                             target_layer = model.module.convlru_model.down_blocks[0].lru_layer
-                         
+                    if hasattr(model.module.convlru_model, 'convlru_blocks'):
+                         target_layer = model.module.convlru_model.convlru_blocks[0].lru_layer
+                    elif hasattr(model.module.convlru_model, 'down_blocks'):
+                         target_layer = model.module.convlru_model.down_blocks[0].lru_layer
+                    else:
+                         target_layer = None
+                    if target_layer and hasattr(target_layer, 'forcing_scale'):
                          fs = target_layer.forcing_scale.item()
                          nl = target_layer.noise_level.item()
                          log_dict["phys/forcing_scale"] = fs
@@ -695,4 +680,3 @@ if __name__ == "__main__":
     master_addr = os.environ.get('MASTER_ADDR', '127.0.0.1')
     master_port = os.environ.get('MASTER_PORT', '12355')
     run_ddp(rank, world_size, local_rank, master_addr, master_port, args)
-    
