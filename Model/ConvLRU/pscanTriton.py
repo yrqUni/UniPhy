@@ -118,7 +118,7 @@ class PScanTriton(torch.autograd.Function):
 
 pscan = PScanTriton.apply
 
-def pscan_check(batch_size=2, seq_length=16, channels=4, height=4, width=4):
+def pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
     if not torch.cuda.is_available():
         return True
 
@@ -127,8 +127,8 @@ def pscan_check(batch_size=2, seq_length=16, channels=4, height=4, width=4):
     
     print(f"Checking PScan with 5D Input (L={seq_length})...")
     
-    A = torch.randn(batch_size, seq_length, channels, height, width, device=device, dtype=dtype, requires_grad=True)
-    X = torch.randn(batch_size, seq_length, channels, height, width, device=device, dtype=dtype, requires_grad=True)
+    A = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
+    X = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
     
     try:
         Y_triton = pscan(A, X)
@@ -137,7 +137,7 @@ def pscan_check(batch_size=2, seq_length=16, channels=4, height=4, width=4):
         return False
     
     Y_serial = torch.zeros_like(X)
-    h = torch.zeros(batch_size, channels, height, width, device=device, dtype=dtype)
+    h = torch.zeros(batch_size, channels, state_dim, device=device, dtype=dtype)
     
     for t in range(seq_length):
         h = A[:, t] * h + X[:, t]

@@ -14,8 +14,7 @@ except ImportError:
 
 BATCH_SIZE = 8
 CHANNELS = 32
-HEIGHT = 8
-WIDTH = 8
+STATE = 8
 SEQLENS = [128, 512, 1024, 2048, 4096, 8192]
 WARMUP_STEPS = 10
 REP_STEPS = 50
@@ -24,8 +23,8 @@ NAIVE_MAX_L = 2048
 
 def get_input(L, device="cuda"):
     dtype = torch.complex64
-    A = torch.randn(BATCH_SIZE, L, CHANNELS, HEIGHT, WIDTH, device=device, dtype=dtype, requires_grad=True)
-    X = torch.randn(BATCH_SIZE, L, CHANNELS, HEIGHT, WIDTH, device=device, dtype=dtype, requires_grad=True)
+    A = torch.randn(BATCH_SIZE, L, CHANNELS, STATE, device=device, dtype=dtype, requires_grad=True)
+    X = torch.randn(BATCH_SIZE, L, CHANNELS, STATE, device=device, dtype=dtype, requires_grad=True)
     return A, X
 
 def measure_perf(fn_apply, L, name):
