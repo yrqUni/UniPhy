@@ -90,7 +90,7 @@ class Args:
         self.lr = 1e-5
         self.use_scheduler = False
         self.init_lr_scheduler = False
-        self.loss = 'nll'
+        self.loss = 'lat'
         self.T = 6
         self.use_amp = False
         self.amp_dtype = 'fp16'
