@@ -664,8 +664,17 @@ class ConvLRUModel(nn.Module):
         else:
             skips = []
             last_hidden_outs = []
+            # Split last_hidden_ins into encoder and decoder states
+            if last_hidden_ins is not None:
+                num_down = len(self.down_blocks)
+                h_in_down = last_hidden_ins[:num_down]
+                h_in_up = last_hidden_ins[num_down:]
+            else:
+                h_in_down = [None] * len(self.down_blocks)
+                h_in_up = [None] * len(self.up_blocks)
+
             for idx, block in enumerate(self.down_blocks):
-                h_in = last_hidden_ins[idx] if (last_hidden_ins is not None) else None
+                h_in = h_in_down[idx]
                 curr_cond = cond
                 if cond is not None:
                     target_size = x.shape[-2:]
@@ -678,6 +687,7 @@ class ConvLRUModel(nn.Module):
                     x_s = x.permute(0, 2, 1, 3, 4)
                     x_s = F.avg_pool3d(x_s, kernel_size=(1, 2, 2), stride=(1, 2, 2))
                     x = x_s.permute(0, 2, 1, 3, 4).contiguous()
+            
             for idx, block in enumerate(self.up_blocks):
                 x_s = x.permute(0, 2, 1, 3, 4)
                 x_s = self.upsample(x_s)
@@ -690,7 +700,11 @@ class ConvLRUModel(nn.Module):
                     target_size = x.shape[-2:]
                     if cond.shape[-2:] != target_size:
                         curr_cond = F.interpolate(cond, size=target_size, mode='bilinear', align_corners=False)
-                x, _ = block(x, None, listT=listT, cond=curr_cond)
+                
+                h_in = h_in_up[idx]
+                x, last_hidden_out = block(x, h_in, listT=listT, cond=curr_cond)
+                last_hidden_outs.append(last_hidden_out)
+
             return x, last_hidden_outs
 
 class Embedding(nn.Module):
