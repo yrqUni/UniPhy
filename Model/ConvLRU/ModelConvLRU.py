@@ -697,6 +697,10 @@ class ConvLRUModel(nn.Module):
                 x_s = self.upsample(x_s)
                 x = x_s.permute(0, 2, 1, 3, 4).contiguous()
                 skip = skips.pop()
+                if x.shape[-2:] != skip.shape[-2:]:
+                    diffY = skip.size(-2) - x.size(-2)
+                    diffX = skip.size(-1) - x.size(-1)
+                    x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
                 x = torch.cat([x, skip], dim=2)
                 x = self.fusion(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
                 curr_cond = cond
