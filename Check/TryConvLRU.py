@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../Model/ConvLRU"))
 from ModelConvLRU import ConvLRU
-from pscanTriton import pscan_check
+from pscan import pscan_check
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -264,7 +264,7 @@ def main():
     print("========================================")
     
     print("[1/3] Checking PScan Operator...")
-    if not pscan_check(batch_size=2, seq_length=16, channels=4, height=8, width=8):
+    if not pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
         print("❌ PScan Check Failed!")
         sys.exit(1)
     print("✅ PScan Check Passed.")

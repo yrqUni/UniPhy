@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pscanTriton import pscan
+from pscan import pscan
 
 # =============================================================================
 # Utils & Init
