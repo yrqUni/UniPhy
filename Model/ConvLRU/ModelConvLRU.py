@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pscan import PScan
+from Model.ConvLRU.pscanTriton import PScan
 
 def _kaiming_like_(tensor):
     nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
