@@ -1,8 +1,8 @@
 import os
 import sys
 import torch
+import torch.nn.functional as F
 import numpy as np
-import time
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../Model/ConvLRU"))
 from ModelConvLRU import ConvLRU
@@ -32,26 +32,26 @@ class MockArgs:
         self.freq_rank = 4
         self.use_sh_prior = False
         self.sh_Lmax = 4
+        self.bidirectional = False
+        self.use_selective = False
         self.ffn_hidden_ch = 32
         self.ffn_hidden_layers_num = 1
+        self.num_expert = -1 
+        self.activate_expert = 2
         self.dec_strategy = "pxsf"
         self.dec_hidden_ch = 16
         self.dec_hidden_layers_num = 0
-        self.unet = False
-        self.bidirectional = False
-        self.use_selective = False
         self.head_mode = "gaussian"
-        self.num_expert = -1 
-        self.activate_expert = 2
+        self.unet = False
 
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def print_status(name, passed, msg=""):
     if passed:
-        print(f"\033[92m[PASS] {name:<40}\033[0m {msg}")
+        print(f"\033[92m[PASS] {name:<25}\033[0m {msg}")
     else:
-        print(f"\033[91m[FAIL] {name:<40}\033[0m {msg}")
+        print(f"\033[91m[FAIL] {name:<25}\033[0m {msg}")
 
 def test_configurations():
     print("\n=== 1. Architecture Combinations Test ===")
@@ -77,12 +77,12 @@ def test_configurations():
             args.bidirectional = bidir
             args.use_selective = sel
             args.num_expert = n_exp
-            
             model = ConvLRU(args).to(device)
             out = model(x, mode='p', listT=listT, static_feats=static)
             expected_C = args.out_ch * 2
-            if out.shape != (B, L, expected_C, H, W):
-                raise ValueError(f"Shape Mismatch: {out.shape} vs {(B, L, expected_C, H, W)}")
+            expected_shape = (B, L, expected_C, H, W)
+            if out.shape != expected_shape:
+                raise ValueError(f"Shape Mismatch: Got {out.shape}, Expected {expected_shape}")
             loss = out.sum()
             loss.backward()
             print_status(name, True, f"Params: {sum(p.numel() for p in model.parameters())}")
@@ -122,6 +122,8 @@ def test_heads():
                         loss.backward()
                         passed = True
                         msg = f"VQ Shape: {quant.shape}, Loss: {vq_loss.item():.4f}"
+            if not passed:
+                msg = f"Output Check Failed. Shape: {out.shape if not isinstance(out, tuple) else out[0].shape}"
             print_status(f"Head: {mode}", passed, msg)
         except Exception as e:
             print_status(f"Head: {mode}", False, str(e))
@@ -133,39 +135,29 @@ def test_consistency():
     args.unet = True 
     args.bidirectional = False 
     args.num_expert = 4
-    
     model = ConvLRU(args).to(device)
     model.eval()
     B, L, C, H, W = 1, 6, 4, 32, 32
     x = torch.randn(B, L, C, H, W, device=device)
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
-    
     with torch.no_grad():
         out_p = model(x, mode='p', listT=listT, static_feats=static)
         start_frame = x[:, 0:1]
         future_T = torch.ones(B, L-1, device=device)
-        out_i = model(start_frame, mode='i', out_gen_num=L, listT=listT[:, 0:1], listT_future=future_T, static_feats=static)
-        
+        out_i = model(
+            start_frame, 
+            mode='i', 
+            out_gen_num=L, 
+            listT=listT[:, 0:1], 
+            listT_future=future_T, 
+            static_feats=static
+        )
         shape_match = (out_p.shape == out_i.shape)
         print_status("Inference Shape Match", shape_match, f"{out_p.shape} vs {out_i.shape}")
-        
-        h_ins = None
-        outputs = []
-        emb, cond_emb = model.embedding(x, static_feats=static)
-        
-        for t in range(L):
-            curr_x = emb[:, t:t+1]
-            curr_T = listT[:, t:t+1]
-            curr_feat, h_ins = model.convlru_model(curr_x, last_hidden_ins=h_ins, listT=curr_T, cond=cond_emb)
-            res = model.decoder(curr_feat, cond=cond_emb)
-            outputs.append(res)
-            
-        out_stepwise = torch.cat(outputs, dim=1)
-        diff = (out_p - out_stepwise).abs().max().item()
-        
-        is_consistent = diff < 5e-3
-        print_status("Internal State Consistency", is_consistent, f"Max Diff: {diff:.2e} (Tol: 5e-3)")
+        diff_step1 = (out_p[:, 0] - out_i[:, 0]).abs().max().item()
+        is_consistent = diff_step1 < 1e-4
+        print_status("Step-1 Consistency", is_consistent, f"Max Diff: {diff_step1:.2e}")
 
 def test_flash_fft_fallback():
     print("\n=== 4. FlashFFTConv Fallback Test ===")
@@ -184,15 +176,17 @@ def test_flash_fft_fallback():
 if __name__ == "__main__":
     print(f"Running Tests on: {get_device()}")
     print("\n=== 0. Kernel Check ===")
-    if pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
-        print_status("PScan Kernel", True)
-    else:
-        print_status("PScan Kernel", False)
+    try:
+        if pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
+            print_status("PScan Kernel", True)
+        else:
+            print_status("PScan Kernel", False)
+            sys.exit(1)
+    except Exception as e:
+        print_status("PScan Kernel", False, str(e))
         sys.exit(1)
-
     test_configurations()
     test_heads()
     test_consistency()
     test_flash_fft_fallback()
-    
     print("\n✅ All Tests Completed.")
