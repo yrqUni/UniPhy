@@ -86,7 +86,7 @@ class Args:
         self.ckpt_step = 0.25
         self.do_eval = False
         self.use_tf32 = False
-        self.use_compile = False
+        self.use_compile = True
         self.lr = 1e-5
         self.use_scheduler = False
         self.init_lr_scheduler = False
