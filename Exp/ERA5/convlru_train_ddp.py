@@ -562,7 +562,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     t_str = f"T~{current_T_mean:.2f}({current_T_min:.1f}-{current_T_max:.1f})"
                 message = (
                     f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
-                    f"- AvgLoss: {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- Loss({args.loss}): {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
                     f"- {gate_str}{grad_str}"
                 )
                 if isinstance(train_dataloader_iter, tqdm):
@@ -573,7 +573,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                     log_dict = {
                         "train/epoch": ep + 1,
                         "train/step": global_step,
-                        "train/loss_nll": avg_loss,
+                        f"train/loss_{args.loss}": avg_loss,
                         "train/loss_l1": avg_l1,
                         "train/lr": current_lr,
                         "train/K": K,
