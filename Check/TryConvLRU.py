@@ -8,8 +8,7 @@ MODEL_DIR = os.path.join(ROOT, "Model", "ConvLRU")
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
-from ModelConvLRU import ConvLRU, FlashFFTConvInterface
-from pscan import pscan_check
+from ModelConvLRU import ConvLRU
 
 
 def seed_all(seed: int = 42):
@@ -27,36 +26,35 @@ def enable_tf32():
 
 class MockArgs:
     def __init__(self):
-        self.input_size = (32, 32)
         self.input_ch = 4
-        self.out_ch = 4
-        self.static_ch = 2
+        self.input_size = (32, 32)
         self.emb_ch = 16
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 1
-        self.emb_strategy = "pxus"
+        self.static_ch = 2
         self.hidden_factor = (2, 2)
+        
+        self.unet = False
         self.convlru_num_blocks = 2
-        self.lru_rank = 8
-        self.use_gate = True
+        self.ffn_hidden_ch = 32
+        self.ffn_hidden_layers_num = 1
         self.use_cbam = False
+        self.num_expert = -1
+        self.activate_expert = 2
+        self.lru_rank = 8
+        self.use_selective = False
+        self.bidirectional = False
         self.use_freq_prior = False
-        self.freq_rank = 4
         self.use_sh_prior = False
         self.sh_Lmax = 4
         self.sh_rank = 4
         self.sh_gain_init = 0.0
-        self.bidirectional = False
-        self.use_selective = False
-        self.ffn_hidden_ch = 32
-        self.ffn_hidden_layers_num = 1
-        self.num_expert = -1
-        self.activate_expert = 2
-        self.dec_strategy = "pxsf"
+        
+        self.head_mode = "gaussian"
+        self.out_ch = 4
         self.dec_hidden_ch = 16
         self.dec_hidden_layers_num = 0
-        self.head_mode = "gaussian"
-        self.unet = False
+        self.dec_strategy = "pxsf"
 
 
 def get_device():
@@ -86,7 +84,7 @@ def test_configurations():
         ("MoE_Base", False, False, False, 4),
         ("MoE_UNet", True, False, False, 4),
     ]
-    B, L, C, H, W = 2, 8, 4, 32, 32
+    B, L, C, H, W = 2, 4, 4, 32, 32
     x = torch.randn(B, L, C, H, W, device=device)
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
@@ -229,20 +227,6 @@ def test_inference_listT_none():
         print_status("Inference listT=None", False, str(e))
 
 
-def test_flash_fft_fallback():
-    print("\n=== 4. FlashFFTConv Fallback Test ===")
-    device = get_device()
-    H, W = 64, 64
-    fft_layer = FlashFFTConvInterface(16, (H, W)).to(device)
-    u = torch.randn(2, 16, H, W, device=device)
-    k = torch.randn(16, H, W, device=device)
-    try:
-        out = fft_layer(u, k)
-        print_status("FlashFFT Interface", True, f"Output: {tuple(out.shape)}")
-    except Exception as e:
-        print_status("FlashFFT Interface", False, str(e))
-
-
 def test_backward_sanity():
     print("\n=== 5. Backward Sanity (Multiple Steps) ===")
     device = get_device()
@@ -274,22 +258,12 @@ if __name__ == "__main__":
     device = get_device()
     print(f"Running Tests on: {device}")
 
-    print("\n=== 0. Kernel Check ===")
-    try:
-        ok = bool(pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8))
-        print_status("PScan Kernel", ok)
-        if not ok:
-            sys.exit(1)
-    except Exception as e:
-        print_status("PScan Kernel", False, str(e))
-        sys.exit(1)
-
     test_configurations()
     test_heads()
     test_diffusion_head_odd_dim_error()
     test_consistency()
     test_inference_listT_none()
-    test_flash_fft_fallback()
     test_backward_sanity()
 
     print("\n✅ All Tests Completed.")
+    

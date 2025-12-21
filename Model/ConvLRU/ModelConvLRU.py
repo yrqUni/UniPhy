@@ -6,6 +6,12 @@ import torch.nn.functional as F
 from pscan import pscan
 
 
+def next_fast_len(size):
+    if size <= 2:
+        return size
+    return 1 << (size - 1).bit_length()
+
+
 def _kaiming_like_(tensor):
     nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
     return tensor
@@ -54,14 +60,6 @@ def pixel_shuffle_hw_3d(x, rH: int, rW: int):
     return x
 
 
-def pixel_unshuffle_hw_3d(x, rH: int, rW: int):
-    N, C, D, H, W = x.shape
-    x = x.view(N, C, D, H // rH, rH, W // rW, rW)
-    x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
-    x = x.view(N, C * rH * rW, D, H // rH, W // rW)
-    return x
-
-
 class SpatialLayerNorm(nn.Module):
     def __init__(self, H: int, W: int, eps: float = 1e-5, elementwise_affine: bool = True):
         super().__init__()
@@ -80,45 +78,10 @@ class SpatialLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() < 2:
             raise ValueError(f"SpatialLayerNorm expects tensor with >=2 dims, got {x.shape}")
-        H, W = x.shape[-2], x.shape[-1]
-        if int(H) != self.H or int(W) != self.W:
-            raise ValueError(f"SpatialLayerNorm got spatial {(int(H), int(W))}, expected {(self.H, self.W)}")
-        y = x.reshape(*x.shape[:-2], self.H * self.W)
+        orig_shape = x.shape
+        y = x.reshape(*x.shape[:-2], -1)
         y = F.layer_norm(y, (self.H * self.W,), self.weight, self.bias, self.eps)
-        return y.view_as(x)
-
-
-class FlashFFTConvInterface(nn.Module):
-    def __init__(self, dim, size):
-        super().__init__()
-        self.dim = dim
-        self.H, self.W = size
-        self.padded_H = 1 << (self.H - 1).bit_length()
-        if self.padded_H < self.H:
-            self.padded_H *= 2
-        self.padded_W = 1 << (self.W - 1).bit_length()
-        if self.padded_W < self.W:
-            self.padded_W *= 2
-        self.use_flash = False
-        try:
-            from flash_fft_conv import FlashFFTConv
-
-            self.flash_conv = FlashFFTConv(size, dtype=torch.bfloat16)
-            self.use_flash = True
-        except ImportError:
-            self.flash_conv = None
-
-    def forward(self, u, k):
-        if self.use_flash and self.flash_conv is not None:
-            return self.flash_conv(u, k)
-        B, C, H, W = u.shape
-        u_pad = F.pad(u, (0, self.padded_W - W, 0, self.padded_H - H))
-        k_pad = F.pad(k, (0, self.padded_W - W, 0, self.padded_H - H))
-        u_f = torch.fft.rfft2(u_pad.float())
-        k_f = torch.fft.rfft2(k_pad.float())
-        y_f = u_f * k_f
-        y = torch.fft.irfft2(y_f, s=(self.padded_H, self.padded_W))
-        return y[..., :H, :W].type_as(u)
+        return y.view(*orig_shape)
 
 
 class SpectralConv2d(nn.Module):
@@ -239,8 +202,10 @@ class SphericalHarmonicsPrior(nn.Module):
         if Y.dtype != x.dtype or Y.device != x.device:
             Y = Y.to(dtype=x.dtype, device=x.device)
         coeff = torch.matmul(self.W1, self.W2)
-        Yf = Y.view(self.K, H * W)
-        bias = torch.matmul(coeff, Yf).view(C, H, W)
+        Yf = Y.view(self.K, self.H * self.W)
+        bias = torch.matmul(coeff, Yf).view(C, self.H, self.W)
+        if (H, W) != (self.H, self.W):
+            bias = F.interpolate(bias.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False).squeeze(0)
         bias = (self.gain.view(C, 1, 1) * bias).view(1, 1, C, H, W)
         return x + bias
 
@@ -335,7 +300,7 @@ class GatedConvBlock(nn.Module):
 
 
 class SpatialPatchMoE(nn.Module):
-    def __init__(self, channels, hidden_size, num_experts, active_experts, use_cbam, cond_channels):
+    def __init__(self, channels, hidden_size, num_experts, active_experts, use_cbam, cond_channels=None):
         super().__init__()
         self.num_experts = int(num_experts)
         self.active_experts = int(active_experts)
@@ -376,15 +341,16 @@ class SpatialPatchMoE(nn.Module):
         logits = self.router(router_input)
         topk_logits, topk_indices = torch.topk(logits, self.active_experts, dim=1)
         topk_weights = F.softmax(topk_logits, dim=1)
-        full_weights = torch.zeros_like(logits)
-        full_weights.scatter_(1, topk_indices, topk_weights)
         final_output = torch.zeros_like(x_patches)
         for i, expert in enumerate(self.experts):
-            w_i = full_weights[:, i].view(-1, 1, 1, 1, 1)
-            if float(w_i.sum()) < 1e-6:
-                continue
-            expert_out = expert(x_patches, cond_patches)
-            final_output = final_output + w_i * expert_out
+            mask = topk_indices == i
+            if mask.any():
+                rows, cols = torch.where(mask)
+                weights = topk_weights[rows, cols].view(-1, 1, 1, 1, 1)
+                selected_x = x_patches[rows]
+                selected_cond = cond_patches[rows] if cond_patches is not None else None
+                expert_out = expert(selected_x, selected_cond)
+                final_output.index_add_(0, rows, weights * expert_out)
         output = final_output.view(B, nH, nW, C, L, P, P).permute(0, 3, 4, 1, 5, 2, 6).reshape(B, C, L, H_pad, W_pad)
         if pad_h > 0 or pad_w > 0:
             output = output[..., :H, :W]
@@ -392,19 +358,16 @@ class SpatialPatchMoE(nn.Module):
 
 
 class ConvLRULayer(nn.Module):
-    def __init__(self, args, input_downsp_shape):
+    def __init__(self, input_shape, emb_ch, lru_rank=32, use_selective=False, bidirectional=False, use_freq_prior=False, use_sh_prior=False, sh_config=None):
         super().__init__()
-        self.args = args
-        self.use_bias = True
+        self.emb_ch = int(emb_ch)
+        self.hidden_size = [int(input_shape[1]), int(input_shape[2])]
+        S, W = self.hidden_size
+        self.rank = int(min(S, W, lru_rank))
+        self.is_selective = bool(use_selective)
+        self.bidirectional = bool(bidirectional)
         self.r_min = 0.8
         self.r_max = 0.99
-        self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.hidden_size = [int(input_downsp_shape[1]), int(input_downsp_shape[2])]
-        S, W = self.hidden_size
-        self.rank = int(getattr(args, "lru_rank", min(S, W, 32)))
-        self.is_selective = bool(getattr(args, "use_selective", False))
-        self.bidirectional = bool(getattr(args, "bidirectional", False))
-        self.flash_fft = FlashFFTConvInterface(self.emb_ch, (S, W))
         u1 = torch.rand(self.emb_ch, self.rank)
         u2 = torch.rand(self.emb_ch, self.rank)
         nu_log = torch.log(-0.5 * torch.log(u1 * (self.r_max**2 - self.r_min**2) + self.r_min**2))
@@ -423,20 +386,20 @@ class ConvLRULayer(nn.Module):
         self.V_col = nn.Parameter(torch.randn(self.emb_ch, W, self.rank, dtype=torch.cfloat) / math.sqrt(W))
         C = self.emb_ch
         self.proj_W = nn.Parameter(torch.randn(C, C, dtype=torch.cfloat) / math.sqrt(C))
-        self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
-        self.post_ifft_conv_real = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1))
-        self.post_ifft_conv_imag = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1))
-        out_dim_fusion = self.emb_ch * 2 if not self.bidirectional else self.emb_ch * 4
-        self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
+        self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat))
+        self.post_ifft_conv_real = nn.Conv3d(C, C, kernel_size=(1, 3, 3), padding=(0, 1, 1))
+        self.post_ifft_conv_imag = nn.Conv3d(C, C, kernel_size=(1, 3, 3), padding=(0, 1, 1))
+        out_dim_fusion = C * 2 if not self.bidirectional else C * 4
+        self.post_ifft_proj = nn.Conv3d(out_dim_fusion, C, kernel_size=1, padding="same")
         self.layer_norm = SpatialLayerNorm(S, W)
         self.noise_level = nn.Parameter(torch.tensor(0.01))
-        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
-        self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, S, W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
-        if bool(getattr(args, "use_gate", False)):
-            self.gate_conv = nn.Sequential(
-                nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
-                nn.Sigmoid(),
+        self.freq_prior = SpectralConv2d(C, C, 8, 8) if use_freq_prior else None
+        if use_sh_prior and sh_config:
+            self.sh_prior = SphericalHarmonicsPrior(
+                channels=C, H=S, W=W, Lmax=sh_config.get("Lmax", 6), rank=sh_config.get("rank", 8), gain_init=sh_config.get("gain_init", 0.0)
             )
+        else:
+            self.sh_prior = None
         self.pscan = pscan
 
     def _apply_forcing(self, x, dt):
@@ -454,115 +417,133 @@ class ConvLRULayer(nn.Module):
 
     def _fft_impl(self, x):
         B, L, C, S, W = x.shape
-        pad_size = S // 4
+        target_S = next_fast_len(S)
+        target_W = next_fast_len(W)
+        pad_h_total = target_S - S
+        pad_w_total = target_W - W
+        pad_t = pad_h_total // 2
+        pad_b = pad_h_total - pad_t
+        pad_l = pad_w_total // 2
+        pad_r = pad_w_total - pad_l
         x = x.contiguous()
         x_reshaped = x.reshape(B * L, C, S, W)
-        x_pad = F.pad(x_reshaped, (0, 0, pad_size, pad_size), mode="reflect")
-        x_pad = x_pad.view(B, L, C, S + 2 * pad_size, W)
-        h = torch.fft.fft2(x_pad.to(torch.cfloat), dim=(-2, -1), norm="ortho")
-        return h, pad_size
+        if pad_w_total > 0:
+            feat_l = x_reshaped[..., -pad_l:] if pad_l > 0 else torch.empty(0, device=x.device)
+            feat_r = x_reshaped[..., :pad_r] if pad_r > 0 else torch.empty(0, device=x.device)
+            if pad_l > 0:
+                x_reshaped = torch.cat([feat_l, x_reshaped], dim=-1)
+            if pad_r > 0:
+                x_reshaped = torch.cat([x_reshaped, feat_r], dim=-1)
+        if pad_h_total > 0:
+            x_reshaped = F.pad(x_reshaped, (0, 0, pad_t, pad_b), mode="reflect")
+        h = torch.fft.fft2(x_reshaped.to(torch.cfloat), dim=(-2, -1), norm="ortho")
+        return h, (pad_t, pad_b, pad_l, pad_r)
 
     def forward(self, x, last_hidden_in, listT=None):
         B, L, C, S, W = x.size()
         if listT is None:
-            dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
+            dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=torch.float32)
         else:
-            dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
-        h, pad_size = self._fft_impl(x)
-        S_pad = h.shape[-2]
-        h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_pad * W, C)
-        h_proj = torch.matmul(h_perm, self.proj_W)
-        h = h_proj.view(B, L, S_pad, W, C).permute(0, 1, 4, 2, 3).contiguous()
-        if self.proj_b is not None:
-            h = h + self.proj_b.view(1, 1, C, 1, 1)
-        h_spatial = torch.fft.ifft2(h, dim=(-2, -1), norm="ortho")
-        if pad_size > 0:
-            h_spatial = h_spatial[..., pad_size:-pad_size, :]
-        h = torch.fft.fft2(h_spatial, dim=(-2, -1), norm="ortho")
-        if self.freq_prior is not None:
-            h = h + self.freq_prior(h)
-        Uc = self.U_row.conj()
-        t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
-        t = t.permute(0, 1, 2, 4, 3)
-        zq = torch.matmul(t, self.V_col)
-        nu_log, theta_log = self.params_log_base.unbind(dim=0)
-        disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-        nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
-        th_base = torch.exp(theta_log + disp_th).view(1, 1, C, self.rank, 1)
-        dnu_force, dth_force = self._apply_forcing(x, dt)
-        nu_t = torch.clamp(nu_base * dt + dnu_force, min=1e-6)
-        th_t = th_base * dt + dth_force
-        lamb = torch.exp(torch.complex(-nu_t, th_t))
-        if self.training:
-            noise_std = self.noise_level * torch.sqrt(dt + 1e-6)
-            noise = torch.randn_like(zq) * noise_std
-            x_in = zq + noise
-        else:
-            x_in = zq
-        gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
-        x_in = x_in * gamma_t
-        zero_prev = torch.zeros_like(x_in[:, :1])
-        if last_hidden_in is not None:
-            x_in_fwd = torch.cat([last_hidden_in, x_in], dim=1)
-        else:
-            x_in_fwd = torch.cat([zero_prev, x_in], dim=1)
-        lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
-        lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
-        z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())[:, 1:]
-        last_hidden_out = z_out[:, -1:]
-        if self.bidirectional:
-            x_in_bwd = x_in.flip(1)
-            lamb_bwd = lamb.flip(1)
-            x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
-            lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
-            lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-            z_out_bwd = self.pscan(lamb_in_bwd, x_in_bwd.contiguous())[:, 1:]
-            z_out_bwd = z_out_bwd.flip(1)
+            dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=torch.float32)
+        with torch.cuda.amp.autocast(enabled=False):
+            x_f32 = x.float()
+            h, pads = self._fft_impl(x_f32)
+            pad_t, pad_b, pad_l, pad_r = pads
+            S_pad, W_pad = h.shape[-2], h.shape[-1]
+            h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_pad * W_pad, C)
+            h_proj = torch.matmul(h_perm, self.proj_W.float())
+            h = h_proj.view(B, L, S_pad, W_pad, C).permute(0, 1, 4, 2, 3).contiguous()
+            if self.proj_b is not None:
+                h = h + self.proj_b.float().view(1, 1, C, 1, 1)
+            h_spatial = torch.fft.ifft2(h, dim=(-2, -1), norm="ortho")
+            if (pad_t + pad_b + pad_l + pad_r) > 0:
+                h_spatial = h_spatial[..., pad_t : S_pad - pad_b, pad_l : W_pad - pad_r]
+            h = torch.fft.fft2(h_spatial, dim=(-2, -1), norm="ortho")
+            if self.freq_prior is not None:
+                h = h + self.freq_prior(h)
+            Uc = self.U_row.conj().float()
+            t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
+            t = t.permute(0, 1, 2, 4, 3)
+            zq = torch.matmul(t, self.V_col.float())
+            nu_log, theta_log = self.params_log_base.float().unbind(dim=0)
+            disp_nu, disp_th = self.dispersion_mod.float().unbind(dim=0)
+            nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
+            th_base = torch.exp(theta_log + disp_th).view(1, 1, C, self.rank, 1)
+            dnu_force, dth_force = self._apply_forcing(x_f32, dt)
+            nu_t = torch.clamp(nu_base * dt + dnu_force, min=1e-5, max=5.0)
+            th_t = th_base * dt + dth_force
+            lamb = torch.exp(torch.complex(-nu_t, th_t))
+            if self.training:
+                noise_std = self.noise_level * torch.sqrt(dt + 1e-6)
+                noise = torch.randn_like(zq) * noise_std
+                x_in = zq + noise
+            else:
+                x_in = zq
+            gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
+            x_in = x_in * gamma_t
+            B_in, L_in, C_in, R_in, _ = x_in.shape
+            x_in_flat = x_in.view(B_in, L_in, -1)
+            lamb_flat = lamb.view(B_in, L_in, -1)
+            zero_prev = torch.zeros_like(x_in_flat[:, :1])
+            if last_hidden_in is not None:
+                last_h_flat = last_hidden_in.view(B_in, 1, -1)
+                x_in_fwd = torch.cat([last_h_flat, x_in_flat], dim=1)
+            else:
+                x_in_fwd = torch.cat([zero_prev, x_in_flat], dim=1)
+            lamb_fwd = torch.cat([lamb_flat[:, :1], lamb_flat], dim=1)
+            z_out_flat = self.pscan(lamb_fwd, x_in_fwd.contiguous())[:, 1:]
+            z_out = z_out_flat.view(B_in, L_in, C_in, R_in, 1)
+            last_hidden_out = z_out[:, -1:].detach()
 
-        def project_back(z):
-            t2 = torch.matmul(z, self.V_col.conj().transpose(1, 2))
-            t2 = t2.permute(0, 1, 2, 4, 3)
-            return torch.matmul(t2, self.U_row.transpose(1, 2)).permute(0, 1, 2, 4, 3)
+            def project_back(z):
+                t2 = torch.matmul(z, self.V_col.conj().float().transpose(1, 2))
+                t2 = t2.permute(0, 1, 2, 4, 3)
+                res = torch.matmul(t2, self.U_row.float().transpose(1, 2))
+                return res.permute(0, 1, 2, 4, 3)
 
-        h_rec_fwd = project_back(z_out)
+            h_rec_fwd = project_back(z_out)
 
-        def recover_spatial(h_rec):
-            h_sp = torch.fft.ifft2(h_rec, dim=(-2, -1), norm="ortho")
-            hr = self.post_ifft_conv_real(h_sp.real.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            hi = self.post_ifft_conv_imag(h_sp.imag.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            return torch.cat([hr, hi], dim=2)
+            def recover_spatial(h_rec):
+                h_sp = torch.fft.ifft2(h_rec, dim=(-2, -1), norm="ortho")
+                hr = self.post_ifft_conv_real(h_sp.real.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+                hi = self.post_ifft_conv_imag(h_sp.imag.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+                return torch.cat([hr, hi], dim=2)
 
-        feat_fwd = recover_spatial(h_rec_fwd)
-        if self.bidirectional:
-            h_rec_bwd = project_back(z_out_bwd)
-            feat_bwd = recover_spatial(h_rec_bwd)
-            feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
-        else:
-            feat_final = feat_fwd
-        h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-        if self.sh_prior is not None:
-            h_final = self.sh_prior(h_final)
-        h_final = self.layer_norm(h_final)
-        if hasattr(self, "gate_conv"):
-            gate = self.gate_conv(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            x = (1 - gate) * x + gate * h_final
-        else:
-            x = x + h_final
+            feat_fwd = recover_spatial(h_rec_fwd)
+            if self.bidirectional:
+                x_in_bwd = x_in.flip(1)
+                lamb_bwd = lamb.flip(1)
+                x_in_bwd_flat = x_in_bwd.view(B_in, L_in, -1)
+                lamb_bwd_flat = lamb_bwd.view(B_in, L_in, -1)
+                x_in_bwd_fwd = torch.cat([zero_prev, x_in_bwd_flat], dim=1)
+                lamb_bwd_fwd = torch.cat([lamb_bwd_flat[:, :1], lamb_bwd_flat], dim=1)
+                z_out_bwd_flat = self.pscan(lamb_bwd_fwd, x_in_bwd_fwd.contiguous())[:, 1:]
+                z_out_bwd = z_out_bwd_flat.view(B_in, L_in, C_in, R_in, 1).flip(1)
+                h_rec_bwd = project_back(z_out_bwd)
+                feat_bwd = recover_spatial(h_rec_bwd)
+                feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
+            else:
+                feat_final = feat_fwd
+            h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            if self.sh_prior is not None:
+                h_final = self.sh_prior(h_final)
+        h_final = h_final.type_as(x)
+        x = x + h_final
+        x = self.layer_norm(x)
         return x, last_hidden_out
 
 
 class FeedForward(nn.Module):
-    def __init__(self, args, input_downsp_shape):
+    def __init__(self, emb_ch, hidden_size, ffn_hidden_ch, layers_num=1, use_cbam=False, static_ch=0, num_expert=-1, activate_expert=2):
         super().__init__()
-        self.args = args
-        self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.ffn_hidden_ch = int(getattr(args, "ffn_hidden_ch", 32))
-        self.hidden_size = [int(input_downsp_shape[1]), int(input_downsp_shape[2])]
-        self.layers_num = int(getattr(args, "ffn_hidden_layers_num", 1))
-        self.use_cbam = bool(getattr(args, "use_cbam", False))
-        self.static_ch = int(getattr(args, "static_ch", 0))
-        self.num_expert = int(getattr(args, "num_expert", -1))
-        self.activate_expert = int(getattr(args, "activate_expert", 2))
+        self.emb_ch = int(emb_ch)
+        self.ffn_hidden_ch = int(ffn_hidden_ch)
+        self.hidden_size = [int(hidden_size[0]), int(hidden_size[1])]
+        self.layers_num = int(layers_num)
+        self.use_cbam = bool(use_cbam)
+        self.static_ch = int(static_ch)
+        self.num_expert = int(num_expert)
+        self.activate_expert = int(activate_expert)
         self.c_in = nn.Conv3d(self.emb_ch, self.ffn_hidden_ch, kernel_size=(1, 1, 1), padding="same")
         cond_ch = self.emb_ch if self.static_ch > 0 else None
         blocks = []
@@ -596,10 +577,10 @@ class FeedForward(nn.Module):
 
 
 class ConvLRUBlock(nn.Module):
-    def __init__(self, args, input_downsp_shape):
+    def __init__(self, emb_ch, input_shape, ffn_hidden_ch, ffn_layers_num, use_cbam, static_ch, num_expert, activate_expert, lru_rank, use_selective, bidirectional, use_freq_prior, use_sh_prior, sh_config):
         super().__init__()
-        self.lru_layer = ConvLRULayer(args, input_downsp_shape)
-        self.feed_forward = FeedForward(args, input_downsp_shape)
+        self.lru_layer = ConvLRULayer(input_shape, emb_ch, lru_rank, use_selective, bidirectional, use_freq_prior, use_sh_prior, sh_config)
+        self.feed_forward = FeedForward(emb_ch, input_shape[1:], ffn_hidden_ch, ffn_layers_num, use_cbam, static_ch, num_expert, activate_expert)
 
     def forward(self, x, last_hidden_in, listT=None, cond=None):
         x, last_hidden_out = self.lru_layer(x, last_hidden_in, listT=listT)
@@ -619,15 +600,10 @@ class VectorQuantizer(nn.Module):
     def forward(self, inputs):
         B, C, L, H, W = inputs.shape
         flat_input = inputs.permute(0, 2, 3, 4, 1).contiguous().view(-1, self.embedding_dim)
-        dist = (
-            torch.sum(flat_input**2, dim=1, keepdim=True)
-            + torch.sum(self.embedding.weight**2, dim=1)
-            - 2 * torch.matmul(flat_input, self.embedding.weight.t())
-        )
+        dist = torch.cdist(flat_input, self.embedding.weight, p=2.0)
         encoding_indices = torch.argmin(dist, dim=1).unsqueeze(1)
-        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
-        quantized = torch.matmul(encodings, self.embedding.weight).view(B, L, H, W, C).permute(0, 4, 1, 2, 3)
+        quantized_flat = self.embedding(encoding_indices.squeeze(1))
+        quantized = quantized_flat.view(B, L, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
         e_latent_loss = F.mse_loss(quantized.detach(), inputs)
         q_latent_loss = F.mse_loss(quantized, inputs.detach())
         loss = q_latent_loss + self.commitment_cost * e_latent_loss
@@ -658,21 +634,19 @@ class DiffusionHead(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, args, input_downsp_shape):
+    def __init__(self, head_mode, out_ch, emb_ch, dec_hidden_ch, dec_hidden_layers_num, static_ch, input_downsp_shape, dec_strategy, hidden_factor):
         super().__init__()
-        self.args = args
-        self.head_mode = getattr(args, "head_mode", "gaussian")
-        self.output_ch = int(getattr(args, "out_ch", 1))
-        self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.dec_hidden_ch = int(getattr(args, "dec_hidden_ch", 0))
-        self.dec_hidden_layers_num = int(getattr(args, "dec_hidden_layers_num", 0))
-        self.static_ch = int(getattr(args, "static_ch", 0))
+        self.head_mode = head_mode
+        self.output_ch = int(out_ch)
+        self.emb_ch = int(emb_ch)
+        self.dec_hidden_ch = int(dec_hidden_ch)
+        self.dec_hidden_layers_num = int(dec_hidden_layers_num)
+        self.static_ch = int(static_ch)
         self.hidden_size = [int(input_downsp_shape[1]), int(input_downsp_shape[2])]
-        self.dec_strategy = getattr(args, "dec_strategy", "pxsf")
-        hf = getattr(args, "hidden_factor", (2, 2))
-        self.rH, self.rW = int(hf[0]), int(hf[1])
+        self.dec_strategy = dec_strategy
+        self.rH, self.rW = int(hidden_factor[0]), int(hidden_factor[1])
         if self.dec_hidden_layers_num != 0:
-            self.dec_hidden_ch = int(getattr(args, "dec_hidden_ch", self.emb_ch))
+            self.dec_hidden_ch = int(dec_hidden_ch)
         out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
         if self.dec_strategy == "deconv":
             self.upsp = nn.ConvTranspose3d(
@@ -756,23 +730,28 @@ class Decoder(nn.Module):
 
 
 class ConvLRUModel(nn.Module):
-    def __init__(self, args, input_downsp_shape):
+    def __init__(self, emb_ch, input_downsp_shape, unet, convlru_num_blocks, ffn_hidden_ch, ffn_layers_num, use_cbam, static_ch, num_expert, activate_expert, lru_rank, use_selective, bidirectional, use_freq_prior, use_sh_prior, sh_config):
         super().__init__()
-        self.args = args
-        self.use_unet = bool(getattr(args, "unet", False))
-        layers = int(getattr(args, "convlru_num_blocks", 2))
+        self.use_unet = bool(unet)
+        layers = int(convlru_num_blocks)
         self.down_blocks = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         self.skip_convs = nn.ModuleList()
-        C = int(args.emb_ch)
+        self.convlru_blocks = nn.ModuleList()
+        C = int(emb_ch)
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
         if not self.use_unet:
-            self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
+            for _ in range(layers):
+                self.convlru_blocks.append(
+                    ConvLRUBlock(emb_ch, (C, H, W), ffn_hidden_ch, ffn_layers_num, use_cbam, static_ch, num_expert, activate_expert, lru_rank, use_selective, bidirectional, use_freq_prior, use_sh_prior, sh_config)
+                )
         else:
             curr_H, curr_W = H, W
             encoder_res = []
             for i in range(layers):
-                self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
+                self.down_blocks.append(
+                    ConvLRUBlock(emb_ch, (C, curr_H, curr_W), ffn_hidden_ch, ffn_layers_num, use_cbam, static_ch, num_expert, activate_expert, lru_rank, use_selective, bidirectional, use_freq_prior, use_sh_prior, sh_config)
+                )
                 encoder_res.append((curr_H, curr_W))
                 if i < layers - 1:
                     self.skip_convs.append(nn.Identity())
@@ -780,7 +759,9 @@ class ConvLRUModel(nn.Module):
                     curr_W //= 2
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
-                self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
+                self.up_blocks.append(
+                    ConvLRUBlock(emb_ch, (C, h_up, w_up), ffn_hidden_ch, ffn_layers_num, use_cbam, static_ch, num_expert, activate_expert, lru_rank, use_selective, bidirectional, use_freq_prior, use_sh_prior, sh_config)
+                )
             self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
             self.fusion = nn.Conv3d(C * 2, C, 1)
 
@@ -838,16 +819,15 @@ class ConvLRUModel(nn.Module):
 
 
 class Embedding(nn.Module):
-    def __init__(self, args):
+    def __init__(self, input_ch, input_size, emb_ch, emb_hidden_ch, emb_hidden_layers_num, static_ch, hidden_factor):
         super().__init__()
-        self.input_ch = int(getattr(args, "input_ch", 1))
-        self.input_size = getattr(args, "input_size", (64, 64))
-        self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.emb_hidden_ch = int(getattr(args, "emb_hidden_ch", 32))
-        self.emb_hidden_layers_num = int(getattr(args, "emb_hidden_layers_num", 0))
-        self.static_ch = int(getattr(args, "static_ch", 0))
-        hf = getattr(args, "hidden_factor", (2, 2))
-        self.rH, self.rW = int(hf[0]), int(hf[1])
+        self.input_ch = int(input_ch)
+        self.input_size = input_size
+        self.emb_ch = int(emb_ch)
+        self.emb_hidden_ch = int(emb_hidden_ch)
+        self.emb_hidden_layers_num = int(emb_hidden_layers_num)
+        self.static_ch = int(static_ch)
+        self.rH, self.rW = int(hidden_factor[0]), int(hidden_factor[1])
         self.patch_embed = nn.Conv3d(
             self.input_ch,
             self.emb_hidden_ch,
@@ -910,9 +890,68 @@ class ConvLRU(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.embedding = Embedding(self.args)
-        self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
-        self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
+        input_ch = int(getattr(args, "input_ch", 1))
+        input_size = getattr(args, "input_size", (64, 64))
+        emb_ch = int(getattr(args, "emb_ch", 32))
+        emb_hidden_ch = int(getattr(args, "emb_hidden_ch", 32))
+        emb_hidden_layers_num = int(getattr(args, "emb_hidden_layers_num", 0))
+        static_ch = int(getattr(args, "static_ch", 0))
+        hidden_factor = getattr(args, "hidden_factor", (2, 2))
+        self.embedding = Embedding(input_ch, input_size, emb_ch, emb_hidden_ch, emb_hidden_layers_num, static_ch, hidden_factor)
+        
+        unet = bool(getattr(args, "unet", False))
+        convlru_num_blocks = int(getattr(args, "convlru_num_blocks", 2))
+        ffn_hidden_ch = int(getattr(args, "ffn_hidden_ch", 32))
+        ffn_layers_num = int(getattr(args, "ffn_hidden_layers_num", 1))
+        use_cbam = bool(getattr(args, "use_cbam", False))
+        num_expert = int(getattr(args, "num_expert", -1))
+        activate_expert = int(getattr(args, "activate_expert", 2))
+        lru_rank = int(getattr(args, "lru_rank", 32))
+        use_selective = bool(getattr(args, "use_selective", False))
+        bidirectional = bool(getattr(args, "bidirectional", False))
+        use_freq_prior = bool(getattr(args, "use_freq_prior", False))
+        use_sh_prior = bool(getattr(args, "use_sh_prior", False))
+        sh_config = {
+            "Lmax": int(getattr(args, "sh_Lmax", 6)),
+            "rank": int(getattr(args, "sh_rank", 8)),
+            "gain_init": float(getattr(args, "sh_gain_init", 0.0)),
+        }
+        self.convlru_model = ConvLRUModel(
+            emb_ch,
+            self.embedding.input_downsp_shape,
+            unet,
+            convlru_num_blocks,
+            ffn_hidden_ch,
+            ffn_layers_num,
+            use_cbam,
+            static_ch,
+            num_expert,
+            activate_expert,
+            lru_rank,
+            use_selective,
+            bidirectional,
+            use_freq_prior,
+            use_sh_prior,
+            sh_config,
+        )
+
+        head_mode = getattr(args, "head_mode", "gaussian")
+        out_ch = int(getattr(args, "out_ch", 1))
+        dec_hidden_ch = int(getattr(args, "dec_hidden_ch", 0))
+        dec_hidden_layers_num = int(getattr(args, "dec_hidden_layers_num", 0))
+        dec_strategy = getattr(args, "dec_strategy", "pxsf")
+        self.decoder = Decoder(
+            head_mode,
+            out_ch,
+            emb_ch,
+            dec_hidden_ch,
+            dec_hidden_layers_num,
+            static_ch,
+            self.embedding.input_downsp_shape,
+            dec_strategy,
+            hidden_factor,
+        )
+        
         skip_contains = ["layer_norm", "params_log", "prior", "post_ifft", "spatial_mod", "forcing", "dispersion"]
         with torch.no_grad():
             for n, p in self.named_parameters():
