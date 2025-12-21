@@ -497,10 +497,10 @@ class ConvLRULayer(nn.Module):
 
         h_perm = h.permute(0, 1, 2, 4, 3)
         t0 = torch.matmul(h_perm, self.U_row)
-        t0 = t0 * scale_u.unsqueeze(-2)
+        t0 = t0 * scale_u
         t0 = t0.permute(0, 1, 2, 4, 3)
         zq = torch.matmul(t0, self.V_col)
-        zq = zq * scale_v.unsqueeze(-2)
+        zq = zq * scale_v
 
         if self.proj_b is not None:
              zq = zq + self.proj_b.view(1, 1, C, 1, 1)
@@ -544,11 +544,11 @@ class ConvLRULayer(nn.Module):
             z_out_bwd = None
 
         def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
-            t1 = torch.matmul(z, self.V_col.conj().transpose(1, 2))
-            t1 = t1 * sc_v.unsqueeze(-2)
+            z_scaled = z * sc_v
+            t1 = torch.matmul(z_scaled, self.V_col.conj().transpose(1, 2))
             t1 = t1.permute(0, 1, 2, 4, 3)
-            rec = torch.matmul(t1, self.U_row.transpose(1, 2))
-            rec = rec * sc_u.unsqueeze(-2)
+            t1_scaled = t1 * sc_u
+            rec = torch.matmul(t1_scaled, self.U_row.transpose(1, 2))
             rec = rec.permute(0, 1, 2, 4, 3)
             return rec
 
