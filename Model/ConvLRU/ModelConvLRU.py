@@ -315,32 +315,24 @@ class SpatialPatchMoE(nn.Module):
                 cond = F.pad(cond, (0, pad_w, 0, pad_h))
         H_pad, W_pad = x.shape[-2:]
         nH, nW = H_pad // P, W_pad // P
-        
-        # [B, C, L, nH, P, nW, P] -> [B, L, nH, nW, C, 1, P, P]
         x_patches = x.view(B, C, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, C, 1, P, P)
-        
-        # Router: [Total_Instances, C] -> [B*L*nH*nW, Experts]
         router_in = x_patches.mean(dim=(2, 3, 4))
-        
         if cond is not None:
             if cond.dim() == 4:
                 cond_patches = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
                 cond_patches = cond_patches.view(B, -1, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, cond.size(1), 1, P, P)
             else:
-                # If cond is 5D [B, C, L, H, W]
                 cond_patches = cond.view(B, -1, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, cond.size(1), 1, P, P)
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_in, router_cond], dim=1)
         else:
             cond_patches = None
             router_input = router_in
-            
         logits = self.router(router_input)
         topk_logits, topk_indices = torch.topk(logits, self.active_experts, dim=1)
         topk_weights = F.softmax(topk_logits, dim=1)
         full_weights = torch.zeros_like(logits)
         full_weights.scatter_(1, topk_indices, topk_weights)
-        
         final_output = 0
         for i, expert in enumerate(self.experts):
             w_i = full_weights[:, i].view(-1, 1, 1, 1, 1)
@@ -348,11 +340,8 @@ class SpatialPatchMoE(nn.Module):
                 continue
             expert_out = expert(x_patches, cond_patches)
             final_output += w_i * expert_out
-            
-        # [B*L*nH*nW, C, 1, P, P] -> [B, L, nH, nW, C, P, P] -> [B, C, L, H, W]
         output = final_output.view(B, L, nH, nW, C, P, P).permute(0, 4, 1, 2, 5, 3, 6)
         output = output.reshape(B, C, L, H_pad, W_pad)
-        
         if pad_h > 0 or pad_w > 0:
             output = output[..., :H, :W]
         return output
@@ -470,9 +459,7 @@ class ConvLRULayer(nn.Module):
             x_in = zq
         gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
         x_in = x_in.permute(0, 2, 1, 3, 4).contiguous()
-        gamma_t = gamma_t.permute(0, 2, 1, 3, 4).contiguous()
         x_in = x_in * gamma_t
-        x_in = x_in.permute(0, 2, 1, 3, 4).contiguous()
         if last_hidden_in is not None:
             prev_state = last_hidden_in
             x_in_fwd = torch.concat([prev_state, x_in], dim=2)
@@ -521,18 +508,18 @@ class ConvLRULayer(nn.Module):
             h_sp = torch.fft.ifft2(h_rec, dim=(-2, -1), norm="ortho")
             hr = self.post_ifft_conv_real(h_sp.real.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             hi = self.post_ifft_conv_imag(h_sp.imag.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            return torch.cat([hr, hi], dim=2)
+            return torch.cat([hr, hi], dim=1)
 
         feat_fwd = recover_spatial(h_rec_fwd)
         
         if self.bidirectional:
             h_rec_bwd = project_back(z_out_bwd)
             feat_bwd = recover_spatial(h_rec_bwd)
-            feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
+            feat_final = torch.cat([feat_fwd, feat_bwd], dim=1)
         else:
             feat_final = feat_fwd
             
-        h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+        h_final = self.post_ifft_proj(feat_final)
         if self.sh_prior:
             h_final = self.sh_prior(h_final)
         h_final = self.layer_norm(h_final)
