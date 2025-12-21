@@ -288,6 +288,55 @@ class GatedConvBlock(nn.Module):
         x = self.pw_conv_out(x)
         return residual + x
 
+class SpatialMoE(nn.Module):
+    def __init__(self, channels, hidden_size, num_experts, active_experts, use_cbam, cond_channels):
+        super().__init__()
+        self.num_experts = num_experts
+        self.active_experts = active_experts
+        self.experts = nn.ModuleList([
+            GatedConvBlock(channels, hidden_size, use_cbam=use_cbam, cond_channels=cond_channels)
+            for _ in range(num_experts)
+        ])
+        # Router input dim: channels + (cond_channels if cond else 0)
+        router_in_dim = channels
+        if cond_channels is not None:
+            router_in_dim += cond_channels
+        self.router = nn.Conv3d(router_in_dim, num_experts, kernel_size=1)
+
+    def forward(self, x, cond=None):
+        # x: [B, C, L, H, W]
+        # cond: [B, C_cond, L, H, W] or broadcastable
+        
+        # 1. Prepare Router Input (Concat x and cond for location awareness)
+        if cond is not None:
+            if cond.dim() == 4:
+                cond_in = cond.unsqueeze(2).expand(-1, -1, x.size(2), -1, -1)
+            else:
+                cond_in = cond
+            router_input = torch.cat([x, cond_in], dim=1)
+        else:
+            router_input = x
+            
+        # 2. Compute Router Logits & Top-K
+        logits = self.router(router_input) # [B, Experts, L, H, W]
+        topk_logits, topk_indices = torch.topk(logits, self.active_experts, dim=1)
+        topk_weights = F.softmax(topk_logits, dim=1)
+        
+        # 3. Create Full Weight Map (Sparse -> Dense)
+        full_weights = torch.zeros_like(logits)
+        full_weights.scatter_(1, topk_indices, topk_weights)
+        
+        # 4. Weighted Sum of Experts
+        output = 0
+        for i, expert in enumerate(self.experts):
+            weight_i = full_weights[:, i:i+1]
+            if weight_i.abs().sum() == 0:
+                continue
+            expert_out = expert(x, cond)
+            output += weight_i * expert_out
+            
+        return output
+
 class ConvLRULayer(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
@@ -465,17 +514,41 @@ class ConvLRULayer(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, args, input_downsp_shape):
         super().__init__()
+        self.args = args
         self.emb_ch = getattr(args, "emb_ch", 32)
         self.ffn_hidden_ch = getattr(args, "ffn_hidden_ch", 32)
         self.hidden_size = [input_downsp_shape[1], input_downsp_shape[2]]
         self.layers_num = getattr(args, "ffn_hidden_layers_num", 1)
         self.use_cbam = bool(getattr(args, "use_cbam", False))
         self.static_ch = int(getattr(args, "static_ch", 0))
+        self.num_expert = int(getattr(args, "num_expert", -1))
+        self.activate_expert = int(getattr(args, "activate_expert", 2))
+        
         self.c_in = nn.Conv3d(self.emb_ch, self.ffn_hidden_ch, kernel_size=(1, 1, 1), padding="same")
-        self.blocks = nn.ModuleList([
-            GatedConvBlock(self.ffn_hidden_ch, self.hidden_size, use_cbam=self.use_cbam, cond_channels=self.emb_ch if self.static_ch > 0 else None)
-            for _ in range(self.layers_num)
-        ])
+        
+        blocks_list = []
+        cond_ch = self.emb_ch if self.static_ch > 0 else None
+        
+        for _ in range(self.layers_num):
+            if self.num_expert > 1:
+                block = SpatialMoE(
+                    self.ffn_hidden_ch, 
+                    self.hidden_size, 
+                    self.num_expert, 
+                    self.activate_expert, 
+                    self.use_cbam, 
+                    cond_ch
+                )
+            else:
+                block = GatedConvBlock(
+                    self.ffn_hidden_ch, 
+                    self.hidden_size, 
+                    use_cbam=self.use_cbam, 
+                    cond_channels=cond_ch
+                )
+            blocks_list.append(block)
+            
+        self.blocks = nn.ModuleList(blocks_list)
         self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.act = nn.SiLU()
 
@@ -821,4 +894,3 @@ class ConvLRU(nn.Module):
                 x_step_mean = x_step_dist
             out.append(x_step_dist)
         return torch.concat(out, dim=1)
-    

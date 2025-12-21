@@ -39,6 +39,8 @@ class MockArgs:
         self.bidirectional = False
         self.use_selective = False
         self.head_mode = "gaussian"
+        self.num_expert = -1 
+        self.activate_expert = 2
 
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,23 +55,27 @@ def test_configurations():
     print("\n=== 1. Architecture Combinations Test ===")
     device = get_device()
     configs = [
-        ("Base_Flat", False, False, False),
-        ("UNet_Only", True, False, False),
-        ("BiDir_Only", False, True, False),
-        ("Selective_Only", False, False, True),
-        ("Full_Advanced", True, True, True),
+        ("Base_Flat", False, False, False, -1),
+        ("UNet_Only", True, False, False, -1),
+        ("BiDir_Only", False, True, False, -1),
+        ("Selective_Only", False, False, True, -1),
+        ("Full_Advanced", True, True, True, -1),
+        ("MoE_Base", False, False, False, 4),
+        ("MoE_UNet", True, False, False, 4),
     ]
     B, L, C, H, W = 2, 8, 4, 32, 32
     x = torch.randn(B, L, C, H, W, device=device)
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
     
-    for name, unet, bidir, sel in configs:
+    for name, unet, bidir, sel, n_exp in configs:
         try:
             args = MockArgs()
             args.unet = unet
             args.bidirectional = bidir
             args.use_selective = sel
+            args.num_expert = n_exp
+            
             model = ConvLRU(args).to(device)
             out = model(x, mode='p', listT=listT, static_feats=static)
             expected_C = args.out_ch * 2
@@ -124,6 +130,8 @@ def test_consistency():
     args = MockArgs()
     args.unet = True 
     args.bidirectional = False 
+    args.num_expert = 4
+    
     model = ConvLRU(args).to(device)
     model.eval()
     B, L, C, H, W = 1, 6, 4, 32, 32
