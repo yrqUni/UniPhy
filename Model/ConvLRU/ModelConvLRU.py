@@ -459,7 +459,6 @@ class ConvLRULayer(nn.Module):
             x_in = zq
         gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
         x_in = x_in.permute(0, 2, 1, 3, 4).contiguous()
-        gamma_t = gamma_t.permute(0, 2, 1, 3, 4).contiguous()
         x_in = x_in * gamma_t
         x_in = x_in.permute(0, 2, 1, 3, 4).contiguous()
         if last_hidden_in is not None:
