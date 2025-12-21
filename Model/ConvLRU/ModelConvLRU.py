@@ -352,7 +352,6 @@ class ConvLRULayer(nn.Module):
     def _fft_impl(self, x):
         B, L, C, S, W = x.shape
         pad_size = S // 4
-        # [FIX] Force contiguous for torch.compile compat
         x = x.contiguous()
         x_reshaped = x.reshape(B * L, C, S, W)
         x_pad = F.pad(x_reshaped, (0, 0, pad_size, pad_size), mode='reflect')
@@ -412,8 +411,8 @@ class ConvLRULayer(nn.Module):
                 x_in_fwd = x_in
                 lamb_fwd = lamb
         L_eff = x_in_fwd.size(1)
-        lamb_in_fwd = lamb_fwd[:, :L_eff].expand_as(x_in_fwd)
-        z_out = self.pscan(lamb_in_fwd.contiguous(), x_in_fwd.contiguous())
+        lamb_in_fwd = lamb_fwd[:, :L_eff].expand_as(x_in_fwd).contiguous()
+        z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())
         if last_hidden_in is not None or (last_hidden_in is None and L == 1):
             z_out = z_out[:, 1:]
         last_hidden_out = z_out[:, -1:]
@@ -424,8 +423,8 @@ class ConvLRULayer(nn.Module):
                  x_in_bwd = torch.cat([torch.zeros_like(x_in_bwd[:,:1]), x_in_bwd], dim=1)
                  lamb_bwd = torch.cat([lamb_bwd[:,:1], lamb_bwd], dim=1)
             L_eff_b = x_in_bwd.size(1)
-            lamb_in_bwd = lamb_bwd[:, :L_eff_b].expand_as(x_in_bwd)
-            z_out_bwd = self.pscan(lamb_in_bwd.contiguous(), x_in_bwd.contiguous())
+            lamb_in_bwd = lamb_bwd[:, :L_eff_b].expand_as(x_in_bwd).contiguous()
+            z_out_bwd = self.pscan(lamb_in_bwd, x_in_bwd.contiguous())
             if L == 1:
                 z_out_bwd = z_out_bwd[:, 1:]
             z_out_bwd = z_out_bwd.flip(1)
@@ -822,3 +821,4 @@ class ConvLRU(nn.Module):
                 x_step_mean = x_step_dist
             out.append(x_step_dist)
         return torch.concat(out, dim=1)
+    
