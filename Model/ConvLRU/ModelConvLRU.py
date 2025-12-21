@@ -437,7 +437,6 @@ class ConvLRULayer(nn.Module):
         if pad_h_total > 0:
             x_reshaped = F.pad(x_reshaped, (0, 0, pad_t, pad_b), mode="reflect")
         h = torch.fft.fft2(x_reshaped.to(torch.cfloat), dim=(-2, -1), norm="ortho")
-        # 修正：将 (B*L, C, H, W) 还原为 (B, L, C, H, W)
         h = h.view(B, L, C, h.shape[-2], h.shape[-1])
         return h, (pad_t, pad_b, pad_l, pad_r)
 
@@ -447,27 +446,30 @@ class ConvLRULayer(nn.Module):
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=torch.float32)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=torch.float32)
-        # 修正：更新 autocast 语法
         with torch.amp.autocast("cuda", enabled=False):
             x_f32 = x.float()
             h, pads = self._fft_impl(x_f32)
             pad_t, pad_b, pad_l, pad_r = pads
             S_pad, W_pad = h.shape[-2], h.shape[-1]
             h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_pad * W_pad, C)
-            h_proj = torch.matmul(h_perm, self.proj_W.float())
+            # 修正点1：直接使用复数参数，不转float
+            h_proj = torch.matmul(h_perm, self.proj_W)
             h = h_proj.view(B, L, S_pad, W_pad, C).permute(0, 1, 4, 2, 3).contiguous()
             if self.proj_b is not None:
-                h = h + self.proj_b.float().view(1, 1, C, 1, 1)
+                # 修正点2：直接使用复数参数
+                h = h + self.proj_b.view(1, 1, C, 1, 1)
             h_spatial = torch.fft.ifft2(h, dim=(-2, -1), norm="ortho")
             if (pad_t + pad_b + pad_l + pad_r) > 0:
                 h_spatial = h_spatial[..., pad_t : S_pad - pad_b, pad_l : W_pad - pad_r]
             h = torch.fft.fft2(h_spatial, dim=(-2, -1), norm="ortho")
             if self.freq_prior is not None:
                 h = h + self.freq_prior(h)
-            Uc = self.U_row.conj().float()
+            # 修正点3：直接使用复数参数
+            Uc = self.U_row.conj()
             t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
             t = t.permute(0, 1, 2, 4, 3)
-            zq = torch.matmul(t, self.V_col.float())
+            # 修正点4：直接使用复数参数
+            zq = torch.matmul(t, self.V_col)
             nu_log, theta_log = self.params_log_base.float().unbind(dim=0)
             disp_nu, disp_th = self.dispersion_mod.float().unbind(dim=0)
             nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
@@ -499,9 +501,11 @@ class ConvLRULayer(nn.Module):
             last_hidden_out = z_out[:, -1:].detach()
 
             def project_back(z):
-                t2 = torch.matmul(z, self.V_col.conj().float().transpose(1, 2))
+                # 修正点5：直接使用复数参数
+                t2 = torch.matmul(z, self.V_col.conj().transpose(1, 2))
                 t2 = t2.permute(0, 1, 2, 4, 3)
-                res = torch.matmul(t2, self.U_row.float().transpose(1, 2))
+                # 修正点6：直接使用复数参数
+                res = torch.matmul(t2, self.U_row.transpose(1, 2))
                 return res.permute(0, 1, 2, 4, 3)
 
             h_rec_fwd = project_back(z_out)
