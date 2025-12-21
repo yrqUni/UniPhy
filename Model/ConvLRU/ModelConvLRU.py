@@ -352,6 +352,8 @@ class ConvLRULayer(nn.Module):
     def _fft_impl(self, x):
         B, L, C, S, W = x.shape
         pad_size = S // 4
+        # [FIX] Force contiguous for torch.compile compat
+        x = x.contiguous()
         x_reshaped = x.reshape(B * L, C, S, W)
         x_pad = F.pad(x_reshaped, (0, 0, pad_size, pad_size), mode='reflect')
         x_pad = x_pad.view(B, L, C, S + 2 * pad_size, W)
