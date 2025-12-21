@@ -91,33 +91,6 @@ def lat_even_crop_5d(x_ext: torch.Tensor, H: int) -> torch.Tensor:
     return x_ext[:, :, :, :H, :]
 
 
-class FlashFFTConvInterface(nn.Module):
-    def __init__(self, dim: int, size: Tuple[int, int]):
-        super().__init__()
-        self.dim = int(dim)
-        self.H, self.W = int(size[0]), int(size[1])
-        self.use_flash = False
-        self.flash_conv = None
-        try:
-            from flash_fft_conv import FlashFFTConv  # type: ignore
-
-            self.flash_conv = FlashFFTConv(size, dtype=torch.bfloat16)
-            self.use_flash = True
-        except Exception:
-            self.use_flash = False
-            self.flash_conv = None
-
-    def forward(self, u: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        if self.use_flash and self.flash_conv is not None:
-            return self.flash_conv(u, k)
-        B, C, H, W = u.shape
-        u_f = torch.fft.rfft2(u.float(), dim=(-2, -1), norm="ortho")
-        k_f = torch.fft.rfft2(k.float(), dim=(-2, -1), norm="ortho")
-        y_f = u_f * k_f
-        y = torch.fft.irfft2(y_f, s=(H, W), dim=(-2, -1), norm="ortho")
-        return y.to(dtype=u.dtype)
-
-
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
         super().__init__()
@@ -433,8 +406,6 @@ class ConvLRULayer(nn.Module):
         self.rank = int(getattr(args, "lru_rank", min(self.S_ext, self.W, 32)))
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.bidirectional = bool(getattr(args, "bidirectional", False))
-
-        self.flash_fft = FlashFFTConvInterface(self.emb_ch, (self.S_ext, self.W))
 
         u1 = torch.rand(self.emb_ch, self.rank)
         u2 = torch.rand(self.emb_ch, self.rank)
