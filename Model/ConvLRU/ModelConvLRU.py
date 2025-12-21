@@ -298,7 +298,7 @@ class GatedConvBlock(nn.Module):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.dw_conv = nn.Conv3d(int(channels), int(channels), kernel_size=(1, 7, 7), padding="same", groups=int(channels))
-        self.norm = nn.LayerNorm([int(hidden_size[0]), int(hidden_size[1])])
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=int(channels), affine=True)
         self.cond_channels = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels, int(channels) * 2, kernel_size=1) if self.cond_channels > 0 else None
         self.pw_conv_in = nn.Conv3d(int(channels), int(channels) * 2, kernel_size=1)
@@ -309,9 +309,7 @@ class GatedConvBlock(nn.Module):
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
         x = self.dw_conv(x)
-        x = x.permute(0, 2, 1, 3, 4)
         x = self.norm(x)
-        x = x.permute(0, 2, 1, 3, 4).contiguous()
 
         if self.cond_proj is not None and cond is not None:
             if cond.dim() == 4:
@@ -467,7 +465,8 @@ class ConvLRULayer(nn.Module):
         out_dim_fusion = self.emb_ch * 2 if not self.bidirectional else self.emb_ch * 4
         self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
 
-        self.layer_norm = nn.LayerNorm([self.S, self.W])
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=self.emb_ch, affine=True)
+
         self.noise_level = nn.Parameter(torch.tensor(0.01))
 
         self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
@@ -597,7 +596,7 @@ class ConvLRULayer(nn.Module):
         if self.sh_prior is not None:
             h_final = self.sh_prior(h_final)
 
-        h_final = self.layer_norm(h_final)
+        h_final = self.norm(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
 
         if self.gate_conv is not None:
             gate = self.gate_conv(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
@@ -752,10 +751,10 @@ class Decoder(nn.Module):
             self.upsp = None
 
         if self.dec_hidden_layers_num != 0:
-            H = self.hidden_size[0] * self.rH
-            W = self.hidden_size[1] * self.rW
             cond_ch = self.emb_ch if self.static_ch > 0 else None
-            self.c_hidden = nn.ModuleList([GatedConvBlock(out_ch_after_up, (H, W), use_cbam=False, cond_channels=cond_ch) for _ in range(self.dec_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList(
+                [GatedConvBlock(out_ch_after_up, (1, 1), use_cbam=False, cond_channels=cond_ch) for _ in range(self.dec_hidden_layers_num)]
+            )
         else:
             self.c_hidden = None
 
@@ -954,7 +953,7 @@ class Embedding(nn.Module):
 
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
-        self.layer_norm = nn.LayerNorm([self.hidden_size[0], self.hidden_size[1]])
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=self.emb_ch, affine=True)
 
     def forward(self, x: torch.Tensor, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = x.permute(0, 2, 1, 3, 4).contiguous()
@@ -970,8 +969,8 @@ class Embedding(nn.Module):
                 x = layer(x, cond=cond)
 
         x = self.c_out(x)
+        x = self.norm(x)
         x = x.permute(0, 2, 1, 3, 4).contiguous()
-        x = self.layer_norm(x)
         return x, cond
 
 
@@ -983,7 +982,7 @@ class ConvLRU(nn.Module):
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
 
-        skip_contains = ["layer_norm", "params_log", "prior", "post_ifft", "forcing", "dispersion"]
+        skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion"]
         with torch.no_grad():
             for n, p in self.named_parameters():
                 if any(tok in n for tok in skip_contains):
