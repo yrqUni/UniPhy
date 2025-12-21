@@ -1,22 +1,20 @@
 import os
 import sys
-import math
 import random
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT, "Model", "ConvLRU")
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
-from ModelConvLRU import ConvLRU  # noqa: E402
+from ModelConvLRU import ConvLRU
 
 try:
-    from pscan import pscan_check  # noqa: E402
+    from pscan import pscan_check
 except Exception:
     pscan_check = None
 
@@ -37,7 +35,7 @@ def enable_tf32(enable: bool = True):
         torch.set_float32_matmul_precision("high" if enable else "highest")
 
 
-def get_device():
+def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -85,6 +83,12 @@ class MockArgs:
         self.dec_strategy = "pxsf"
 
 
+def expected_out_channels(args: MockArgs) -> int:
+    if str(args.head_mode).lower() == "gaussian":
+        return int(args.out_ch) * 2
+    return int(args.out_ch)
+
+
 def make_inputs(
     device: torch.device,
     B: int,
@@ -94,18 +98,12 @@ def make_inputs(
     W: int,
     static_ch: int,
     dtype: torch.dtype,
-):
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     x = torch.randn(B, L, C, H, W, device=device, dtype=dtype)
     static = None
     if static_ch > 0:
         static = torch.randn(B, static_ch, H, W, device=device, dtype=dtype)
     return x, static
-
-
-def expected_out_channels(args: MockArgs) -> int:
-    if str(args.head_mode).lower() == "gaussian":
-        return int(args.out_ch) * 2
-    return int(args.out_ch)
 
 
 def test_pscan_kernel():
@@ -145,6 +143,7 @@ def test_configurations():
         for dtype in dtypes:
             x, static = make_inputs(device, B, L, C, H, W, static_ch=2, dtype=dtype)
             listT = torch.ones(B, L, device=device, dtype=dtype)
+
             for name, unet, bidir, sel, n_exp in configs:
                 tag = f"{name}|B{B}L{L}|{str(dtype).replace('torch.', '')}"
                 try:
@@ -155,12 +154,18 @@ def test_configurations():
                     args.num_expert = int(n_exp)
                     model = ConvLRU(args).to(device)
                     model.train()
-                    out = model(x, mode="p", listT=listT, static_feats=static)
-                    expC = expected_out_channels(args)
-                    exp_shape = (B, L, expC, H, W)
-                    if not isinstance(out, torch.Tensor) or tuple(out.shape) != exp_shape:
-                        raise ValueError(f"Shape mismatch: got {tuple(out.shape) if isinstance(out, torch.Tensor) else type(out)} expected {exp_shape}")
-                    loss = out.float().pow(2).mean()
+
+                    use_amp = device.type == "cuda" and dtype == torch.float16
+                    with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.float16):
+                        out = model(x, mode="p", listT=listT, static_feats=static)
+                        expC = expected_out_channels(args)
+                        exp_shape = (B, L, expC, H, W)
+                        if not isinstance(out, torch.Tensor) or tuple(out.shape) != exp_shape:
+                            raise ValueError(
+                                f"Shape mismatch: got {tuple(out.shape) if isinstance(out, torch.Tensor) else type(out)} expected {exp_shape}"
+                            )
+                        loss = out.float().pow(2).mean()
+
                     loss.backward()
                     print_status(tag, True, f"Params: {count_params(model)}")
                 except Exception as e:
@@ -223,10 +228,7 @@ def test_listT_none_all_modes():
     x = torch.randn(B, L, C, H, W, device=device, dtype=torch.float32)
     static = torch.randn(B, 2, H, W, device=device, dtype=torch.float32)
 
-    configs = [
-        ("Flat", False),
-        ("UNet", True),
-    ]
+    configs = [("Flat", False), ("UNet", True)]
     for name, unet in configs:
         try:
             args = MockArgs()
@@ -276,7 +278,14 @@ def test_consistency_step1():
 
     with torch.no_grad():
         out_p_step1 = model(start_frame, mode="p", listT=listT[:, 0:1], static_feats=static)
-        out_i = model(start_frame, mode="i", out_gen_num=L, listT=listT[:, 0:1], listT_future=future_T, static_feats=static)
+        out_i = model(
+            start_frame,
+            mode="i",
+            out_gen_num=L,
+            listT=listT[:, 0:1],
+            listT_future=future_T,
+            static_feats=static,
+        )
 
     shape_ok = tuple(out_p_step1.shape) == tuple(out_i[:, 0:1].shape)
     diff = (out_p_step1[:, 0] - out_i[:, 0]).abs().max().item() if shape_ok else float("inf")
@@ -300,7 +309,7 @@ def test_backward_sanity():
     listT = torch.ones(B, L, device=device, dtype=torch.float32)
 
     try:
-        for step in range(3):
+        for _ in range(3):
             opt.zero_grad(set_to_none=True)
             out = model(x, mode="p", listT=listT, static_feats=static)
             loss = out.float().pow(2).mean()
@@ -312,8 +321,8 @@ def test_backward_sanity():
         print_status("Backward/Step", False, str(e))
 
 
-def test_large_hw_accuracy_paths():
-    print("\n=== 6. Large H,W (Accuracy-Oriented) Smoke ===")
+def test_large_hw_smoke():
+    print("\n=== 6. Large H,W Smoke ===")
     device = get_device()
     args = MockArgs()
     args.input_size = (721, 1440)
@@ -343,7 +352,6 @@ def test_large_hw_accuracy_paths():
     H, W = args.input_size
     x = torch.randn(B, L, C, H, W, device=device, dtype=torch.float32)
     static = torch.randn(B, args.static_ch, H, W, device=device, dtype=torch.float32)
-
     listT = torch.ones(B, L, device=device, dtype=torch.float32)
 
     try:
@@ -353,8 +361,6 @@ def test_large_hw_accuracy_paths():
             out = model(x, mode="p", listT=listT, static_feats=static)
         ok = isinstance(out, torch.Tensor) and tuple(out.shape) == (B, L, args.out_ch * 2, H, W)
         print_status("Large p forward", ok, f"Shape: {tuple(out.shape)}")
-    except RuntimeError as e:
-        print_status("Large p forward", False, str(e))
     except Exception as e:
         print_status("Large p forward", False, str(e))
 
@@ -372,6 +378,6 @@ if __name__ == "__main__":
     test_listT_none_all_modes()
     test_consistency_step1()
     test_backward_sanity()
-    test_large_hw_accuracy_paths()
+    test_large_hw_smoke()
 
     print("\n✅ All Tests Completed.")

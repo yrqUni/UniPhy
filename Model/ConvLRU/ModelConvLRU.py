@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -66,27 +66,31 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
 
 
 def lat_even_extend_4d(x: torch.Tensor) -> torch.Tensor:
-    B, C, H, W = x.shape
-    if H < 2:
+    if x.dim() != 4:
+        raise ValueError(f"lat_even_extend_4d expects 4D tensor, got {x.dim()}D")
+    H = x.size(-2)
+    if H <= 2:
         return x
-    tail = x[:, :, -2:0:-1, :]
-    return torch.cat([x, tail], dim=2)
+    tail = torch.flip(x[..., 1:-1, :], dims=[-2])
+    return torch.cat([x, tail], dim=-2)
 
 
 def lat_even_extend_5d(x: torch.Tensor) -> torch.Tensor:
-    B, L, C, H, W = x.shape
-    if H < 2:
+    if x.dim() != 5:
+        raise ValueError(f"lat_even_extend_5d expects 5D tensor, got {x.dim()}D")
+    H = x.size(-2)
+    if H <= 2:
         return x
-    tail = x[:, :, :, -2:0:-1, :]
-    return torch.cat([x, tail], dim=3)
+    tail = torch.flip(x[..., 1:-1, :], dims=[-2])
+    return torch.cat([x, tail], dim=-2)
 
 
 def lat_even_crop_4d(x_ext: torch.Tensor, H: int) -> torch.Tensor:
-    return x_ext[:, :, :H, :]
+    return x_ext[..., :H, :]
 
 
 def lat_even_crop_5d(x_ext: torch.Tensor, H: int) -> torch.Tensor:
-    return x_ext[:, :, :, :H, :]
+    return x_ext[..., :H, :]
 
 
 class FlashFFTConvInterface(nn.Module):
@@ -124,8 +128,26 @@ class SpectralConv2d(nn.Module):
         self.modes1 = int(modes1)
         self.modes2 = int(modes2)
         scale = 1.0 / max(1, (self.in_channels * self.out_channels))
-        self.weights1 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
-        self.weights2 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        self.weights1 = nn.Parameter(
+            scale
+            * torch.randn(
+                self.in_channels,
+                self.out_channels,
+                self.modes1,
+                self.modes2,
+                dtype=torch.cfloat,
+            )
+        )
+        self.weights2 = nn.Parameter(
+            scale
+            * torch.randn(
+                self.in_channels,
+                self.out_channels,
+                self.modes1,
+                self.modes2,
+                dtype=torch.cfloat,
+            )
+        )
 
     @staticmethod
     def _cmul(input_: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -207,7 +229,9 @@ class SphericalHarmonicsPrior(nn.Module):
 
         for m in range(1, Lmax):
             m_f = torch.tensor(m, device=device, dtype=dtype)
-            P_mm = ((-1) ** m) * SphericalHarmonicsPrior._double_factorial(2 * m - 1, dtype, device) * (1 - x * x).pow(m_f / 2)
+            P_mm = ((-1) ** m) * SphericalHarmonicsPrior._double_factorial(2 * m - 1, dtype, device) * (1 - x * x).pow(
+                m_f / 2
+            )
             P[m][m] = P_mm
             if m + 1 < Lmax:
                 P[m + 1][m] = (2 * m_f + 1) * x * P_mm
@@ -349,7 +373,12 @@ class SpatialPatchMoE(nn.Module):
         self.cond_channels = int(cond_channels) if cond_channels is not None else 0
         self.experts = nn.ModuleList(
             [
-                GatedConvBlock(self.channels, self.expert_hidden_size, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
+                GatedConvBlock(
+                    self.channels,
+                    self.expert_hidden_size,
+                    use_cbam=bool(use_cbam),
+                    cond_channels=(self.cond_channels if self.cond_channels > 0 else None),
+                )
                 for _ in range(self.num_experts)
             ]
         )
@@ -377,9 +406,9 @@ class SpatialPatchMoE(nn.Module):
         )
 
         router_in = x_patches.mean(dim=(2, 3, 4))
-
         cond_patches: Optional[torch.Tensor] = None
         router_input = router_in
+
         if self.cond_channels > 0 and cond is not None:
             if cond.dim() == 4:
                 cond_l = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
@@ -473,7 +502,18 @@ class ConvLRULayer(nn.Module):
         self.noise_level = nn.Parameter(torch.tensor(0.01))
 
         self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
-        self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
+        self.sh_prior = (
+            SphericalHarmonicsPrior(
+                self.emb_ch,
+                self.S,
+                self.W,
+                Lmax=int(getattr(args, "sh_Lmax", 6)),
+                rank=int(getattr(args, "sh_rank", 8)),
+                gain_init=float(getattr(args, "sh_gain_init", 0.0)),
+            )
+            if bool(getattr(args, "use_sh_prior", False))
+            else None
+        )
 
         if bool(getattr(args, "use_gate", False)):
             self.gate_conv = nn.Sequential(
@@ -506,15 +546,12 @@ class ConvLRULayer(nn.Module):
         x_fft = torch.fft.fft2(x_ext.to(torch.float32), dim=(-2, -1), norm="ortho").to(torch.cfloat)
         return x_fft
 
-    def _ifft_lat_even_crop(self, h: torch.Tensor) -> torch.Tensor:
-        h_sp = torch.fft.ifft2(h, dim=(-2, -1), norm="ortho")
-        h_sp = h_sp.real
-        if h_sp.shape[-2] != self.S_ext:
-            raise ValueError(f"Internal S_ext mismatch: {h_sp.shape[-2]} vs {self.S_ext}")
-        h_crop = lat_even_crop_5d(h_sp.unsqueeze(2).transpose(2, 2).squeeze(2), self.S)
-        return h_crop
-
-    def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        last_hidden_in: Optional[torch.Tensor],
+        listT: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, C, S, W = x.shape
         if listT is None:
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
@@ -536,9 +573,9 @@ class ConvLRULayer(nn.Module):
             h = h + self.freq_prior(h)
 
         Uc = self.U_row.conj()
-        t0 = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
-        t0 = t0.permute(0, 1, 2, 4, 3)
-        zq = torch.matmul(t0, self.V_col)
+        t0 = torch.einsum("blcsw,csr->blcrw", h, Uc)
+        zq4 = torch.einsum("blcrw,cwr->blcr", t0, self.V_col)
+        zq = zq4.unsqueeze(-1)
 
         nu_log, theta_log = self.params_log_base.unbind(dim=0)
         disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
@@ -579,9 +616,10 @@ class ConvLRULayer(nn.Module):
             z_out_bwd = None
 
         def project_back(z: torch.Tensor) -> torch.Tensor:
-            t1 = torch.matmul(z, self.V_col.conj().transpose(1, 2))
-            t1 = t1.permute(0, 1, 2, 4, 3)
-            return torch.matmul(t1, self.U_row.transpose(1, 2)).permute(0, 1, 2, 4, 3)
+            z4 = z.squeeze(-1)
+            t1 = torch.einsum("blcr,cwr->blcrw", z4, self.V_col.conj())
+            h_rec = torch.einsum("blcrw,csr->blcsw", t1, self.U_row)
+            return h_rec
 
         h_rec_fwd = project_back(z_out)
 
@@ -660,7 +698,13 @@ class ConvLRUBlock(nn.Module):
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
 
-    def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        last_hidden_in: Optional[torch.Tensor],
+        listT: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, last_hidden_out = self.lru_layer(x, last_hidden_in, listT=listT)
         x = self.feed_forward(x, cond=cond)
         return x, last_hidden_out
@@ -765,7 +809,9 @@ class Decoder(nn.Module):
             H = self.hidden_size[0] * self.rH
             W = self.hidden_size[1] * self.rW
             cond_ch = self.emb_ch if self.static_ch > 0 else None
-            self.c_hidden = nn.ModuleList([GatedConvBlock(out_ch_after_up, (H, W), use_cbam=False, cond_channels=cond_ch) for _ in range(self.dec_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList(
+                [GatedConvBlock(out_ch_after_up, (H, W), use_cbam=False, cond_channels=cond_ch) for _ in range(self.dec_hidden_layers_num)]
+            )
         else:
             self.c_hidden = None
 
@@ -861,7 +907,13 @@ class ConvLRUModel(nn.Module):
             self.fusion = nn.Conv3d(C * 2, C, 1)
             self.convlru_blocks = None
 
-    def forward(self, x: torch.Tensor, last_hidden_ins: Optional[List[torch.Tensor]] = None, listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        last_hidden_ins: Optional[List[torch.Tensor]] = None,
+        listT: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         if not self.use_unet:
             if self.convlru_blocks is None:
                 raise RuntimeError("Model misconfigured")
@@ -873,7 +925,7 @@ class ConvLRUModel(nn.Module):
             return x, last_hidden_outs
 
         skips: List[torch.Tensor] = []
-        last_hidden_outs = []
+        last_hidden_outs: List[torch.Tensor] = []
 
         num_down = len(self.down_blocks)
         hs_in_down = last_hidden_ins[:num_down] if last_hidden_ins is not None else [None] * num_down
@@ -960,7 +1012,9 @@ class Embedding(nn.Module):
 
         if self.emb_hidden_layers_num > 0:
             cond_ch = self.emb_ch if self.static_ch > 0 else None
-            self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, use_cbam=False, cond_channels=cond_ch) for _ in range(self.emb_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList(
+                [GatedConvBlock(self.emb_hidden_ch, self.hidden_size, use_cbam=False, cond_channels=cond_ch) for _ in range(self.emb_hidden_layers_num)]
+            )
         else:
             self.c_hidden = None
 
