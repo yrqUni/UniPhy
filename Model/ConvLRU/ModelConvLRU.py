@@ -317,9 +317,8 @@ class SpatialPatchMoE(nn.Module):
         nH, nW = H_pad // P, W_pad // P
         
         # [B, C, L, nH, P, nW, P] -> [B, L, nH, nW, C, 1, P, P]
+        # Merged B*L*nH*nW into one batch dimension for router to be Time-Specific
         x_patches = x.view(B, C, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, C, 1, P, P)
-        
-        # Router: [Total_Instances, C] -> [B*L*nH*nW, Experts]
         router_in = x_patches.mean(dim=(2, 3, 4))
         
         if cond is not None:
@@ -327,7 +326,6 @@ class SpatialPatchMoE(nn.Module):
                 cond_patches = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
                 cond_patches = cond_patches.view(B, -1, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, cond.size(1), 1, P, P)
             else:
-                # If cond is 5D [B, C, L, H, W]
                 cond_patches = cond.view(B, -1, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, cond.size(1), 1, P, P)
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_in, router_cond], dim=1)
@@ -346,10 +344,11 @@ class SpatialPatchMoE(nn.Module):
             w_i = full_weights[:, i].view(-1, 1, 1, 1, 1)
             if w_i.sum() < 1e-6:
                 continue
+            # Experts handle 5D input [Batch, C, Time, H, W]
+            # Here Batch is effectively B*L*Patches, Time is 1
             expert_out = expert(x_patches, cond_patches)
             final_output += w_i * expert_out
             
-        # [B*L*nH*nW, C, 1, P, P] -> [B, L, nH, nW, C, P, P] -> [B, C, L, H, W]
         output = final_output.view(B, L, nH, nW, C, P, P).permute(0, 4, 1, 2, 5, 3, 6)
         output = output.reshape(B, C, L, H_pad, W_pad)
         
@@ -469,7 +468,6 @@ class ConvLRULayer(nn.Module):
         else:
             x_in = zq
         gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
-        x_in = x_in.permute(0, 2, 1, 3, 4).contiguous()
         x_in = x_in * gamma_t
         if last_hidden_in is not None:
             prev_state = last_hidden_in
@@ -491,7 +489,7 @@ class ConvLRULayer(nn.Module):
         z_out = z_out.permute(0, 2, 1, 3, 4)
         if last_hidden_in is not None or (last_hidden_in is None and L == 1):
             z_out = z_out[:, :, 1:]
-        last_hidden_out = z_out[:, :, -1:].contiguous().permute(0, 2, 1, 3, 4)
+        last_hidden_out = z_out[:, :, -1:].clone()
         if self.bidirectional:
             x_in_bwd = x_in.flip(2)
             lamb_bwd = lamb.flip(2)
@@ -513,21 +511,19 @@ class ConvLRULayer(nn.Module):
             t = t.permute(0, 1, 2, 4, 3)
             return torch.matmul(t, self.U_row.transpose(1, 2)).permute(0, 1, 2, 4, 3)
         
-        z_out_proj = z_out.permute(0, 2, 1, 3, 4)
-        h_rec_fwd = project_back(z_out_proj)
+        h_rec_fwd = project_back(z_out)
         
         def recover_spatial(h_rec):
             h_sp = torch.fft.ifft2(h_rec, dim=(-2, -1), norm="ortho")
-            h_sp_p = h_sp.permute(0, 2, 1, 4, 3)
-            hr = self.post_ifft_conv_real(h_sp_p.real)
-            hi = self.post_ifft_conv_imag(h_sp_p.imag)
+            h_sp = h_sp.permute(0, 1, 2, 4, 3)
+            hr = self.post_ifft_conv_real(h_sp.real)
+            hi = self.post_ifft_conv_imag(h_sp.imag)
             return torch.cat([hr, hi], dim=1)
 
         feat_fwd = recover_spatial(h_rec_fwd)
         
         if self.bidirectional:
-            z_out_bwd_proj = z_out_bwd.permute(0, 2, 1, 3, 4)
-            h_rec_bwd = project_back(z_out_bwd_proj)
+            h_rec_bwd = project_back(z_out_bwd)
             feat_bwd = recover_spatial(h_rec_bwd)
             feat_final = torch.cat([feat_fwd, feat_bwd], dim=1)
         else:
