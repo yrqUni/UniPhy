@@ -13,6 +13,7 @@ torch.cuda.manual_seed(42)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+
 class MockArgs:
     def __init__(self):
         self.input_size = (32, 32)
@@ -36,7 +37,7 @@ class MockArgs:
         self.use_selective = False
         self.ffn_hidden_ch = 32
         self.ffn_hidden_layers_num = 1
-        self.num_expert = -1 
+        self.num_expert = -1
         self.activate_expert = 2
         self.dec_strategy = "pxsf"
         self.dec_hidden_ch = 16
@@ -44,14 +45,17 @@ class MockArgs:
         self.head_mode = "gaussian"
         self.unet = False
 
+
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def print_status(name, passed, msg=""):
     if passed:
         print(f"\033[92m[PASS] {name:<25}\033[0m {msg}")
     else:
         print(f"\033[91m[FAIL] {name:<25}\033[0m {msg}")
+
 
 def test_configurations():
     print("\n=== 1. Architecture Combinations Test ===")
@@ -69,7 +73,6 @@ def test_configurations():
     x = torch.randn(B, L, C, H, W, device=device)
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
-    
     for name, unet, bidir, sel, n_exp in configs:
         try:
             args = MockArgs()
@@ -78,7 +81,7 @@ def test_configurations():
             args.use_selective = sel
             args.num_expert = n_exp
             model = ConvLRU(args).to(device)
-            out = model(x, mode='p', listT=listT, static_feats=static)
+            out = model(x, mode="p", listT=listT, static_feats=static)
             expected_C = args.out_ch * 2
             expected_shape = (B, L, expected_C, H, W)
             if out.shape != expected_shape:
@@ -88,6 +91,7 @@ def test_configurations():
             print_status(name, True, f"Params: {sum(p.numel() for p in model.parameters())}")
         except Exception as e:
             print_status(name, False, str(e))
+
 
 def test_heads():
     print("\n=== 2. Decoder Heads Test ===")
@@ -103,7 +107,7 @@ def test_heads():
             timestep = None
             if mode == "diffusion":
                 timestep = torch.randint(0, 1000, (B,), device=device).float()
-            out = model(x, mode='p', listT=None, static_feats=None, timestep=timestep)
+            out = model(x, mode="p", listT=None, static_feats=None, timestep=timestep)
             passed = False
             msg = ""
             if mode == "gaussian":
@@ -128,12 +132,13 @@ def test_heads():
         except Exception as e:
             print_status(f"Head: {mode}", False, str(e))
 
+
 def test_consistency():
     print("\n=== 3. Consistency (Parallel vs Inference) ===")
     device = get_device()
     args = MockArgs()
-    args.unet = True 
-    args.bidirectional = False 
+    args.unet = True
+    args.bidirectional = False
     args.num_expert = 4
     model = ConvLRU(args).to(device)
     model.eval()
@@ -142,26 +147,28 @@ def test_consistency():
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
     with torch.no_grad():
-        out_p = model(x, mode='p', listT=listT, static_feats=static)
+        out_p = model(x, mode="p", listT=listT, static_feats=static)
         start_frame = x[:, 0:1]
-        future_T = torch.ones(B, L-1, device=device)
+        future_T = torch.ones(B, L - 1, device=device)
         out_i = model(
-            start_frame, 
-            mode='i', 
-            out_gen_num=L, 
-            listT=listT[:, 0:1], 
-            listT_future=future_T, 
-            static_feats=static
+            start_frame,
+            mode="i",
+            out_gen_num=L,
+            listT=listT[:, 0:1],
+            listT_future=future_T,
+            static_feats=static,
         )
-        shape_match = (out_p.shape == out_i.shape)
+        shape_match = out_p.shape == out_i.shape
         print_status("Inference Shape Match", shape_match, f"{out_p.shape} vs {out_i.shape}")
         diff_step1 = (out_p[:, 0] - out_i[:, 0]).abs().max().item()
         is_consistent = diff_step1 < 1e-4
         print_status("Step-1 Consistency", is_consistent, f"Max Diff: {diff_step1:.2e}")
 
+
 def test_flash_fft_fallback():
     print("\n=== 4. FlashFFTConv Fallback Test ===")
     from ModelConvLRU import FlashFFTConvInterface
+
     device = get_device()
     H, W = 64, 64
     fft_layer = FlashFFTConvInterface(16, (H, W)).to(device)
@@ -172,6 +179,7 @@ def test_flash_fft_fallback():
         print_status("FlashFFT Interface", True, f"Output: {out.shape}")
     except Exception as e:
         print_status("FlashFFT Interface", False, str(e))
+
 
 if __name__ == "__main__":
     print(f"Running Tests on: {get_device()}")
