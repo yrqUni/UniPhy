@@ -65,30 +65,27 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     return x
 
 
-def lat_even_extend_4d(x: torch.Tensor) -> torch.Tensor:
-    B, C, H, W = x.shape
-    if H < 2:
-        return x
-    core = x[:, :, 1:-1, :]
-    tail = torch.flip(core, dims=[2])
-    return torch.cat([x, tail], dim=2)
+class DiscreteCosineTransform(nn.Module):
+    def __init__(self, n: int, dim: int):
+        super().__init__()
+        self.n = n
+        self.dim = dim
+        k = torch.arange(n).unsqueeze(1)
+        i = torch.arange(n).unsqueeze(0)
+        basis = torch.cos(math.pi * k * (2 * i + 1) / (2 * n))
+        basis[0] = basis[0] * math.sqrt(1 / n)
+        basis[1:] = basis[1:] * math.sqrt(2 / n)
+        self.register_buffer("dct_matrix", basis)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(self.dim, -1)
+        out = torch.matmul(x, self.dct_matrix.t())
+        return out.transpose(self.dim, -1)
 
-def lat_even_extend_5d(x: torch.Tensor) -> torch.Tensor:
-    B, L, C, H, W = x.shape
-    if H < 2:
-        return x
-    core = x[:, :, :, 1:-1, :]
-    tail = torch.flip(core, dims=[3])
-    return torch.cat([x, tail], dim=3)
-
-
-def lat_even_crop_4d(x_ext: torch.Tensor, H: int) -> torch.Tensor:
-    return x_ext[:, :, :H, :]
-
-
-def lat_even_crop_5d(x_ext: torch.Tensor, H: int) -> torch.Tensor:
-    return x_ext[:, :, :, :H, :]
+    def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(self.dim, -1)
+        out = torch.matmul(x, self.dct_matrix)
+        return out.transpose(self.dim, -1)
 
 
 class SpectralConv2d(nn.Module):
@@ -136,7 +133,7 @@ class SphericalHarmonicsPrior(nn.Module):
         nn.init.normal_(self.W2, std=1e-3)
         theta, phi = self._latlon_to_spherical(self.H, self.W, device=None)
         Y = self._real_sph_harm_basis(theta, phi, self.Lmax)
-        self.register_buffer("Y_real", Y, persistent=False)
+        self.register_buffer("Y_real", Y, persistent=True)
 
     @staticmethod
     def _latlon_to_spherical(H: int, W: int, device: Optional[torch.device]):
@@ -399,11 +396,9 @@ class ConvLRULayer(nn.Module):
         self.r_max = 0.99
         self.emb_ch = int(getattr(args, "emb_ch", 32))
         self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
-        S, W = self.hidden_size
-        self.S = int(S)
-        self.W = int(W)
-        self.S_ext = int(2 * self.S - 2) if self.S >= 2 else int(self.S)
-        self.rank = int(getattr(args, "lru_rank", min(self.S_ext, self.W, 32)))
+        self.S = int(self.hidden_size[0])
+        self.W = int(self.hidden_size[1])
+        self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.bidirectional = bool(getattr(args, "bidirectional", False))
 
@@ -423,7 +418,15 @@ class ConvLRULayer(nn.Module):
         )
         self.forcing_scale = nn.Parameter(torch.tensor(0.1))
 
-        self.U_row = nn.Parameter(torch.randn(self.emb_ch, self.S_ext, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.S_ext)))
+        self.dct_h = DiscreteCosineTransform(self.S, dim=-2)
+
+        self.selection_net = nn.Sequential(
+            nn.Linear(self.emb_ch, self.emb_ch),
+            nn.SiLU(),
+            nn.Linear(self.emb_ch, self.rank * 2)
+        )
+
+        self.U_row = nn.Parameter(torch.randn(self.emb_ch, self.S, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.S)))
         self.V_col = nn.Parameter(torch.randn(self.emb_ch, self.W, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.W)))
 
         C = self.emb_ch
@@ -466,13 +469,15 @@ class ConvLRULayer(nn.Module):
         dth = self.forcing_scale * torch.tanh(mod[..., 1])
         return dnu.unsqueeze(-1), dth.unsqueeze(-1)
 
-    def _fft_lat_even_extend(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, C, S, W = x.shape
-        if S != self.S:
-            raise ValueError(f"ConvLRULayer expects fixed H={self.S}, got {S}")
-        x_ext = lat_even_extend_5d(x)
-        x_fft = torch.fft.fft2(x_ext.to(torch.float32), dim=(-2, -1), norm="ortho").to(torch.cfloat)
-        return x_fft
+    def _hybrid_forward_transform(self, x: torch.Tensor) -> torch.Tensor:
+        x_dct = self.dct_h(x.float())
+        x_hybrid = torch.fft.fft(x_dct.to(torch.complex64), dim=-1, norm="ortho")
+        return x_hybrid
+
+    def _hybrid_inverse_transform(self, h: torch.Tensor) -> torch.Tensor:
+        x_dct = torch.fft.ifft(h, dim=-1, norm="ortho").real
+        x_out = self.dct_h.inverse(x_dct)
+        return x_out
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, C, S, W = x.shape
@@ -481,24 +486,24 @@ class ConvLRULayer(nn.Module):
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
 
-        h = self._fft_lat_even_extend(x)
-        B2, L2, C2, S_ext, W2 = h.shape
-        if (B2, L2, C2, W2) != (B, L, C, W):
-            raise ValueError("FFT shape mismatch")
+        h = self._hybrid_forward_transform(x)
+        h = h.contiguous()
 
-        h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_ext * W, C)
-        h_proj = torch.matmul(h_perm, self.proj_W)
-        h = h_proj.view(B, L, S_ext, W, C).permute(0, 1, 4, 2, 3).contiguous()
-        if self.proj_b is not None:
-            h = h + self.proj_b.view(1, 1, C, 1, 1)
+        ctx = x.mean(dim=(-2, -1))
+        selection = self.selection_net(ctx)
+        sel_u, sel_v = torch.chunk(selection, 2, dim=-1)
+        scale_u = torch.sigmoid(sel_u).view(B, L, 1, 1, self.rank)
+        scale_v = torch.sigmoid(sel_v).view(B, L, 1, 1, self.rank)
 
-        if self.freq_prior is not None:
-            h = h + self.freq_prior(h)
-
-        Uc = self.U_row.conj()
-        t0 = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
+        h_perm = h.permute(0, 1, 2, 4, 3)
+        t0 = torch.matmul(h_perm, self.U_row)
+        t0 = t0 * scale_u.unsqueeze(-2)
         t0 = t0.permute(0, 1, 2, 4, 3)
         zq = torch.matmul(t0, self.V_col)
+        zq = zq * scale_v.unsqueeze(-2)
+
+        if self.proj_b is not None:
+             zq = zq + self.proj_b.view(1, 1, C, 1, 1)
 
         nu_log, theta_log = self.params_log_base.unbind(dim=0)
         disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
@@ -538,26 +543,21 @@ class ConvLRULayer(nn.Module):
         else:
             z_out_bwd = None
 
-        def project_back(z: torch.Tensor) -> torch.Tensor:
+        def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
             t1 = torch.matmul(z, self.V_col.conj().transpose(1, 2))
+            t1 = t1 * sc_v.unsqueeze(-2)
             t1 = t1.permute(0, 1, 2, 4, 3)
-            return torch.matmul(t1, self.U_row.transpose(1, 2)).permute(0, 1, 2, 4, 3)
+            rec = torch.matmul(t1, self.U_row.transpose(1, 2))
+            rec = rec * sc_u.unsqueeze(-2)
+            rec = rec.permute(0, 1, 2, 4, 3)
+            return rec
 
-        h_rec_fwd = project_back(z_out)
-
-        def recover_spatial(h_rec: torch.Tensor) -> torch.Tensor:
-            h_sp = torch.fft.ifft2(h_rec, dim=(-2, -1), norm="ortho")
-            hr = self.post_ifft_conv_real(h_sp.real.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            hi = self.post_ifft_conv_imag(h_sp.imag.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            h_cat = torch.cat([hr, hi], dim=2)
-            h_cat = lat_even_crop_5d(h_cat, self.S)
-            return h_cat
-
-        feat_fwd = recover_spatial(h_rec_fwd)
+        h_rec_fwd = project_back(z_out, scale_u, scale_v)
+        feat_fwd = self._hybrid_inverse_transform(h_rec_fwd)
 
         if self.bidirectional and z_out_bwd is not None:
-            h_rec_bwd = project_back(z_out_bwd)
-            feat_bwd = recover_spatial(h_rec_bwd)
+            h_rec_bwd = project_back(z_out_bwd, scale_u, scale_v)
+            feat_bwd = self._hybrid_inverse_transform(h_rec_bwd)
             feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
         else:
             feat_final = feat_fwd
@@ -953,7 +953,7 @@ class ConvLRU(nn.Module):
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
 
-        skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion"]
+        skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion", "dct_matrix"]
         with torch.no_grad():
             for n, p in self.named_parameters():
                 if any(tok in n for tok in skip_contains):
