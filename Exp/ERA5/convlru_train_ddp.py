@@ -86,7 +86,7 @@ class Args:
         self.ckpt_step = 0.25
         self.do_eval = False
         self.use_tf32 = False
-        self.use_compile = True
+        self.use_compile = False
         self.lr = 1e-5
         self.use_scheduler = False
         self.init_lr_scheduler = False
@@ -106,6 +106,15 @@ class Args:
         self.bidirectional = True
         self.unet = True
         self.head_mode = "diffusion"
+        self.check_args()
+    def check_args(self):
+        if self.use_amp == True:
+            print("[Warning] AMP is disabled by policy. Forcing use_amp=False.")
+            logging.warning("AMP is disabled by policy. Forcing use_amp=False.")
+            self.use_amp = False
+        if self.use_compile == True:
+            print("[Warning] Torch Compile is experimental. Use with caution.")
+            logging.warning("Torch Compile is experimental. Use with caution.")
 
 def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
     os.environ['MASTER_ADDR'] = master_addr
