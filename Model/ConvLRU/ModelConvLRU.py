@@ -399,12 +399,12 @@ class ConvLRULayer(nn.Module):
         if self.is_selective:
             inp = ctx 
         else:
-            dt_feat = dt
+            dt_feat = dt.squeeze(1)
             inp = torch.cat([ctx, dt_feat], dim=1)
         inp = inp.permute(0, 2, 1)
         mod = self.forcing_mlp(inp)
-        mod = mod.permute(0, 2, 1)
-        mod = mod.view(x.size(0), x.size(1), self.emb_ch, self.rank, 2)
+        mod = mod.view(x.size(0), x.size(2), self.emb_ch, self.rank, 2)
+        mod = mod.permute(0, 2, 1, 3, 4)
         dnu = self.forcing_scale * torch.tanh(mod[..., 0])
         dth = self.forcing_scale * torch.tanh(mod[..., 1])
         return dnu.unsqueeze(-1), dth.unsqueeze(-1)
@@ -874,7 +874,7 @@ class ConvLRU(nn.Module):
         if mode == "p":
             x, _ = self.embedding(x, static_feats=static_feats)
             x, _ = self.convlru_model(x, listT=listT, cond=cond)
-            return self.decoder(x, cond=cond, timestep=timestep)
+            return self.decoder(x, cond=cond, timestep=timestep).permute(0, 2, 1, 3, 4).contiguous()
         out = []
         x_emb, _ = self.embedding(x, static_feats=None)
         x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT, cond=cond)
@@ -889,7 +889,7 @@ class ConvLRU(nn.Module):
         out.append(x_step_dist)
         for t in range(out_gen_num - 1):
             dt = listT_future[:, t:t+1] if listT_future is not None else torch.ones_like(listT[:, 0:1])
-            x_in, _ = self.embedding(x_step_mean, static_feats=None)
+            x_in, _ = self.embedding(x_step_mean.permute(0, 2, 1, 3, 4), static_feats=None)
             x_hidden, last_hidden_outs = self.convlru_model(
                 x_in, 
                 last_hidden_ins=last_hidden_outs, 
@@ -904,4 +904,4 @@ class ConvLRU(nn.Module):
             else:
                 x_step_mean = x_step_dist
             out.append(x_step_dist)
-        return torch.concat(out, dim=2)
+        return torch.concat(out, dim=2).permute(0, 2, 1, 3, 4).contiguous()
