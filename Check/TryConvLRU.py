@@ -33,7 +33,7 @@ class MockArgs:
         self.emb_hidden_layers_num = 1
         self.static_ch = 2
         self.hidden_factor = (2, 2)
-        
+
         self.unet = False
         self.convlru_num_blocks = 2
         self.ffn_hidden_ch = 32
@@ -49,7 +49,8 @@ class MockArgs:
         self.sh_Lmax = 4
         self.sh_rank = 4
         self.sh_gain_init = 0.0
-        
+        self.use_gate = True
+
         self.head_mode = "gaussian"
         self.out_ch = 4
         self.dec_hidden_ch = 16
@@ -63,13 +64,26 @@ def get_device():
 
 def print_status(name, passed, msg=""):
     if passed:
-        print(f"\033[92m[PASS] {name:<28}\033[0m {msg}")
+        print(f"\033[92m[PASS] {name:<32}\033[0m {msg}")
     else:
-        print(f"\033[91m[FAIL] {name:<28}\033[0m {msg}")
+        print(f"\033[91m[FAIL] {name:<32}\033[0m {msg}")
 
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
+
+
+def expected_out_channels(args: MockArgs):
+    if args.head_mode == "gaussian":
+        return args.out_ch * 2
+    return args.out_ch
+
+
+def make_inputs(device, B=2, L=4, C=4, H=32, W=32, static_ch=2):
+    x = torch.randn(B, L, C, H, W, device=device)
+    static = torch.randn(B, static_ch, H, W, device=device) if static_ch > 0 else None
+    listT = torch.ones(B, L, device=device)
+    return x, static, listT
 
 
 def test_configurations():
@@ -85,9 +99,7 @@ def test_configurations():
         ("MoE_UNet", True, False, False, 4),
     ]
     B, L, C, H, W = 2, 4, 4, 32, 32
-    x = torch.randn(B, L, C, H, W, device=device)
-    static = torch.randn(B, 2, H, W, device=device)
-    listT = torch.ones(B, L, device=device)
+    x, static, listT = make_inputs(device, B=B, L=L, C=C, H=H, W=W, static_ch=2)
     for name, unet, bidir, sel, n_exp in configs:
         try:
             args = MockArgs()
@@ -98,9 +110,8 @@ def test_configurations():
             model = ConvLRU(args).to(device)
             model.train()
             out = model(x, mode="p", listT=listT, static_feats=static)
-            expected_C = args.out_ch * 2 if args.head_mode == "gaussian" else args.out_ch
-            expected_shape = (B, L, expected_C, H, W)
-            if out.shape != expected_shape:
+            expected_shape = (B, L, expected_out_channels(args), H, W)
+            if tuple(out.shape) != expected_shape:
                 raise ValueError(f"Shape mismatch: got {tuple(out.shape)} expected {expected_shape}")
             out.sum().backward()
             print_status(name, True, f"Params: {count_params(model)}")
@@ -124,21 +135,19 @@ def test_heads():
             if mode == "diffusion":
                 timestep = torch.randint(0, 1000, (B,), device=device).float()
             out = model(x, mode="p", listT=None, static_feats=None, timestep=timestep)
-            passed = False
-            msg = ""
             if mode == "gaussian":
-                passed = out.shape == (B, L, args.out_ch * 2, H, W)
+                passed = tuple(out.shape) == (B, L, args.out_ch * 2, H, W)
                 msg = f"Shape: {tuple(out.shape)}"
                 out.sum().backward()
             elif mode == "diffusion":
-                passed = out.shape == (B, L, args.out_ch, H, W)
+                passed = tuple(out.shape) == (B, L, args.out_ch, H, W)
                 msg = f"Shape: {tuple(out.shape)}"
                 out.sum().backward()
             else:
                 if isinstance(out, tuple) and len(out) == 3:
                     quant, vq_loss, idx = out
-                    passed = quant.shape == (B, L, args.out_ch, H, W) and vq_loss.dim() == 0
-                    msg = f"VQ Shape: {tuple(quant.shape)}, Loss: {float(vq_loss):.4f}"
+                    passed = tuple(quant.shape) == (B, L, args.out_ch, H, W) and vq_loss.dim() == 0
+                    msg = f"VQ Shape: {tuple(quant.shape)}, Loss: {float(vq_loss):.4f}, Idx: {tuple(idx.shape)}"
                     (quant.sum() + vq_loss).backward()
                 else:
                     passed = False
@@ -156,7 +165,7 @@ def test_diffusion_head_odd_dim_error():
         args.head_mode = "diffusion"
         args.dec_hidden_layers_num = 1
         args.dec_hidden_ch = 15
-        model = ConvLRU(args).to(device)
+        _ = ConvLRU(args).to(device)
         print_status("Odd dim should fail", False, "Expected ValueError but model constructed")
     except ValueError as e:
         print_status("Odd dim should fail", True, str(e))
@@ -206,10 +215,9 @@ def test_inference_listT_none():
     args.num_expert = 4
     model = ConvLRU(args).to(device)
     model.eval()
-    B, L, C, H, W = 1, 6, 4, 32, 32
+    B, out_gen_num, C, H, W = 1, 6, 4, 32, 32
     start_frame = torch.randn(B, 1, C, H, W, device=device)
     static = torch.randn(B, 2, H, W, device=device)
-    out_gen_num = L
     try:
         with torch.no_grad():
             out_i = model(
@@ -220,8 +228,8 @@ def test_inference_listT_none():
                 listT_future=None,
                 static_feats=static,
             )
-        expected_C = args.out_ch * 2 if args.head_mode == "gaussian" else args.out_ch
-        ok = out_i.shape == (B, out_gen_num, expected_C, H, W)
+        expected_C = expected_out_channels(args)
+        ok = tuple(out_i.shape) == (B, out_gen_num, expected_C, H, W)
         print_status("Inference listT=None", ok, f"Shape: {tuple(out_i.shape)}")
     except Exception as e:
         print_status("Inference listT=None", False, str(e))
@@ -241,7 +249,7 @@ def test_backward_sanity():
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
     try:
-        for step in range(3):
+        for _ in range(3):
             opt.zero_grad(set_to_none=True)
             out = model(x, mode="p", listT=listT, static_feats=static)
             loss = out.float().pow(2).mean()
