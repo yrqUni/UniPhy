@@ -433,10 +433,8 @@ class ConvLRULayer(nn.Module):
         self.proj_W = nn.Parameter(torch.randn(C, C, dtype=torch.cfloat) / math.sqrt(max(1, C)))
         self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
 
-        self.post_ifft_conv_real = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1))
-        self.post_ifft_conv_imag = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1))
-
-        out_dim_fusion = self.emb_ch * 2 if not self.bidirectional else self.emb_ch * 4
+        # post_ifft layers removed as they are not needed for real-valued hybrid output
+        out_dim_fusion = self.emb_ch if not self.bidirectional else self.emb_ch * 2
         self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
 
         self.norm = nn.GroupNorm(num_groups=1, num_channels=self.emb_ch, affine=True)
