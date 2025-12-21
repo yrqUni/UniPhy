@@ -59,8 +59,8 @@ class Args:
         self.use_cbam = True
         self.ffn_hidden_ch = 120
         self.ffn_hidden_layers_num = 2
-        self.num_expert = 4
-        self.activate_expert = 2
+        self.num_expert = 16
+        self.activate_expert = 4
         self.use_gate = True
         self.lru_rank = 32
         self.use_selective = True
