@@ -443,6 +443,10 @@ class SpatialPatchMoE(nn.Module):
 
         flat_weights = topk_weights.view(-1)
         weights_sorted = flat_weights[sorted_args]
+        
+        # Explicit dtype conversion for AMP safety
+        weights_sorted = weights_sorted.to(dtype=y_sorted.dtype)
+        
         y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1)
 
         out_patches = torch.zeros_like(x_patches)
