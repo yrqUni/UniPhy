@@ -399,7 +399,7 @@ class ConvLRULayer(nn.Module):
         if self.is_selective:
             inp = ctx 
         else:
-            dt_feat = dt.squeeze(1)
+            dt_feat = dt
             inp = torch.cat([ctx, dt_feat], dim=1)
         inp = inp.permute(0, 2, 1)
         mod = self.forcing_mlp(inp)
@@ -883,7 +883,7 @@ class ConvLRU(nn.Module):
             x_dec = x_dec[0]
         x_step_dist = x_dec[:, :, -1:]
         if self.decoder.head_mode == "gaussian":
-            x_step_mean = x_step_dist[:, :, :, :self.args.out_ch]
+            x_step_mean = x_step_dist[:, :self.args.out_ch]
         else:
             x_step_mean = x_step_dist
         out.append(x_step_dist)
@@ -900,7 +900,7 @@ class ConvLRU(nn.Module):
             if isinstance(x_dec, tuple): x_dec = x_dec[0]
             x_step_dist = x_dec[:, :, -1:]
             if self.decoder.head_mode == "gaussian":
-                x_step_mean = x_step_dist[:, :, :, :self.args.out_ch]
+                x_step_mean = x_step_dist[:, :self.args.out_ch]
             else:
                 x_step_mean = x_step_dist
             out.append(x_step_dist)
