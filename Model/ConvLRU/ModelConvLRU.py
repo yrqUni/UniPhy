@@ -452,11 +452,9 @@ class ConvLRULayer(nn.Module):
             pad_t, pad_b, pad_l, pad_r = pads
             S_pad, W_pad = h.shape[-2], h.shape[-1]
             h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_pad * W_pad, C)
-            # 修正点1：直接使用复数参数，不转float
             h_proj = torch.matmul(h_perm, self.proj_W)
             h = h_proj.view(B, L, S_pad, W_pad, C).permute(0, 1, 4, 2, 3).contiguous()
             if self.proj_b is not None:
-                # 修正点2：直接使用复数参数
                 h = h + self.proj_b.view(1, 1, C, 1, 1)
             h_spatial = torch.fft.ifft2(h, dim=(-2, -1), norm="ortho")
             if (pad_t + pad_b + pad_l + pad_r) > 0:
@@ -464,11 +462,9 @@ class ConvLRULayer(nn.Module):
             h = torch.fft.fft2(h_spatial, dim=(-2, -1), norm="ortho")
             if self.freq_prior is not None:
                 h = h + self.freq_prior(h)
-            # 修正点3：直接使用复数参数
             Uc = self.U_row.conj()
             t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
             t = t.permute(0, 1, 2, 4, 3)
-            # 修正点4：直接使用复数参数
             zq = torch.matmul(t, self.V_col)
             nu_log, theta_log = self.params_log_base.float().unbind(dim=0)
             disp_nu, disp_th = self.dispersion_mod.float().unbind(dim=0)
@@ -496,15 +492,23 @@ class ConvLRULayer(nn.Module):
             else:
                 x_in_fwd = torch.cat([zero_prev, x_in_flat], dim=1)
             lamb_fwd = torch.cat([lamb_flat[:, :1], lamb_flat], dim=1)
-            z_out_flat = self.pscan(lamb_fwd, x_in_fwd.contiguous())[:, 1:]
+            
+            # 修正：将 (B, L, D) 转置为 (B, D, L) 以适配 pscan 内核要求
+            x_in_fwd = x_in_fwd.transpose(1, 2).contiguous()
+            lamb_fwd = lamb_fwd.transpose(1, 2).contiguous()
+            
+            z_out_flat = self.pscan(lamb_fwd, x_in_fwd)
+            
+            # 修正：转置回 (B, L, D)
+            z_out_flat = z_out_flat.transpose(1, 2)
+            z_out_flat = z_out_flat[:, 1:] # 丢弃 padding step
+            
             z_out = z_out_flat.view(B_in, L_in, C_in, R_in, 1)
             last_hidden_out = z_out[:, -1:].detach()
 
             def project_back(z):
-                # 修正点5：直接使用复数参数
                 t2 = torch.matmul(z, self.V_col.conj().transpose(1, 2))
                 t2 = t2.permute(0, 1, 2, 4, 3)
-                # 修正点6：直接使用复数参数
                 res = torch.matmul(t2, self.U_row.transpose(1, 2))
                 return res.permute(0, 1, 2, 4, 3)
 
@@ -524,7 +528,17 @@ class ConvLRULayer(nn.Module):
                 lamb_bwd_flat = lamb_bwd.view(B_in, L_in, -1)
                 x_in_bwd_fwd = torch.cat([zero_prev, x_in_bwd_flat], dim=1)
                 lamb_bwd_fwd = torch.cat([lamb_bwd_flat[:, :1], lamb_bwd_flat], dim=1)
-                z_out_bwd_flat = self.pscan(lamb_bwd_fwd, x_in_bwd_fwd.contiguous())[:, 1:]
+                
+                # 修正：双向部分也做同样的转置
+                x_in_bwd_fwd = x_in_bwd_fwd.transpose(1, 2).contiguous()
+                lamb_bwd_fwd = lamb_bwd_fwd.transpose(1, 2).contiguous()
+                
+                z_out_bwd_flat = self.pscan(lamb_bwd_fwd, x_in_bwd_fwd)
+                
+                # 修正：转置回
+                z_out_bwd_flat = z_out_bwd_flat.transpose(1, 2)
+                z_out_bwd_flat = z_out_bwd_flat[:, 1:]
+                
                 z_out_bwd = z_out_bwd_flat.view(B_in, L_in, C_in, R_in, 1).flip(1)
                 h_rec_bwd = project_back(z_out_bwd)
                 feat_bwd = recover_spatial(h_rec_bwd)
