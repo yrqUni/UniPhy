@@ -399,8 +399,8 @@ class ConvLRULayer(nn.Module):
         if self.is_selective:
             inp = ctx 
         else:
-            dt_feat = dt.view(x.size(0), x.size(1), 1)
-            inp = torch.cat([ctx, dt_feat], dim=-1)
+            dt_feat = dt
+            inp = torch.cat([ctx, dt_feat], dim=1)
         inp = inp.permute(0, 2, 1)
         mod = self.forcing_mlp(inp)
         mod = mod.permute(0, 2, 1)
@@ -422,9 +422,9 @@ class ConvLRULayer(nn.Module):
     def forward(self, x, last_hidden_in, listT=None):
         B, C, L, S, W = x.size()
         if listT is None:
-            dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
+            dt = torch.ones(B, 1, L, device=x.device, dtype=x.dtype)
         else:
-            dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
+            dt = listT.view(B, 1, L).to(device=x.device, dtype=x.dtype)
         h, pad_size = self._fft_impl(x)
         S_pad = h.shape[-2]
         h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_pad * W, C)
@@ -444,14 +444,15 @@ class ConvLRULayer(nn.Module):
         zq = torch.matmul(t, self.V_col)
         nu_log, theta_log = self.params_log_base.unbind(dim=0)
         disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-        nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
-        th_base = torch.exp(theta_log + disp_th).view(1, 1, C, self.rank, 1)
+        nu_base = torch.exp(nu_log + disp_nu).view(1, C, 1, self.rank, 1)
+        th_base = torch.exp(theta_log + disp_th).view(1, C, 1, self.rank, 1)
+        dt_ex = dt.view(B, 1, L, 1, 1)
         dnu_force, dth_force = self._apply_forcing(x, dt)
-        nu_t = torch.clamp(nu_base * dt + dnu_force, min=1e-6)
-        th_t = th_base * dt + dth_force
+        nu_t = torch.clamp(nu_base * dt_ex + dnu_force, min=1e-6)
+        th_t = th_base * dt_ex + dth_force
         lamb = torch.exp(torch.complex(-nu_t, th_t))
         if self.training:
-            noise_std = self.noise_level * torch.sqrt(dt + 1e-6)
+            noise_std = self.noise_level * torch.sqrt(dt_ex + 1e-6)
             noise = torch.randn_like(zq) * noise_std
             x_in = zq + noise
         else:
@@ -460,34 +461,40 @@ class ConvLRULayer(nn.Module):
         x_in = x_in * gamma_t
         if last_hidden_in is not None:
             prev_state = last_hidden_in
-            x_in_fwd = torch.concat([prev_state, x_in], dim=1)
-            lamb_fwd = torch.concat([lamb[:, :1], lamb], dim=1)
+            x_in_fwd = torch.concat([prev_state, x_in], dim=2)
+            lamb_fwd = torch.concat([lamb[:, :, :1], lamb], dim=2)
         else:
             if L == 1:
-                zero_prev = torch.zeros_like(x_in[:, :1])
-                x_in_fwd = torch.cat([zero_prev, x_in], dim=1)
-                lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
+                zero_prev = torch.zeros_like(x_in[:, :, :1])
+                x_in_fwd = torch.cat([zero_prev, x_in], dim=2)
+                lamb_fwd = torch.cat([lamb[:, :, :1], lamb], dim=2)
             else:
                 x_in_fwd = x_in
                 lamb_fwd = lamb
-        L_eff = x_in_fwd.size(1)
-        lamb_in_fwd = lamb_fwd[:, :L_eff].expand_as(x_in_fwd).contiguous()
-        z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())
+        L_eff = x_in_fwd.size(2)
+        lamb_in_fwd = lamb_fwd[:, :, :L_eff].expand_as(x_in_fwd).contiguous()
+        x_in_pscan = x_in_fwd.permute(0, 2, 1, 3, 4).contiguous()
+        lamb_in_pscan = lamb_in_fwd.permute(0, 2, 1, 3, 4).contiguous()
+        z_out = self.pscan(lamb_in_pscan, x_in_pscan)
+        z_out = z_out.permute(0, 2, 1, 3, 4)
         if last_hidden_in is not None or (last_hidden_in is None and L == 1):
-            z_out = z_out[:, 1:]
-        last_hidden_out = z_out[:, -1:]
+            z_out = z_out[:, :, 1:]
+        last_hidden_out = z_out[:, :, -1:]
         if self.bidirectional:
-            x_in_bwd = x_in.flip(1)
-            lamb_bwd = lamb.flip(1)
+            x_in_bwd = x_in.flip(2)
+            lamb_bwd = lamb.flip(2)
             if L == 1:
-                 x_in_bwd = torch.cat([torch.zeros_like(x_in_bwd[:,:1]), x_in_bwd], dim=1)
-                 lamb_bwd = torch.cat([lamb_bwd[:,:1], lamb_bwd], dim=1)
-            L_eff_b = x_in_bwd.size(1)
-            lamb_in_bwd = lamb_bwd[:, :L_eff_b].expand_as(x_in_bwd).contiguous()
-            z_out_bwd = self.pscan(lamb_in_bwd, x_in_bwd.contiguous())
+                 x_in_bwd = torch.cat([torch.zeros_like(x_in_bwd[:,:,:1]), x_in_bwd], dim=2)
+                 lamb_bwd = torch.cat([lamb_bwd[:,:,:1], lamb_bwd], dim=2)
+            L_eff_b = x_in_bwd.size(2)
+            lamb_in_bwd = lamb_bwd[:, :, :L_eff_b].expand_as(x_in_bwd).contiguous()
+            x_in_pscan_bwd = x_in_bwd.permute(0, 2, 1, 3, 4).contiguous()
+            lamb_in_pscan_bwd = lamb_in_bwd.permute(0, 2, 1, 3, 4).contiguous()
+            z_out_bwd = self.pscan(lamb_in_pscan_bwd, x_in_pscan_bwd)
+            z_out_bwd = z_out_bwd.permute(0, 2, 1, 3, 4)
             if L == 1:
-                z_out_bwd = z_out_bwd[:, 1:]
-            z_out_bwd = z_out_bwd.flip(1)
+                z_out_bwd = z_out_bwd[:, :, 1:]
+            z_out_bwd = z_out_bwd.flip(2)
         
         def project_back(z):
             t = torch.matmul(z, self.V_col.conj().transpose(1, 2))
@@ -703,12 +710,12 @@ class Decoder(nn.Module):
         if self.head_mode == "gaussian":
             mu, log_sigma = torch.chunk(x, 2, dim=1)
             sigma = F.softplus(log_sigma) + 1e-6
-            return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4)
+            return torch.cat([mu, sigma], dim=1)
         elif self.head_mode == "token":
             quantized, loss, indices = self.vq(x)
-            return quantized.permute(0, 2, 1, 3, 4), loss, indices
+            return quantized, loss, indices
         else:
-            return x.permute(0, 2, 1, 3, 4)
+            return x
 
 class ConvLRUModel(nn.Module):
     def __init__(self, args, input_downsp_shape):
@@ -874,9 +881,9 @@ class ConvLRU(nn.Module):
         x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
         if isinstance(x_dec, tuple):
             x_dec = x_dec[0]
-        x_step_dist = x_dec[:, -1:]
+        x_step_dist = x_dec[:, :, -1:]
         if self.decoder.head_mode == "gaussian":
-            x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
+            x_step_mean = x_step_dist[:, :, :, :self.args.out_ch]
         else:
             x_step_mean = x_step_dist
         out.append(x_step_dist)
@@ -891,10 +898,10 @@ class ConvLRU(nn.Module):
             )
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
             if isinstance(x_dec, tuple): x_dec = x_dec[0]
-            x_step_dist = x_dec[:, -1:]
+            x_step_dist = x_dec[:, :, -1:]
             if self.decoder.head_mode == "gaussian":
-                x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
+                x_step_mean = x_step_dist[:, :, :, :self.args.out_ch]
             else:
                 x_step_mean = x_step_dist
             out.append(x_step_dist)
-        return torch.concat(out, dim=1)
+        return torch.concat(out, dim=2)
