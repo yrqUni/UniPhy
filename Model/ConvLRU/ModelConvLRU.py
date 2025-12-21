@@ -254,7 +254,7 @@ class GatedConvBlock(nn.Module):
         super().__init__()
         self.use_cbam = use_cbam
         self.dw_conv = nn.Conv3d(channels, channels, kernel_size=(1, 7, 7), padding="same", groups=channels)
-        self.norm = nn.GroupNorm(1, channels)
+        self.norm = nn.LayerNorm([*hidden_size])
         self.cond_channels = cond_channels
         if self.cond_channels is not None and self.cond_channels > 0:
             self.cond_proj = nn.Conv3d(self.cond_channels, channels * 2, kernel_size=1)
@@ -269,7 +269,9 @@ class GatedConvBlock(nn.Module):
     def forward(self, x, cond=None):
         residual = x
         x = self.dw_conv(x)
+        x = x.permute(0, 2, 1, 3, 4)
         x = self.norm(x)
+        x = x.permute(0, 2, 1, 3, 4)
         if self.cond_proj is not None and cond is not None:
             if cond.dim() == 4:
                 cond_in = cond.unsqueeze(2)
@@ -315,43 +317,33 @@ class SpatialPatchMoE(nn.Module):
                 cond = F.pad(cond, (0, pad_w, 0, pad_h))
         H_pad, W_pad = x.shape[-2:]
         nH, nW = H_pad // P, W_pad // P
-        
-        # [B, C, L, nH, P, nW, P] -> [B, L, nH, nW, C, 1, P, P]
-        # Merged B*L*nH*nW into one batch dimension for router to be Time-Specific
-        x_patches = x.view(B, C, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, C, 1, P, P)
+        x_patches = x.view(B, C, L, nH, P, nW, P).permute(0, 3, 5, 1, 2, 4, 6).reshape(-1, C, L, P, P)
         router_in = x_patches.mean(dim=(2, 3, 4))
-        
         if cond is not None:
             if cond.dim() == 4:
                 cond_patches = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
-                cond_patches = cond_patches.view(B, -1, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, cond.size(1), 1, P, P)
+                cond_patches = cond_patches.view(B, -1, L, nH, P, nW, P).permute(0, 3, 5, 1, 2, 4, 6).reshape(-1, cond.size(1), L, P, P)
             else:
-                cond_patches = cond.view(B, -1, L, nH, P, nW, P).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, cond.size(1), 1, P, P)
+                cond_patches = cond.view(B, -1, L, nH, P, nW, P).permute(0, 3, 5, 1, 2, 4, 6).reshape(-1, cond.size(1), L, P, P)
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_in, router_cond], dim=1)
         else:
             cond_patches = None
             router_input = router_in
-            
         logits = self.router(router_input)
         topk_logits, topk_indices = torch.topk(logits, self.active_experts, dim=1)
         topk_weights = F.softmax(topk_logits, dim=1)
         full_weights = torch.zeros_like(logits)
         full_weights.scatter_(1, topk_indices, topk_weights)
-        
         final_output = 0
         for i, expert in enumerate(self.experts):
             w_i = full_weights[:, i].view(-1, 1, 1, 1, 1)
             if w_i.sum() < 1e-6:
                 continue
-            # Experts handle 5D input [Batch, C, Time, H, W]
-            # Here Batch is effectively B*L*Patches, Time is 1
             expert_out = expert(x_patches, cond_patches)
             final_output += w_i * expert_out
-            
-        output = final_output.view(B, L, nH, nW, C, P, P).permute(0, 4, 1, 2, 5, 3, 6)
+        output = final_output.view(B, nH, nW, C, L, P, P).permute(0, 3, 4, 1, 5, 2, 6)
         output = output.reshape(B, C, L, H_pad, W_pad)
-        
         if pad_h > 0 or pad_w > 0:
             output = output[..., :H, :W]
         return output
@@ -393,7 +385,7 @@ class ConvLRULayer(nn.Module):
         self.post_ifft_conv_imag = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1))
         out_dim_fusion = self.emb_ch * 2 if not self.bidirectional else self.emb_ch * 4
         self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-        self.layer_norm = nn.GroupNorm(1, self.emb_ch)
+        self.layer_norm = nn.LayerNorm([*self.hidden_size])
         self.noise_level = nn.Parameter(torch.tensor(0.01))
         self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if getattr(args, "use_freq_prior", False) else None
         self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, S, W, Lmax=6) if getattr(args, "use_sh_prior", False) else None
@@ -409,20 +401,18 @@ class ConvLRULayer(nn.Module):
         if self.is_selective:
             inp = ctx 
         else:
-            dt_feat = dt
-            inp = torch.cat([ctx, dt_feat], dim=1)
-        inp = inp.permute(0, 2, 1)
+            dt_feat = dt.view(x.size(0), x.size(1), 1)
+            inp = torch.cat([ctx, dt_feat], dim=-1)
         mod = self.forcing_mlp(inp)
-        mod = mod.view(x.size(0), x.size(2), self.emb_ch, self.rank, 2)
-        mod = mod.permute(0, 2, 1, 3, 4)
+        mod = mod.view(x.size(0), x.size(1), self.emb_ch, self.rank, 2)
         dnu = self.forcing_scale * torch.tanh(mod[..., 0])
         dth = self.forcing_scale * torch.tanh(mod[..., 1])
         return dnu.unsqueeze(-1), dth.unsqueeze(-1)
 
     def _fft_impl(self, x):
-        B, C, L, S, W = x.shape
+        B, L, C, S, W = x.shape
         pad_size = S // 4
-        x = x.permute(0, 2, 1, 3, 4).contiguous()
+        x = x.contiguous()
         x_reshaped = x.reshape(B * L, C, S, W)
         x_pad = F.pad(x_reshaped, (0, 0, pad_size, pad_size), mode='reflect')
         x_pad = x_pad.view(B, L, C, S + 2 * pad_size, W)
@@ -430,11 +420,11 @@ class ConvLRULayer(nn.Module):
         return h, pad_size
 
     def forward(self, x, last_hidden_in, listT=None):
-        B, C, L, S, W = x.size()
+        B, L, C, S, W = x.size()
         if listT is None:
-            dt = torch.ones(B, 1, L, device=x.device, dtype=x.dtype)
+            dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
         else:
-            dt = listT.view(B, 1, L).to(device=x.device, dtype=x.dtype)
+            dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
         h, pad_size = self._fft_impl(x)
         S_pad = h.shape[-2]
         h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_pad * W, C)
@@ -447,22 +437,21 @@ class ConvLRULayer(nn.Module):
             h_spatial = h_spatial[..., pad_size:-pad_size, :]
         h = torch.fft.fft2(h_spatial, dim=(-2, -1), norm="ortho")
         if self.freq_prior:
-            h = h + self.freq_prior(h.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            h = h + self.freq_prior(h)
         Uc = self.U_row.conj()
         t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
         t = t.permute(0, 1, 2, 4, 3)
         zq = torch.matmul(t, self.V_col)
         nu_log, theta_log = self.params_log_base.unbind(dim=0)
         disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-        nu_base = torch.exp(nu_log + disp_nu).view(1, C, 1, self.rank, 1)
-        th_base = torch.exp(theta_log + disp_th).view(1, C, 1, self.rank, 1)
-        dt_ex = dt.view(B, 1, L, 1, 1)
+        nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
+        th_base = torch.exp(theta_log + disp_th).view(1, 1, C, self.rank, 1)
         dnu_force, dth_force = self._apply_forcing(x, dt)
-        nu_t = torch.clamp(nu_base * dt_ex + dnu_force, min=1e-6)
-        th_t = th_base * dt_ex + dth_force
+        nu_t = torch.clamp(nu_base * dt + dnu_force, min=1e-6)
+        th_t = th_base * dt + dth_force
         lamb = torch.exp(torch.complex(-nu_t, th_t))
         if self.training:
-            noise_std = self.noise_level * torch.sqrt(dt_ex + 1e-6)
+            noise_std = self.noise_level * torch.sqrt(dt + 1e-6)
             noise = torch.randn_like(zq) * noise_std
             x_in = zq + noise
         else:
@@ -471,40 +460,34 @@ class ConvLRULayer(nn.Module):
         x_in = x_in * gamma_t
         if last_hidden_in is not None:
             prev_state = last_hidden_in
-            x_in_fwd = torch.concat([prev_state, x_in], dim=2)
-            lamb_fwd = torch.concat([lamb[:, :, :1], lamb], dim=2)
+            x_in_fwd = torch.concat([prev_state, x_in], dim=1)
+            lamb_fwd = torch.concat([lamb[:, :1], lamb], dim=1)
         else:
             if L == 1:
-                zero_prev = torch.zeros_like(x_in[:, :, :1])
-                x_in_fwd = torch.cat([zero_prev, x_in], dim=2)
-                lamb_fwd = torch.cat([lamb[:, :, :1], lamb], dim=2)
+                zero_prev = torch.zeros_like(x_in[:, :1])
+                x_in_fwd = torch.cat([zero_prev, x_in], dim=1)
+                lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
             else:
                 x_in_fwd = x_in
                 lamb_fwd = lamb
-        L_eff = x_in_fwd.size(2)
-        lamb_in_fwd = lamb_fwd[:, :, :L_eff].expand_as(x_in_fwd).contiguous()
-        x_in_pscan = x_in_fwd.permute(0, 2, 1, 3, 4).contiguous()
-        lamb_in_pscan = lamb_in_fwd.permute(0, 2, 1, 3, 4).contiguous()
-        z_out = self.pscan(lamb_in_pscan, x_in_pscan)
-        z_out = z_out.permute(0, 2, 1, 3, 4)
+        L_eff = x_in_fwd.size(1)
+        lamb_in_fwd = lamb_fwd[:, :L_eff].expand_as(x_in_fwd).contiguous()
+        z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())
         if last_hidden_in is not None or (last_hidden_in is None and L == 1):
-            z_out = z_out[:, :, 1:]
-        last_hidden_out = z_out[:, :, -1:].clone()
+            z_out = z_out[:, 1:]
+        last_hidden_out = z_out[:, -1:]
         if self.bidirectional:
-            x_in_bwd = x_in.flip(2)
-            lamb_bwd = lamb.flip(2)
+            x_in_bwd = x_in.flip(1)
+            lamb_bwd = lamb.flip(1)
             if L == 1:
-                 x_in_bwd = torch.cat([torch.zeros_like(x_in_bwd[:,:,:1]), x_in_bwd], dim=2)
-                 lamb_bwd = torch.cat([lamb_bwd[:,:,:1], lamb_bwd], dim=2)
-            L_eff_b = x_in_bwd.size(2)
-            lamb_in_bwd = lamb_bwd[:, :, :L_eff_b].expand_as(x_in_bwd).contiguous()
-            x_in_pscan_bwd = x_in_bwd.permute(0, 2, 1, 3, 4).contiguous()
-            lamb_in_pscan_bwd = lamb_in_bwd.permute(0, 2, 1, 3, 4).contiguous()
-            z_out_bwd = self.pscan(lamb_in_pscan_bwd, x_in_pscan_bwd)
-            z_out_bwd = z_out_bwd.permute(0, 2, 1, 3, 4)
+                 x_in_bwd = torch.cat([torch.zeros_like(x_in_bwd[:,:1]), x_in_bwd], dim=1)
+                 lamb_bwd = torch.cat([lamb_bwd[:,:1], lamb_bwd], dim=1)
+            L_eff_b = x_in_bwd.size(1)
+            lamb_in_bwd = lamb_bwd[:, :L_eff_b].expand_as(x_in_bwd).contiguous()
+            z_out_bwd = self.pscan(lamb_in_bwd, x_in_bwd.contiguous())
             if L == 1:
-                z_out_bwd = z_out_bwd[:, :, 1:]
-            z_out_bwd = z_out_bwd.flip(2)
+                z_out_bwd = z_out_bwd[:, 1:]
+            z_out_bwd = z_out_bwd.flip(1)
         
         def project_back(z):
             t = torch.matmul(z, self.V_col.conj().transpose(1, 2))
@@ -515,26 +498,25 @@ class ConvLRULayer(nn.Module):
         
         def recover_spatial(h_rec):
             h_sp = torch.fft.ifft2(h_rec, dim=(-2, -1), norm="ortho")
-            h_sp = h_sp.permute(0, 1, 2, 4, 3)
-            hr = self.post_ifft_conv_real(h_sp.real)
-            hi = self.post_ifft_conv_imag(h_sp.imag)
-            return torch.cat([hr, hi], dim=1)
+            hr = self.post_ifft_conv_real(h_sp.real.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            hi = self.post_ifft_conv_imag(h_sp.imag.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            return torch.cat([hr, hi], dim=2)
 
         feat_fwd = recover_spatial(h_rec_fwd)
         
         if self.bidirectional:
             h_rec_bwd = project_back(z_out_bwd)
             feat_bwd = recover_spatial(h_rec_bwd)
-            feat_final = torch.cat([feat_fwd, feat_bwd], dim=1)
+            feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
         else:
             feat_final = feat_fwd
             
-        h_final = self.post_ifft_proj(feat_final)
+        h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         if self.sh_prior:
             h_final = self.sh_prior(h_final)
         h_final = self.layer_norm(h_final)
         if hasattr(self, 'gate_conv'):
-            gate = self.gate_conv(h_final)
+            gate = self.gate_conv(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             x = (1 - gate) * x + gate * h_final
         else:
             x = x + h_final
@@ -579,11 +561,12 @@ class FeedForward(nn.Module):
 
     def forward(self, x, cond=None):
         residual = x
-        x = self.c_in(x)
+        x = self.c_in(x.permute(0, 2, 1, 3, 4))
         x = self.act(x)
         for block in self.blocks:
             x = block(x, cond=cond)
         x = self.c_out(x)
+        x = x.permute(0, 2, 1, 3, 4)
         return residual + x
 
 class ConvLRUBlock(nn.Module):
@@ -705,6 +688,7 @@ class Decoder(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, x, cond=None, timestep=None):
+        x = x.permute(0, 2, 1, 3, 4)
         if self.dec_strategy == "deconv":
             x = self.upsp(x)
         else:
@@ -721,12 +705,12 @@ class Decoder(nn.Module):
         if self.head_mode == "gaussian":
             mu, log_sigma = torch.chunk(x, 2, dim=1)
             sigma = F.softplus(log_sigma) + 1e-6
-            return torch.cat([mu, sigma], dim=1)
+            return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4)
         elif self.head_mode == "token":
             quantized, loss, indices = self.vq(x)
-            return quantized, loss, indices
+            return quantized.permute(0, 2, 1, 3, 4), loss, indices
         else:
-            return x
+            return x.permute(0, 2, 1, 3, 4)
 
 class ConvLRUModel(nn.Module):
     def __init__(self, args, input_downsp_shape):
@@ -786,20 +770,20 @@ class ConvLRUModel(nn.Module):
                 last_hidden_outs.append(last_hidden_out)
                 if idx < len(self.down_blocks) - 1:
                     skips.append(x)
-                    x_s = x
+                    x_s = x.permute(0, 2, 1, 3, 4)
                     x_s = F.avg_pool3d(x_s, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-                    x = x_s.contiguous()
+                    x = x_s.permute(0, 2, 1, 3, 4).contiguous()
             for idx, block in enumerate(self.up_blocks):
-                x_s = x
+                x_s = x.permute(0, 2, 1, 3, 4)
                 x_s = self.upsample(x_s)
-                x = x_s.contiguous()
+                x = x_s.permute(0, 2, 1, 3, 4).contiguous()
                 skip = skips.pop()
                 if x.shape[-2:] != skip.shape[-2:]:
                     diffY = skip.size(-2) - x.size(-2)
                     diffX = skip.size(-1) - x.size(-1)
                     x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-                x = torch.cat([x, skip], dim=1)
-                x = self.fusion(x)
+                x = torch.cat([x, skip], dim=2)
+                x = self.fusion(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
                 curr_cond = cond
                 if cond is not None:
                     target_size = x.shape[-2:]
@@ -848,7 +832,7 @@ class Embedding(nn.Module):
             self.c_hidden = None
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
-        self.layer_norm = nn.GroupNorm(1, self.emb_ch)
+        self.layer_norm = nn.LayerNorm([*self.hidden_size])
 
     def forward(self, x, static_feats=None):
         x = x.permute(0, 2, 1, 3, 4)
@@ -861,6 +845,7 @@ class Embedding(nn.Module):
             for layer in self.c_hidden:
                 x = layer(x, cond=cond)
         x = self.c_out(x)
+        x = x.permute(0, 2, 1, 3, 4)
         x = self.layer_norm(x)
         return x, cond
 
@@ -885,22 +870,22 @@ class ConvLRU(nn.Module):
         if mode == "p":
             x, _ = self.embedding(x, static_feats=static_feats)
             x, _ = self.convlru_model(x, listT=listT, cond=cond)
-            return self.decoder(x, cond=cond, timestep=timestep).permute(0, 2, 1, 3, 4).contiguous()
+            return self.decoder(x, cond=cond, timestep=timestep)
         out = []
         x_emb, _ = self.embedding(x, static_feats=None)
         x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT, cond=cond)
         x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
         if isinstance(x_dec, tuple):
             x_dec = x_dec[0]
-        x_step_dist = x_dec[:, :, -1:]
+        x_step_dist = x_dec[:, -1:]
         if self.decoder.head_mode == "gaussian":
-            x_step_mean = x_step_dist[:, :self.args.out_ch]
+            x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
         else:
             x_step_mean = x_step_dist
         out.append(x_step_dist)
         for t in range(out_gen_num - 1):
             dt = listT_future[:, t:t+1] if listT_future is not None else torch.ones_like(listT[:, 0:1])
-            x_in, _ = self.embedding(x_step_mean.permute(0, 2, 1, 3, 4), static_feats=None)
+            x_in, _ = self.embedding(x_step_mean, static_feats=None)
             x_hidden, last_hidden_outs = self.convlru_model(
                 x_in, 
                 last_hidden_ins=last_hidden_outs, 
@@ -909,10 +894,10 @@ class ConvLRU(nn.Module):
             )
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
             if isinstance(x_dec, tuple): x_dec = x_dec[0]
-            x_step_dist = x_dec[:, :, -1:]
+            x_step_dist = x_dec[:, -1:]
             if self.decoder.head_mode == "gaussian":
-                x_step_mean = x_step_dist[:, :self.args.out_ch]
+                x_step_mean = x_step_dist[..., :self.args.out_ch, :, :]
             else:
                 x_step_mean = x_step_dist
             out.append(x_step_dist)
-        return torch.concat(out, dim=2).permute(0, 2, 1, 3, 4).contiguous()
+        return torch.concat(out, dim=1)
