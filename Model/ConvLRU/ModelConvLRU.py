@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from pscan import pscan
 
@@ -63,6 +65,36 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
     x = x.view(N, C * rH * rW, D, H // rH, W // rW)
     return x
+
+
+@triton.jit
+def fused_moe_router_kernel(
+    logits_ptr,
+    weights_out_ptr,
+    indices_out_ptr,
+    n_experts,
+    k: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    logits_row_start = logits_ptr + pid * n_experts
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_experts
+    logits = tl.load(logits_row_start + offsets, mask=mask, other=-float('inf'))
+    logits_max = tl.max(logits, 0)
+    logits = logits - logits_max
+    numerator = tl.exp(logits)
+    denominator = tl.sum(numerator, 0)
+    probs = numerator / denominator
+    weights_row_start = weights_out_ptr + pid * k
+    indices_row_start = indices_out_ptr + pid * k
+    for i in range(k):
+        current_max_val = tl.max(probs, 0)
+        current_max_idx = tl.argmax(probs, 0)
+        tl.store(weights_row_start + i, current_max_val)
+        tl.store(indices_row_start + i, current_max_idx)
+        mask_max = offsets == current_max_idx
+        probs = tl.where(mask_max, 0.0, probs)
 
 
 class DiscreteCosineTransform(nn.Module):
@@ -343,10 +375,9 @@ class SpatialPatchMoE(nn.Module):
             .reshape(B * nH * nW, C, L, P, P)
         )
 
-        router_in = x_patches.mean(dim=(2, 3, 4))
-
-        cond_patches: Optional[torch.Tensor] = None
-        router_input = router_in
+        cond_patches = None
+        router_input = x_patches.mean(dim=(2, 3, 4))
+        
         if self.cond_channels > 0 and cond is not None:
             if cond.dim() == 4:
                 cond_l = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
@@ -358,22 +389,66 @@ class SpatialPatchMoE(nn.Module):
                 .reshape(B * nH * nW, self.cond_channels, L, P, P)
             )
             router_cond = cond_patches.mean(dim=(2, 3, 4))
-            router_input = torch.cat([router_in, router_cond], dim=1)
+            router_input = torch.cat([router_input, router_cond], dim=1)
 
-        logits = self.router(router_input)
-        topk_logits, topk_idx = torch.topk(logits, k=self.active_experts, dim=1)
-        topk_w = F.softmax(topk_logits, dim=1).to(dtype=logits.dtype)
+        router_logits = self.router(router_input)
+        
+        N_total = router_logits.size(0)
+        topk_weights = torch.empty((N_total, self.active_experts), device=x.device, dtype=x.dtype)
+        topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
+        
+        BLOCK_SIZE = triton.next_power_of_2(self.num_experts)
+        fused_moe_router_kernel[(N_total,)](
+            router_logits,
+            topk_weights,
+            topk_indices,
+            self.num_experts,
+            self.active_experts,
+            BLOCK_SIZE
+        )
+        topk_indices = topk_indices.long()
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        full_w = torch.zeros_like(logits, dtype=logits.dtype)
-        full_w.scatter_(1, topk_idx, topk_w)
+        flat_indices = topk_indices.view(-1)
+        x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
+        
+        cond_repeated = None
+        if cond_patches is not None:
+            cond_repeated = cond_patches.repeat_interleave(self.active_experts, dim=0)
+
+        sorted_expert_ids, sorted_args = torch.sort(flat_indices)
+        x_sorted = x_repeated[sorted_args]
+        
+        cond_sorted = None
+        if cond_repeated is not None:
+            cond_sorted = cond_repeated[sorted_args]
+
+        expert_counts = torch.bincount(sorted_expert_ids, minlength=self.num_experts).tolist()
+        y_sorted = torch.empty_like(x_sorted)
+
+        start_idx = 0
+        for i, count in enumerate(expert_counts):
+            if count == 0:
+                continue
+            end_idx = start_idx + count
+            inp_slice = x_sorted[start_idx:end_idx]
+            
+            c_slice = None
+            if cond_sorted is not None:
+                c_slice = cond_sorted[start_idx:end_idx]
+                
+            out_slice = self.experts[i](inp_slice.view(count, C, L, P, P), cond=c_slice)
+            y_sorted[start_idx:end_idx] = out_slice
+            start_idx = end_idx
+
+        flat_weights = topk_weights.view(-1)
+        weights_sorted = flat_weights[sorted_args]
+        y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1)
 
         out_patches = torch.zeros_like(x_patches)
-        for i, expert in enumerate(self.experts):
-            w_i = full_w[:, i].view(-1, 1, 1, 1, 1)
-            if torch.count_nonzero(w_i).item() == 0:
-                continue
-            out_i = expert(x_patches, cond=cond_patches)
-            out_patches = out_patches + w_i * out_i
+        token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
+        sorted_token_ids = token_ids[sorted_args]
+        out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
 
         out = (
             out_patches.view(B, nH, nW, C, L, P, P)
@@ -433,7 +508,6 @@ class ConvLRULayer(nn.Module):
         self.proj_W = nn.Parameter(torch.randn(C, C, dtype=torch.cfloat) / math.sqrt(max(1, C)))
         self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
 
-        # post_ifft layers removed as they are not needed for real-valued hybrid output
         out_dim_fusion = self.emb_ch if not self.bidirectional else self.emb_ch * 2
         self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
 
