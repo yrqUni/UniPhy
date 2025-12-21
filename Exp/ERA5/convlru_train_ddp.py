@@ -63,6 +63,9 @@ class Args:
         self.activate_expert = 2
         self.use_gate = True
         self.lru_rank = 32
+        self.use_selective = True
+        self.bidirectional = True
+        self.unet = True
         self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
@@ -71,12 +74,11 @@ class Args:
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
-        self.lambda_type = "exogenous"
-        self.exo_mode = "mlp"
-        self.lambda_mlp_hidden = 16
         self.dec_strategy = "pxsf"
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
+        self.head_mode = "diffusion"
+        self.diffusion_steps = 1000
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
@@ -107,11 +109,6 @@ class Args:
         self.wandb_run_name = self.ckpt
         self.wandb_group = "v2.1.0"
         self.wandb_mode = "online"
-        self.use_selective = True
-        self.bidirectional = True
-        self.unet = True
-        self.head_mode = "diffusion"
-        self.diffusion_steps = 1000
         self.check_args()
 
     def check_args(self):
@@ -138,6 +135,21 @@ def setup_ddp(rank, world_size, master_addr, master_port, local_rank):
 
 def cleanup_ddp():
     dist.destroy_process_group()
+
+
+def setup_logging(args):
+    if not dist.is_initialized() or dist.get_rank() != 0:
+        return
+    os.makedirs(args.log_path, exist_ok=True)
+    log_filename = os.path.join(
+        args.log_path, f"training_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
+    logging.basicConfig(
+        filename=log_filename,
+        level=logging.INFO,
+        format="%(asctime)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def keep_latest_ckpts(ckpt_dir):
@@ -175,9 +187,6 @@ MODEL_ARG_KEYS = [
     "sh_Lmax",
     "sh_rank",
     "sh_gain_init",
-    "lambda_type",
-    "exo_mode",
-    "lambda_mlp_hidden",
     "ffn_hidden_ch",
     "ffn_hidden_layers_num",
     "num_expert",
@@ -237,27 +246,6 @@ def load_model_args_from_ckpt(ckpt_path, map_location="cpu"):
     return model_args
 
 
-def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    state = {
-        "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-        "optimizer": opt.state_dict(),
-        "epoch": int(epoch),
-        "step": int(step),
-        "loss": float(loss),
-        "args_all": dict(vars(args)),
-        "model_args": extract_model_args(args),
-    }
-    if scheduler is not None:
-        state["scheduler"] = scheduler.state_dict()
-    ckpt_path = os.path.join(args.ckpt_dir, f"e{epoch}_s{step}_l{state['loss']:.6f}.pth")
-    torch.save(state, ckpt_path)
-    keep_latest_ckpts(args.ckpt_dir)
-    del state
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def get_prefix(keys):
     if not keys:
         return ""
@@ -283,6 +271,27 @@ def adapt_state_dict_keys(state_dict, model):
             new_k = model_prefix + new_k
         new_state_dict[new_k] = v
     return new_state_dict
+
+
+def save_ckpt(model, opt, epoch, step, loss, args, scheduler=None):
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    state = {
+        "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+        "optimizer": opt.state_dict(),
+        "epoch": int(epoch),
+        "step": int(step),
+        "loss": float(loss),
+        "args_all": dict(vars(args)),
+        "model_args": extract_model_args(args),
+    }
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
+    ckpt_path = os.path.join(args.ckpt_dir, f"e{epoch}_s{step}_l{state['loss']:.6f}.pth")
+    torch.save(state, ckpt_path)
+    keep_latest_ckpts(args.ckpt_dir)
+    del state
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location="cpu", args=None, restore_model_args=False):
@@ -321,21 +330,6 @@ def load_ckpt(model, opt, ckpt_path, scheduler=None, map_location="cpu", args=No
     return epoch, step
 
 
-def setup_logging(args):
-    if not dist.is_initialized() or dist.get_rank() != 0:
-        return
-    os.makedirs(args.log_path, exist_ok=True)
-    log_filename = os.path.join(
-        args.log_path, f"training_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    )
-    logging.basicConfig(
-        filename=log_filename,
-        level=logging.INFO,
-        format="%(asctime)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-
 _LAT_WEIGHT_CACHE = {}
 
 
@@ -356,22 +350,18 @@ def gaussian_nll_loss_weighted(preds, targets):
     C = C2 // 2
     mu = preds[:, :, :C]
     sigma = preds[:, :, C:]
-    device = preds.device
-    dtype = preds.dtype
-    w = get_latitude_weights(H, device, dtype).view(1, 1, 1, H, 1)
+    w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     var = sigma.pow(2)
     nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
     return (nll * w).mean()
 
 
 def latitude_weighted_l1(preds, targets):
-    B, T, C_pred, H, W = preds.shape
+    _, _, C_pred, H, _ = preds.shape
     _, _, C_gt, _, _ = targets.shape
-    device = preds.device
-    dtype = preds.dtype
     if C_pred == 2 * C_gt:
         preds = preds[:, :, :C_gt]
-    w = get_latitude_weights(H, device, dtype).view(1, 1, 1, H, 1)
+    w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
 
 
@@ -421,12 +411,6 @@ def get_grad_stats(model):
     return float(total_norm_sq**0.5 if cnt > 0 else 0.0), float(max_abs), int(cnt)
 
 
-def make_listT_from_arg_T(B, L, device, dtype, T):
-    if T is None or T < 0:
-        return None
-    return torch.full((B, L), float(T), device=device, dtype=dtype)
-
-
 def make_random_indices(L_eff, K):
     if K <= 0:
         return np.array([], dtype=int)
@@ -445,6 +429,12 @@ def build_dt_from_indices(idxs, base_T):
         gap = int(idxs[i] - idxs[i - 1])
         dt.append(float(base_T) * max(1, gap))
     return dt
+
+
+def make_listT_from_arg_T(B, L, device, dtype, T):
+    if T is None or T < 0:
+        return None
+    return torch.full((B, L), float(T), device=device, dtype=dtype)
 
 
 def setup_wandb(rank, args, model):
@@ -475,6 +465,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
     if rank == 0:
         setup_logging(args)
+
     if bool(args.use_tf32):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -498,12 +489,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             if rank == 0:
                 logging.info("[Args] applying model args from ckpt before building model.")
             apply_model_args(args, ckpt_model_args, verbose=True)
-
-    if rank == 0:
-        logging.info("==== Training Arguments (Updated) ====")
-        for k, v in vars(args).items():
-            logging.info(f"{k}: {v}")
-        logging.info("======================================")
 
     model = ConvLRU(args).cuda(local_rank)
     if bool(args.use_compile):
@@ -530,7 +515,14 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
         gpus=dist.get_world_size(),
     )
     tmp_sampler = torch.utils.data.distributed.DistributedSampler(tmp_dataset, shuffle=False, drop_last=True)
-    tmp_loader = DataLoader(tmp_dataset, sampler=tmp_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1)
+    tmp_loader = DataLoader(
+        tmp_dataset,
+        sampler=tmp_sampler,
+        batch_size=args.train_batch_size,
+        num_workers=1,
+        pin_memory=True,
+        prefetch_factor=1,
+    )
     len_train_dataloader = len(tmp_loader)
     del tmp_dataset, tmp_sampler, tmp_loader
     gc.collect()
@@ -539,14 +531,32 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr))
     scheduler = None
     if bool(args.use_scheduler):
-        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=float(args.lr), steps_per_epoch=len_train_dataloader, epochs=int(args.epochs))
+        scheduler = lr_scheduler.OneCycleLR(
+            opt,
+            max_lr=float(args.lr),
+            steps_per_epoch=len_train_dataloader,
+            epochs=int(args.epochs),
+        )
 
     start_epoch = 0
     if args.ckpt and os.path.isfile(args.ckpt):
-        start_epoch, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}", args=args, restore_model_args=False)
+        start_epoch, _ = load_ckpt(
+            model,
+            opt,
+            args.ckpt,
+            scheduler,
+            map_location=f"cuda:{local_rank}",
+            args=args,
+            restore_model_args=False,
+        )
 
     if bool(args.init_lr_scheduler) and bool(args.use_scheduler):
-        scheduler = lr_scheduler.OneCycleLR(opt, max_lr=float(args.lr), steps_per_epoch=len_train_dataloader, epochs=int(args.epochs) - int(start_epoch))
+        scheduler = lr_scheduler.OneCycleLR(
+            opt,
+            max_lr=float(args.lr),
+            steps_per_epoch=len_train_dataloader,
+            epochs=int(args.epochs) - int(start_epoch),
+        )
 
     if not bool(args.use_scheduler):
         for g in opt.param_groups:
@@ -713,7 +723,15 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
             if rank == 0:
                 ckpt_every = max(1, int(len(train_dataloader) * float(args.ckpt_step)))
                 if (train_step % ckpt_every == 0) or (train_step == len(train_dataloader)):
-                    save_ckpt(model, opt, ep + 1, train_step, avg_loss, args, scheduler if (bool(args.use_scheduler) and scheduler is not None) else None)
+                    save_ckpt(
+                        model,
+                        opt,
+                        ep + 1,
+                        train_step,
+                        avg_loss,
+                        args,
+                        scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
+                    )
 
             del x, preds, target, loss, loss_tensor, listT, static_feats, l1_tensor, metric_l1, timestep
             gc.collect()
@@ -781,10 +799,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, args):
                             static_feats=static_feats,
                             timestep=timestep,
                         )
-                        if preds.size(2) == 2 * target.size(2):
-                            preds_cmp = preds[:, :, : target.size(2)]
-                        else:
-                            preds_cmp = preds
+                        preds_cmp = preds[:, :, : target.size(2)] if preds.size(2) == 2 * target.size(2) else preds
                         loss_eval = torch.nn.L1Loss()(preds_cmp, target)
 
                     tot_tensor = loss_eval.detach()
