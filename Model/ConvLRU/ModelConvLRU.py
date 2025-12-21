@@ -62,6 +62,22 @@ def pixel_unshuffle_hw_3d(x, rH: int, rW: int):
     return x
 
 
+class SpatialLayerNorm(nn.Module):
+    def __init__(self, H: int, W: int, eps: float = 1e-5, elementwise_affine: bool = True):
+        super().__init__()
+        self.H = int(H)
+        self.W = int(W)
+        self.ln = nn.LayerNorm(self.H * self.W, eps=eps, elementwise_affine=elementwise_affine)
+
+    def forward(self, x):
+        *prefix, H, W = x.shape
+        if H != self.H or W != self.W:
+            raise ValueError(f"SpatialLayerNorm shape mismatch: got ({H},{W}) expected ({self.H},{self.W})")
+        x = x.view(*prefix, H * W)
+        x = self.ln(x)
+        return x.view(*prefix, H, W)
+
+
 class FlashFFTConvInterface(nn.Module):
     def __init__(self, dim, size):
         super().__init__()
@@ -105,15 +121,11 @@ class SpectralConv2d(nn.Module):
         self.scale = 1 / (in_channels * out_channels)
         self.weights1 = nn.Parameter(
             self.scale
-            * torch.randn(
-                in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat
-            )
+            * torch.randn(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
         )
         self.weights2 = nn.Parameter(
             self.scale
-            * torch.randn(
-                in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat
-            )
+            * torch.randn(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
         )
 
     def _complex_mul2d(self, input, weights):
@@ -121,30 +133,22 @@ class SpectralConv2d(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        out_ft = torch.zeros(
-            B, L, self.out_channels, H, W, device=x.device, dtype=torch.cfloat
-        )
+        out_ft = torch.zeros(B, L, self.out_channels, H, W, device=x.device, dtype=torch.cfloat)
         eff_m1 = min(H, self.modes1)
         eff_m2 = min(W, self.modes2)
         w1 = self.weights1[:, :, :eff_m1, :eff_m2]
-        out_ft[:, :, :, :eff_m1, :eff_m2] = self._complex_mul2d(
-            x[:, :, :, :eff_m1, :eff_m2], w1
-        )
+        out_ft[:, :, :, :eff_m1, :eff_m2] = self._complex_mul2d(x[:, :, :, :eff_m1, :eff_m2], w1)
         if H > self.modes1 or W > self.modes2:
             eff_m1_neg = min(H, self.modes1)
             eff_m2_pos = min(W, self.modes2)
             x_slice = x[:, :, :, -eff_m1_neg:, :eff_m2_pos]
             w2 = self.weights2[:, :, :eff_m1_neg, :eff_m2_pos]
-            out_ft[:, :, :, -eff_m1_neg:, :eff_m2_pos] = self._complex_mul2d(
-                x_slice, w2
-            )
+            out_ft[:, :, :, -eff_m1_neg:, :eff_m2_pos] = self._complex_mul2d(x_slice, w2)
         return out_ft
 
 
 class SphericalHarmonicsPrior(nn.Module):
-    def __init__(
-        self, channels: int, H: int, W: int, Lmax: int = 6, rank: int = 8, gain_init: float = 0.0
-    ):
+    def __init__(self, channels: int, H: int, W: int, Lmax: int = 6, rank: int = 8, gain_init: float = 0.0):
         super().__init__()
         self.C = channels
         self.H = H
@@ -186,9 +190,9 @@ class SphericalHarmonicsPrior(nn.Module):
             P[l][0] = ((2 * l_f - 1) * x * P[l - 1][0] - (l_f - 1) * P[l - 2][0]) / l_f
         for m in range(1, Lmax):
             m_f = torch.tensor(m, device=device, dtype=dtype)
-            P_mm = ((-1) ** m) * SphericalHarmonicsPrior._double_factorial(
-                2 * m - 1, dtype, device
-            ) * (1 - x * x).pow(m_f / 2)
+            P_mm = ((-1) ** m) * SphericalHarmonicsPrior._double_factorial(2 * m - 1, dtype, device) * (
+                1 - x * x
+            ).pow(m_f / 2)
             P[m][m] = P_mm
             if m + 1 < Lmax:
                 P[m + 1][m] = (2 * m_f + 1) * x * P_mm
@@ -205,9 +209,7 @@ class SphericalHarmonicsPrior(nn.Module):
             l_f = torch.tensor(l, device=device, dtype=dtype)
             for m in range(-l, l + 1):
                 m_abs = abs(m)
-                N_lm = torch.sqrt(
-                    (2 * l_f + 1) / (4 * pi) * SphericalHarmonicsPrior._fact_ratio(l, m_abs, dtype, device)
-                )
+                N_lm = torch.sqrt((2 * l_f + 1) / (4 * pi) * SphericalHarmonicsPrior._fact_ratio(l, m_abs, dtype, device))
                 if m == 0:
                     Y = N_lm * P[l][0]
                 elif m > 0:
@@ -293,10 +295,9 @@ class GatedConvBlock(nn.Module):
     def __init__(self, channels, hidden_size, use_cbam=False, cond_channels=None):
         super().__init__()
         self.use_cbam = use_cbam
-        self.dw_conv = nn.Conv3d(
-            channels, channels, kernel_size=(1, 7, 7), padding="same", groups=channels
-        )
-        self.norm = nn.LayerNorm([*hidden_size])
+        H, W = int(hidden_size[0]), int(hidden_size[1])
+        self.dw_conv = nn.Conv3d(channels, channels, kernel_size=(1, 7, 7), padding="same", groups=channels)
+        self.norm = SpatialLayerNorm(H, W)
         self.cond_channels = cond_channels
         if self.cond_channels is not None and self.cond_channels > 0:
             self.cond_proj = nn.Conv3d(self.cond_channels, channels * 2, kernel_size=1)
@@ -311,20 +312,14 @@ class GatedConvBlock(nn.Module):
     def forward(self, x, cond=None):
         residual = x
         x = self.dw_conv(x)
-        x = x.permute(0, 2, 1, 3, 4)
+        x = x.permute(0, 2, 1, 3, 4).contiguous()
         x = self.norm(x)
-        x = x.permute(0, 2, 1, 3, 4)
+        x = x.permute(0, 2, 1, 3, 4).contiguous()
         if self.cond_proj is not None and cond is not None:
-            if cond.dim() == 4:
-                cond_in = cond.unsqueeze(2)
-            else:
-                cond_in = cond
+            cond_in = cond.unsqueeze(2) if cond.dim() == 4 else cond
             if cond_in.shape[-2:] != x.shape[-2:]:
                 cond_in = F.interpolate(
-                    cond_in.squeeze(2),
-                    size=x.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
+                    cond_in.squeeze(2), size=x.shape[-2:], mode="bilinear", align_corners=False
                 ).unsqueeze(2)
             affine = self.cond_proj(cond_in)
             gamma, beta = torch.chunk(affine, 2, dim=1)
@@ -372,11 +367,7 @@ class SpatialPatchMoE(nn.Module):
                 cond = F.pad(cond, (0, pad_w, 0, pad_h))
         H_pad, W_pad = x.shape[-2:]
         nH, nW = H_pad // P, W_pad // P
-        x_patches = (
-            x.view(B, C, L, nH, P, nW, P)
-            .permute(0, 3, 5, 1, 2, 4, 6)
-            .reshape(-1, C, L, P, P)
-        )
+        x_patches = x.view(B, C, L, nH, P, nW, P).permute(0, 3, 5, 1, 2, 4, 6).reshape(-1, C, L, P, P)
         router_in = x_patches.mean(dim=(2, 3, 4))
         if cond is not None:
             if cond.dim() == 4:
@@ -408,12 +399,8 @@ class SpatialPatchMoE(nn.Module):
             if w_i.sum() < 1e-6:
                 continue
             expert_out = expert(x_patches, cond_patches)
-            final_output += w_i * expert_out
-        output = (
-            final_output.view(B, nH, nW, C, L, P, P)
-            .permute(0, 3, 4, 1, 5, 2, 6)
-            .reshape(B, C, L, H_pad, W_pad)
-        )
+            final_output = final_output + w_i * expert_out
+        output = final_output.view(B, nH, nW, C, L, P, P).permute(0, 3, 4, 1, 5, 2, 6).reshape(B, C, L, H_pad, W_pad)
         if pad_h > 0 or pad_w > 0:
             output = output[..., :H, :W]
         return output
@@ -456,7 +443,7 @@ class ConvLRULayer(nn.Module):
         self.post_ifft_conv_imag = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1))
         out_dim_fusion = self.emb_ch * 2 if not self.bidirectional else self.emb_ch * 4
         self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-        self.layer_norm = nn.LayerNorm([*self.hidden_size])
+        self.layer_norm = SpatialLayerNorm(S, W)
         self.noise_level = nn.Parameter(torch.tensor(0.01))
         self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if getattr(args, "use_freq_prior", False) else None
         self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, S, W, Lmax=6) if getattr(args, "use_sh_prior", False) else None
@@ -483,8 +470,7 @@ class ConvLRULayer(nn.Module):
     def _fft_impl(self, x):
         B, L, C, S, W = x.shape
         pad_size = S // 4
-        x = x.contiguous()
-        x_reshaped = x.reshape(B * L, C, S, W)
+        x_reshaped = x.contiguous().reshape(B * L, C, S, W)
         x_pad = F.pad(x_reshaped, (0, 0, pad_size, pad_size), mode="reflect")
         x_pad = x_pad.view(B, L, C, S + 2 * pad_size, W)
         h = torch.fft.fft2(x_pad.to(torch.cfloat), dim=(-2, -1), norm="ortho")
@@ -496,6 +482,7 @@ class ConvLRULayer(nn.Module):
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
+
         h, pad_size = self._fft_impl(x)
         S_pad = h.shape[-2]
         h_perm = h.permute(0, 1, 3, 4, 2).contiguous().view(B * L * S_pad * W, C)
@@ -503,16 +490,19 @@ class ConvLRULayer(nn.Module):
         h = h_proj.view(B, L, S_pad, W, C).permute(0, 1, 4, 2, 3).contiguous()
         if self.proj_b is not None:
             h = h + self.proj_b.view(1, 1, C, 1, 1)
+
         h_spatial = torch.fft.ifft2(h, dim=(-2, -1), norm="ortho")
         if pad_size > 0:
             h_spatial = h_spatial[..., pad_size:-pad_size, :]
         h = torch.fft.fft2(h_spatial, dim=(-2, -1), norm="ortho")
+
         if self.freq_prior:
             h = h + self.freq_prior(h)
+
         Uc = self.U_row.conj()
-        t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc)
-        t = t.permute(0, 1, 2, 4, 3)
+        t = torch.matmul(h.permute(0, 1, 2, 4, 3), Uc).permute(0, 1, 2, 4, 3)
         zq = torch.matmul(t, self.V_col)
+
         nu_log, theta_log = self.params_log_base.unbind(dim=0)
         disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
         nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
@@ -521,23 +511,27 @@ class ConvLRULayer(nn.Module):
         nu_t = torch.clamp(nu_base * dt + dnu_force, min=1e-6)
         th_t = th_base * dt + dth_force
         lamb = torch.exp(torch.complex(-nu_t, th_t))
+
         if self.training:
             noise_std = self.noise_level * torch.sqrt(dt + 1e-6)
-            noise = torch.randn_like(zq) * noise_std
-            x_in = zq + noise
+            x_in = zq + torch.randn_like(zq) * noise_std
         else:
             x_in = zq
+
         gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
         x_in = x_in * gamma_t
+
         zero_prev = torch.zeros_like(x_in[:, :1])
         if last_hidden_in is not None:
             x_in_fwd = torch.cat([last_hidden_in, x_in], dim=1)
         else:
             x_in_fwd = torch.cat([zero_prev, x_in], dim=1)
+
         lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
         lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
         z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())[:, 1:]
         last_hidden_out = z_out[:, -1:]
+
         if self.bidirectional:
             x_in_bwd = x_in.flip(1)
             lamb_bwd = lamb.flip(1)
@@ -548,11 +542,8 @@ class ConvLRULayer(nn.Module):
             z_out_bwd = z_out_bwd.flip(1)
 
         def project_back(z):
-            t = torch.matmul(z, self.V_col.conj().transpose(1, 2))
-            t = t.permute(0, 1, 2, 4, 3)
-            return torch.matmul(t, self.U_row.transpose(1, 2)).permute(0, 1, 2, 4, 3)
-
-        h_rec_fwd = project_back(z_out)
+            t2 = torch.matmul(z, self.V_col.conj().transpose(1, 2)).permute(0, 1, 2, 4, 3)
+            return torch.matmul(t2, self.U_row.transpose(1, 2)).permute(0, 1, 2, 4, 3)
 
         def recover_spatial(h_rec):
             h_sp = torch.fft.ifft2(h_rec, dim=(-2, -1), norm="ortho")
@@ -560,22 +551,29 @@ class ConvLRULayer(nn.Module):
             hi = self.post_ifft_conv_imag(h_sp.imag.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             return torch.cat([hr, hi], dim=2)
 
+        h_rec_fwd = project_back(z_out)
         feat_fwd = recover_spatial(h_rec_fwd)
+
         if self.bidirectional:
             h_rec_bwd = project_back(z_out_bwd)
             feat_bwd = recover_spatial(h_rec_bwd)
             feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
         else:
             feat_final = feat_fwd
+
         h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+
         if self.sh_prior:
             h_final = self.sh_prior(h_final)
+
         h_final = self.layer_norm(h_final)
+
         if hasattr(self, "gate_conv"):
             gate = self.gate_conv(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
             x = (1 - gate) * x + gate * h_final
         else:
             x = x + h_final
+
         return x, last_hidden_out
 
 
@@ -605,9 +603,7 @@ class FeedForward(nn.Module):
                     cond_ch,
                 )
             else:
-                block = GatedConvBlock(
-                    self.ffn_hidden_ch, self.hidden_size, use_cbam=self.use_cbam, cond_channels=cond_ch
-                )
+                block = GatedConvBlock(self.ffn_hidden_ch, self.hidden_size, use_cbam=self.use_cbam, cond_channels=cond_ch)
             blocks_list.append(block)
         self.blocks = nn.ModuleList(blocks_list)
         self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
@@ -907,7 +903,7 @@ class Embedding(nn.Module):
             self.c_hidden = None
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
-        self.layer_norm = nn.LayerNorm([*self.hidden_size])
+        self.layer_norm = SpatialLayerNorm(H, W)
 
     def forward(self, x, static_feats=None):
         x = x.permute(0, 2, 1, 3, 4)
@@ -963,8 +959,10 @@ class ConvLRU(nn.Module):
         else:
             x_step_mean = x_step_dist
         out.append(x_step_dist)
-        for t in range(out_gen_num - 1):
-            dt = listT_future[:, t : t + 1] if listT_future is not None else torch.ones_like(listT[:, 0:1])
+        for _ in range(out_gen_num - 1):
+            dt = listT_future[:, :1] if listT_future is not None else torch.ones_like(listT[:, 0:1])
+            if listT_future is not None:
+                listT_future = listT_future[:, 1:]
             x_in, _ = self.embedding(x_step_mean, static_feats=None)
             x_hidden, last_hidden_outs = self.convlru_model(
                 x_in,
