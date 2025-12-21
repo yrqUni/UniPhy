@@ -437,6 +437,8 @@ class ConvLRULayer(nn.Module):
         if pad_h_total > 0:
             x_reshaped = F.pad(x_reshaped, (0, 0, pad_t, pad_b), mode="reflect")
         h = torch.fft.fft2(x_reshaped.to(torch.cfloat), dim=(-2, -1), norm="ortho")
+        # 修正：将 (B*L, C, H, W) 还原为 (B, L, C, H, W)
+        h = h.view(B, L, C, h.shape[-2], h.shape[-1])
         return h, (pad_t, pad_b, pad_l, pad_r)
 
     def forward(self, x, last_hidden_in, listT=None):
@@ -445,7 +447,8 @@ class ConvLRULayer(nn.Module):
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=torch.float32)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=torch.float32)
-        with torch.cuda.amp.autocast(enabled=False):
+        # 修正：更新 autocast 语法
+        with torch.amp.autocast("cuda", enabled=False):
             x_f32 = x.float()
             h, pads = self._fft_impl(x_f32)
             pad_t, pad_b, pad_l, pad_r = pads
