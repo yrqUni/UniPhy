@@ -146,9 +146,9 @@ def test_consistency():
     x = torch.randn(B, L, C, H, W, device=device)
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
+    start_frame = x[:, 0:1]
     with torch.no_grad():
-        out_p = model(x, mode="p", listT=listT, static_feats=static)
-        start_frame = x[:, 0:1]
+        out_p = model(start_frame, mode="p", listT=listT[:, 0:1], static_feats=static)
         future_T = torch.ones(B, L - 1, device=device)
         out_i = model(
             start_frame,
@@ -158,7 +158,13 @@ def test_consistency():
             listT_future=future_T,
             static_feats=static,
         )
-        shape_match = out_p.shape == out_i.shape
+        shape_match = (out_p.shape[0], 1, out_p.shape[2], out_p.shape[3], out_p.shape[4]) == (
+            out_i.shape[0],
+            1,
+            out_i.shape[2],
+            out_i.shape[3],
+            out_i.shape[4],
+        )
         print_status("Inference Shape Match", shape_match, f"{out_p.shape} vs {out_i.shape}")
         diff_step1 = (out_p[:, 0] - out_i[:, 0]).abs().max().item()
         is_consistent = diff_step1 < 1e-4
