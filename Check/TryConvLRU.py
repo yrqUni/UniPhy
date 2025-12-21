@@ -86,8 +86,7 @@ def test_configurations():
             expected_shape = (B, L, expected_C, H, W)
             if out.shape != expected_shape:
                 raise ValueError(f"Shape Mismatch: Got {out.shape}, Expected {expected_shape}")
-            loss = out.sum()
-            loss.backward()
+            out.sum().backward()
             print_status(name, True, f"Params: {sum(p.numel() for p in model.parameters())}")
         except Exception as e:
             print_status(name, False, str(e))
@@ -111,23 +110,20 @@ def test_heads():
             passed = False
             msg = ""
             if mode == "gaussian":
-                if out.shape[2] == args.out_ch * 2:
-                    passed = True
-                    msg = f"Shape: {out.shape}"
+                passed = out.shape[2] == args.out_ch * 2
+                msg = f"Shape: {out.shape}"
             elif mode == "diffusion":
-                if out.shape[2] == args.out_ch:
-                    passed = True
-                    msg = f"Shape: {out.shape}"
-            elif mode == "token":
+                passed = out.shape[2] == args.out_ch
+                msg = f"Shape: {out.shape}"
+            else:
                 if isinstance(out, tuple) and len(out) == 3:
                     quant, vq_loss, idx = out
-                    if quant.shape[2] == args.out_ch:
-                        loss = quant.sum() + vq_loss
-                        loss.backward()
-                        passed = True
+                    passed = quant.shape[2] == args.out_ch
+                    if passed:
+                        (quant.sum() + vq_loss).backward()
                         msg = f"VQ Shape: {quant.shape}, Loss: {vq_loss.item():.4f}"
-            if not passed:
-                msg = f"Output Check Failed. Shape: {out.shape if not isinstance(out, tuple) else out[0].shape}"
+                if not msg:
+                    msg = f"Output Check Failed. Shape: {out.shape if not isinstance(out, tuple) else out[0].shape}"
             print_status(f"Head: {mode}", passed, msg)
         except Exception as e:
             print_status(f"Head: {mode}", False, str(e))
@@ -147,9 +143,10 @@ def test_consistency():
     static = torch.randn(B, 2, H, W, device=device)
     listT = torch.ones(B, L, device=device)
     start_frame = x[:, 0:1]
+    future_T = torch.ones(B, L - 1, device=device)
     with torch.no_grad():
-        out_p = model(start_frame, mode="p", listT=listT[:, 0:1], static_feats=static)
-        future_T = torch.ones(B, L - 1, device=device)
+        out_p_full = model(x, mode="p", listT=listT, static_feats=static)
+        out_p_step1 = model(start_frame, mode="p", listT=listT[:, 0:1], static_feats=static)
         out_i = model(
             start_frame,
             mode="i",
@@ -158,15 +155,10 @@ def test_consistency():
             listT_future=future_T,
             static_feats=static,
         )
-        shape_match = (out_p.shape[0], 1, out_p.shape[2], out_p.shape[3], out_p.shape[4]) == (
-            out_i.shape[0],
-            1,
-            out_i.shape[2],
-            out_i.shape[3],
-            out_i.shape[4],
-        )
-        print_status("Inference Shape Match", shape_match, f"{out_p.shape} vs {out_i.shape}")
-        diff_step1 = (out_p[:, 0] - out_i[:, 0]).abs().max().item()
+        print_status("Parallel Full Shape", True, f"{out_p_full.shape}")
+        shape_match = out_p_step1.shape == out_i[:, 0:1].shape
+        print_status("Inference Shape Match", shape_match, f"{out_p_step1.shape} vs {out_i[:, 0:1].shape}")
+        diff_step1 = (out_p_step1[:, 0] - out_i[:, 0]).abs().max().item()
         is_consistent = diff_step1 < 1e-4
         print_status("Step-1 Consistency", is_consistent, f"Max Diff: {diff_step1:.2e}")
 
