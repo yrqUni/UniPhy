@@ -110,16 +110,21 @@ def fused_gate_kernel(
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
+
     batch_idx = offsets // (C * Spatial)
     rem = offsets % (C * Spatial)
     c_idx = rem // Spatial
     s_idx = rem % Spatial
+
     in_idx_x = batch_idx * (2 * C * Spatial) + c_idx * Spatial + s_idx
     in_idx_g = batch_idx * (2 * C * Spatial) + (c_idx + C) * Spatial + s_idx
+
     x = tl.load(in_ptr + in_idx_x, mask=mask, other=0.0).to(tl.float32)
     g = tl.load(in_ptr + in_idx_g, mask=mask, other=0.0).to(tl.float32)
+
     sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
     out = (x * sigmoid_x) * g
+
     tl.store(out_ptr + offsets, out, mask=mask)
 
 
@@ -463,18 +468,20 @@ class CBAM2DPerStep(nn.Module):
 
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, channels: int, hidden_size: Tuple[int, int], use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.use_ada_norm = use_ada_norm
         self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=7)
-        if self.use_ada_norm and cond_channels is not None:
-            self.norm = AdaRMSNorm(int(channels), int(cond_channels))
-            self.cond_proj = None
+        
+        if self.use_ada_norm and ada_norm_cond_dim is not None:
+            self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
+            self.cond_proj = None 
         else:
             self.norm = RMSNorm(int(channels))
             self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
             self.cond_proj = nn.Conv3d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
+
         self.pw_conv_in = nn.Conv3d(int(channels), int(channels) * 2, kernel_size=1)
         self.fused_gate = FusedGatedSiLU()
         self.pw_conv_out = nn.Conv3d(int(channels), int(channels), kernel_size=1)
@@ -483,10 +490,12 @@ class GatedConvBlock(nn.Module):
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
         x = self.dw_conv(x)
+        
         if self.use_ada_norm:
             x = self.norm(x, time_emb)
         else:
             x = self.norm(x)
+
         if self.cond_proj is not None and cond is not None:
             if cond.dim() == 4:
                 cond_in = cond.unsqueeze(2)
@@ -496,13 +505,17 @@ class GatedConvBlock(nn.Module):
                 cond_rs = F.interpolate(cond_in.squeeze(2), size=x.shape[-2:], mode="bilinear", align_corners=False).unsqueeze(2)
             else:
                 cond_rs = cond_in
+            
             affine = self.cond_proj(cond_rs)
             gamma, beta = torch.chunk(affine, 2, dim=1)
             x = x * (1 + gamma) + beta
+
         x = self.pw_conv_in(x)
         x = self.fused_gate(x)
+
         if self.cbam is not None:
             x = self.cbam(x)
+
         x = self.pw_conv_out(x)
         return residual + x
 
@@ -992,8 +1005,19 @@ class Decoder(nn.Module):
         if self.dec_hidden_layers_num != 0:
             cond_ch = self.emb_ch if self.static_ch > 0 else None
             use_ada = (self.head_mode == "diffusion")
+            ada_cond_dim = out_ch_after_up if use_ada else None
             self.c_hidden = nn.ModuleList(
-                [GatedConvBlock(out_ch_after_up, (1, 1), use_cbam=False, cond_channels=cond_ch, use_ada_norm=use_ada) for _ in range(self.dec_hidden_layers_num)]
+                [
+                    GatedConvBlock(
+                        out_ch_after_up,
+                        (1, 1),
+                        use_cbam=False,
+                        cond_channels=cond_ch,
+                        use_ada_norm=use_ada,
+                        ada_norm_cond_dim=ada_cond_dim,
+                    )
+                    for _ in range(self.dec_hidden_layers_num)
+                ]
             )
         else:
             self.c_hidden = None
