@@ -18,7 +18,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# 确保路径正确
 sys.path.append("/nfs/ConvLRU/Model/ConvLRU")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
@@ -28,14 +27,43 @@ from ModelConvLRU import ConvLRU
 warnings.filterwarnings("ignore")
 
 MODEL_ARG_KEYS = [
-    "input_size", "input_ch", "out_ch", "hidden_activation", "output_activation",
-    "emb_strategy", "hidden_factor", "emb_ch", "emb_hidden_ch", "emb_hidden_layers_num",
-    "convlru_num_blocks", "use_cbam", "use_gate", "lru_rank", "use_freq_prior",
-    "freq_rank", "freq_gain_init", "freq_mode", "use_sh_prior", "sh_Lmax", "sh_rank",
-    "sh_gain_init", "ffn_hidden_ch", "ffn_hidden_layers_num", "num_expert",
-    "activate_expert", "dec_strategy", "dec_hidden_ch", "dec_hidden_layers_num",
-    "static_ch", "use_selective", "bidirectional", "unet", "head_mode", "use_checkpointing",
+    "input_size",
+    "input_ch",
+    "out_ch",
+    "hidden_activation",
+    "output_activation",
+    "emb_strategy",
+    "hidden_factor",
+    "emb_ch",
+    "emb_hidden_ch",
+    "emb_hidden_layers_num",
+    "convlru_num_blocks",
+    "use_cbam",
+    "use_gate",
+    "lru_rank",
+    "use_freq_prior",
+    "freq_rank",
+    "freq_gain_init",
+    "freq_mode",
+    "use_sh_prior",
+    "sh_Lmax",
+    "sh_rank",
+    "sh_gain_init",
+    "ffn_hidden_ch",
+    "ffn_hidden_layers_num",
+    "num_expert",
+    "activate_expert",
+    "dec_strategy",
+    "dec_hidden_ch",
+    "dec_hidden_layers_num",
+    "static_ch",
+    "use_selective",
+    "bidirectional",
+    "unet",
+    "head_mode",
+    "use_checkpointing",
 ]
+
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
@@ -51,13 +79,15 @@ def set_random_seed(seed: int, deterministic: bool = False) -> None:
             torch.backends.cudnn.deterministic = False
             torch.backends.cudnn.benchmark = True
 
+
 set_random_seed(1017, deterministic=False)
+
 
 class Args:
     def __init__(self) -> None:
         self.input_size = (721, 1440)
         self.input_ch = 30
-        self.out_ch = 30 # 确保这里与 input_ch 一致，除非你有意为之
+        self.out_ch = 30
         self.static_ch = 6
         self.hidden_activation = "SiLU"
         self.output_activation = "Tanh"
@@ -75,7 +105,7 @@ class Args:
         self.use_gate = True
         self.lru_rank = 32
         self.use_selective = True
-        self.bidirectional = True
+        self.bidirectional = False
         self.unet = True
         self.use_freq_prior = True
         self.freq_rank = 8
@@ -132,6 +162,7 @@ class Args:
             print("[Warning] Torch Compile is experimental. Use with caution.")
             logging.warning("Torch Compile is experimental. Use with caution.")
 
+
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
@@ -143,9 +174,11 @@ def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, lo
     )
     torch.cuda.set_device(local_rank)
 
+
 def cleanup_ddp() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
+
 
 def setup_logging(args: Args) -> None:
     if not dist.is_initialized() or dist.get_rank() != 0:
@@ -159,6 +192,7 @@ def setup_logging(args: Args) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+
 def keep_latest_ckpts(ckpt_dir: str) -> None:
     ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
     if len(ckpt_files) <= 64:
@@ -170,8 +204,10 @@ def keep_latest_ckpts(ckpt_dir: str) -> None:
         except Exception:
             pass
 
+
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
     return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
+
 
 def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], verbose: bool = True) -> None:
     if not model_args_dict:
@@ -185,6 +221,7 @@ def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], v
                 if dist.is_initialized() and dist.get_rank() == 0:
                     logging.info(msg)
             setattr(args_obj, k, v)
+
 
 def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
     if not os.path.isfile(ckpt_path):
@@ -212,6 +249,7 @@ def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Opti
         return None
     return model_args
 
+
 def get_prefix(keys: List[str]) -> str:
     if not keys:
         return ""
@@ -221,6 +259,7 @@ def get_prefix(keys: List[str]) -> str:
     if key.startswith("module."):
         return "module."
     return ""
+
 
 def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     model_keys = list(model.state_dict().keys())
@@ -236,6 +275,7 @@ def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.M
             new_k = model_prefix + new_k
         new_state_dict[new_k] = v
     return new_state_dict
+
 
 def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -257,6 +297,7 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
 
 def load_ckpt(
     model: torch.nn.Module,
@@ -304,7 +345,9 @@ def load_ckpt(
         logging.info(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
     return epoch, step
 
+
 _LAT_WEIGHT_CACHE: Dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
+
 
 def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     key = (H, device, dtype)
@@ -317,42 +360,29 @@ def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> to
     _LAT_WEIGHT_CACHE[key] = w
     return w
 
+
 def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    # [Fix] Handle channel mismatch for prediction
     B, L, C2, H, W = preds.shape
     C_gt = targets.size(2)
-    # If preds has double channels of target, standard Gaussian NLL
-    if C2 == 2 * C_gt:
-        mu = preds[:, :, :C_gt]
-        sigma = preds[:, :, C_gt:]
-        w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
-        var = sigma.pow(2)
-        nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
-        return (nll * w).mean()
-    else:
-        # Fallback for shape mismatch (e.g. diffusion head might output single channel if not careful)
-        # Or if output is just mean
-        preds_cmp = preds[:, :, :C_gt]
-        w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
-        return ((preds_cmp - targets).pow(2) * w).mean()
+    mu = preds[:, :, :C_gt]
+    sigma = preds[:, :, C_gt:]
+    w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
+    var = sigma.pow(2)
+    nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
+    return (nll * w).mean()
+
 
 def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    # [Fix] Handle channel mismatch. 
-    # Preds: (B, L, C_pred, H, W)
-    # Targets: (B, L, C_gt, H, W)
     _, _, C_pred, H, _ = preds.shape
     _, _, C_gt, _, _ = targets.shape
-    
     if C_pred == 2 * C_gt:
-        preds = preds[:, :, :C_gt] # Take mean for L1
-    elif C_pred > C_gt:
-        # If just larger but not double, take first C_gt (Defensive)
         preds = preds[:, :, :C_gt]
-    
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
 
+
 _LRU_GATE_MEAN: Dict[Any, float] = {}
+
 
 def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
@@ -372,11 +402,13 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
 
             module.register_forward_hook(_hook)
 
+
 def format_gate_means() -> str:
     if not _LRU_GATE_MEAN:
         return "g=NA"
     keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: (0, k) if isinstance(k, int) else (1, str(k)))
     return " ".join([f"g[b{k}]={_LRU_GATE_MEAN[k]:.4f}" if isinstance(k, int) else f"g[{k}]={_LRU_GATE_MEAN[k]:.4f}" for k in keys])
+
 
 def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
     total_norm_sq = 0.0
@@ -392,6 +424,7 @@ def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
         max_abs = max(max_abs, g.abs().max().item())
     return float(total_norm_sq**0.5 if cnt > 0 else 0.0), float(max_abs), int(cnt)
 
+
 def make_random_indices(L_eff: int, K: int) -> np.ndarray:
     if K <= 0:
         return np.array([], dtype=int)
@@ -400,6 +433,7 @@ def make_random_indices(L_eff: int, K: int) -> np.ndarray:
     idx = np.random.choice(L_eff, size=K, replace=False)
     idx.sort()
     return idx
+
 
 def build_dt_from_indices(idxs: np.ndarray, base_T: float) -> List[float]:
     if len(idxs) == 0:
@@ -410,10 +444,12 @@ def build_dt_from_indices(idxs: np.ndarray, base_T: float) -> List[float]:
         dt.append(float(base_T) * max(1, gap))
     return dt
 
+
 def make_listT_from_arg_T(B: int, L: int, device: torch.device, dtype: torch.dtype, T: Optional[float]) -> Optional[torch.Tensor]:
     if T is None or T < 0:
         return None
     return torch.full((B, L), float(T), device=device, dtype=dtype)
+
 
 def setup_wandb(rank: int, args: Args, model: torch.nn.Module) -> None:
     if rank != 0 or not bool(getattr(args, "use_wandb", False)):
@@ -430,12 +466,14 @@ def setup_wandb(rank: int, args: Args, model: torch.nn.Module) -> None:
     wandb.init(**wandb_kwargs)
     wandb.watch(model.module if isinstance(model, DDP) else model, log="all", log_freq=100)
 
+
 def sample_timestep(args: Args, batch_size: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
     if str(getattr(args, "head_mode", "gaussian")).lower() != "diffusion":
         return None
     steps = int(getattr(args, "diffusion_steps", 1000))
     t = torch.randint(0, max(1, steps), (batch_size,), device=device)
     return t.to(dtype=dtype)
+
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
@@ -476,14 +514,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
     register_lru_gate_hooks(model)
     setup_wandb(rank, args, model)
-
-    # Loss selector
-    if str(args.loss).lower() == "nll":
-        loss_fn = gaussian_nll_loss_weighted
-    elif str(args.loss).lower() == "lat":
-        loss_fn = latitude_weighted_l1
-    else:
-        loss_fn = torch.nn.L1Loss()
 
     train_dataset = ERA5_Dataset(
         input_dir=args.data_root,
@@ -600,31 +630,14 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
-                # preds shape: (B, L, C_out, H, W)
-                # If C_out is greater than target (e.g. Gaussian), it will have 2x channels
+                preds = preds[:, 1:]
                 
-                # IMPORTANT: Shift for next token prediction logic
-                # Your code does: preds[:, 1:] vs target
-                # preds corresponds to output at steps t=1..L (given inputs at t=0..L-1)
-                # target is data at t=1..L (indices 2 to L_eff+1 in your slicing logic?)
-                # Verify slicing: 
-                # x = data[:, 0:L_eff] -> inputs 0, 1, ..., L-2
-                # target = data[:, 2:L_eff+1] -> This looks like stride 2? Or offset?
-                # Usually: input t -> predict t+1.
-                # If x is 0..L-1, target should be 1..L
-                # The slicing logic above 'data[:, 2: L_eff + 1]' seems specific to your dataset structure.
-                # Assuming preds are aligned such that we need to drop the first prediction to match target?
-                preds = preds[:, 1:] 
-                
-                # Compute Loss
-                loss = loss_fn(preds, target)
-                
-                # Compute Metric (L1) on deterministic part
-                p_det = preds.detach()
-                if p_det.size(2) == 2 * target.size(2):
-                    p_det = p_det[:, :, : target.size(2)]
-                elif p_det.size(2) > target.size(2):
-                    p_det = p_det[:, :, : target.size(2)]
+                if preds.shape[2] == 2 * target.shape[2]:
+                    loss = gaussian_nll_loss_weighted(preds, target)
+                    p_det = preds[:, :, :target.shape[2]]
+                else:
+                    loss = latitude_weighted_l1(preds, target)
+                    p_det = preds
                 
                 metric_l1 = F.l1_loss(p_det, target)
 
@@ -670,7 +683,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 message = (
                     f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
-                    f"- Loss({args.loss}): {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- Loss: {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
                     f"- {gate_str}{grad_str} - MoE(n={int(args.num_expert)},k={int(args.activate_expert)})"
                 )
                 if isinstance(train_iter, tqdm):
@@ -682,7 +695,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     log_dict: Dict[str, Any] = {
                         "train/epoch": ep + 1,
                         "train/step": global_step,
-                        f"train/loss_{args.loss}": avg_loss,
+                        "train/loss": avg_loss,
                         "train/loss_l1": avg_l1,
                         "train/lr": float(current_lr),
                         "train/K": int(K),
@@ -783,11 +796,9 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             static_feats=static_feats,
                             timestep=timestep,
                         )
-                        # Fix Eval Metric Channel Mismatch
-                        if preds.size(2) == 2 * target.size(2):
-                            preds_cmp = preds[:, :, : target.size(2)]
-                        elif preds.size(2) > target.size(2):
-                            preds_cmp = preds[:, :, : target.size(2)]
+                        
+                        if preds.shape[2] == 2 * target.shape[2]:
+                            preds_cmp = preds[:, :, :target.shape[2]]
                         else:
                             preds_cmp = preds
                             
@@ -819,6 +830,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if rank == 0 and bool(getattr(args, "use_wandb", False)):
         wandb.finish()
     cleanup_ddp()
+
 
 if __name__ == "__main__":
     args = Args()

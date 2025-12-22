@@ -1,283 +1,19 @@
 import math
-from typing import Any, List, Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 import triton
-import triton.language as tl
-
-from pscan import pscan
-
-
-def _kaiming_like_(tensor: torch.Tensor) -> torch.Tensor:
-    nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
-    return tensor
-
-
-def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
-    out_ch, in_ch, kD, kH, kW = weight.shape
-    base_out = out_ch // (rH * rW)
-    base = weight.new_zeros((base_out, in_ch, 1, kH, kW))
-    _kaiming_like_(base)
-    base = base.repeat_interleave(rH * rW, dim=0)
-    with torch.no_grad():
-        weight.copy_(base)
-    return weight
-
-
-def _bilinear_kernel_2d(kH: int, kW: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    factor_h = (kH + 1) // 2
-    factor_w = (kW + 1) // 2
-    center_h = factor_h - 1 if kH % 2 == 1 else factor_h - 0.5
-    center_w = factor_w - 1 if kW % 2 == 1 else factor_w - 0.5
-    og_h = torch.arange(kH, device=device, dtype=dtype)
-    og_w = torch.arange(kW, device=device, dtype=dtype)
-    fh = (1 - torch.abs(og_h - center_h) / factor_h).unsqueeze(1)
-    fw = (1 - torch.abs(og_w - center_w) / factor_w).unsqueeze(0)
-    return fh @ fw
-
-
-def deconv3d_bilinear_init_(weight: torch.Tensor) -> torch.Tensor:
-    in_ch, out_ch, kD, kH, kW = weight.shape
-    with torch.no_grad():
-        weight.zero_()
-        kernel = _bilinear_kernel_2d(kH, kW, weight.device, weight.dtype)
-        c = min(in_ch, out_ch)
-        for i in range(c):
-            weight[i, i, 0, :, :] = kernel
-    return weight
-
-
-def pixel_shuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
-    N, C_mul, D, H, W = x.shape
-    C = C_mul // (rH * rW)
-    x = x.view(N, C, rH, rW, D, H, W)
-    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
-    x = x.view(N, C, D, H * rH, W * rW)
-    return x
-
-
-def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
-    N, C, D, H, W = x.shape
-    x = x.view(N, C, D, H // rH, rH, W // rW, rW)
-    x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
-    x = x.view(N, C * rH * rW, D, H // rH, W // rW)
-    return x
-
-
-@triton.jit
-def fused_moe_router_kernel(
-    logits_ptr,
-    weights_out_ptr,
-    indices_out_ptr,
-    n_experts,
-    k: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    logits_row_start = logits_ptr + pid * n_experts
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_experts
-    logits = tl.load(logits_row_start + offsets, mask=mask, other=-float("inf"))
-    logits_max = tl.max(logits, 0)
-    logits = logits - logits_max
-    numerator = tl.exp(logits)
-    denominator = tl.sum(numerator, 0)
-    probs = numerator / denominator
-    weights_row_start = weights_out_ptr + pid * k
-    indices_row_start = indices_out_ptr + pid * k
-    for i in range(k):
-        current_max_val = tl.max(probs, 0)
-        current_max_idx = tl.argmax(probs, 0)
-        tl.store(weights_row_start + i, current_max_val)
-        tl.store(indices_row_start + i, current_max_idx)
-        mask_max = offsets == current_max_idx
-        probs = tl.where(mask_max, 0.0, probs)
-
-
-@triton.jit
-def fused_gate_kernel(
-    in_ptr,
-    out_ptr,
-    C,
-    Spatial,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    batch_idx = offsets // (C * Spatial)
-    rem = offsets % (C * Spatial)
-    c_idx = rem // Spatial
-    s_idx = rem % Spatial
-    in_idx_x = batch_idx * (2 * C * Spatial) + c_idx * Spatial + s_idx
-    in_idx_g = batch_idx * (2 * C * Spatial) + (c_idx + C) * Spatial + s_idx
-    x = tl.load(in_ptr + in_idx_x, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(in_ptr + in_idx_g, mask=mask, other=0.0).to(tl.float32)
-    sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
-    out = (x * sigmoid_x) * g
-    tl.store(out_ptr + offsets, out, mask=mask)
-
-
-class FusedGatedSiLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        B, C2, D, H, W = x.shape
-        C = C2 // 2
-        out = torch.empty((B, C, D, H, W), device=x.device, dtype=x.dtype)
-        n_elements = B * C * D * H * W
-        Spatial = D * H * W
-        grid = (triton.cdiv(n_elements, 1024),)
-        fused_gate_kernel[grid](x, out, C, Spatial, n_elements, BLOCK_SIZE=1024)
-        return out
-
-
-@triton.jit
-def rms_norm_kernel(
-    x_ptr,
-    w_ptr,
-    out_ptr,
-    stride_x_row,
-    N_COLS,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < N_COLS
-    x_row_start = x_ptr + row_idx * stride_x_row
-    x = tl.load(x_row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
-    mean_sq = tl.sum(x * x, axis=0) / N_COLS
-    rstd = tl.rsqrt(mean_sq + eps)
-    w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-    y = x * rstd * w
-    out_row_start = out_ptr + row_idx * stride_x_row
-    tl.store(out_row_start + col_offsets, y, mask=mask)
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.channels = int(channels)
-        self.eps = float(eps)
-        self.weight = nn.Parameter(torch.ones(self.channels))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_shape = x.shape
-        if x.dim() == 5:
-            x = x.permute(0, 2, 3, 4, 1).contiguous()
-        x_flat = x.view(-1, self.channels)
-        if not x_flat.is_contiguous():
-            x_flat = x_flat.contiguous()
-        M, N = x_flat.shape
-        out = torch.empty_like(x_flat)
-        grid = (M,)
-        BLOCK_SIZE = triton.next_power_of_2(N)
-        BLOCK_SIZE = max(1, min(BLOCK_SIZE, 4096))
-        if N > 4096:
-            var = x.pow(2).mean(dim=-1, keepdim=True)
-            out_norm = x * torch.rsqrt(var + self.eps)
-            return out_norm * self.weight
-        rms_norm_kernel[grid](
-            x_flat,
-            self.weight,
-            out,
-            x_flat.stride(0),
-            N,
-            self.eps,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-        out = out.view(*x.shape)
-        if len(orig_shape) == 5:
-            out = out.permute(0, 4, 1, 2, 3).contiguous()
-        return out
-
-
-class AdaRMSNorm(nn.Module):
-    def __init__(self, channels: int, cond_channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.norm = RMSNorm(channels, eps=eps)
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(cond_channels, channels * 2)
-        nn.init.zeros_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
-
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
-        x = self.norm(x)
-        if cond is not None:
-            emb = self.linear(self.silu(cond))
-            scale, shift = torch.chunk(emb, 2, dim=1)
-            scale = scale.view(x.size(0), x.size(1), 1, 1, 1) + 1.0
-            shift = shift.view(x.size(0), x.size(1), 1, 1, 1)
-            x = x * scale + shift
-        return x
-
-
-class RevIN(nn.Module):
-    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
-        super().__init__()
-        self.num_features = int(num_features)
-        self.eps = float(eps)
-        self.affine = bool(affine)
-        if self.affine:
-            self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
-            self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
-
-    def _get_statistics(self, x: torch.Tensor) -> None:
-        dim2reduce = (1, 3, 4)
-        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight + self.affine_bias
-        return x
-
-    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.affine:
-            x = (x - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
-        x = x * self.stdev + self.mean
-        return x
-
-    def forward(self, x: torch.Tensor, mode: str) -> torch.Tensor:
-        if mode == "norm":
-            self._get_statistics(x)
-            return self._normalize(x)
-        elif mode == "denorm":
-            return self._denormalize(x)
-        else:
-            raise NotImplementedError
-
-
-class PeriodicConv3d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
-        super().__init__()
-        self.pad_k = kernel_size // 2
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.pad(x, (self.pad_k, self.pad_k, 0, 0, 0, 0), mode="circular")
-        x = F.pad(x, (0, 0, self.pad_k, self.pad_k, self.pad_k, self.pad_k), mode="replicate")
-        return self.conv(x)
-
+from typing import Any, Tuple, Optional, List
 
 class FactorizedPeriodicConv3d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7):
         super().__init__()
-        self.pad_sp = kernel_size // 2
+        self.pad_sp = (kernel_size - 1) // 2
         self.spatial_conv = nn.Conv2d(
             in_channels,
             out_channels,
-            kernel_size=(kernel_size, kernel_size),
+            kernel_size=kernel_size,
             padding=0,
             bias=False,
         )
@@ -298,7 +34,6 @@ class FactorizedPeriodicConv3d(nn.Module):
         x_sp = x_sp.view(B, D, -1, H, W).permute(0, 2, 1, 3, 4)
         out = self.depth_conv(x_sp)
         return out
-
 
 class DiscreteCosineTransform(nn.Module):
     def __init__(self, n: int, dim: int):
@@ -321,7 +56,6 @@ class DiscreteCosineTransform(nn.Module):
         x = x.transpose(self.dim, -1)
         out = torch.matmul(x, self.dct_matrix)
         return out.transpose(self.dim, -1)
-
 
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
@@ -355,7 +89,6 @@ class SpectralConv2d(nn.Module):
                     self.weights2[:, :, :m1, :m2]
                 )
             return out_ft
-
 
 class SphericalHarmonicsPrior(nn.Module):
     def __init__(self, channels: int, H: int, W: int, Lmax: int = 6, rank: int = 8, gain_init: float = 0.0):
@@ -449,7 +182,6 @@ class SphericalHarmonicsPrior(nn.Module):
         bias = (self.gain.view(C, 1, 1) * bias).view(1, 1, C, H, W)
         return x + bias
 
-
 class ChannelAttention2D(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
@@ -467,7 +199,6 @@ class ChannelAttention2D(nn.Module):
         attn = torch.sigmoid(self.mlp(avg_pool) + self.mlp(max_pool)).view(BL, C, 1, 1)
         return x * attn
 
-
 class SpatialAttention2D(nn.Module):
     def __init__(self, kernel_size: int = 7):
         super().__init__()
@@ -482,7 +213,6 @@ class SpatialAttention2D(nn.Module):
         attn = torch.sigmoid(self.conv(attn))
         return x * attn
 
-
 class CBAM2DPerStep(nn.Module):
     def __init__(self, channels: int, reduction: int = 16, spatial_kernel: int = 7):
         super().__init__()
@@ -495,7 +225,6 @@ class CBAM2DPerStep(nn.Module):
         x_flat = self.ca(x_flat)
         x_flat = self.sa(x_flat)
         return x_flat.view(B, L, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
-
 
 class CrossScaleAttentionGate(nn.Module):
     def __init__(self, channels: int):
@@ -513,7 +242,6 @@ class CrossScaleAttentionGate(nn.Module):
         psi = self.relu(g + l)
         attn = self.sigmoid(self.psi(psi))
         return self.norm(local_x * attn)
-
 
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None):
@@ -558,7 +286,6 @@ class GatedConvBlock(nn.Module):
             x = self.cbam(x)
         x = self.pw_conv_out(x)
         return residual + x
-
 
 class SpatialPatchMoE(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], num_experts: int, active_experts: int, use_cbam: bool, cond_channels: Optional[int]):
@@ -662,7 +389,6 @@ class SpatialPatchMoE(nn.Module):
         if pad_h > 0 or pad_w > 0:
             out = out[..., :H, :W]
         return out
-
 
 class ConvLRULayer(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -794,10 +520,10 @@ class ConvLRULayer(nn.Module):
             lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
             lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
             B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
-            x_flat = x_in_fwd.view(B_sz, L_sz, -1).contiguous()
-            l_flat = lamb_in_fwd.view(B_sz, L_sz, -1).contiguous()
-            z_flat = self.pscan(l_flat, x_flat)
-            z_out = z_flat.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
+            x_in_pscan = x_in_fwd.view(B_sz, L_sz, C_sz * W_sz, R_sz).contiguous()
+            l_in_pscan = lamb_in_fwd.view(B_sz, L_sz, C_sz * W_sz, R_sz).contiguous()
+            z_pscan_out = self.pscan(l_in_pscan, x_in_pscan)
+            z_out = z_pscan_out.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
             last_hidden_out = z_out[:, -1:]
             if self.bidirectional:
                 x_in_bwd = x_in_lru.flip(1)
@@ -805,10 +531,10 @@ class ConvLRULayer(nn.Module):
                 x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
                 lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
                 lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-                x_flat_b = x_in_bwd.view(B_sz, L_sz, -1).contiguous()
-                l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1).contiguous()
-                z_flat_b = self.pscan(l_flat_b, x_flat_b)
-                z_out_bwd = z_flat_b.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
+                x_in_pscan_b = x_in_bwd.view(B_sz, L_sz, C_sz * W_sz, R_sz).contiguous()
+                l_in_pscan_b = lamb_in_bwd.view(B_sz, L_sz, C_sz * W_sz, R_sz).contiguous()
+                z_pscan_out_b = self.pscan(l_in_pscan_b, x_in_pscan_b)
+                z_out_bwd = z_pscan_out_b.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
             else:
                 z_out_bwd = None
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
@@ -840,7 +566,6 @@ class ConvLRULayer(nn.Module):
         else:
             x_out = x + h_final
         return x_out, last_hidden_out
-
 
 class FeedForward(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -876,7 +601,6 @@ class FeedForward(nn.Module):
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         return residual + x
 
-
 class ConvLRUBlock(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -893,7 +617,6 @@ class ConvLRUBlock(nn.Module):
             return checkpoint.checkpoint(_inner_forward, x, last_hidden_in, listT, cond, use_reentrant=False)
         else:
             return _inner_forward(x, last_hidden_in, listT, cond)
-
 
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25):
@@ -920,7 +643,6 @@ class VectorQuantizer(nn.Module):
         quantized = inputs + (quantized - inputs).detach()
         return quantized, loss, encoding_indices
 
-
 class DiffusionHead(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -943,7 +665,6 @@ class DiffusionHead(nn.Module):
         tt = t.float().view(-1, 1) * freqs.view(1, -1)
         emb = torch.cat([tt.sin(), tt.cos()], dim=-1)
         return self.mlp(emb.to(dtype=t.dtype))
-
 
 class Decoder(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -1053,7 +774,6 @@ class Decoder(nn.Module):
             return quantized.permute(0, 2, 1, 3, 4).contiguous(), loss, indices
         return x.permute(0, 2, 1, 3, 4).contiguous()
 
-
 class ConvLRUModel(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -1138,7 +858,6 @@ class ConvLRUModel(nn.Module):
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         return x, last_hidden_outs
 
-
 class Embedding(nn.Module):
     def __init__(self, args: Any):
         super().__init__()
@@ -1212,7 +931,6 @@ class Embedding(nn.Module):
         x = self.norm(x)
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         return x, cond
-
 
 class ConvLRU(nn.Module):
     def __init__(self, args: Any):
