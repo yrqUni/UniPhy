@@ -227,11 +227,11 @@ class RevIN(nn.Module):
         self.eps = float(eps)
         self.affine = bool(affine)
         if self.affine:
-            self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
-            self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
+            self.affine_weight = nn.Parameter(torch.ones(1, self.num_features, 1, 1, 1))
+            self.affine_bias = nn.Parameter(torch.zeros(1, self.num_features, 1, 1, 1))
 
     def _get_statistics(self, x: torch.Tensor) -> None:
-        dim2reduce = (1, 3, 4)
+        dim2reduce = (2, 3, 4)
         self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
         self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
 
@@ -677,7 +677,6 @@ class ConvLRULayer(nn.Module):
         self.W = int(self.hidden_size[1])
         self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
-        self.bidirectional = bool(getattr(args, "bidirectional", False))
         self.use_checkpointing = bool(getattr(args, "use_checkpointing", False))
         self.W_freq = self.W // 2 + 1
         dt_min, dt_max = 0.001, 0.1
@@ -709,8 +708,7 @@ class ConvLRULayer(nn.Module):
         C = self.emb_ch
         self.proj_W = nn.Parameter(torch.randn(C, C, dtype=torch.cfloat) / math.sqrt(max(1, C)))
         self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
-        out_dim_fusion = self.emb_ch if not self.bidirectional else self.emb_ch * 2
-        self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
+        self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = RMSNorm(self.emb_ch)
         self.noise_level = nn.Parameter(torch.tensor(0.01))
         self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
@@ -786,31 +784,26 @@ class ConvLRULayer(nn.Module):
                 x_in_lru = zq
             gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
             x_in_lru = x_in_lru * gamma_t
-            zero_prev = torch.zeros_like(x_in_lru[:, :1])
-            if last_hidden_in is not None:
-                x_in_fwd = torch.cat([last_hidden_in.to(x_in_lru.dtype), x_in_lru], dim=1)
+            
+            if L == 1 and last_hidden_in is not None:
+                h_prev = last_hidden_in.to(x_in_lru.dtype)
+                z_out = lamb * h_prev + x_in_lru
+                last_hidden_out = z_out
             else:
-                x_in_fwd = torch.cat([zero_prev, x_in_lru], dim=1)
-            lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
-            lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
-            B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
-            x_scan = x_in_fwd.view(B_sz, L_sz, -1, R_sz).contiguous()
-            l_scan = lamb_in_fwd.view(B_sz, L_sz, -1, R_sz).contiguous()
-            z_scan = self.pscan(l_scan, x_scan)
-            z_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
-            last_hidden_out = z_out[:, -1:]
-            if self.bidirectional:
-                x_in_bwd = x_in_lru.flip(1)
-                lamb_bwd = lamb.flip(1)
-                x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
-                lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
-                lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-                x_scan_b = x_in_bwd.view(B_sz, L_sz, -1, R_sz).contiguous()
-                l_scan_b = lamb_in_bwd.view(B_sz, L_sz, -1, R_sz).contiguous()
-                z_scan_b = self.pscan(l_scan_b, x_scan_b)
-                z_out_bwd = z_scan_b.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
-            else:
-                z_out_bwd = None
+                zero_prev = torch.zeros_like(x_in_lru[:, :1])
+                if last_hidden_in is not None:
+                    x_in_fwd = torch.cat([last_hidden_in.to(x_in_lru.dtype), x_in_lru], dim=1)
+                else:
+                    x_in_fwd = torch.cat([zero_prev, x_in_lru], dim=1)
+                lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
+                lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
+                B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
+                x_scan = x_in_fwd.view(B_sz, L_sz, -1, R_sz).contiguous()
+                l_scan = lamb_in_fwd.view(B_sz, L_sz, -1, R_sz).contiguous()
+                z_scan = self.pscan(l_scan, x_scan)
+                z_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
+                last_hidden_out = z_out[:, -1:]
+
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
                 z = z * sc_v
                 t1 = torch.einsum("blcwr,cwr->blcwr", z, self.V_col.conj())
@@ -819,14 +812,8 @@ class ConvLRULayer(nn.Module):
                 return rec
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
             h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
-            feat_fwd = self._hybrid_inverse_transform(h_rec_fwd)
-            if self.bidirectional and z_out_bwd is not None:
-                h_rec_bwd = project_back(z_out_bwd, scale_u, scale_v)
-                h_rec_bwd = h_rec_bwd.permute(0, 1, 2, 4, 3)
-                feat_bwd = self._hybrid_inverse_transform(h_rec_bwd)
-                feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
-            else:
-                feat_final = feat_fwd
+            feat_final = self._hybrid_inverse_transform(h_rec_fwd)
+        
         feat_final = feat_final.to(x.dtype)
         h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
         if self.sh_prior is not None:
