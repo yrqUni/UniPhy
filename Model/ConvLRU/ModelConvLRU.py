@@ -133,6 +133,8 @@ class FusedGatedSiLU(nn.Module):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_contiguous():
+            x = x.contiguous()
         B, C2, D, H, W = x.shape
         C = C2 // 2
         out = torch.empty((B, C, D, H, W), device=x.device, dtype=x.dtype)
@@ -183,6 +185,9 @@ class RMSNorm(nn.Module):
             x = x.permute(0, 2, 3, 4, 1).contiguous()
         
         x_flat = x.view(-1, self.channels)
+        if not x_flat.is_contiguous():
+            x_flat = x_flat.contiguous()
+            
         M, N = x_flat.shape
         out = torch.empty_like(x_flat)
         
@@ -476,7 +481,7 @@ class GatedConvBlock(nn.Module):
         
         if self.use_ada_norm and ada_norm_cond_dim is not None:
             self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
-            self.cond_proj = None 
+            self.cond_proj = None
         else:
             self.norm = RMSNorm(int(channels))
             self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
