@@ -1330,3 +1330,4 @@ class ConvLRU(nn.Module):
                     x_step_dist = self.revin(x_step_dist, "denorm")
                 out_list.append(x_step_dist)
         return torch.cat(out_list, dim=1)
+
