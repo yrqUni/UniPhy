@@ -1454,8 +1454,8 @@ class ConvLRU(nn.Module):
                 x_step_mean = x_step_dist
             x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
             if str(self.decoder.head_mode).lower() == "gaussian":
-                mu = x_step_dist_perm[..., : int(getattr(self.args, "out_ch", x_step_dist_perm.size(2) // 2)), :, :]
-                sigma = x_step_dist_perm[..., int(getattr(self.args, "out_ch", x_step_dist_perm.size(2) // 2)) :, :, :]
+                mu = x_step_dist_perm[..., : int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)), :, :]
+                sigma = x_step_dist_perm[..., int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)) :, :, :]
                 mu_denorm = self.revin(mu, "denorm")
                 sigma_denorm = sigma * self.revin.stdev
                 out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
