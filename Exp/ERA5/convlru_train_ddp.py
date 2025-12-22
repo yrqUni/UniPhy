@@ -58,7 +58,6 @@ MODEL_ARG_KEYS = [
     "dec_hidden_layers_num",
     "static_ch",
     "use_selective",
-    "bidirectional",
     "unet",
     "head_mode",
     "use_checkpointing",
@@ -105,7 +104,6 @@ class Args:
         self.use_gate = True
         self.lru_rank = 32
         self.use_selective = True
-        self.bidirectional = False
         self.unet = True
         self.use_freq_prior = True
         self.freq_rank = 8
