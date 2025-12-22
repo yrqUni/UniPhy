@@ -1239,7 +1239,7 @@ class ConvLRUModel(nn.Module):
                 diffY = skip.size(-2) - x.size(-2)
                 diffX = skip.size(-1) - x.size(-1)
                 x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-            
+
             skip_c = skip.permute(0, 2, 1, 3, 4)
             x_c = x.permute(0, 2, 1, 3, 4)
             skip_out = self.csa_blocks[i](skip_c, x_c)
@@ -1379,7 +1379,6 @@ class ConvLRU(nn.Module):
         if mode == "p":
             x = self.revin(x, "norm")
             x_emb, _ = self.embedding(x, static_feats=static_feats)
-            x_emb = x_emb.permute(0, 2, 1, 3, 4).contiguous()
             x_hid, _ = self.convlru_model(x_emb, listT=listT, cond=cond)
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             
@@ -1409,7 +1408,6 @@ class ConvLRU(nn.Module):
         
         x_norm = self.revin(x, "norm")
         x_emb, _ = self.embedding(x_norm, static_feats=static_feats)
-        x_emb = x_emb.permute(0, 2, 1, 3, 4).contiguous()
         
         x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT0, cond=cond)
         x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
@@ -1446,7 +1444,6 @@ class ConvLRU(nn.Module):
         for t in range(int(out_gen_num) - 1):
             dt = future[:, t : t + 1]
             x_in, _ = self.embedding(x_step_mean, static_feats=None)
-            x_in = x_in.permute(0, 2, 1, 3, 4).contiguous()
             x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
             x_dec0 = x_dec[0] if isinstance(x_dec, tuple) else x_dec
