@@ -870,14 +870,14 @@ class ConvLRULayer(nn.Module):
                 x_in_fwd = torch.cat([last_hidden_in.to(x_in_lru.dtype), x_in_lru], dim=1)
             else:
                 x_in_fwd = torch.cat([zero_prev, x_in_lru], dim=1)
-
+            
             lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
             lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
 
             B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
             x_flat = x_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
             l_flat = lamb_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
-
+            
             z_flat = self.pscan(l_flat, x_flat)
             z_out = z_flat.transpose(1, 2).view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
             last_hidden_out = z_out[:, -1:]
@@ -888,7 +888,7 @@ class ConvLRULayer(nn.Module):
                 x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
                 lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
                 lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-
+                
                 x_flat_b = x_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
                 l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
                 z_flat_b = self.pscan(l_flat_b, x_flat_b)
@@ -904,12 +904,10 @@ class ConvLRULayer(nn.Module):
                 return rec
 
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
-            h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
             feat_fwd = self._hybrid_inverse_transform(h_rec_fwd)
 
             if self.bidirectional and z_out_bwd is not None:
                 h_rec_bwd = project_back(z_out_bwd, scale_u, scale_v)
-                h_rec_bwd = h_rec_bwd.permute(0, 1, 2, 4, 3)
                 feat_bwd = self._hybrid_inverse_transform(h_rec_bwd)
                 feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
             else:
