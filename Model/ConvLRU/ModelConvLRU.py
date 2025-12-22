@@ -904,10 +904,12 @@ class ConvLRULayer(nn.Module):
                 return rec
 
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
+            h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
             feat_fwd = self._hybrid_inverse_transform(h_rec_fwd)
 
             if self.bidirectional and z_out_bwd is not None:
                 h_rec_bwd = project_back(z_out_bwd, scale_u, scale_v)
+                h_rec_bwd = h_rec_bwd.permute(0, 1, 2, 4, 3)
                 feat_bwd = self._hybrid_inverse_transform(h_rec_bwd)
                 feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
             else:
@@ -1374,29 +1376,20 @@ class ConvLRU(nn.Module):
         if mode == "p":
             x = self.revin(x, "norm")
             x_emb, _ = self.embedding(x, static_feats=static_feats)
-            # Permute to (B, L, C, H, W) for ConvLRUModel
             x_emb = x_emb.permute(0, 2, 1, 3, 4).contiguous()
             x_hid, _ = self.convlru_model(x_emb, listT=listT, cond=cond)
-            # Decoder expects (B, L, C, H, W) as input, so pass x_hid directly
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             
             if self.decoder.head_mode == "gaussian":
-                # out shape: (B, 2*C_out, L, H, W)
-                # We need to chunk on Channel dimension (dim 1)
                 mu, sigma = torch.chunk(out, 2, dim=1)
-                # Permute for RevIN denorm which expects (B, L, C, H, W)
                 mu = mu.permute(0, 2, 1, 3, 4).contiguous()
                 sigma = sigma.permute(0, 2, 1, 3, 4).contiguous()
-                
                 mu = self.revin(mu, "denorm")
                 sigma = sigma * self.revin.stdev
-                # Permute back to (B, C, L, H, W) or keep as (B, L, C, H, W)?
-                # Standard convention is usually (B, L, C, H, W) for output
-                return torch.cat([mu, sigma], dim=2) # dim 2 is C
+                return torch.cat([mu, sigma], dim=2) 
             elif self.decoder.head_mode == "token":
                 return out
             else:
-                 # out shape: (B, C_out, L, H, W)
                  out = out.permute(0, 2, 1, 3, 4).contiguous()
                  return self.revin(out, "denorm")
 
@@ -1423,25 +1416,13 @@ class ConvLRU(nn.Module):
         else:
              x_dec0 = x_dec
 
-        # x_dec0 is (B, C_out, L, H, W). We want last time step.
-        # Last time step is at dim 2.
-        x_step_dist = x_dec0[:, :, -1:] # (B, C_out, 1, H, W)
-        
-        # Prepare next input (mean). Need (B, 1, C, H, W) for embedding? 
-        # Or (B, C, 1, H, W)? Embedding expects (B, C, L, H, W).
-        # x_step_dist is (B, C_out, 1, H, W).
+        x_step_dist = x_dec0[:, :, -1:] 
         
         if str(self.decoder.head_mode).lower() == "gaussian":
-             # Chunk at dim 1 (Channel)
              x_step_mean = x_step_dist[:, : int(getattr(self.args, "out_ch", x_step_dist.size(1) // 2))]
         else:
              x_step_mean = x_step_dist
              
-        # Need to permute x_step_mean to (B, 1, C, H, W) for loop usage? 
-        # Embedding takes (B, C, L, H, W). x_step_mean is (B, C, 1, H, W). correct.
-
-        # Denorm and store output
-        # x_step_dist is (B, C, 1, H, W). RevIN needs (B, 1, C, H, W).
         x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
         
         if str(self.decoder.head_mode).lower() == "gaussian":
@@ -1459,33 +1440,19 @@ class ConvLRU(nn.Module):
         if future is None:
             future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype)
 
-        # Loop
-        # x_step_mean is (B, C, 1, H, W). Embedding expects this.
-        # We need to flip to (B, 1, C, H, W) for embedding? 
-        # Embedding: x.permute(0, 2, 1, 3, 4). If input (B, C, L, H, W) -> (B, L, C, H, W).
-        # Correct. Embedding takes (B, C, L, H, W).
-
         for t in range(int(out_gen_num) - 1):
             dt = future[:, t : t + 1]
-            
-            # Embedding call
-            # x_step_mean is normalized mean from previous step
             x_in, _ = self.embedding(x_step_mean, static_feats=None)
             x_in = x_in.permute(0, 2, 1, 3, 4).contiguous()
-            
             x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
             x_dec0 = x_dec[0] if isinstance(x_dec, tuple) else x_dec
-            
-            x_step_dist = x_dec0[:, :, -1:] # (B, C, 1, H, W)
-            
+            x_step_dist = x_dec0[:, :, -1:]
             if str(self.decoder.head_mode).lower() == "gaussian":
                 x_step_mean = x_step_dist[:, : int(getattr(self.args, "out_ch", x_step_dist.size(1) // 2))]
             else:
                 x_step_mean = x_step_dist
-            
             x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
-
             if str(self.decoder.head_mode).lower() == "gaussian":
                 mu = x_step_dist_perm[..., : int(getattr(self.args, "out_ch", x_step_dist_perm.size(2) // 2)), :, :]
                 sigma = x_step_dist_perm[..., int(getattr(self.args, "out_ch", x_step_dist_perm.size(2) // 2)) :, :, :]
