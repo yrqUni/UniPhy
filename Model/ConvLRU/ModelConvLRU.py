@@ -443,15 +443,12 @@ class SpatialPatchMoE(nn.Module):
 
         flat_weights = topk_weights.view(-1)
         weights_sorted = flat_weights[sorted_args]
-        
-        weights_sorted = weights_sorted.to(dtype=y_sorted.dtype)
-        
         y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1)
 
         out_patches = torch.zeros_like(x_patches)
         token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
         sorted_token_ids = token_ids[sorted_args]
-        out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
+        out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted.to(out_patches.dtype))
 
         out = (
             out_patches.view(B, nH, nW, C, L, P, P)
