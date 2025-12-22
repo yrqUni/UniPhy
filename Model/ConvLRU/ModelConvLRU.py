@@ -1385,9 +1385,8 @@ class ConvLRU(nn.Module):
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             
             if self.decoder.head_mode == "gaussian":
-                mu, sigma = torch.chunk(out, 2, dim=1)
-                mu = mu.permute(0, 2, 1, 3, 4).contiguous()
-                sigma = sigma.permute(0, 2, 1, 3, 4).contiguous()
+                # [Fix: Splitting Channels] Chunk along dim=2 (C), not dim=1 (L)
+                mu, sigma = torch.chunk(out, 2, dim=2)
                 mu = self.revin(mu, "denorm")
                 sigma = sigma * self.revin.stdev
                 return torch.cat([mu, sigma], dim=2) 
