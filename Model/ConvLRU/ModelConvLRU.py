@@ -110,21 +110,16 @@ def fused_gate_kernel(
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
-
     batch_idx = offsets // (C * Spatial)
     rem = offsets % (C * Spatial)
     c_idx = rem // Spatial
     s_idx = rem % Spatial
-
     in_idx_x = batch_idx * (2 * C * Spatial) + c_idx * Spatial + s_idx
     in_idx_g = batch_idx * (2 * C * Spatial) + (c_idx + C) * Spatial + s_idx
-
     x = tl.load(in_ptr + in_idx_x, mask=mask, other=0.0).to(tl.float32)
     g = tl.load(in_ptr + in_idx_g, mask=mask, other=0.0).to(tl.float32)
-
     sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
     out = (x * sigmoid_x) * g
-
     tl.store(out_ptr + offsets, out, mask=mask)
 
 
@@ -143,17 +138,67 @@ class FusedGatedSiLU(nn.Module):
         return out
 
 
+@triton.jit
+def rms_norm_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    stride_x_row,
+    N_COLS,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < N_COLS
+    
+    x_row_start = x_ptr + row_idx * stride_x_row
+    x = tl.load(x_row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    
+    mean_sq = tl.sum(x * x, axis=0) / N_COLS
+    rstd = tl.rsqrt(mean_sq + eps)
+    
+    w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    y = x * rstd * w
+    
+    out_row_start = out_ptr + row_idx * stride_x_row
+    tl.store(out_row_start + col_offsets, y, mask=mask)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
-        self.channels = channels
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(channels))
+        self.channels = int(channels)
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(self.channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = x.pow(2).mean(dim=1, keepdim=True)
-        x_norm = x * torch.rsqrt(var + self.eps)
-        return x_norm * self.weight.view(1, self.channels, 1, 1, 1)
+        orig_shape = x.shape
+        if x.dim() == 5:
+            x = x.permute(0, 2, 3, 4, 1).contiguous()
+        
+        x_flat = x.view(-1, self.channels)
+        M, N = x_flat.shape
+        out = torch.empty_like(x_flat)
+        
+        grid = (M,)
+        BLOCK_SIZE = triton.next_power_of_2(N)
+        
+        rms_norm_kernel[grid](
+            x_flat,
+            self.weight,
+            out,
+            x_flat.stride(0),
+            N,
+            self.eps,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        
+        out = out.view(*x.shape)
+        if len(orig_shape) == 5:
+            out = out.permute(0, 4, 1, 2, 3).contiguous()
+            
+        return out
 
 
 class AdaRMSNorm(nn.Module):
@@ -186,6 +231,36 @@ class PeriodicConv3d(nn.Module):
         x = F.pad(x, (self.pad_k, self.pad_k, 0, 0, 0, 0), mode="circular")
         x = F.pad(x, (0, 0, self.pad_k, self.pad_k, self.pad_k, self.pad_k), mode="replicate")
         return self.conv(x)
+
+
+class FactorizedPeriodicConv3d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7):
+        super().__init__()
+        self.pad_sp = kernel_size // 2
+        self.spatial_conv = nn.Conv2d(
+            in_channels, 
+            out_channels, 
+            kernel_size=(kernel_size, kernel_size), 
+            padding=0, 
+            bias=False
+        )
+        self.depth_conv = nn.Conv3d(
+            out_channels, 
+            out_channels, 
+            kernel_size=(kernel_size, 1, 1), 
+            padding=(self.pad_sp, 0, 0), 
+            bias=True 
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        x_sp = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
+        x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
+        x_sp = self.spatial_conv(x_sp)
+        x_sp = x_sp.view(B, D, -1, H, W).permute(0, 2, 1, 3, 4)
+        out = self.depth_conv(x_sp)
+        return out
 
 
 class DiscreteCosineTransform(nn.Module):
@@ -392,7 +467,7 @@ class GatedConvBlock(nn.Module):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.use_ada_norm = use_ada_norm
-        self.dw_conv = PeriodicConv3d(int(channels), int(channels), kernel_size=7)
+        self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=7)
         if self.use_ada_norm and cond_channels is not None:
             self.norm = AdaRMSNorm(int(channels), int(cond_channels))
             self.cond_proj = None
