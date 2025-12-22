@@ -794,10 +794,10 @@ class ConvLRULayer(nn.Module):
             lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
             lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
             B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
-            x_flat = x_in_fwd.view(B_sz, L_sz, -1)
-            l_flat = lamb_in_fwd.view(B_sz, L_sz, -1)
+            x_flat = x_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
+            l_flat = lamb_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
             z_flat = self.pscan(l_flat, x_flat)
-            z_out = z_flat.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
+            z_out = z_flat.transpose(1, 2).view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
             last_hidden_out = z_out[:, -1:]
             if self.bidirectional:
                 x_in_bwd = x_in_lru.flip(1)
@@ -805,10 +805,10 @@ class ConvLRULayer(nn.Module):
                 x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
                 lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
                 lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-                x_flat_b = x_in_bwd.view(B_sz, L_sz, -1)
-                l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1)
+                x_flat_b = x_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
+                l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
                 z_flat_b = self.pscan(l_flat_b, x_flat_b)
-                z_out_bwd = z_flat_b.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
+                z_out_bwd = z_flat_b.transpose(1, 2).view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
             else:
                 z_out_bwd = None
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
@@ -1252,14 +1252,17 @@ class ConvLRU(nn.Module):
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             if self.decoder.head_mode == "gaussian":
                 mu, sigma = torch.chunk(out, 2, dim=2)
-                mu = self.revin(mu, "denorm")
-                sigma = sigma * self.revin.stdev
+                if mu.size(2) == self.revin.num_features:
+                    mu = self.revin(mu, "denorm")
+                    sigma = sigma * self.revin.stdev
                 return torch.cat([mu, sigma], dim=2)
             elif self.decoder.head_mode == "token":
                 return out
             else:
                 out = out.permute(0, 2, 1, 3, 4).contiguous()
-                return self.revin(out, "denorm")
+                if out.size(2) == self.revin.num_features:
+                    return self.revin(out, "denorm")
+                return out
         if out_gen_num is None or int(out_gen_num) <= 0:
             raise ValueError("out_gen_num must be positive for inference mode")
         B = x.size(0)
@@ -1286,13 +1289,16 @@ class ConvLRU(nn.Module):
             out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
             mu = x_step_dist[:, :, :out_ch, :, :]
             sigma = x_step_dist[:, :, out_ch:, :, :]
-            mu_denorm = self.revin(mu, "denorm")
-            sigma_denorm = sigma * self.revin.stdev
-            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+            if mu.size(2) == self.revin.num_features:
+                mu = self.revin(mu, "denorm")
+                sigma = sigma * self.revin.stdev
+            out_list.append(torch.cat([mu, sigma], dim=2))
         elif str(self.decoder.head_mode).lower() == "token":
             out_list.append(x_step_dist)
         else:
-            out_list.append(self.revin(x_step_dist, "denorm"))
+            if x_step_dist.size(2) == self.revin.num_features:
+                x_step_dist = self.revin(x_step_dist, "denorm")
+            out_list.append(x_step_dist)
         future = listT_future
         if future is None:
             future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype)
@@ -1312,11 +1318,14 @@ class ConvLRU(nn.Module):
                 out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
                 mu = x_step_dist[:, :, :out_ch, :, :]
                 sigma = x_step_dist[:, :, out_ch:, :, :]
-                mu_denorm = self.revin(mu, "denorm")
-                sigma_denorm = sigma * self.revin.stdev
-                out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+                if mu.size(2) == self.revin.num_features:
+                    mu = self.revin(mu, "denorm")
+                    sigma = sigma * self.revin.stdev
+                out_list.append(torch.cat([mu, sigma], dim=2))
             elif str(self.decoder.head_mode).lower() == "token":
                 out_list.append(x_step_dist)
             else:
-                out_list.append(self.revin(x_step_dist, "denorm"))
+                if x_step_dist.size(2) == self.revin.num_features:
+                    x_step_dist = self.revin(x_step_dist, "denorm")
+                out_list.append(x_step_dist)
         return torch.cat(out_list, dim=1)
