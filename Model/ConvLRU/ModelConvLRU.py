@@ -227,13 +227,12 @@ class RevIN(nn.Module):
         self.eps = float(eps)
         self.affine = bool(affine)
         if self.affine:
-            # Input format: (B, L, C, H, W)
-            # Affine shape: (1, 1, C, 1, 1) to broadcast over B, L, H, W
+            # Fix: Parameters shape to (1, 1, C, 1, 1) for (B, L, C, H, W) input
             self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
             self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
 
     def _get_statistics(self, x: torch.Tensor) -> None:
-        # Reduce over Length(1), Height(3), Width(4)
+        # Fix: Normalize over Length(1), Height(3), Width(4)
         dim2reduce = (1, 3, 4)
         self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
         self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
@@ -780,9 +779,8 @@ class ConvLRULayer(nn.Module):
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
             if self.training:
-                noise_std = self.noise_level * torch.sqrt(dt_fp32 + 1e-6)
-                noise = torch.randn_like(zq) * noise_std
-                x_in_lru = zq + noise
+                # Removed noise injection to prevent CheckpointError in MoE models due to non-deterministic routing
+                x_in_lru = zq
             else:
                 x_in_lru = zq
             gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
