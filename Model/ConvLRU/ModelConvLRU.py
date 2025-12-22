@@ -119,12 +119,11 @@ def fused_gate_kernel(
     in_idx_x = batch_idx * (2 * C * Spatial) + c_idx * Spatial + s_idx
     in_idx_g = batch_idx * (2 * C * Spatial) + (c_idx + C) * Spatial + s_idx
 
-    x = tl.load(in_ptr + in_idx_x, mask=mask, other=0.0)
-    g = tl.load(in_ptr + in_idx_g, mask=mask, other=0.0)
+    x = tl.load(in_ptr + in_idx_x, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(in_ptr + in_idx_g, mask=mask, other=0.0).to(tl.float32)
 
-    # SiLU(x) * g
-    silu_x = x * tl.sigmoid(x)
-    out = silu_x * g
+    sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
+    out = (x * sigmoid_x) * g
 
     tl.store(out_ptr + offsets, out, mask=mask)
 
