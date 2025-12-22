@@ -222,6 +222,44 @@ class AdaRMSNorm(nn.Module):
         return x
 
 
+class RevIN(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
+        super().__init__()
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.affine = bool(affine)
+        if self.affine:
+            self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
+            self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
+
+    def _get_statistics(self, x: torch.Tensor) -> None:
+        dim2reduce = (1, 3, 4)
+        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
+        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        x = x - self.mean
+        x = x / self.stdev
+        if self.affine:
+            x = x * self.affine_weight + self.affine_bias
+        return x
+
+    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.affine:
+            x = (x - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
+        x = x * self.stdev + self.mean
+        return x
+
+    def forward(self, x: torch.Tensor, mode: str) -> torch.Tensor:
+        if mode == "norm":
+            self._get_statistics(x)
+            return self._normalize(x)
+        elif mode == "denorm":
+            return self._denormalize(x)
+        else:
+            raise NotImplementedError
+
+
 class PeriodicConv3d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
         super().__init__()
@@ -461,6 +499,24 @@ class CBAM2DPerStep(nn.Module):
         return x_flat.view(B, L, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
 
 
+class CrossScaleAttentionGate(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv_g = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.conv_l = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.psi = nn.Conv3d(channels, 1, kernel_size=1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+        self.norm = RMSNorm(channels)
+
+    def forward(self, local_x: torch.Tensor, global_x: torch.Tensor) -> torch.Tensor:
+        g = self.conv_g(global_x)
+        l = self.conv_l(local_x)
+        psi = self.relu(g + l)
+        attn = self.sigmoid(self.psi(psi))
+        return self.norm(local_x * attn)
+
+
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None):
         super().__init__()
@@ -659,6 +715,7 @@ class ConvLRULayer(nn.Module):
         self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = RMSNorm(self.emb_ch)
         self.noise_level = nn.Parameter(torch.tensor(0.01))
+        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
         self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
         if bool(getattr(args, "use_gate", False)):
             self.gate_conv = nn.Sequential(
@@ -1003,6 +1060,7 @@ class ConvLRUModel(nn.Module):
         layers = int(getattr(args, "convlru_num_blocks", 2))
         self.down_blocks = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
+        self.csa_blocks = nn.ModuleList()
         C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
         if not self.use_unet:
@@ -1021,6 +1079,7 @@ class ConvLRUModel(nn.Module):
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
                 self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
+                self.csa_blocks.append(CrossScaleAttentionGate(C))
             self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
             self.fusion = nn.Conv3d(C * 2, C, 1)
             self.convlru_blocks = None
@@ -1062,6 +1121,7 @@ class ConvLRUModel(nn.Module):
                 diffY = skip.size(-2) - x.size(-2)
                 diffX = skip.size(-1) - x.size(-1)
                 x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+            skip = self.csa_blocks[i](skip, x)
             x = torch.cat([x, skip], dim=2)
             x = self.fusion(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
             curr_cond = cond
@@ -1154,6 +1214,7 @@ class ConvLRU(nn.Module):
         self.embedding = Embedding(self.args)
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
+        self.revin = RevIN(int(getattr(args, "input_ch", 1)), affine=True)
         skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion", "dct_matrix", "grid_embed"]
         with torch.no_grad():
             for n, p in self.named_parameters():
@@ -1178,9 +1239,19 @@ class ConvLRU(nn.Module):
         if self.embedding.static_ch > 0 and self.embedding.static_embed is not None and static_feats is not None:
             cond = self.embedding.static_embed(static_feats)
         if mode == "p":
+            x = self.revin(x, "norm")
             x_emb, _ = self.embedding(x, static_feats=static_feats)
             x_hid, _ = self.convlru_model(x_emb, listT=listT, cond=cond)
-            return self.decoder(x_hid, cond=cond, timestep=timestep)
+            out = self.decoder(x_hid, cond=cond, timestep=timestep)
+            if self.decoder.head_mode == "gaussian":
+                mu, sigma = torch.chunk(out, 2, dim=2)
+                mu = self.revin(mu, "denorm")
+                sigma = sigma * self.revin.stdev
+                return torch.cat([mu, sigma], dim=2)
+            elif self.decoder.head_mode == "token":
+                return out
+            else:
+                return self.revin(out, "denorm")
         if out_gen_num is None or int(out_gen_num) <= 0:
             raise ValueError("out_gen_num must be positive for inference mode")
         B = x.size(0)
@@ -1188,17 +1259,32 @@ class ConvLRU(nn.Module):
             listT0 = torch.ones(B, x.size(1), device=x.device, dtype=x.dtype)
         else:
             listT0 = listT
-        out: List[torch.Tensor] = []
-        x_emb, _ = self.embedding(x, static_feats=static_feats)
+        out_list: List[torch.Tensor] = []
+        x_norm = self.revin(x, "norm")
+        x_emb, _ = self.embedding(x_norm, static_feats=static_feats)
         x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT0, cond=cond)
         x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
-        x_dec0 = x_dec[0] if isinstance(x_dec, tuple) else x_dec
+        if isinstance(x_dec, tuple):
+             x_dec0 = x_dec[0]
+        else:
+             x_dec0 = x_dec
         x_step_dist = x_dec0[:, -1:]
         if str(self.decoder.head_mode).lower() == "gaussian":
-            x_step_mean = x_step_dist[..., : int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)), :, :]
+             x_step_mean = x_step_dist[..., : int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)), :, :]
+        elif str(self.decoder.head_mode).lower() == "token":
+             x_step_mean = x_step_dist
         else:
-            x_step_mean = x_step_dist
-        out.append(x_step_dist)
+             x_step_mean = x_step_dist
+        if str(self.decoder.head_mode).lower() == "gaussian":
+            mu = x_step_dist[..., : int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)), :, :]
+            sigma = x_step_dist[..., int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)) :, :, :]
+            mu_denorm = self.revin(mu, "denorm")
+            sigma_denorm = sigma * self.revin.stdev
+            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+        elif str(self.decoder.head_mode).lower() == "token":
+             out_list.append(x_step_dist)
+        else:
+             out_list.append(self.revin(x_step_dist, "denorm"))
         future = listT_future
         if future is None:
             future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype)
@@ -1213,5 +1299,14 @@ class ConvLRU(nn.Module):
                 x_step_mean = x_step_dist[..., : int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)), :, :]
             else:
                 x_step_mean = x_step_dist
-            out.append(x_step_dist)
-        return torch.cat(out, dim=1)
+            if str(self.decoder.head_mode).lower() == "gaussian":
+                mu = x_step_dist[..., : int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)), :, :]
+                sigma = x_step_dist[..., int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)) :, :, :]
+                mu_denorm = self.revin(mu, "denorm")
+                sigma_denorm = sigma * self.revin.stdev
+                out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+            elif str(self.decoder.head_mode).lower() == "token":
+                 out_list.append(x_step_dist)
+            else:
+                 out_list.append(self.revin(x_step_dist, "denorm"))
+        return torch.cat(out_list, dim=1)
