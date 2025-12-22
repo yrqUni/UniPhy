@@ -1259,6 +1259,7 @@ class ConvLRU(nn.Module):
             elif self.decoder.head_mode == "token":
                 return out
             else:
+                out = out.permute(0, 2, 1, 3, 4).contiguous()
                 if out.size(2) == self.revin.num_features:
                     return self.revin(out, "denorm")
                 return out
