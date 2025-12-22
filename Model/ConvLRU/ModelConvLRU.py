@@ -1152,9 +1152,9 @@ class Decoder(nn.Module):
         x = self.c_out(x)
 
         if self.head_mode == "gaussian":
-            mu, log_sigma = torch.chunk(x, 2, dim=2)
+            mu, log_sigma = torch.chunk(x, 2, dim=1)
             sigma = F.softplus(log_sigma) + 1e-6
-            return torch.cat([mu, sigma], dim=2).permute(0, 2, 1, 3, 4).contiguous()
+            return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4).contiguous()
 
         if self.head_mode == "token":
             if self.vq is None:
@@ -1417,7 +1417,7 @@ class ConvLRU(nn.Module):
         else:
              x_dec0 = x_dec
 
-        x_step_dist = x_dec0[:, -1:, :, :, :] 
+        x_step_dist = x_dec0[:, -1:, :, :, :]
         
         if str(self.decoder.head_mode).lower() == "gaussian":
              out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
@@ -1435,9 +1435,9 @@ class ConvLRU(nn.Module):
             sigma_denorm = sigma * self.revin.stdev
             out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=1))
         elif str(self.decoder.head_mode).lower() == "token":
-             out_list.append(x_step_dist_perm)
+             out_list.append(x_step_dist)
         else:
-             out_list.append(self.revin(x_step_dist_perm, "denorm"))
+             out_list.append(self.revin(x_step_dist, "denorm"))
 
         future = listT_future
         if future is None:
@@ -1468,8 +1468,8 @@ class ConvLRU(nn.Module):
                 sigma_denorm = sigma * self.revin.stdev
                 out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=1))
             elif str(self.decoder.head_mode).lower() == "token":
-                 out_list.append(x_step_dist_perm)
+                 out_list.append(x_step_dist)
             else:
-                 out_list.append(self.revin(x_step_dist_perm, "denorm"))
+                 out_list.append(self.revin(x_step_dist, "denorm"))
 
-        return torch.cat(out_list, dim=2).permute(0, 2, 1, 3, 4)
+        return torch.cat(out_list, dim=1)
