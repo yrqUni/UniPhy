@@ -105,7 +105,7 @@ def fused_gate_kernel(
     C,
     Spatial,
     n_elements,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -192,16 +192,14 @@ class RMSNorm(nn.Module):
         out = torch.empty_like(x_flat)
 
         grid = (M,)
-        # Ensure BLOCK_SIZE is reasonable for the hardware
         BLOCK_SIZE = triton.next_power_of_2(N)
         BLOCK_SIZE = max(1, min(BLOCK_SIZE, 4096))
 
-        # Fallback to PyTorch for very large dimensions where simple kernel might fail or differ
         if N > 4096:
-             var = x.pow(2).mean(dim=-1, keepdim=True)
-             out_norm = x * torch.rsqrt(var + self.eps)
-             return out_norm * self.weight
-        
+            var = x.pow(2).mean(dim=-1, keepdim=True)
+            out_norm = x * torch.rsqrt(var + self.eps)
+            return out_norm * self.weight
+
         rms_norm_kernel[grid](
             x_flat,
             self.weight,
@@ -324,24 +322,18 @@ class SpectralConv2d(nn.Module):
             m1 = min(H, self.modes1)
             m2 = min(W_freq, self.modes2)
 
-            # Optimization: Use broadcasting matmul instead of einsum for better cuBLAS utilization
-            # x_ft slice: [B, L, C_in, H_slice, W_slice]
-            # weights: [C_in, C_out, H_slice, W_slice]
-            
             if m1 > 0 and m2 > 0:
-                # Top-Left Corner
-                inp_slice = x_ft[:, :, :, :m1, :m2].permute(0, 1, 3, 4, 2)  # [B, L, m1, m2, Cin]
-                w1 = self.weights1[:, :, :m1, :m2].permute(2, 3, 0, 1)      # [m1, m2, Cin, Cout]
-                out_slice = torch.matmul(inp_slice, w1)                     # [B, L, m1, m2, Cout]
+                inp_slice = x_ft[:, :, :, :m1, :m2].permute(0, 1, 3, 4, 2)
+                w1 = self.weights1[:, :, :m1, :m2].permute(2, 3, 0, 1)
+                out_slice = torch.matmul(inp_slice, w1)
                 out_ft[:, :, :, :m1, :m2] = out_slice.permute(0, 1, 4, 2, 3)
 
             if m1 > 0 and m2 > 0 and H > 1:
-                # Bottom-Left Corner
                 inp_slice = x_ft[:, :, :, -m1:, :m2].permute(0, 1, 3, 4, 2)
                 w2 = self.weights2[:, :, :m1, :m2].permute(2, 3, 0, 1)
                 out_slice = torch.matmul(inp_slice, w2)
                 out_ft[:, :, :, -m1:, :m2] = out_slice.permute(0, 1, 4, 2, 3)
-                
+
             return out_ft
 
 
@@ -497,10 +489,10 @@ class GatedConvBlock(nn.Module):
         self.use_cbam = bool(use_cbam)
         self.use_ada_norm = use_ada_norm
         self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=7)
-        
+
         if self.use_ada_norm and ada_norm_cond_dim is not None:
             self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
-            self.cond_proj = None 
+            self.cond_proj = None
         else:
             self.norm = RMSNorm(int(channels))
             self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
@@ -514,7 +506,7 @@ class GatedConvBlock(nn.Module):
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
         x = self.dw_conv(x)
-        
+
         if self.use_ada_norm:
             x = self.norm(x, time_emb)
         else:
@@ -529,7 +521,7 @@ class GatedConvBlock(nn.Module):
                 cond_rs = F.interpolate(cond_in.squeeze(2), size=x.shape[-2:], mode="bilinear", align_corners=False).unsqueeze(2)
             else:
                 cond_rs = cond_in
-            
+
             affine = self.cond_proj(cond_rs)
             gamma, beta = torch.chunk(affine, 2, dim=1)
             x = x * (1 + gamma) + beta
@@ -691,7 +683,7 @@ class ConvLRULayer(nn.Module):
         nu = 1.0 / ts
         nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
         nu_log = torch.log(nu)
-        
+
         u2 = torch.rand(self.emb_ch, self.rank)
         theta_log = torch.log(u2 * (2 * torch.tensor(np.pi)))
         self.params_log_base = nn.Parameter(torch.stack([nu_log, theta_log], dim=0))
@@ -821,7 +813,7 @@ class ConvLRULayer(nn.Module):
                 x_in_fwd = torch.cat([last_hidden_in.to(x_in_lru.dtype), x_in_lru], dim=1)
             else:
                 x_in_fwd = torch.cat([zero_prev, x_in_lru], dim=1)
-            
+
             lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
             lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
             z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())[:, 1:]
