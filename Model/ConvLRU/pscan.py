@@ -66,7 +66,7 @@ class PScanTriton(torch.autograd.Function):
 
         BLOCK_SIZE = next_power_of_2(L)
         BLOCK_SIZE = max(BLOCK_SIZE, 16)
-        if BLOCK_SIZE > 175680:
+        if BLOCK_SIZE > 16384:
              raise ValueError(f"Sequence length L={L} exceeds Triton block limits.")
 
         grid = (num_sequences,)
