@@ -97,6 +97,19 @@ def fused_moe_router_kernel(
         probs = tl.where(mask_max, 0.0, probs)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        var = x.pow(2).mean(dim=1, keepdim=True)
+        x_norm = x * torch.rsqrt(var + self.eps)
+        return x_norm * self.weight.view(1, self.channels, 1, 1, 1)
+
+
 class DiscreteCosineTransform(nn.Module):
     def __init__(self, n: int, dim: int):
         super().__init__()
@@ -300,7 +313,7 @@ class GatedConvBlock(nn.Module):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.dw_conv = nn.Conv3d(int(channels), int(channels), kernel_size=(1, 7, 7), padding="same", groups=int(channels))
-        self.norm = nn.GroupNorm(num_groups=1, num_channels=int(channels), affine=True)
+        self.norm = RMSNorm(int(channels))
         self.cond_channels = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels, int(channels) * 2, kernel_size=1) if self.cond_channels > 0 else None
         self.pw_conv_in = nn.Conv3d(int(channels), int(channels) * 2, kernel_size=1)
@@ -493,6 +506,8 @@ class ConvLRULayer(nn.Module):
         )
         self.forcing_scale = nn.Parameter(torch.tensor(0.1))
 
+        self.local_conv = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=3, padding="same")
+
         self.dct_h = DiscreteCosineTransform(self.S, dim=-2)
 
         self.selection_net = nn.Sequential(
@@ -511,7 +526,7 @@ class ConvLRULayer(nn.Module):
         out_dim_fusion = self.emb_ch if not self.bidirectional else self.emb_ch * 2
         self.post_ifft_proj = nn.Conv3d(out_dim_fusion, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
 
-        self.norm = nn.GroupNorm(num_groups=1, num_channels=self.emb_ch, affine=True)
+        self.norm = RMSNorm(self.emb_ch)
 
         self.noise_level = nn.Parameter(torch.tensor(0.01))
 
@@ -638,6 +653,9 @@ class ConvLRULayer(nn.Module):
 
         if self.sh_prior is not None:
             h_final = self.sh_prior(h_final)
+
+        x_local = self.local_conv(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+        h_final = h_final + x_local
 
         h_final = self.norm(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
 
@@ -996,7 +1014,7 @@ class Embedding(nn.Module):
 
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
-        self.norm = nn.GroupNorm(num_groups=1, num_channels=self.emb_ch, affine=True)
+        self.norm = RMSNorm(self.emb_ch)
 
     def forward(self, x: torch.Tensor, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = x.permute(0, 2, 1, 3, 4).contiguous()
