@@ -302,41 +302,6 @@ class DiscreteCosineTransform(nn.Module):
         return out.transpose(self.dim, -1)
 
 
-class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
-        super().__init__()
-        self.in_channels = int(in_channels)
-        self.out_channels = int(out_channels)
-        self.modes1 = int(modes1)
-        self.modes2 = int(modes2)
-        scale = 1.0 / max(1, (self.in_channels * self.out_channels))
-        self.weights1 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
-        self.weights2 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
-
-    def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast(enabled=False):
-            if not torch.is_complex(x_ft):
-                x_ft = x_ft.to(torch.cfloat)
-            B, L, C, H, W_freq = x_ft.shape
-            out_ft = torch.zeros(B, L, self.out_channels, H, W_freq, device=x_ft.device, dtype=torch.cfloat)
-            m1 = min(H, self.modes1)
-            m2 = min(W_freq, self.modes2)
-
-            if m1 > 0 and m2 > 0:
-                inp_slice = x_ft[:, :, :, :m1, :m2].permute(0, 1, 3, 4, 2)
-                w1 = self.weights1[:, :, :m1, :m2].permute(2, 3, 0, 1)
-                out_slice = torch.matmul(inp_slice, w1)
-                out_ft[:, :, :, :m1, :m2] = out_slice.permute(0, 1, 4, 2, 3)
-
-            if m1 > 0 and m2 > 0 and H > 1:
-                inp_slice = x_ft[:, :, :, -m1:, :m2].permute(0, 1, 3, 4, 2)
-                w2 = self.weights2[:, :, :m1, :m2].permute(2, 3, 0, 1)
-                out_slice = torch.matmul(inp_slice, w2)
-                out_ft[:, :, :, -m1:, :m2] = out_slice.permute(0, 1, 4, 2, 3)
-
-            return out_ft
-
-
 class SphericalHarmonicsPrior(nn.Module):
     def __init__(self, channels: int, H: int, W: int, Lmax: int = 6, rank: int = 8, gain_init: float = 0.0):
         super().__init__()
@@ -722,7 +687,6 @@ class ConvLRULayer(nn.Module):
 
         self.noise_level = nn.Parameter(torch.tensor(0.01))
 
-        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
         self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
 
         if bool(getattr(args, "use_gate", False)):
