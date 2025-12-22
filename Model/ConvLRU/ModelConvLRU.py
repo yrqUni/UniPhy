@@ -105,7 +105,7 @@ def fused_gate_kernel(
     C,
     Spatial,
     n_elements,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -158,16 +158,16 @@ def rms_norm_kernel(
     row_idx = tl.program_id(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < N_COLS
-    
+
     x_row_start = x_ptr + row_idx * stride_x_row
     x = tl.load(x_row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
-    
+
     mean_sq = tl.sum(x * x, axis=0) / N_COLS
     rstd = tl.rsqrt(mean_sq + eps)
-    
+
     w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
     y = x * rstd * w
-    
+
     out_row_start = out_ptr + row_idx * stride_x_row
     tl.store(out_row_start + col_offsets, y, mask=mask)
 
@@ -183,16 +183,24 @@ class RMSNorm(nn.Module):
         orig_shape = x.shape
         if x.dim() == 5:
             x = x.permute(0, 2, 3, 4, 1).contiguous()
-        
+
         x_flat = x.view(-1, self.channels)
         if not x_flat.is_contiguous():
             x_flat = x_flat.contiguous()
-            
+
         M, N = x_flat.shape
         out = torch.empty_like(x_flat)
-        
+
         grid = (M,)
+        # Ensure BLOCK_SIZE is reasonable for the hardware
         BLOCK_SIZE = triton.next_power_of_2(N)
+        BLOCK_SIZE = max(1, min(BLOCK_SIZE, 4096))
+
+        # Fallback to PyTorch for very large dimensions where simple kernel might fail or differ
+        if N > 4096:
+             var = x.pow(2).mean(dim=-1, keepdim=True)
+             out_norm = x * torch.rsqrt(var + self.eps)
+             return out_norm * self.weight
         
         rms_norm_kernel[grid](
             x_flat,
@@ -201,13 +209,13 @@ class RMSNorm(nn.Module):
             x_flat.stride(0),
             N,
             self.eps,
-            BLOCK_SIZE=BLOCK_SIZE
+            BLOCK_SIZE=BLOCK_SIZE,
         )
-        
+
         out = out.view(*x.shape)
         if len(orig_shape) == 5:
             out = out.permute(0, 4, 1, 2, 3).contiguous()
-            
+
         return out
 
 
@@ -248,18 +256,18 @@ class FactorizedPeriodicConv3d(nn.Module):
         super().__init__()
         self.pad_sp = kernel_size // 2
         self.spatial_conv = nn.Conv2d(
-            in_channels, 
-            out_channels, 
-            kernel_size=(kernel_size, kernel_size), 
-            padding=0, 
-            bias=False
+            in_channels,
+            out_channels,
+            kernel_size=(kernel_size, kernel_size),
+            padding=0,
+            bias=False,
         )
         self.depth_conv = nn.Conv3d(
-            out_channels, 
-            out_channels, 
-            kernel_size=(kernel_size, 1, 1), 
-            padding=(self.pad_sp, 0, 0), 
-            bias=True 
+            out_channels,
+            out_channels,
+            kernel_size=(kernel_size, 1, 1),
+            padding=(self.pad_sp, 0, 0),
+            bias=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -307,10 +315,6 @@ class SpectralConv2d(nn.Module):
         self.weights1 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
         self.weights2 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
 
-    @staticmethod
-    def _cmul(input_: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("blcxy,coxy->bloxy", input_, weights)
-
     def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
         with torch.cuda.amp.autocast(enabled=False):
             if not torch.is_complex(x_ft):
@@ -319,10 +323,25 @@ class SpectralConv2d(nn.Module):
             out_ft = torch.zeros(B, L, self.out_channels, H, W_freq, device=x_ft.device, dtype=torch.cfloat)
             m1 = min(H, self.modes1)
             m2 = min(W_freq, self.modes2)
+
+            # Optimization: Use broadcasting matmul instead of einsum for better cuBLAS utilization
+            # x_ft slice: [B, L, C_in, H_slice, W_slice]
+            # weights: [C_in, C_out, H_slice, W_slice]
+            
             if m1 > 0 and m2 > 0:
-                out_ft[:, :, :, :m1, :m2] = self._cmul(x_ft[:, :, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
+                # Top-Left Corner
+                inp_slice = x_ft[:, :, :, :m1, :m2].permute(0, 1, 3, 4, 2)  # [B, L, m1, m2, Cin]
+                w1 = self.weights1[:, :, :m1, :m2].permute(2, 3, 0, 1)      # [m1, m2, Cin, Cout]
+                out_slice = torch.matmul(inp_slice, w1)                     # [B, L, m1, m2, Cout]
+                out_ft[:, :, :, :m1, :m2] = out_slice.permute(0, 1, 4, 2, 3)
+
             if m1 > 0 and m2 > 0 and H > 1:
-                out_ft[:, :, :, -m1:, :m2] = self._cmul(x_ft[:, :, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
+                # Bottom-Left Corner
+                inp_slice = x_ft[:, :, :, -m1:, :m2].permute(0, 1, 3, 4, 2)
+                w2 = self.weights2[:, :, :m1, :m2].permute(2, 3, 0, 1)
+                out_slice = torch.matmul(inp_slice, w2)
+                out_ft[:, :, :, -m1:, :m2] = out_slice.permute(0, 1, 4, 2, 3)
+                
             return out_ft
 
 
@@ -481,7 +500,7 @@ class GatedConvBlock(nn.Module):
         
         if self.use_ada_norm and ada_norm_cond_dim is not None:
             self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
-            self.cond_proj = None
+            self.cond_proj = None 
         else:
             self.norm = RMSNorm(int(channels))
             self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
@@ -754,7 +773,7 @@ class ConvLRULayer(nn.Module):
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
 
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.cuda.amp.autocast(enabled=False):
             x_in_fp32 = x.float()
             dt_fp32 = dt.float()
             h = self._hybrid_forward_transform(x_in_fp32)
