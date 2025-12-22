@@ -81,6 +81,7 @@ class MockArgs:
         self.dec_hidden_ch = 16
         self.dec_hidden_layers_num = 0
         self.dec_strategy = "pxsf"
+        self.use_checkpointing = True
 
 
 def expected_out_channels(args: MockArgs) -> int:

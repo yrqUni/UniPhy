@@ -546,6 +546,7 @@ class ConvLRULayer(nn.Module):
         self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.bidirectional = bool(getattr(args, "bidirectional", False))
+        self.use_checkpointing = bool(getattr(args, "use_checkpointing", False))
 
         dt_min, dt_max = 0.001, 0.1
         ts = torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
@@ -770,6 +771,7 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
+        self.use_checkpointing = bool(getattr(args, "use_checkpointing", False))
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         def _inner_forward(x_in, last_h, t_val, c_val):
@@ -777,7 +779,7 @@ class ConvLRUBlock(nn.Module):
             x_out = self.feed_forward(x_mid, cond=c_val)
             return x_out, h_out
 
-        if self.training and x.requires_grad:
+        if self.training and x.requires_grad and self.use_checkpointing:
             return checkpoint.checkpoint(_inner_forward, x, last_hidden_in, listT, cond, use_reentrant=False)
         else:
             return _inner_forward(x, last_hidden_in, listT, cond)
