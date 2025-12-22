@@ -158,7 +158,6 @@ def test_configurations():
 
                     use_amp = device.type == "cuda" and dtype == torch.float16
                     
-                    # Updated to new API standard
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
                         out = model(x, mode="p", listT=listT, static_feats=static)
                         expC = expected_out_channels(args)
