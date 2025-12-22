@@ -676,7 +676,6 @@ class ConvLRULayer(nn.Module):
         self.W = int(self.hidden_size[1])
         self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
-        self.use_checkpointing = bool(getattr(args, "use_checkpointing", False))
         self.W_freq = self.W // 2 + 1
         dt_min, dt_max = 0.001, 0.1
         ts = torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
@@ -775,14 +774,9 @@ class ConvLRULayer(nn.Module):
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
-            if self.training:
-                # Removed noise injection to fix CheckpointError in MoE DDP training
-                x_in_lru = zq
-            else:
-                x_in_lru = zq
+            x_in_lru = zq
             gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
             x_in_lru = x_in_lru * gamma_t
-            
             if L == 1 and last_hidden_in is not None:
                 h_prev = last_hidden_in.to(x_in_lru.dtype)
                 z_out = lamb * h_prev + x_in_lru
@@ -867,8 +861,6 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-        # Checkpointing removed to fix DDP errors
-        self.use_checkpointing = False
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         x_mid, h_out = self.lru_layer(x, last_hidden_in, listT=listT)
