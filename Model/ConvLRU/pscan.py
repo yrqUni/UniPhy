@@ -66,7 +66,7 @@ class PScanTriton(torch.autograd.Function):
 
         BLOCK_SIZE = next_power_of_2(L)
         BLOCK_SIZE = max(BLOCK_SIZE, 16)
-        if BLOCK_SIZE > 16384:
+        if BLOCK_SIZE > 175680:
              raise ValueError(f"Sequence length L={L} exceeds Triton block limits.")
 
         grid = (num_sequences,)
@@ -125,10 +125,8 @@ def pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
     device = 'cuda'
     dtype = torch.complex64
     
-    print(f"Checking PScan with 5D Input (L={seq_length})...")
-    
-    A = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
-    X = torch.randn(batch_size, seq_length, channels, state_dim, device=device, dtype=dtype, requires_grad=True)
+    A = torch.randn(batch_size, seq_length, channels, state_dim, state_dim, device=device, dtype=dtype, requires_grad=True)
+    X = torch.randn(batch_size, seq_length, channels, state_dim, state_dim, device=device, dtype=dtype, requires_grad=True)
     
     try:
         Y_triton = pscan(A, X)
@@ -152,3 +150,4 @@ def pscan_check(batch_size=2, seq_length=16, channels=4, state_dim=8):
     loss.backward()
     print("✅ PScan Check Passed (Forward + Backward).")
     return True
+
