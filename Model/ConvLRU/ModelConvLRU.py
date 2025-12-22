@@ -1240,7 +1240,10 @@ class ConvLRUModel(nn.Module):
                 diffX = skip.size(-1) - x.size(-1)
                 x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
             
-            skip = self.csa_blocks[i](skip, x)
+            skip_c = skip.permute(0, 2, 1, 3, 4)
+            x_c = x.permute(0, 2, 1, 3, 4)
+            skip_out = self.csa_blocks[i](skip_c, x_c)
+            skip = skip_out.permute(0, 2, 1, 3, 4).contiguous()
 
             x = torch.cat([x, skip], dim=2)
             x = self.fusion(x.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
