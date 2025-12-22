@@ -227,11 +227,14 @@ class RevIN(nn.Module):
         self.eps = float(eps)
         self.affine = bool(affine)
         if self.affine:
-            self.affine_weight = nn.Parameter(torch.ones(1, self.num_features, 1, 1, 1))
-            self.affine_bias = nn.Parameter(torch.zeros(1, self.num_features, 1, 1, 1))
+            # Input format: (B, L, C, H, W)
+            # Affine shape: (1, 1, C, 1, 1) to broadcast over B, L, H, W
+            self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
+            self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
 
     def _get_statistics(self, x: torch.Tensor) -> None:
-        dim2reduce = (2, 3, 4)
+        # Reduce over Length(1), Height(3), Width(4)
+        dim2reduce = (1, 3, 4)
         self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
         self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
 
