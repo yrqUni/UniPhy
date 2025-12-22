@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 import triton
 import triton.language as tl
 
@@ -97,6 +98,52 @@ def fused_moe_router_kernel(
         probs = tl.where(mask_max, 0.0, probs)
 
 
+@triton.jit
+def fused_gate_kernel(
+    in_ptr,
+    out_ptr,
+    C,
+    Spatial,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    batch_idx = offsets // (C * Spatial)
+    rem = offsets % (C * Spatial)
+    c_idx = rem // Spatial
+    s_idx = rem % Spatial
+
+    in_idx_x = batch_idx * (2 * C * Spatial) + c_idx * Spatial + s_idx
+    in_idx_g = batch_idx * (2 * C * Spatial) + (c_idx + C) * Spatial + s_idx
+
+    x = tl.load(in_ptr + in_idx_x, mask=mask, other=0.0)
+    g = tl.load(in_ptr + in_idx_g, mask=mask, other=0.0)
+
+    # SiLU(x) * g
+    silu_x = x * tl.sigmoid(x)
+    out = silu_x * g
+
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+
+class FusedGatedSiLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C2, D, H, W = x.shape
+        C = C2 // 2
+        out = torch.empty((B, C, D, H, W), device=x.device, dtype=x.dtype)
+        n_elements = B * C * D * H * W
+        Spatial = D * H * W
+        grid = (triton.cdiv(n_elements, 256),)
+        fused_gate_kernel[grid](x, out, C, Spatial, n_elements, BLOCK_SIZE=256)
+        return out
+
+
 class RMSNorm(nn.Module):
     def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
@@ -108,6 +155,18 @@ class RMSNorm(nn.Module):
         var = x.pow(2).mean(dim=1, keepdim=True)
         x_norm = x * torch.rsqrt(var + self.eps)
         return x_norm * self.weight.view(1, self.channels, 1, 1, 1)
+
+
+class PeriodicConv3d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
+        super().__init__()
+        self.pad_k = kernel_size // 2
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.pad(x, (self.pad_k, self.pad_k, 0, 0, 0, 0), mode="circular")
+        x = F.pad(x, (0, 0, self.pad_k, self.pad_k, self.pad_k, self.pad_k), mode="replicate")
+        return self.conv(x)
 
 
 class DiscreteCosineTransform(nn.Module):
@@ -312,12 +371,12 @@ class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], use_cbam: bool = False, cond_channels: Optional[int] = None):
         super().__init__()
         self.use_cbam = bool(use_cbam)
-        self.dw_conv = nn.Conv3d(int(channels), int(channels), kernel_size=(1, 7, 7), padding="same", groups=int(channels))
+        self.dw_conv = PeriodicConv3d(int(channels), int(channels), kernel_size=7)
         self.norm = RMSNorm(int(channels))
         self.cond_channels = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels, int(channels) * 2, kernel_size=1) if self.cond_channels > 0 else None
         self.pw_conv_in = nn.Conv3d(int(channels), int(channels) * 2, kernel_size=1)
-        self.act = nn.SiLU()
+        self.fused_gate = FusedGatedSiLU()
         self.pw_conv_out = nn.Conv3d(int(channels), int(channels), kernel_size=1)
         self.cbam = CBAM2DPerStep(int(channels), reduction=16) if self.use_cbam else None
 
@@ -340,8 +399,7 @@ class GatedConvBlock(nn.Module):
             x = x * (1 + gamma) + beta
 
         x = self.pw_conv_in(x)
-        x, gate = torch.chunk(x, 2, dim=1)
-        x = self.act(x) * gate
+        x = self.fused_gate(x)
 
         if self.cbam is not None:
             x = self.cbam(x)
@@ -490,9 +548,13 @@ class ConvLRULayer(nn.Module):
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.bidirectional = bool(getattr(args, "bidirectional", False))
 
-        u1 = torch.rand(self.emb_ch, self.rank)
+        dt_min, dt_max = 0.001, 0.1
+        ts = torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
+        nu = 1.0 / ts
+        nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
+        nu_log = torch.log(nu)
+        
         u2 = torch.rand(self.emb_ch, self.rank)
-        nu_log = torch.log(-0.5 * torch.log(u1 * (self.r_max**2 - self.r_min**2) + self.r_min**2))
         theta_log = torch.log(u2 * (2 * torch.tensor(np.pi)))
         self.params_log_base = nn.Parameter(torch.stack([nu_log, theta_log], dim=0))
         self.dispersion_mod = nn.Parameter(torch.zeros(2, self.emb_ch, self.rank) * 0.01)
@@ -506,7 +568,7 @@ class ConvLRULayer(nn.Module):
         )
         self.forcing_scale = nn.Parameter(torch.tensor(0.1))
 
-        self.local_conv = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=3, padding="same")
+        self.local_conv = PeriodicConv3d(self.emb_ch, self.emb_ch, kernel_size=3)
 
         self.dct_h = DiscreteCosineTransform(self.S, dim=-2)
 
@@ -711,9 +773,15 @@ class ConvLRUBlock(nn.Module):
         self.feed_forward = FeedForward(args, input_downsp_shape)
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, last_hidden_out = self.lru_layer(x, last_hidden_in, listT=listT)
-        x = self.feed_forward(x, cond=cond)
-        return x, last_hidden_out
+        def _inner_forward(x_in, last_h, t_val, c_val):
+            x_mid, h_out = self.lru_layer(x_in, last_h, listT=t_val)
+            x_out = self.feed_forward(x_mid, cond=c_val)
+            return x_out, h_out
+
+        if self.training and x.requires_grad:
+            return checkpoint.checkpoint(_inner_forward, x, last_hidden_in, listT, cond, use_reentrant=False)
+        else:
+            return _inner_forward(x, last_hidden_in, listT, cond)
 
 
 class VectorQuantizer(nn.Module):
