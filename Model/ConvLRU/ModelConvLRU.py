@@ -612,7 +612,7 @@ class SpatialPatchMoE(nn.Module):
         N_total = router_logits.size(0)
         topk_weights = torch.empty((N_total, self.active_experts), device=x.device, dtype=x.dtype)
         topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
-        BLOCK_SIZE = triton.next_power_of_2(self.num_experts)
+        BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
         fused_moe_router_kernel[(N_total,)](
             router_logits,
             topk_weights,
@@ -794,10 +794,11 @@ class ConvLRULayer(nn.Module):
             lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
             lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
             B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
-            x_flat = x_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
-            l_flat = lamb_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
+            x_flat = x_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2).contiguous()
+            l_flat = lamb_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2).contiguous()
             z_flat = self.pscan(l_flat, x_flat)
-            z_out = z_flat.transpose(1, 2).view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
+            z_flat = z_flat.transpose(1, 2).contiguous()
+            z_out = z_flat.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
             last_hidden_out = z_out[:, -1:]
             if self.bidirectional:
                 x_in_bwd = x_in_lru.flip(1)
@@ -805,10 +806,11 @@ class ConvLRULayer(nn.Module):
                 x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
                 lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
                 lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-                x_flat_b = x_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
-                l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
+                x_flat_b = x_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2).contiguous()
+                l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2).contiguous()
                 z_flat_b = self.pscan(l_flat_b, x_flat_b)
-                z_out_bwd = z_flat_b.transpose(1, 2).view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
+                z_flat_b = z_flat_b.transpose(1, 2).contiguous()
+                z_out_bwd = z_flat_b.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
             else:
                 z_out_bwd = None
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
@@ -1259,7 +1261,6 @@ class ConvLRU(nn.Module):
             elif self.decoder.head_mode == "token":
                 return out
             else:
-                out = out.permute(0, 2, 1, 3, 4).contiguous()
                 if out.size(2) == self.revin.num_features:
                     return self.revin(out, "denorm")
                 return out
