@@ -74,13 +74,13 @@ def fused_moe_router_kernel(
     indices_out_ptr,
     n_experts,
     k: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     logits_row_start = logits_ptr + pid * n_experts
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_experts
-    logits = tl.load(logits_row_start + offsets, mask=mask, other=-float('inf'))
+    logits = tl.load(logits_row_start + offsets, mask=mask, other=-float("inf"))
     logits_max = tl.max(logits, 0)
     logits = logits - logits_max
     numerator = tl.exp(logits)
@@ -377,7 +377,7 @@ class SpatialPatchMoE(nn.Module):
 
         cond_patches = None
         router_input = x_patches.mean(dim=(2, 3, 4))
-        
+
         if self.cond_channels > 0 and cond is not None:
             if cond.dim() == 4:
                 cond_l = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
@@ -392,11 +392,11 @@ class SpatialPatchMoE(nn.Module):
             router_input = torch.cat([router_input, router_cond], dim=1)
 
         router_logits = self.router(router_input)
-        
+
         N_total = router_logits.size(0)
         topk_weights = torch.empty((N_total, self.active_experts), device=x.device, dtype=x.dtype)
         topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
-        
+
         BLOCK_SIZE = triton.next_power_of_2(self.num_experts)
         fused_moe_router_kernel[(N_total,)](
             router_logits,
@@ -411,14 +411,14 @@ class SpatialPatchMoE(nn.Module):
 
         flat_indices = topk_indices.view(-1)
         x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
-        
+
         cond_repeated = None
         if cond_patches is not None:
             cond_repeated = cond_patches.repeat_interleave(self.active_experts, dim=0)
 
         sorted_expert_ids, sorted_args = torch.sort(flat_indices)
         x_sorted = x_repeated[sorted_args]
-        
+
         cond_sorted = None
         if cond_repeated is not None:
             cond_sorted = cond_repeated[sorted_args]
@@ -432,11 +432,11 @@ class SpatialPatchMoE(nn.Module):
                 continue
             end_idx = start_idx + count
             inp_slice = x_sorted[start_idx:end_idx]
-            
+
             c_slice = None
             if cond_sorted is not None:
                 c_slice = cond_sorted[start_idx:end_idx]
-                
+
             out_slice = self.experts[i](inp_slice.view(count, C, L, P, P), cond=c_slice)
             y_sorted[start_idx:end_idx] = out_slice
             start_idx = end_idx
@@ -575,7 +575,7 @@ class ConvLRULayer(nn.Module):
         zq = zq * scale_v
 
         if self.proj_b is not None:
-             zq = zq + self.proj_b.view(1, 1, C, 1, 1)
+            zq = zq + self.proj_b.view(1, 1, C, 1, 1)
 
         nu_log, theta_log = self.params_log_base.unbind(dim=0)
         disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
