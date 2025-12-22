@@ -424,16 +424,13 @@ class SphericalHarmonicsPrior(nn.Module):
         x = torch.cos(theta)
         one = torch.ones_like(x)
         pi = torch.tensor(math.pi, device=device, dtype=dtype)
-
         P: List[List[Optional[torch.Tensor]]] = [[None] * (l + 1) for l in range(Lmax)]
         P[0][0] = one
         if Lmax >= 2:
             P[1][0] = x
-
         for l in range(2, Lmax):
             l_f = torch.tensor(l, device=device, dtype=dtype)
             P[l][0] = ((2 * l_f - 1) * x * P[l - 1][0] - (l_f - 1) * P[l - 2][0]) / l_f
-
         for m in range(1, Lmax):
             m_f = torch.tensor(m, device=device, dtype=dtype)
             P_mm = ((-1) ** m) * SphericalHarmonicsPrior._double_factorial(2 * m - 1, dtype, device) * (1 - x * x).pow(m_f / 2)
@@ -443,11 +440,9 @@ class SphericalHarmonicsPrior(nn.Module):
             for l in range(m + 2, Lmax):
                 l_f = torch.tensor(l, device=device, dtype=dtype)
                 P[l][m] = ((2 * l_f - 1) * x * P[l - 1][m] - (l_f + m_f - 1) * P[l - 2][m]) / (l_f - m_f)
-
         idx = torch.arange(0, Lmax, device=device, dtype=dtype).view(-1, 1, 1)
         cos_mphi = torch.cos(idx * phi)
         sin_mphi = torch.sin(idx * phi)
-
         Ys: List[torch.Tensor] = []
         for l in range(Lmax):
             l_f = torch.tensor(l, device=device, dtype=dtype)
@@ -461,7 +456,6 @@ class SphericalHarmonicsPrior(nn.Module):
                 else:
                     Y = math.sqrt(2.0) * N_lm * P[l][m_abs] * sin_mphi[m_abs]
                 Ys.append(Y)
-
         return torch.stack(Ys, dim=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -804,7 +798,7 @@ class ConvLRULayer(nn.Module):
         mod = mod.view(x.size(0), x.size(1), self.emb_ch, self.rank, 2)
         dnu = self.forcing_scale * torch.tanh(mod[..., 0])
         dth = self.forcing_scale * torch.tanh(mod[..., 1])
-        return dnu.unsqueeze(-2), dth.unsqueeze(-2)
+        return dnu.unsqueeze(-1), dth.unsqueeze(-1)
 
     def _hybrid_forward_transform(self, x: torch.Tensor) -> torch.Tensor:
         x_dct = self.dct_h(x.float())
@@ -839,14 +833,15 @@ class ConvLRULayer(nn.Module):
             t0 = torch.einsum("blcwh,chr->blcwr", h_perm, self.U_row)
             t0 = t0 * scale_u
             zq = torch.einsum("blcwr,cwr->blcwr", t0, self.V_col)
+            zq = zq * scale_v
 
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
 
             nu_log, theta_log = self.params_log_base.unbind(dim=0)
             disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-            nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, 1, self.rank)
-            th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
+            nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
+            th_base = torch.exp(theta_log + disp_th).view(1, 1, C, self.rank, 1)
 
             dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32)
 
@@ -896,18 +891,17 @@ class ConvLRULayer(nn.Module):
                 z_out_bwd = None
 
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
+                z = z * sc_v
                 t1 = torch.einsum("blcwr,cwr->blcwr", z, self.V_col.conj())
-                t1 = t1 * sc_u.unsqueeze(-2)
+                t1 = t1 * sc_u
                 rec = torch.einsum("blcwr,chr->blcwh", t1, self.U_row.transpose(1, 2).conj())
                 return rec
 
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
-            h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
             feat_fwd = self._hybrid_inverse_transform(h_rec_fwd)
 
             if self.bidirectional and z_out_bwd is not None:
                 h_rec_bwd = project_back(z_out_bwd, scale_u, scale_v)
-                h_rec_bwd = h_rec_bwd.permute(0, 1, 2, 4, 3)
                 feat_bwd = self._hybrid_inverse_transform(h_rec_bwd)
                 feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
             else:
