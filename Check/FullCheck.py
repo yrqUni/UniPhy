@@ -1,12 +1,12 @@
 import os
 import sys
 import random
+import traceback
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 
-# Add model directory to path
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT, "Model", "ConvLRU")
 if MODEL_DIR not in sys.path:
@@ -14,7 +14,6 @@ if MODEL_DIR not in sys.path:
 
 from ModelConvLRU import ConvLRU
 
-# Try importing pscan check
 try:
     from pscan import pscan_check
 except Exception:
@@ -192,9 +191,7 @@ def test_heads():
             timestep = None
             if mode == "diffusion":
                 timestep = torch.randint(0, 1000, (B,), device=device).float()
-            
             out = model(x, mode="p", listT=None, static_feats=None, timestep=timestep)
-            
             if mode == "token":
                 if not (isinstance(out, tuple) and len(out) == 3):
                     raise ValueError(f"Token head must return tuple(len=3), got {type(out)}")
@@ -242,8 +239,6 @@ def test_listT_none_all_modes():
             args.num_expert = 4
             model = ConvLRU(args).to(device)
             model.eval()
-            
-            # Test P-Mode (Parallel)
             with torch.no_grad():
                 out = model(x, mode="p", listT=None, static_feats=static)
             exp_shape = (B, L, expected_out_channels(args), H, W)
@@ -252,7 +247,6 @@ def test_listT_none_all_modes():
         except Exception as e:
             print_status(f"{name}: p listT=None", False, str(e))
 
-        # Test I-Mode (Inference)
         try:
             args = MockArgs()
             args.unet = bool(unet)
@@ -260,7 +254,6 @@ def test_listT_none_all_modes():
             model = ConvLRU(args).to(device)
             model.eval()
             with torch.no_grad():
-                # Inference starts with first frame
                 out_i = model(x[:, 0:1], mode="i", out_gen_num=L, listT=None, listT_future=None, static_feats=static)
             exp_shape_i = (B, L, expected_out_channels(args), H, W)
             ok = isinstance(out_i, torch.Tensor) and tuple(out_i.shape) == exp_shape_i
@@ -283,48 +276,28 @@ def test_consistency_step1():
     x = torch.randn(B, L, C, H, W, device=device, dtype=torch.float32)
     static = torch.randn(B, 2, H, W, device=device, dtype=torch.float32)
     listT = torch.ones(B, L, device=device, dtype=torch.float32)
-    
-    # Start frame is x[:, 0:1] (B, 1, C, H, W)
     start_frame = x[:, 0:1]
-    
-    # Split listT for inference
-    # Current step dt = listT[:, 0:1]
-    # Future steps = listT[:, 1:]
-    listT_current = listT[:, 0:1]
-    listT_future = listT[:, 1:]
+    future_T = torch.ones(B, L - 1, device=device, dtype=torch.float32)
 
     try:
         with torch.no_grad():
-            # Parallel Mode: Run on single frame 
-            # Note: Parallel mode output shape is (B, L_in, C_out, H, W)
-            out_p_step1 = model(start_frame, mode="p", listT=listT_current, static_feats=static)
-            
-            # Inference Mode: Run generation for L steps starting from start_frame
-            # We only care about the first output for consistency
+            out_p_step1 = model(start_frame, mode="p", listT=listT[:, 0:1], static_feats=static)
             out_i = model(
                 start_frame,
                 mode="i",
                 out_gen_num=L,
-                listT=listT_current,
-                listT_future=listT_future,
+                listT=listT[:, 0:1],
+                listT_future=future_T,
                 static_feats=static,
             )
 
-        # Compare the first frame of P-mode output with the first frame of I-mode output
-        # out_p_step1 shape: (B, 1, C_out, H, W)
-        # out_i shape: (B, L, C_out, H, W) -> we take [:, 0:1]
-        
         shape_ok = tuple(out_p_step1.shape) == tuple(out_i[:, 0:1].shape)
-        if shape_ok:
-            diff = (out_p_step1 - out_i[:, 0:1]).abs().max().item()
-        else:
-            diff = float("inf")
-            
+        diff = (out_p_step1[:, 0] - out_i[:, 0]).abs().max().item() if shape_ok else float("inf")
         print_status("Shape Match", shape_ok, f"{tuple(out_p_step1.shape)} vs {tuple(out_i[:, 0:1].shape)}")
         print_status("Step-1 MaxDiff<1e-4", diff < 1e-4, f"MaxDiff: {diff:.2e}")
-        
     except Exception as e:
-        print_status("Consistency Test", False, str(e))
+        print_status("Consistency Check", False, str(e))
+        traceback.print_exc()
 
 
 def test_backward_sanity():
@@ -399,6 +372,28 @@ def test_large_hw_smoke():
         print_status("Large p forward", False, str(e))
 
 
+def test_dimension_mismatch_revin():
+    print("\n=== 7. RevIN Dimension Mismatch Test ===")
+    device = get_device()
+    args = MockArgs()
+    args.input_ch = 30
+    args.out_ch = 9
+    args.head_mode = "diffusion"
+    
+    B, L, H, W = 1, 2, 32, 32
+    x = torch.randn(B, L, args.input_ch, H, W, device=device)
+    
+    try:
+        model = ConvLRU(args).to(device)
+        model.eval()
+        with torch.no_grad():
+            out = model(x, mode="p", listT=None, static_feats=None)
+        ok = tuple(out.shape) == (B, L, 9, H, W)
+        print_status("RevIN Skip Check", ok, f"Shape: {tuple(out.shape)}")
+    except Exception as e:
+        print_status("RevIN Skip Check", False, str(e))
+
+
 if __name__ == "__main__":
     seed_all(42)
     enable_tf32(True)
@@ -413,5 +408,6 @@ if __name__ == "__main__":
     test_consistency_step1()
     test_backward_sanity()
     test_large_hw_smoke()
+    test_dimension_mismatch_revin()
 
     print("\n✅ All Tests Completed.")
