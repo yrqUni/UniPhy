@@ -314,7 +314,7 @@ class SpectralConv2d(nn.Module):
         self.weights2 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
 
     def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             if not torch.is_complex(x_ft):
                 x_ft = x_ft.to(torch.cfloat)
             B, L, C, H, W_freq = x_ft.shape
