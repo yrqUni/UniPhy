@@ -1385,11 +1385,11 @@ class ConvLRU(nn.Module):
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             
             if self.decoder.head_mode == "gaussian":
-                # [Fix: Splitting Channels] Chunk along dim=2 (C), not dim=1 (L)
-                mu, sigma = torch.chunk(out, 2, dim=2)
+                out = out.permute(0, 2, 1, 3, 4)
+                mu, sigma = torch.chunk(out, 2, dim=1)
                 mu = self.revin(mu, "denorm")
                 sigma = sigma * self.revin.stdev
-                return torch.cat([mu, sigma], dim=2) 
+                return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4).contiguous()
             elif self.decoder.head_mode == "token":
                 return out
             else:
@@ -1418,21 +1418,23 @@ class ConvLRU(nn.Module):
         else:
              x_dec0 = x_dec
 
-        x_step_dist = x_dec0[:, :, -1:] 
+        x_step_dist = x_dec0[:, -1:, :, :, :]
         
         if str(self.decoder.head_mode).lower() == "gaussian":
-             x_step_mean = x_step_dist[:, : int(getattr(self.args, "out_ch", x_step_dist.size(1) // 2))]
+             out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
+             x_step_mean = x_step_dist[:, :, :out_ch, :, :]
         else:
              x_step_mean = x_step_dist
              
         x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
         
         if str(self.decoder.head_mode).lower() == "gaussian":
-            mu = x_step_dist_perm[..., : int(getattr(self.args, "out_ch", x_step_dist_perm.size(2) // 2)), :, :]
-            sigma = x_step_dist_perm[..., int(getattr(self.args, "out_ch", x_step_dist_perm.size(2) // 2)) :, :, :]
+            out_ch = int(getattr(self.args, "out_ch", x_step_dist_perm.size(1) // 2))
+            mu = x_step_dist_perm[:, :out_ch, :, :, :]
+            sigma = x_step_dist_perm[:, out_ch:, :, :, :]
             mu_denorm = self.revin(mu, "denorm")
             sigma_denorm = sigma * self.revin.stdev
-            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=1))
         elif str(self.decoder.head_mode).lower() == "token":
              out_list.append(x_step_dist_perm)
         else:
@@ -1448,21 +1450,23 @@ class ConvLRU(nn.Module):
             x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
             x_dec0 = x_dec[0] if isinstance(x_dec, tuple) else x_dec
-            x_step_dist = x_dec0[:, :, -1:]
+            x_step_dist = x_dec0[:, -1:, :, :, :]
             if str(self.decoder.head_mode).lower() == "gaussian":
-                x_step_mean = x_step_dist[:, : int(getattr(self.args, "out_ch", x_step_dist.size(1) // 2))]
+                out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
+                x_step_mean = x_step_dist[:, :, :out_ch, :, :]
             else:
                 x_step_mean = x_step_dist
             x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
             if str(self.decoder.head_mode).lower() == "gaussian":
-                mu = x_step_dist_perm[..., : int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)), :, :]
-                sigma = x_step_dist_perm[..., int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2)) :, :, :]
+                out_ch = int(getattr(self.args, "out_ch", x_step_dist_perm.size(1) // 2))
+                mu = x_step_dist_perm[:, :out_ch, :, :, :]
+                sigma = x_step_dist_perm[:, out_ch:, :, :, :]
                 mu_denorm = self.revin(mu, "denorm")
                 sigma_denorm = sigma * self.revin.stdev
-                out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+                out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=1))
             elif str(self.decoder.head_mode).lower() == "token":
                  out_list.append(x_step_dist_perm)
             else:
                  out_list.append(self.revin(x_step_dist_perm, "denorm"))
 
-        return torch.cat(out_list, dim=1)
+        return torch.cat(out_list, dim=2).permute(0, 2, 1, 3, 4)
