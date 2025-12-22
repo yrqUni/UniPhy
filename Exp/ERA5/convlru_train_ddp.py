@@ -61,6 +61,7 @@ MODEL_ARG_KEYS = [
     "bidirectional",
     "unet",
     "head_mode",
+    "use_checkpointing",
 ]
 
 
@@ -149,6 +150,7 @@ class Args:
         self.wandb_run_name = self.ckpt
         self.wandb_group = "v2.1.0"
         self.wandb_mode = "online"
+        self.use_checkpointing = True
         self.check_args()
 
     def check_args(self) -> None:
@@ -633,7 +635,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             timestep = sample_timestep(args, x.size(0), x.device, x.dtype)
 
-            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
                 preds = preds[:, 1:]
                 loss = loss_fn(preds, target)
@@ -787,7 +789,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                     timestep = sample_timestep(args, cond_eff.size(0), cond_eff.device, cond_eff.dtype)
 
-                    with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                         preds = model(
                             cond_eff,
                             mode="i",
