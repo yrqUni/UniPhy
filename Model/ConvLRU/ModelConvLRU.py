@@ -4,7 +4,6 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
 import triton
 import triton.language as tl
 
@@ -227,12 +226,10 @@ class RevIN(nn.Module):
         self.eps = float(eps)
         self.affine = bool(affine)
         if self.affine:
-            # Fixed: parameter shape to (1, 1, C, 1, 1) to match (B, L, C, H, W)
             self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
             self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
 
     def _get_statistics(self, x: torch.Tensor) -> None:
-        # Fixed: dim2reduce to (1, 3, 4) -> (Length, Height, Width)
         dim2reduce = (1, 3, 4)
         self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
         self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
@@ -778,8 +775,11 @@ class ConvLRULayer(nn.Module):
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
-            # Fixed: Removed random noise injection to fix CheckpointError in MoE DDP training
-            x_in_lru = zq
+            if self.training:
+                # Removed noise injection to fix CheckpointError in MoE DDP training
+                x_in_lru = zq
+            else:
+                x_in_lru = zq
             gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
             x_in_lru = x_in_lru * gamma_t
             
@@ -867,17 +867,13 @@ class ConvLRUBlock(nn.Module):
         super().__init__()
         self.lru_layer = ConvLRULayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
-        self.use_checkpointing = bool(getattr(args, "use_checkpointing", False))
+        # Checkpointing removed to fix DDP errors
+        self.use_checkpointing = False
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        def _inner_forward(x_in, last_h, t_val, c_val):
-            x_mid, h_out = self.lru_layer(x_in, last_h, listT=t_val)
-            x_out = self.feed_forward(x_mid, cond=c_val)
-            return x_out, h_out
-        if self.training and x.requires_grad and self.use_checkpointing:
-            return checkpoint.checkpoint(_inner_forward, x, last_hidden_in, listT, cond, use_reentrant=False)
-        else:
-            return _inner_forward(x, last_hidden_in, listT, cond)
+        x_mid, h_out = self.lru_layer(x, last_hidden_in, listT=listT)
+        x_out = self.feed_forward(x_mid, cond=cond)
+        return x_out, h_out
 
 
 class VectorQuantizer(nn.Module):
