@@ -227,17 +227,18 @@ class SpectralConv2d(nn.Module):
         return torch.einsum("blcxy,coxy->bloxy", input_, weights)
 
     def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
-        if not torch.is_complex(x_ft):
-            x_ft = x_ft.to(torch.cfloat)
-        B, L, C, H, W_freq = x_ft.shape
-        out_ft = torch.zeros(B, L, self.out_channels, H, W_freq, device=x_ft.device, dtype=torch.cfloat)
-        m1 = min(H, self.modes1)
-        m2 = min(W_freq, self.modes2)
-        if m1 > 0 and m2 > 0:
-            out_ft[:, :, :, :m1, :m2] = self._cmul(x_ft[:, :, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
-        if m1 > 0 and m2 > 0 and H > 1:
-            out_ft[:, :, :, -m1:, :m2] = self._cmul(x_ft[:, :, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
-        return out_ft
+        with torch.cuda.amp.autocast(enabled=False):
+            if not torch.is_complex(x_ft):
+                x_ft = x_ft.to(torch.cfloat)
+            B, L, C, H, W_freq = x_ft.shape
+            out_ft = torch.zeros(B, L, self.out_channels, H, W_freq, device=x_ft.device, dtype=torch.cfloat)
+            m1 = min(H, self.modes1)
+            m2 = min(W_freq, self.modes2)
+            if m1 > 0 and m2 > 0:
+                out_ft[:, :, :, :m1, :m2] = self._cmul(x_ft[:, :, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
+            if m1 > 0 and m2 > 0 and H > 1:
+                out_ft[:, :, :, -m1:, :m2] = self._cmul(x_ft[:, :, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
+            return out_ft
 
 
 class SphericalHarmonicsPrior(nn.Module):
@@ -660,82 +661,90 @@ class ConvLRULayer(nn.Module):
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
 
-        h = self._hybrid_forward_transform(x)
-        h = h.contiguous()
+        with torch.cuda.amp.autocast(enabled=False):
+            x_in_fp32 = x.float()
+            dt_fp32 = dt.float()
+            h = self._hybrid_forward_transform(x_in_fp32)
+            h = h.contiguous()
 
-        ctx = x.mean(dim=(-2, -1))
-        selection = self.selection_net(ctx)
-        sel_u, sel_v = torch.chunk(selection, 2, dim=-1)
-        scale_u = torch.sigmoid(sel_u).view(B, L, 1, 1, self.rank)
-        scale_v = torch.sigmoid(sel_v).view(B, L, 1, 1, self.rank)
+            ctx = x_in_fp32.mean(dim=(-2, -1))
+            selection = self.selection_net(ctx)
+            sel_u, sel_v = torch.chunk(selection, 2, dim=-1)
+            scale_u = torch.sigmoid(sel_u).view(B, L, 1, 1, self.rank)
+            scale_v = torch.sigmoid(sel_v).view(B, L, 1, 1, self.rank)
 
-        h_perm = h.permute(0, 1, 2, 4, 3)
-        t0 = torch.matmul(h_perm, self.U_row)
-        t0 = t0 * scale_u
-        t0 = t0.permute(0, 1, 2, 4, 3)
-        zq = torch.matmul(t0, self.V_col)
-        zq = zq * scale_v
+            h_perm = h.permute(0, 1, 2, 4, 3)
+            t0 = torch.matmul(h_perm, self.U_row)
+            t0 = t0 * scale_u
+            t0 = t0.permute(0, 1, 2, 4, 3)
+            zq = torch.matmul(t0, self.V_col)
+            zq = zq * scale_v
 
-        if self.proj_b is not None:
-            zq = zq + self.proj_b.view(1, 1, C, 1, 1)
+            if self.proj_b is not None:
+                zq = zq + self.proj_b.view(1, 1, C, 1, 1)
 
-        nu_log, theta_log = self.params_log_base.unbind(dim=0)
-        disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-        nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
-        th_base = torch.exp(theta_log + disp_th).view(1, 1, C, self.rank, 1)
+            nu_log, theta_log = self.params_log_base.unbind(dim=0)
+            disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
+            nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, self.rank, 1)
+            th_base = torch.exp(theta_log + disp_th).view(1, 1, C, self.rank, 1)
 
-        dnu_force, dth_force = self._apply_forcing(x, dt)
+            dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32)
 
-        nu_t = torch.clamp(nu_base * dt + dnu_force, min=1e-6)
-        th_t = th_base * dt + dth_force
-        lamb = torch.exp(torch.complex(-nu_t, th_t))
+            nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
+            th_t = th_base * dt_fp32 + dth_force
+            lamb = torch.exp(torch.complex(-nu_t, th_t))
 
-        if self.training:
-            noise_std = self.noise_level * torch.sqrt(dt + 1e-6)
-            noise = torch.randn_like(zq) * noise_std
-            x_in = zq + noise
-        else:
-            x_in = zq
+            if self.training:
+                noise_std = self.noise_level * torch.sqrt(dt_fp32 + 1e-6)
+                noise = torch.randn_like(zq) * noise_std
+                x_in_lru = zq + noise
+            else:
+                x_in_lru = zq
 
-        gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
-        x_in = x_in * gamma_t
+            gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
+            x_in_lru = x_in_lru * gamma_t
 
-        zero_prev = torch.zeros_like(x_in[:, :1])
-        x_in_fwd = torch.cat([last_hidden_in, x_in], dim=1) if last_hidden_in is not None else torch.cat([zero_prev, x_in], dim=1)
-        lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
-        lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
-        z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())[:, 1:]
-        last_hidden_out = z_out[:, -1:]
+            zero_prev = torch.zeros_like(x_in_lru[:, :1])
+            if last_hidden_in is not None:
+                x_in_fwd = torch.cat([last_hidden_in.to(x_in_lru.dtype), x_in_lru], dim=1)
+            else:
+                x_in_fwd = torch.cat([zero_prev, x_in_lru], dim=1)
+            
+            lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
+            lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
+            z_out = self.pscan(lamb_in_fwd, x_in_fwd.contiguous())[:, 1:]
+            last_hidden_out = z_out[:, -1:]
 
-        if self.bidirectional:
-            x_in_bwd = x_in.flip(1)
-            lamb_bwd = lamb.flip(1)
-            x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
-            lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
-            lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-            z_out_bwd = self.pscan(lamb_in_bwd, x_in_bwd.contiguous())[:, 1:].flip(1)
-        else:
-            z_out_bwd = None
+            if self.bidirectional:
+                x_in_bwd = x_in_lru.flip(1)
+                lamb_bwd = lamb.flip(1)
+                x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
+                lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
+                lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
+                z_out_bwd = self.pscan(lamb_in_bwd, x_in_bwd.contiguous())[:, 1:].flip(1)
+            else:
+                z_out_bwd = None
 
-        def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
-            z_scaled = z * sc_v
-            t1 = torch.matmul(z_scaled, self.V_col.conj().transpose(1, 2))
-            t1 = t1.permute(0, 1, 2, 4, 3)
-            t1_scaled = t1 * sc_u
-            rec = torch.matmul(t1_scaled, self.U_row.transpose(1, 2))
-            rec = rec.permute(0, 1, 2, 4, 3)
-            return rec
+            def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
+                z_scaled = z * sc_v
+                t1 = torch.matmul(z_scaled, self.V_col.conj().transpose(1, 2))
+                t1 = t1.permute(0, 1, 2, 4, 3)
+                t1_scaled = t1 * sc_u
+                rec = torch.matmul(t1_scaled, self.U_row.transpose(1, 2))
+                rec = rec.permute(0, 1, 2, 4, 3)
+                return rec
 
-        h_rec_fwd = project_back(z_out, scale_u, scale_v)
-        feat_fwd = self._hybrid_inverse_transform(h_rec_fwd)
+            h_rec_fwd = project_back(z_out, scale_u, scale_v)
+            feat_fwd = self._hybrid_inverse_transform(h_rec_fwd)
 
-        if self.bidirectional and z_out_bwd is not None:
-            h_rec_bwd = project_back(z_out_bwd, scale_u, scale_v)
-            feat_bwd = self._hybrid_inverse_transform(h_rec_bwd)
-            feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
-        else:
-            feat_final = feat_fwd
+            if self.bidirectional and z_out_bwd is not None:
+                h_rec_bwd = project_back(z_out_bwd, scale_u, scale_v)
+                feat_bwd = self._hybrid_inverse_transform(h_rec_bwd)
+                feat_final = torch.cat([feat_fwd, feat_bwd], dim=2)
+            else:
+                feat_final = feat_fwd
 
+        feat_final = feat_final.to(x.dtype)
         h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
 
         if self.sh_prior is not None:
