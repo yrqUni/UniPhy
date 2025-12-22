@@ -767,6 +767,7 @@ class ConvLRULayer(nn.Module):
         )
 
         self.U_row = nn.Parameter(torch.randn(self.emb_ch, self.S, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.S)))
+        # Correctly initialize V_col with proper dimensions: (C, W_freq, Rank)
         self.V_col = nn.Parameter(torch.randn(self.emb_ch, self.W_freq, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.W_freq)))
 
         C = self.emb_ch
@@ -835,9 +836,18 @@ class ConvLRULayer(nn.Module):
             scale_u = torch.sigmoid(sel_u).view(B, L, 1, 1, self.rank)
             scale_v = torch.sigmoid(sel_v).view(B, L, 1, 1, self.rank)
 
-            h_perm = h.permute(0, 1, 2, 4, 3)
-            t0 = torch.einsum("blcwh,chr->blcwr", h_perm, self.U_row)
+            h_perm = h.permute(0, 1, 2, 4, 3)  # B, L, C, W_freq, S
+            
+            # einsum shapes:
+            # h_perm: (B, L, C, W_freq, S)
+            # U_row: (C, S, R)
+            # Result t0: (B, L, C, W_freq, R)
+            t0 = torch.einsum("blcws,csr->blcwr", h_perm, self.U_row)
             t0 = t0 * scale_u
+
+            # t0: (B, L, C, W_freq, R)
+            # V_col: (C, W_freq, R)
+            # Result zq: (B, L, C, W_freq, R)
             zq = torch.einsum("blcwr,cwr->blcwr", t0, self.V_col)
             zq = zq * scale_v.unsqueeze(-2)
 
@@ -900,7 +910,11 @@ class ConvLRULayer(nn.Module):
                 z = z * sc_v.unsqueeze(-2)
                 t1 = torch.einsum("blcwr,cwr->blcwr", z, self.V_col.conj())
                 t1 = t1 * sc_u
-                rec = torch.einsum("blcwr,chr->blcwh", t1, self.U_row.transpose(1, 2).conj())
+                # 
+                # t1: (B, L, C, W_freq, R)
+                # U_row: (C, S, R)
+                # Output: (B, L, C, W_freq, S) -> Matches h_perm
+                rec = torch.einsum("blcwr,csr->blcws", t1, self.U_row.conj())
                 return rec
 
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
@@ -1239,7 +1253,7 @@ class ConvLRUModel(nn.Module):
                 diffY = skip.size(-2) - x.size(-2)
                 diffX = skip.size(-1) - x.size(-1)
                 x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-
+            
             skip_c = skip.permute(0, 2, 1, 3, 4)
             x_c = x.permute(0, 2, 1, 3, 4)
             skip_out = self.csa_blocks[i](skip_c, x_c)
