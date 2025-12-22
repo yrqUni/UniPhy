@@ -1152,13 +1152,9 @@ class Decoder(nn.Module):
         x = self.c_out(x)
 
         if self.head_mode == "gaussian":
-            # Correct chunk dim=2 (Channels) because x is (B, L, C, H, W) here after c_out?
-            # Wait, Decoder internals use (B, C, L, H, W).
-            # c_out output is (B, C, L, H, W).
-            # So chunk dim should be 1 (C).
-            mu, log_sigma = torch.chunk(x, 2, dim=1)
+            mu, log_sigma = torch.chunk(x, 2, dim=2)
             sigma = F.softplus(log_sigma) + 1e-6
-            return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4).contiguous()
+            return torch.cat([mu, sigma], dim=2).permute(0, 2, 1, 3, 4).contiguous()
 
         if self.head_mode == "token":
             if self.vq is None:
@@ -1389,7 +1385,6 @@ class ConvLRU(nn.Module):
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             
             if self.decoder.head_mode == "gaussian":
-                # out is (B, L, C, H, W)
                 mu, sigma = torch.chunk(out, 2, dim=2)
                 mu = self.revin(mu, "denorm")
                 sigma = sigma * self.revin.stdev
@@ -1422,30 +1417,27 @@ class ConvLRU(nn.Module):
         else:
              x_dec0 = x_dec
 
-        # x_dec0: (B, L, C, H, W). We need the last step.
-        x_step_dist = x_dec0[:, -1:, :, :, :] # (B, 1, C, H, W)
+        x_step_dist = x_dec0[:, -1:, :, :, :] 
         
         if str(self.decoder.head_mode).lower() == "gaussian":
-             # Channel is at dim 2
              out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
-             x_step_mean = x_step_dist[:, :, :out_ch, :, :] # (B, 1, out_ch, H, W)
+             x_step_mean = x_step_dist[:, :, :out_ch, :, :]
         else:
              x_step_mean = x_step_dist
              
-        # DO NOT permute to (B, C, 1, H, W) for output list
-        # Keeping it (B, 1, C, H, W) allows broadcasting with RevIN stats (B, 1, C, 1, 1)
+        x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
         
         if str(self.decoder.head_mode).lower() == "gaussian":
-            out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
-            mu = x_step_dist[:, :, :out_ch, :, :]
-            sigma = x_step_dist[:, :, out_ch:, :, :]
+            out_ch = int(getattr(self.args, "out_ch", x_step_dist_perm.size(1) // 2))
+            mu = x_step_dist_perm[:, :out_ch, :, :, :]
+            sigma = x_step_dist_perm[:, out_ch:, :, :, :]
             mu_denorm = self.revin(mu, "denorm")
             sigma_denorm = sigma * self.revin.stdev
-            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=1))
         elif str(self.decoder.head_mode).lower() == "token":
-             out_list.append(x_step_dist)
+             out_list.append(x_step_dist_perm)
         else:
-             out_list.append(self.revin(x_step_dist, "denorm"))
+             out_list.append(self.revin(x_step_dist_perm, "denorm"))
 
         future = listT_future
         if future is None:
@@ -1466,16 +1458,18 @@ class ConvLRU(nn.Module):
             else:
                 x_step_mean = x_step_dist
             
+            x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
+            
             if str(self.decoder.head_mode).lower() == "gaussian":
-                out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
-                mu = x_step_dist[:, :, :out_ch, :, :]
-                sigma = x_step_dist[:, :, out_ch:, :, :]
+                out_ch = int(getattr(self.args, "out_ch", x_step_dist_perm.size(1) // 2))
+                mu = x_step_dist_perm[:, :out_ch, :, :, :]
+                sigma = x_step_dist_perm[:, out_ch:, :, :, :]
                 mu_denorm = self.revin(mu, "denorm")
                 sigma_denorm = sigma * self.revin.stdev
-                out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+                out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=1))
             elif str(self.decoder.head_mode).lower() == "token":
-                 out_list.append(x_step_dist)
+                 out_list.append(x_step_dist_perm)
             else:
-                 out_list.append(self.revin(x_step_dist, "denorm"))
+                 out_list.append(self.revin(x_step_dist_perm, "denorm"))
 
-        return torch.cat(out_list, dim=1) # cat along Time (dim 1)
+        return torch.cat(out_list, dim=2).permute(0, 2, 1, 3, 4)
