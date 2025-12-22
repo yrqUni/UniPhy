@@ -794,10 +794,10 @@ class ConvLRULayer(nn.Module):
             lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
             lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
             B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
-            x_flat = x_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
-            l_flat = lamb_in_fwd.view(B_sz, L_sz, -1).transpose(1, 2)
+            x_flat = x_in_fwd.view(B_sz, L_sz, -1)
+            l_flat = lamb_in_fwd.view(B_sz, L_sz, -1)
             z_flat = self.pscan(l_flat, x_flat)
-            z_out = z_flat.transpose(1, 2).view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
+            z_out = z_flat.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
             last_hidden_out = z_out[:, -1:]
             if self.bidirectional:
                 x_in_bwd = x_in_lru.flip(1)
@@ -805,10 +805,10 @@ class ConvLRULayer(nn.Module):
                 x_in_bwd = torch.cat([zero_prev, x_in_bwd], dim=1)
                 lamb_bwd = torch.cat([lamb_bwd[:, :1], lamb_bwd], dim=1)
                 lamb_in_bwd = lamb_bwd.expand_as(x_in_bwd).contiguous()
-                x_flat_b = x_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
-                l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1).transpose(1, 2)
+                x_flat_b = x_in_bwd.view(B_sz, L_sz, -1)
+                l_flat_b = lamb_in_bwd.view(B_sz, L_sz, -1)
                 z_flat_b = self.pscan(l_flat_b, x_flat_b)
-                z_out_bwd = z_flat_b.transpose(1, 2).view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
+                z_out_bwd = z_flat_b.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:].flip(1)
             else:
                 z_out_bwd = None
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
