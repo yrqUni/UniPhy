@@ -765,7 +765,7 @@ class ConvLRULayer(nn.Module):
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             x_in_fp32 = x.float()
             dt_fp32 = dt.float()
             h = self._hybrid_forward_transform(x_in_fp32)
