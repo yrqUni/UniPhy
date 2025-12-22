@@ -1152,9 +1152,10 @@ class Decoder(nn.Module):
         x = self.c_out(x)
 
         if self.head_mode == "gaussian":
-            mu, log_sigma = torch.chunk(x, 2, dim=1)
+            # Decoder returns (B, L, C*2, H, W) -> Correctly chunk along dim=2 (Channels)
+            mu, log_sigma = torch.chunk(x, 2, dim=2)
             sigma = F.softplus(log_sigma) + 1e-6
-            return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4).contiguous()
+            return torch.cat([mu, sigma], dim=2).permute(0, 2, 1, 3, 4).contiguous()
 
         if self.head_mode == "token":
             if self.vq is None:
@@ -1385,11 +1386,11 @@ class ConvLRU(nn.Module):
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             
             if self.decoder.head_mode == "gaussian":
-                out = out.permute(0, 2, 1, 3, 4)
-                mu, sigma = torch.chunk(out, 2, dim=1)
+                # [Fix: Splitting Channels] Chunk along dim=2 (C), not dim=1 (L)
+                mu, sigma = torch.chunk(out, 2, dim=2)
                 mu = self.revin(mu, "denorm")
                 sigma = sigma * self.revin.stdev
-                return torch.cat([mu, sigma], dim=1).permute(0, 2, 1, 3, 4).contiguous()
+                return torch.cat([mu, sigma], dim=2) 
             elif self.decoder.head_mode == "token":
                 return out
             else:
@@ -1418,14 +1419,17 @@ class ConvLRU(nn.Module):
         else:
              x_dec0 = x_dec
 
-        x_step_dist = x_dec0[:, -1:, :, :, :]
+        # x_dec0 is (B, L, C, H, W). We take the LAST time step.
+        x_step_dist = x_dec0[:, -1:, :, :, :] # (B, 1, C, H, W)
         
         if str(self.decoder.head_mode).lower() == "gaussian":
+             # Correct slicing for C (dim 2)
              out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
              x_step_mean = x_step_dist[:, :, :out_ch, :, :]
         else:
              x_step_mean = x_step_dist
              
+        # Permute to (B, C, 1, H, W) for RevIN
         x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
         
         if str(self.decoder.head_mode).lower() == "gaussian":
@@ -1450,13 +1454,17 @@ class ConvLRU(nn.Module):
             x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
             x_dec0 = x_dec[0] if isinstance(x_dec, tuple) else x_dec
+            
             x_step_dist = x_dec0[:, -1:, :, :, :]
+            
             if str(self.decoder.head_mode).lower() == "gaussian":
                 out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
                 x_step_mean = x_step_dist[:, :, :out_ch, :, :]
             else:
                 x_step_mean = x_step_dist
+            
             x_step_dist_perm = x_step_dist.permute(0, 2, 1, 3, 4).contiguous()
+            
             if str(self.decoder.head_mode).lower() == "gaussian":
                 out_ch = int(getattr(self.args, "out_ch", x_step_dist_perm.size(1) // 2))
                 mu = x_step_dist_perm[:, :out_ch, :, :, :]
@@ -1469,4 +1477,8 @@ class ConvLRU(nn.Module):
             else:
                  out_list.append(self.revin(x_step_dist_perm, "denorm"))
 
-        return torch.cat(out_list, dim=2).permute(0, 2, 1, 3, 4)
+        return torch.cat(out_list, dim=2).permute(0, 2, 1, 3, 4) 
+        # Note: out_list elements are (B, C, 1, H, W). cat dim=2 (Time). 
+        # Result (B, C, L_out, H, W). Permute to (B, L_out, C, H, W) to match p-mode output format?
+        # Standard format is B, L, C, H, W.
+    
