@@ -156,7 +156,8 @@ def test_configurations():
                     model.train()
 
                     use_amp = device.type == "cuda" and dtype == torch.float16
-                    with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.float16):
+                    
+                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
                         out = model(x, mode="p", listT=listT, static_feats=static)
                         expC = expected_out_channels(args)
                         exp_shape = (B, L, expC, H, W)
@@ -195,7 +196,7 @@ def test_heads():
                 quant, vq_loss, idx = out
                 ok = tuple(quant.shape) == (B, L, args.out_ch, H, W) and vq_loss.dim() == 0 and idx.dim() == 2
                 (quant.sum() + vq_loss).backward()
-                print_status(f"Head: {mode}", ok, f"Quant: {tuple(quant.shape)} Loss: {float(vq_loss):.4f}")
+                print_status(f"Head: {mode}", ok, f"Quant: {tuple(quant.shape)} Loss: {vq_loss.item():.4f}")
             else:
                 exp_shape = (B, L, expected_out_channels(args), H, W)
                 ok = isinstance(out, torch.Tensor) and tuple(out.shape) == exp_shape

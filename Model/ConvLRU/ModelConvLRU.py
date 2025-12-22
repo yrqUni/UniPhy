@@ -404,7 +404,7 @@ class SpatialPatchMoE(nn.Module):
             topk_indices,
             self.num_experts,
             self.active_experts,
-            BLOCK_SIZE
+            BLOCK_SIZE,
         )
         topk_indices = topk_indices.long()
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -498,7 +498,7 @@ class ConvLRULayer(nn.Module):
         self.selection_net = nn.Sequential(
             nn.Linear(self.emb_ch, self.emb_ch),
             nn.SiLU(),
-            nn.Linear(self.emb_ch, self.rank * 2)
+            nn.Linear(self.emb_ch, self.rank * 2),
         )
 
         self.U_row = nn.Parameter(torch.randn(self.emb_ch, self.S, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.S)))
