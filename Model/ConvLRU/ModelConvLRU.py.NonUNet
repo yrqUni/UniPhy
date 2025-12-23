@@ -846,20 +846,15 @@ class ConvLRULayer(nn.Module):
             feat_final = self._hybrid_inverse_transform(h_rec_fwd)
 
         feat_final = feat_final.to(x.dtype)
-        # feat_final is (B, L, C, H, W). Permute to (B, C, L, H, W) for post_ifft_proj
         feat_final_perm = feat_final.permute(0, 2, 1, 3, 4)
         h_final = self.post_ifft_proj(feat_final_perm)
         
         if self.sh_prior is not None:
-            # sh_prior expects (B, L, C, H, W)
-            # Permute h_final to (B, L, C, H, W)
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         
-        # Local conv. x is (B, C, L, H, W).
         x_local = self.local_conv(x)
         h_final = h_final + x_local
         
-        # Norm. h_final is (B, C, L, H, W). RMSNorm handles this.
         h_final = self.norm(h_final)
         
         if self.gate_conv is not None:
@@ -1080,80 +1075,18 @@ class ConvLRUModel(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
         self.args = args
-        self.use_unet = bool(getattr(args, "unet", False))
         layers = int(getattr(args, "convlru_num_blocks", 2))
-        self.down_blocks = nn.ModuleList()
-        self.up_blocks = nn.ModuleList()
-        self.csa_blocks = nn.ModuleList()
         C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
-        if not self.use_unet:
-            self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
-            self.upsample = None
-            self.fusion = None
-        else:
-            curr_H, curr_W = H, W
-            encoder_res: List[Tuple[int, int]] = []
-            for i in range(layers):
-                self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
-                encoder_res.append((curr_H, curr_W))
-                if i < layers - 1:
-                    curr_H = max(1, curr_H // 2)
-                    curr_W = max(1, curr_W // 2)
-            for i in range(layers - 2, -1, -1):
-                h_up, w_up = encoder_res[i]
-                self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
-                self.csa_blocks.append(CrossScaleAttentionGate(C))
-            self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
-            self.fusion = nn.Conv3d(C * 2, C, 1)
-            self.convlru_blocks = None
+        self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor, last_hidden_ins: Optional[List[torch.Tensor]] = None, listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        if not self.use_unet:
-            if self.convlru_blocks is None:
-                raise RuntimeError("Model misconfigured")
-            last_hidden_outs: List[torch.Tensor] = []
-            for idx, blk in enumerate(self.convlru_blocks):
-                h_in = last_hidden_ins[idx] if (last_hidden_ins is not None and idx < len(last_hidden_ins)) else None
-                x, h_out = blk(x, h_in, listT=listT, cond=cond)
-                last_hidden_outs.append(h_out)
-            return x, last_hidden_outs
-        skips: List[torch.Tensor] = []
+        if self.convlru_blocks is None:
+            raise RuntimeError("Model misconfigured")
         last_hidden_outs: List[torch.Tensor] = []
-        num_down = len(self.down_blocks)
-        hs_in_down = last_hidden_ins[:num_down] if last_hidden_ins is not None else [None] * num_down
-        hs_in_up = last_hidden_ins[num_down:] if last_hidden_ins is not None else [None] * len(self.up_blocks)
-        for i, blk in enumerate(self.down_blocks):
-            curr_cond = cond
-            if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
-                curr_cond = F.interpolate(curr_cond, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            x, h_out = blk(x, hs_in_down[i], listT=listT, cond=curr_cond)
-            last_hidden_outs.append(h_out)
-            if i < len(self.down_blocks) - 1:
-                skips.append(x)
-                x_s = x
-                if x_s.shape[-2] >= 2 and x_s.shape[-1] >= 2:
-                    x_s = F.avg_pool3d(x_s, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-                x = x_s
-        if self.upsample is None or self.fusion is None:
-            raise RuntimeError("UNet misconfigured")
-        for i, blk in enumerate(self.up_blocks):
-            x_s = x
-            x_s = self.upsample(x_s)
-            x = x_s
-            skip = skips.pop()
-            if x.shape[-2:] != skip.shape[-2:]:
-                diffY = skip.size(-2) - x.size(-2)
-                diffX = skip.size(-1) - x.size(-1)
-                x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-            skip = self.csa_blocks[i](skip, x)
-            x = torch.cat([x, skip], dim=1)
-            x = self.fusion(x)
-            curr_cond = cond
-            if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
-                curr_cond = F.interpolate(curr_cond, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            x_out, h_out = blk(x, hs_in_up[i], listT=listT, cond=curr_cond)
-            x = x_out
+        for idx, blk in enumerate(self.convlru_blocks):
+            h_in = last_hidden_ins[idx] if (last_hidden_ins is not None and idx < len(last_hidden_ins)) else None
+            x, h_out = blk(x, h_in, listT=listT, cond=cond)
             last_hidden_outs.append(h_out)
         return x, last_hidden_outs
 
