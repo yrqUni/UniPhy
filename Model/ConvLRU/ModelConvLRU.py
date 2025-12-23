@@ -635,7 +635,9 @@ class SpatialPatchMoE(nn.Module):
         self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts
 
         topk_indices = topk_indices.long()
+        topk_weights = torch.gather(router_probs, 1, topk_indices)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        
         flat_indices = topk_indices.view(-1)
         x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
         cond_repeated = None
