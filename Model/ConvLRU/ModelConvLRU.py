@@ -510,11 +510,68 @@ class CrossScaleAttentionGate(nn.Module):
         return self.norm(local_x * attn)
 
 
+class SpectralGatedBlock(nn.Module):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], cond_channels: Optional[int] = None):
+        super().__init__()
+        self.H, self.W = hidden_size
+        self.channels = channels
+        self.modes_h = min(self.H // 2, 32)
+        self.modes_w = min(self.W // 2 + 1, 32)
+        
+        scale = 1 / (channels * channels)
+        self.weights1 = nn.Parameter(scale * torch.randn(channels, channels, self.modes_h, self.modes_w, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(scale * torch.randn(channels, channels, self.modes_h, self.modes_w, dtype=torch.cfloat))
+        
+        self.norm = RMSNorm(channels)
+        self.act = nn.SiLU()
+        
+        self.mlp = nn.Sequential(
+            nn.Conv3d(channels, channels * 2, 1),
+            nn.SiLU(),
+            nn.Conv3d(channels * 2, channels, 1)
+        )
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        residual = x
+        x = self.norm(x)
+        
+        x_2d = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        x_ft = torch.fft.rfft2(x_2d, norm="ortho")
+        
+        out_ft = torch.zeros_like(x_ft)
+        
+        out_ft[:, :, :self.modes_h, :self.modes_w] = torch.einsum(
+            "bixy,ioxy->boxy", 
+            x_ft[:, :, :self.modes_h, :self.modes_w], 
+            self.weights1
+        )
+        out_ft[:, :, -self.modes_h:, :self.modes_w] = torch.einsum(
+            "bixy,ioxy->boxy", 
+            x_ft[:, :, -self.modes_h:, :self.modes_w], 
+            self.weights2
+        )
+        
+        x_2d = torch.fft.irfft2(out_ft, s=(H, W), norm="ortho")
+        x = x_2d.view(B, D, C, H, W).permute(0, 2, 1, 3, 4)
+        
+        x = self.act(x)
+        x = self.mlp(x)
+        
+        return residual + x
+
+
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.use_ada_norm = use_ada_norm
+        
+        self.H, self.W = hidden_size
+        self.register_buffer("pos_embed", self._build_coords(self.H, self.W), persistent=False)
+        
+        self.coord_fusion = nn.Conv3d(int(channels) + 2, int(channels), 1)
+        
         self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size)
         if self.use_ada_norm and ada_norm_cond_dim is not None:
             self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
@@ -528,8 +585,20 @@ class GatedConvBlock(nn.Module):
         self.pw_conv_out = nn.Conv3d(int(channels), int(channels), kernel_size=1)
         self.cbam = CBAM2DPerStep(int(channels), reduction=16) if self.use_cbam else None
 
+    def _build_coords(self, H, W):
+        lat = torch.linspace(-1, 1, H)
+        lon = torch.linspace(-1, 1, W)
+        grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
+        return torch.stack([grid_lat, grid_lon], dim=0).unsqueeze(0).unsqueeze(2)
+
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
+        
+        B, C, D, H, W = x.shape
+        pos = self.pos_embed.expand(B, -1, D, -1, -1).to(x.device, x.dtype)
+        x = torch.cat([x, pos], dim=1)
+        x = self.coord_fusion(x)
+        
         x = self.dw_conv(x)
         if self.use_ada_norm:
             x = self.norm(x, time_emb)
@@ -564,13 +633,21 @@ class SpatialPatchMoE(nn.Module):
         self.expert_hidden_size = (self.patch_size, self.patch_size)
         self.channels = int(channels)
         self.cond_channels = int(cond_channels) if cond_channels is not None else 0
-        expert_kernel_sizes = [3, 7, 11]
-        self.experts = nn.ModuleList(
-            [
-                GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=expert_kernel_sizes[i % len(expert_kernel_sizes)], use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
-                for i in range(self.num_experts)
-            ]
-        )
+        
+        expert_list = []
+        kernel_sizes = [3, 7, 11]
+        for i in range(self.num_experts):
+            if (i + 1) % 4 == 0:
+                expert_list.append(
+                    SpectralGatedBlock(self.channels, self.expert_hidden_size, cond_channels=self.cond_channels)
+                )
+            else:
+                k_size = kernel_sizes[i % 3]
+                expert_list.append(
+                    GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=k_size, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
+                )
+        
+        self.experts = nn.ModuleList(expert_list)
         self.shared_expert = GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=7, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
         self.router = nn.Linear(router_in_dim, self.num_experts)

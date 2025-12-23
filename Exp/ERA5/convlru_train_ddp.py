@@ -6,11 +6,13 @@ import os
 import random
 import sys
 import warnings
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 import wandb
@@ -135,6 +137,8 @@ class Args:
         self.use_compile = False
         self.lr = 1e-5
         self.weight_decay = 0.05
+        self.ema_decay = 0.9999
+        self.input_noise_std = 0.01
         self.use_scheduler = False
         self.init_lr_scheduler = False
         self.loss = "lat"
@@ -160,6 +164,30 @@ class Args:
         if bool(self.use_compile):
             print("[Warning] Torch Compile is experimental. Use with caution.")
             logging.warning("Torch Compile is experimental. Use with caution.")
+
+
+class ModelEma(nn.Module):
+    def __init__(self, model: nn.Module, decay: float = 0.9999, device: Optional[torch.device] = None):
+        super().__init__()
+        self.module = deepcopy(model.module if isinstance(model, DDP) else model)
+        self.module.eval()
+        self.decay = decay
+        self.device = device
+        if self.device is not None:
+            self.module.to(device=device)
+
+    def _update(self, model: nn.Module, update_fn: Any) -> None:
+        with torch.no_grad():
+            for ema_v, model_v in zip(self.module.state_dict().values(), model.state_dict().values()):
+                if self.device is not None:
+                    model_v = model_v.to(device=self.device)
+                ema_v.copy_(update_fn(ema_v, model_v))
+
+    def update(self, model: nn.Module) -> None:
+        self._update(model, update_fn=lambda e, m: self.decay * e + (1.0 - self.decay) * m)
+
+    def set(self, model: nn.Module) -> None:
+        self._update(model, update_fn=lambda e, m: m)
 
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
@@ -234,7 +262,7 @@ def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Opti
         args_all = ckpt.get("args_all", None)
         if isinstance(args_all, dict):
             model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
-    for k in ["model", "optimizer", "scheduler"]:
+    for k in ["model", "optimizer", "scheduler", "ema"]:
         if k in ckpt:
             del ckpt[k]
     del ckpt
@@ -276,10 +304,11 @@ def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.M
     return new_state_dict
 
 
-def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
+def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, ema: ModelEma, epoch: int, step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     state: Dict[str, Any] = {
         "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+        "ema": ema.module.state_dict(),
         "optimizer": opt.state_dict(),
         "epoch": int(epoch),
         "step": int(step),
@@ -301,6 +330,7 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
 def load_ckpt(
     model: torch.nn.Module,
     opt: torch.optim.Optimizer,
+    ema: ModelEma,
     ckpt_path: str,
     scheduler: Optional[Any] = None,
     map_location: str = "cpu",
@@ -326,13 +356,19 @@ def load_ckpt(
 
     state_dict = adapt_state_dict_keys(checkpoint["model"], model)
     model.load_state_dict(state_dict, strict=False)
+    
+    if "ema" in checkpoint:
+        ema_state_dict = adapt_state_dict_keys(checkpoint["ema"], ema.module)
+        ema.module.load_state_dict(ema_state_dict, strict=False)
+        print("Loaded EMA state from checkpoint.")
+    
     opt.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and "scheduler" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler"])
     epoch = int(checkpoint.get("epoch", 0))
     step = int(checkpoint.get("step", 0))
     del state_dict
-    for k in ["model", "optimizer", "scheduler"]:
+    for k in ["model", "optimizer", "scheduler", "ema"]:
         if k in checkpoint:
             del checkpoint[k]
     del checkpoint
@@ -535,6 +571,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if bool(args.use_compile):
         model = torch.compile(model, mode="default")
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    
+    ema = ModelEma(model, decay=float(args.ema_decay), device=torch.device(f"cuda:{local_rank}"))
 
     register_lru_gate_hooks(model)
     setup_wandb(rank, args, model)
@@ -584,6 +622,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         start_epoch, _ = load_ckpt(
             model,
             opt,
+            ema,
             args.ckpt,
             scheduler,
             map_location=f"cuda:{local_rank}",
@@ -659,9 +698,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 static_feats = static_gpu.unsqueeze(0).repeat(x.size(0), 1, 1, 1)
 
             timestep = sample_timestep(args, x.size(0), x.device, x.dtype)
+            
+            noise = torch.randn_like(x) * float(args.input_noise_std)
+            x_noisy = x + noise
 
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
+                preds = model(x_noisy, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
                 preds = preds[:, 1:]
 
                 if preds.shape[2] == 2 * target.shape[2]:
@@ -685,6 +727,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             grad_norm, grad_max, _ = get_grad_stats(model) if rank == 0 else (0.0, 0.0, 0)
             opt.step()
+            ema.update(model)
 
             if bool(args.use_scheduler) and scheduler is not None:
                 scheduler.step()
@@ -771,6 +814,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     save_ckpt(
                         model,
                         opt,
+                        ema,
                         ep + 1,
                         train_step,
                         avg_loss,
@@ -778,14 +822,14 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor, gdl_loss, gdl_tensor, spec_loss, spec_tensor
+            del data, x, x_noisy, noise, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor, gdl_loss, gdl_tensor, spec_loss, spec_tensor
             if train_step % 50 == 0:
                 gc.collect()
 
         dist.barrier()
 
         if bool(args.do_eval):
-            model.eval()
+            ema.module.eval()
             eval_dataset = ERA5_Dataset(
                 input_dir=args.data_root,
                 year_range=args.year_range,
@@ -839,7 +883,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     timestep = sample_timestep(args, cond_eff.size(0), cond_eff.device, cond_eff.dtype)
 
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        preds = model(
+                        preds = ema.module(
                             cond_eff,
                             mode="i",
                             out_gen_num=out_gen_num,
