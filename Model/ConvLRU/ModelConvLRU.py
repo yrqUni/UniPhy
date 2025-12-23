@@ -283,9 +283,11 @@ class PeriodicConv3d(nn.Module):
 
 
 class FactorizedPeriodicConv3d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7, time_kernel_size: int = 1):
         super().__init__()
         self.pad_sp = kernel_size // 2
+        self.pad_time = time_kernel_size // 2
+        
         self.spatial_conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -296,18 +298,39 @@ class FactorizedPeriodicConv3d(nn.Module):
         self.depth_conv = nn.Conv3d(
             out_channels,
             out_channels,
-            kernel_size=(kernel_size, 1, 1),
-            padding=(self.pad_sp, 0, 0),
+            kernel_size=(kernel_size, 1, 1) if time_kernel_size > 1 else (1, 1, 1), # Logic Fix
+            # If we want pure 1x1x1 time conv, we use (1,1,1). 
+            # If we passed time_kernel_size > 1, we use (time_kernel_size, 1, 1)
+            # The original code used 'kernel_size' (7) for depth, which caused the bug.
+            # Now we strictly control it.
+        )
+        
+        # Correction: We should properly instantiate depth_conv based on time_kernel_size
+        self.depth_conv = nn.Conv3d(
+            out_channels,
+            out_channels,
+            kernel_size=(time_kernel_size, 1, 1),
+            padding=(self.pad_time, 0, 0),
             bias=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, D, H, W = x.shape
+        # Spatial Conv (Frame-wise independent)
         x_sp = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
         x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
         x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
         x_sp = self.spatial_conv(x_sp)
+        
+        # Depth Conv (Temporal)
         x_sp = x_sp.view(B, D, -1, H, W).permute(0, 2, 1, 3, 4)
+        # Only pad if kernel > 1
+        if self.depth_conv.kernel_size[0] > 1:
+             # CAUTION: Standard padding is non-causal. 
+             # Since we enforce time_kernel_size=1 in GatedBlock, this path is effectively disabled 
+             # or identity padding.
+             pass 
+        
         out = self.depth_conv(x_sp)
         return out
 
@@ -612,7 +635,9 @@ class GatedConvBlock(nn.Module):
         
         self.coord_fusion = nn.Conv3d(int(channels) + 2, int(channels), 1)
         
-        self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size)
+        # Enforce temporal kernel size to 1 to ensure strict P-mode / I-mode equivalence
+        self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size, time_kernel_size=1)
+        
         if self.use_ada_norm and ada_norm_cond_dim is not None:
             self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
             self.cond_proj = None
