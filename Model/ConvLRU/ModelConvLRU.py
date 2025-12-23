@@ -612,9 +612,10 @@ class SpatialPatchMoE(nn.Module):
         
         router_logits = self.router(router_input)
         
-        z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+        lse = torch.logsumexp(router_logits, dim=-1)
+        z_loss = lse.pow(2).mean()
+        router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
         
-        router_probs = F.softmax(router_logits, dim=-1)
         mean_probs = router_probs.mean(dim=0)
 
         N_total = router_logits.size(0)
@@ -701,6 +702,8 @@ class ConvLRULayer(nn.Module):
         dt_max = 0.1
         self.log_dt_min = nn.Parameter(torch.log(torch.tensor(dt_min)))
         self.log_dt_max = nn.Parameter(torch.log(torch.tensor(dt_max)))
+        
+        self.register_buffer("steps", torch.arange(self.rank, dtype=torch.float32) / (self.rank - 1))
         
         nu = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
         nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
@@ -790,8 +793,7 @@ class ConvLRULayer(nn.Module):
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
             
-            steps = torch.arange(self.rank, device=x.device, dtype=torch.float32) / (self.rank - 1)
-            log_dt = self.log_dt_min + steps * (self.log_dt_max - self.log_dt_min)
+            log_dt = self.log_dt_min + self.steps * (self.log_dt_max - self.log_dt_min)
             ts = torch.exp(log_dt)
             nu_init = 1.0 / ts
             nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
@@ -807,7 +809,7 @@ class ConvLRULayer(nn.Module):
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
             x_in_lru = zq
-            gamma_t = torch.sqrt(torch.clamp(1.0 - torch.exp(-2.0 * nu_t.real), min=1e-12))
+            gamma_t = torch.sqrt(torch.clamp(-torch.expm1(-2.0 * nu_t.real), min=1e-12))
             x_in_lru = x_in_lru * gamma_t
             if L == 1 and last_hidden_in is not None:
                 h_prev = last_hidden_in.to(x_in_lru.dtype)
