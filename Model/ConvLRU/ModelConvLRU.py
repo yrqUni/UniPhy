@@ -576,8 +576,10 @@ class SpatialPatchMoE(nn.Module):
         )
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
         self.router = nn.Linear(router_in_dim, self.num_experts)
+        self.aux_loss = 0.0
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self.aux_loss = 0.0
         B, C, L, H, W = x.shape
         P = self.patch_size
         pad_h = (P - (H % P)) % P
@@ -608,6 +610,10 @@ class SpatialPatchMoE(nn.Module):
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_input, router_cond], dim=1)
         router_logits = self.router(router_input)
+
+        router_probs = F.softmax(router_logits, dim=-1)
+        mean_probs = router_probs.mean(dim=0)
+
         N_total = router_logits.size(0)
         topk_weights = torch.empty((N_total, self.active_experts), device=x.device, dtype=x.dtype)
         topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
@@ -620,6 +626,14 @@ class SpatialPatchMoE(nn.Module):
             self.active_experts,
             BLOCK_SIZE,
         )
+
+        with torch.no_grad():
+            flat_indices_all = topk_indices.view(-1).long()
+            expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
+            fraction_selected = expert_counts / flat_indices_all.numel()
+
+        self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts
+
         topk_indices = topk_indices.long()
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         flat_indices = topk_indices.view(-1)
@@ -805,7 +819,7 @@ class ConvLRULayer(nn.Module):
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
             h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
             feat_final = self._hybrid_inverse_transform(h_rec_fwd)
-        
+
         feat_final = feat_final.to(x.dtype)
         h_final = self.post_ifft_proj(feat_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4).contiguous()
         if self.sh_prior is not None:

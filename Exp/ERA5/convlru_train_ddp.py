@@ -379,6 +379,15 @@ def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Te
     return ((preds - targets).abs() * w).mean()
 
 
+def get_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor:
+    total_aux_loss = torch.tensor(0.0, device=next(model.parameters()).device)
+    model_to_search = model.module if isinstance(model, DDP) else model
+    for module in model_to_search.modules():
+        if hasattr(module, "aux_loss") and isinstance(module.aux_loss, torch.Tensor):
+            total_aux_loss = total_aux_loss + module.aux_loss
+    return total_aux_loss
+
+
 _LRU_GATE_MEAN: Dict[Any, float] = {}
 
 
@@ -629,15 +638,18 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
                 preds = preds[:, 1:]
-                
+
                 if preds.shape[2] == 2 * target.shape[2]:
                     loss = gaussian_nll_loss_weighted(preds, target)
                     p_det = preds[:, :, :target.shape[2]]
                 else:
                     loss = latitude_weighted_l1(preds, target)
                     p_det = preds
-                
+
                 metric_l1 = F.l1_loss(p_det, target)
+
+                moe_loss = get_moe_aux_loss(model)
+                loss = loss + 0.01 * moe_loss
 
             loss.backward()
 
@@ -657,6 +669,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             l1_tensor = metric_l1.detach()
             dist.all_reduce(l1_tensor, op=dist.ReduceOp.SUM)
             avg_l1 = (l1_tensor / world_size).item()
+
+            moe_tensor = moe_loss.detach()
+            dist.all_reduce(moe_tensor, op=dist.ReduceOp.SUM)
+            avg_moe_loss = (moe_tensor / world_size).item()
 
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
@@ -704,6 +720,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/moe_active_expert": int(args.activate_expert),
                         "train/grad_norm": float(grad_norm),
                         "train/grad_max": float(grad_max),
+                        "train/moe_aux_loss": avg_moe_loss,
                     }
                     for k, v in _LRU_GATE_MEAN.items():
                         g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
@@ -724,7 +741,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor
+            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor
             if train_step % 50 == 0:
                 gc.collect()
 
@@ -794,12 +811,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             static_feats=static_feats,
                             timestep=timestep,
                         )
-                        
+
                         if preds.shape[2] == 2 * target.shape[2]:
                             preds_cmp = preds[:, :, :target.shape[2]]
                         else:
                             preds_cmp = preds
-                            
+
                         loss_eval = F.l1_loss(preds_cmp, target)
 
                     tot_tensor = loss_eval.detach()
