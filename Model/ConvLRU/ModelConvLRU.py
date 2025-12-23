@@ -511,11 +511,11 @@ class CrossScaleAttentionGate(nn.Module):
 
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, channels: int, hidden_size: Tuple[int, int], use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.use_ada_norm = use_ada_norm
-        self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=7)
+        self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size)
         if self.use_ada_norm and ada_norm_cond_dim is not None:
             self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
             self.cond_proj = None
@@ -564,13 +564,14 @@ class SpatialPatchMoE(nn.Module):
         self.expert_hidden_size = (self.patch_size, self.patch_size)
         self.channels = int(channels)
         self.cond_channels = int(cond_channels) if cond_channels is not None else 0
+        expert_kernel_sizes = [3, 7, 11]
         self.experts = nn.ModuleList(
             [
-                GatedConvBlock(self.channels, self.expert_hidden_size, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
-                for _ in range(self.num_experts)
+                GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=expert_kernel_sizes[i % len(expert_kernel_sizes)], use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
+                for i in range(self.num_experts)
             ]
         )
-        self.shared_expert = GatedConvBlock(self.channels, self.expert_hidden_size, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
+        self.shared_expert = GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=7, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
         self.router = nn.Linear(router_in_dim, self.num_experts)
         self.aux_loss = 0.0
@@ -610,6 +611,9 @@ class SpatialPatchMoE(nn.Module):
         shared_out = self.shared_expert(x_patches, cond=cond_patches)
         
         router_logits = self.router(router_input)
+        
+        z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+        
         router_probs = F.softmax(router_logits, dim=-1)
         mean_probs = router_probs.mean(dim=0)
 
@@ -629,7 +633,7 @@ class SpatialPatchMoE(nn.Module):
             expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
             fraction_selected = expert_counts / flat_indices_all.numel()
 
-        self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts
+        self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
 
         topk_indices = topk_indices.long()
         topk_weights = torch.gather(router_probs, 1, topk_indices)
@@ -868,7 +872,7 @@ class FeedForward(nn.Module):
             if self.num_expert > 1:
                 blocks.append(SpatialPatchMoE(self.ffn_hidden_ch, self.hidden_size, self.num_expert, self.activate_expert, self.use_cbam, cond_ch))
             else:
-                blocks.append(GatedConvBlock(self.ffn_hidden_ch, self.hidden_size, use_cbam=self.use_cbam, cond_channels=cond_ch))
+                blocks.append(GatedConvBlock(self.ffn_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=self.use_cbam, cond_channels=cond_ch))
         self.blocks = nn.ModuleList(blocks)
         self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.act = nn.SiLU()
@@ -996,6 +1000,7 @@ class Decoder(nn.Module):
                     GatedConvBlock(
                         out_ch_after_up,
                         (1, 1),
+                        kernel_size=7,
                         use_cbam=False,
                         cond_channels=cond_ch,
                         use_ada_norm=use_ada,
@@ -1181,7 +1186,7 @@ class Embedding(nn.Module):
             self.static_embed = None
         if self.emb_hidden_layers_num > 0:
             cond_ch = self.emb_ch if self.static_ch > 0 else None
-            self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, use_cbam=False, cond_channels=cond_ch) for _ in range(self.emb_hidden_layers_num)])
+            self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch) for _ in range(self.emb_hidden_layers_num)])
         else:
             self.c_hidden = None
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
