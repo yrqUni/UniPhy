@@ -379,6 +379,16 @@ def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Te
     return ((preds - targets).abs() * w).mean()
 
 
+def gradient_difference_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    diff_y_pred = preds[:, :, :, 1:, :] - preds[:, :, :, :-1, :]
+    diff_y_gt = targets[:, :, :, 1:, :] - targets[:, :, :, :-1, :]
+    loss_y = torch.mean(torch.abs(diff_y_pred - diff_y_gt))
+    diff_x_pred = preds[:, :, :, :, 1:] - preds[:, :, :, :, :-1]
+    diff_x_gt = targets[:, :, :, :, 1:] - targets[:, :, :, :, :-1]
+    loss_x = torch.mean(torch.abs(diff_x_pred - diff_x_gt))
+    return loss_x + loss_y
+
+
 def get_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor:
     total_aux_loss = torch.tensor(0.0, device=next(model.parameters()).device)
     model_to_search = model.module if isinstance(model, DDP) else model
@@ -647,9 +657,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     p_det = preds
 
                 metric_l1 = F.l1_loss(p_det, target)
+                gdl_loss = gradient_difference_loss(p_det, target)
 
                 moe_loss = get_moe_aux_loss(model)
-                loss = loss + 0.01 * moe_loss
+                loss = loss + 0.01 * moe_loss + 0.5 * gdl_loss
 
             loss.backward()
 
@@ -674,6 +685,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             dist.all_reduce(moe_tensor, op=dist.ReduceOp.SUM)
             avg_moe_loss = (moe_tensor / world_size).item()
 
+            gdl_tensor = gdl_loss.detach()
+            dist.all_reduce(gdl_tensor, op=dist.ReduceOp.SUM)
+            avg_gdl_loss = (gdl_tensor / world_size).item()
+
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
                 gate_str = format_gate_means()
@@ -697,7 +712,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 message = (
                     f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
-                    f"- Loss: {avg_loss:.6f} - L1: {avg_l1:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- Loss: {avg_loss:.6f} - L1: {avg_l1:.6f} - GDL: {avg_gdl_loss:.6f} - LR: {current_lr:.6e} - {t_str} "
                     f"- {gate_str}{grad_str} - MoE(n={int(args.num_expert)},k={int(args.activate_expert)})"
                 )
                 if isinstance(train_iter, tqdm):
@@ -711,6 +726,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/step": global_step,
                         "train/loss": avg_loss,
                         "train/loss_l1": avg_l1,
+                        "train/loss_gdl": avg_gdl_loss,
                         "train/lr": float(current_lr),
                         "train/K": int(K),
                         "train/T_mean": float(current_T_mean),
@@ -741,7 +757,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor
+            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor, gdl_loss, gdl_tensor
             if train_step % 50 == 0:
                 gc.collect()
 
