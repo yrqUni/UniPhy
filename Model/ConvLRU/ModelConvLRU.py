@@ -1,4 +1,21 @@
-import math
+vice: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        factor_h = (kH + 1) // 2
+            factor_w = (kW + 1) // 2
+                center_h = factor_h - 1 if kH % 2 == 1 else factor_h - 0.5
+                    center_w = factor_w - 1 if kW % 2 == 1 else factor_w - 0.5
+                        og_h = torch.arange(kH, device=device, dtype=dtype)
+                            og_w = torch.arange(kW, device=device, dtype=dtype)
+                                fh = (1 - torch.abs(og_h - center_h) / factor_h).unsqueeze(1)
+                                    fw = (1 - torch.abs(og_w - center_w) / factor_w).unsqueeze(0)
+                                        return fh @ fw
+
+
+                                    def deconv3d_bilinear_init_(weight: torch.Tensor) -> torch.Tensor:
+                                            in_ch, out_ch, kD, kH, kW = weight.shape
+                                                with torch.no_grad():
+                                                            weight.zero_()
+                                                                    kernel = _bilinear_kernel_2d(kH, kW, weight.device, weight.dtype)
+                                                                            c = min(in_ch, out_import math
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -26,24 +43,7 @@ def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     return weight
 
 
-def _bilinear_kernel_2d(kH: int, kW: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    factor_h = (kH + 1) // 2
-    factor_w = (kW + 1) // 2
-    center_h = factor_h - 1 if kH % 2 == 1 else factor_h - 0.5
-    center_w = factor_w - 1 if kW % 2 == 1 else factor_w - 0.5
-    og_h = torch.arange(kH, device=device, dtype=dtype)
-    og_w = torch.arange(kW, device=device, dtype=dtype)
-    fh = (1 - torch.abs(og_h - center_h) / factor_h).unsqueeze(1)
-    fw = (1 - torch.abs(og_w - center_w) / factor_w).unsqueeze(0)
-    return fh @ fw
-
-
-def deconv3d_bilinear_init_(weight: torch.Tensor) -> torch.Tensor:
-    in_ch, out_ch, kD, kH, kW = weight.shape
-    with torch.no_grad():
-        weight.zero_()
-        kernel = _bilinear_kernel_2d(kH, kW, weight.device, weight.dtype)
-        c = min(in_ch, out_ch)
+def _bilinear_kernel_2d(kH: int, kW: int, dech)
         for i in range(c):
             weight[i, i, 0, :, :] = kernel
     return weight
