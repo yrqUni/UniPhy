@@ -1,0 +1,229 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            foddtpwn99x8aor61ltfa9dp6421e6lr:
+                codePath: Exp/ERA5/convlru_train_ddp.py
+                codePathLocal: convlru_train_ddp.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "468159021056"
+                        used: "60779048960"
+                email: ruiqing.yan@student.unsw.edu.au
+                executable: /home/ruiqingyan/.conda/envs/tch/bin/python3.12
+                git:
+                    commit: c6783fcf7c1eae7cc055cc6fab5f9ab280a06fb3
+                    remote: git@github.com:yrqUni/ConvLRU.git
+                gpu: NVIDIA A800-SXM4-80GB
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-8d150706-6b36-50cc-04c5-ce8f3fc7a94e
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-3eabe14c-8207-741f-6873-bab6c99eda79
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-e12a041e-ff37-2ae1-f0a6-5f705462383c
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-e1978c74-2aca-c330-757c-227e3cececbb
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-022bf62a-3ff4-0406-9790-393f1cc20a68
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-85ba0322-5505-793c-eb2c-514dad7cbc63
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-08c8d5ef-318d-3e44-d09e-bd02bf0199ae
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-aad99321-054c-ac69-4697-0778b79aee94
+                host: node21
+                memory:
+                    total: "1081798631424"
+                os: Linux-5.15.0-94-generic-x86_64-with-glibc2.35
+                program: /nfs/ConvLRU/Exp/ERA5/convlru_train_ddp.py
+                python: CPython 3.12.12
+                root: /nfs/ConvLRU/Exp/ERA5
+                startedAt: "2025-12-23T17:31:36.113437Z"
+                writerId: foddtpwn99x8aor61ltfa9dp6421e6lr
+        m: []
+        python_version: 3.12.12
+        t:
+            "1":
+                - 1
+                - 53
+            "2":
+                - 1
+                - 53
+            "3":
+                - 1
+                - 16
+            "4": 3.12.12
+            "5": 0.23.0
+            "12": 0.23.0
+            "13": linux-x86_64
+T:
+    value: 6
+activate_expert:
+    value: 4
+amp_dtype:
+    value: fp16
+ckpt:
+    value: ""
+ckpt_dir:
+    value: ./convlru_base/ckpt
+ckpt_step:
+    value: 0.25
+convlru_num_blocks:
+    value: 12
+data_root:
+    value: /nfs/ERA5_data/data_norm
+dec_hidden_ch:
+    value: 0
+dec_hidden_layers_num:
+    value: 0
+dec_strategy:
+    value: pxsf
+diffusion_steps:
+    value: 1000
+do_eval:
+    value: false
+ema_decay:
+    value: 0.9999
+emb_ch:
+    value: 90
+emb_hidden_ch:
+    value: 120
+emb_hidden_layers_num:
+    value: 2
+emb_strategy:
+    value: pxus
+epochs:
+    value: 128
+eval_batch_size:
+    value: 1
+eval_data_n_frames:
+    value: 4
+eval_sample_num:
+    value: 1
+ffn_hidden_ch:
+    value: 120
+ffn_hidden_layers_num:
+    value: 2
+freq_gain_init:
+    value: 0
+freq_mode:
+    value: linear
+freq_rank:
+    value: 8
+grad_clip:
+    value: 0.3
+head_mode:
+    value: diffusion
+hidden_activation:
+    value: SiLU
+hidden_factor:
+    value:
+        - 7
+        - 12
+init_lr_scheduler:
+    value: false
+input_ch:
+    value: 30
+input_noise_std:
+    value: 0.01
+input_size:
+    value:
+        - 721
+        - 1440
+log_path:
+    value: ./convlru_base/logs
+loss:
+    value: lat
+lr:
+    value: 1e-05
+lru_rank:
+    value: 32
+num_expert:
+    value: 16
+out_ch:
+    value: 30
+output_activation:
+    value: Tanh
+sample_k:
+    value: 9
+sh_Lmax:
+    value: 6
+sh_gain_init:
+    value: 0
+sh_rank:
+    value: 8
+static_ch:
+    value: 6
+train_batch_size:
+    value: 1
+train_data_n_frames:
+    value: 27
+unet:
+    value: true
+use_amp:
+    value: false
+use_cbam:
+    value: true
+use_checkpointing:
+    value: true
+use_compile:
+    value: false
+use_freq_prior:
+    value: true
+use_gate:
+    value: true
+use_scheduler:
+    value: false
+use_selective:
+    value: true
+use_sh_prior:
+    value: true
+use_tf32:
+    value: false
+use_wandb:
+    value: true
+wandb_entity:
+    value: ConvLRU
+wandb_group:
+    value: v2.1.0
+wandb_mode:
+    value: online
+wandb_project:
+    value: ERA5
+wandb_run_name:
+    value: ""
+weight_decay:
+    value: 0.05
+year_range:
+    value:
+        - 2000
+        - 2021
