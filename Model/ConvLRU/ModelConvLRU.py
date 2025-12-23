@@ -69,7 +69,6 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
 @triton.jit
 def fused_moe_router_kernel(
     logits_ptr,
-    weights_out_ptr,
     indices_out_ptr,
     n_experts,
     k: tl.constexpr,
@@ -85,12 +84,9 @@ def fused_moe_router_kernel(
     numerator = tl.exp(logits)
     denominator = tl.sum(numerator, 0)
     probs = numerator / denominator
-    weights_row_start = weights_out_ptr + pid * k
     indices_row_start = indices_out_ptr + pid * k
     for i in range(k):
-        current_max_val = tl.max(probs, 0)
         current_max_idx = tl.argmax(probs, 0)
-        tl.store(weights_row_start + i, current_max_val)
         tl.store(indices_row_start + i, current_max_idx)
         mask_max = offsets == current_max_idx
         probs = tl.where(mask_max, 0.0, probs)
@@ -574,6 +570,7 @@ class SpatialPatchMoE(nn.Module):
                 for _ in range(self.num_experts)
             ]
         )
+        self.shared_expert = GatedConvBlock(self.channels, self.expert_hidden_size, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
         self.router = nn.Linear(router_in_dim, self.num_experts)
         self.aux_loss = 0.0
@@ -609,18 +606,18 @@ class SpatialPatchMoE(nn.Module):
             )
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_input, router_cond], dim=1)
+        
+        shared_out = self.shared_expert(x_patches, cond=cond_patches)
+        
         router_logits = self.router(router_input)
-
         router_probs = F.softmax(router_logits, dim=-1)
         mean_probs = router_probs.mean(dim=0)
 
         N_total = router_logits.size(0)
-        topk_weights = torch.empty((N_total, self.active_experts), device=x.device, dtype=x.dtype)
         topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
         BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
         fused_moe_router_kernel[(N_total,)](
             router_logits,
-            topk_weights,
             topk_indices,
             self.num_experts,
             self.active_experts,
@@ -665,10 +662,12 @@ class SpatialPatchMoE(nn.Module):
         flat_weights = topk_weights.view(-1)
         weights_sorted = flat_weights[sorted_args]
         y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1)
-        out_patches = torch.zeros_like(x_patches)
+        
+        out_patches = shared_out
         token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
         sorted_token_ids = token_ids[sorted_args]
         out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted.to(out_patches.dtype))
+        
         out = (
             out_patches.view(B, nH, nW, C, L, P, P)
             .permute(0, 3, 4, 1, 5, 2, 6)
@@ -693,9 +692,13 @@ class ConvLRULayer(nn.Module):
         self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.W_freq = self.W // 2 + 1
-        dt_min, dt_max = 0.001, 0.1
-        ts = torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
-        nu = 1.0 / ts
+        
+        dt_min = 0.001
+        dt_max = 0.1
+        self.log_dt_min = nn.Parameter(torch.log(torch.tensor(dt_min)))
+        self.log_dt_max = nn.Parameter(torch.log(torch.tensor(dt_max)))
+        
+        nu = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
         nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
         nu_log = torch.log(nu)
         u2 = torch.rand(self.emb_ch, self.rank)
@@ -782,10 +785,19 @@ class ConvLRULayer(nn.Module):
             zq = zq * scale_v
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
+            
+            steps = torch.arange(self.rank, device=x.device, dtype=torch.float32) / (self.rank - 1)
+            log_dt = self.log_dt_min + steps * (self.log_dt_max - self.log_dt_min)
+            ts = torch.exp(log_dt)
+            nu_init = 1.0 / ts
+            nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
+            
             nu_log, theta_log = self.params_log_base.unbind(dim=0)
             disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-            nu_base = torch.exp(nu_log + disp_nu).view(1, 1, C, 1, self.rank)
+            
+            nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
+            
             dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32)
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
@@ -804,10 +816,10 @@ class ConvLRULayer(nn.Module):
                 else:
                     x_in_fwd = torch.cat([zero_prev, x_in_lru], dim=1)
                 lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
-                lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd).contiguous()
+                lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd)
                 B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
-                x_scan = x_in_fwd.view(B_sz, L_sz, -1, R_sz).contiguous()
-                l_scan = lamb_in_fwd.view(B_sz, L_sz, -1, R_sz).contiguous()
+                x_scan = x_in_fwd.reshape(B_sz, L_sz, -1, R_sz)
+                l_scan = lamb_in_fwd.reshape(B_sz, L_sz, -1, R_sz)
                 z_scan = self.pscan(l_scan, x_scan)
                 z_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
                 last_hidden_out = z_out[:, -1:]
