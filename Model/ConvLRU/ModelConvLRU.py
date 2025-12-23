@@ -774,10 +774,12 @@ class ConvLRULayer(nn.Module):
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         x_perm = x.permute(0, 2, 1, 3, 4)
         B, L, C, S, W = x_perm.shape
+        
         if listT is None:
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
+        
         with torch.amp.autocast("cuda", enabled=False):
             x_in_fp32 = x_perm.float()
             dt_fp32 = dt.float()
@@ -844,18 +846,28 @@ class ConvLRULayer(nn.Module):
             feat_final = self._hybrid_inverse_transform(h_rec_fwd)
 
         feat_final = feat_final.to(x.dtype)
+        # feat_final is (B, L, C, H, W). Permute to (B, C, L, H, W) for post_ifft_proj
         feat_final_perm = feat_final.permute(0, 2, 1, 3, 4)
         h_final = self.post_ifft_proj(feat_final_perm)
+        
         if self.sh_prior is not None:
+            # sh_prior expects (B, L, C, H, W)
+            # Permute h_final to (B, L, C, H, W)
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+        
+        # Local conv. x is (B, C, L, H, W).
         x_local = self.local_conv(x)
         h_final = h_final + x_local
+        
+        # Norm. h_final is (B, C, L, H, W). RMSNorm handles this.
         h_final = self.norm(h_final)
+        
         if self.gate_conv is not None:
             gate = self.gate_conv(h_final)
             x_out = (1 - gate) * x + gate * h_final
         else:
             x_out = x + h_final
+            
         return x_out, last_hidden_out
 
 
@@ -1120,7 +1132,8 @@ class ConvLRUModel(nn.Module):
             if i < len(self.down_blocks) - 1:
                 skips.append(x)
                 x_s = x
-                x_s = F.avg_pool3d(x_s, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+                if x_s.shape[-2] >= 2 and x_s.shape[-1] >= 2:
+                    x_s = F.avg_pool3d(x_s, kernel_size=(1, 2, 2), stride=(1, 2, 2))
                 x = x_s
         if self.upsample is None or self.fusion is None:
             raise RuntimeError("UNet misconfigured")
