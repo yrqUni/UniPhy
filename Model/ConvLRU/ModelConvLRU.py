@@ -534,14 +534,14 @@ class SpectralGatedBlock(nn.Module):
         self.channels = channels
         self.modes_h = min(self.H // 2, 32)
         self.modes_w = min(self.W // 2 + 1, 32)
-
+        
         scale = 1 / math.sqrt(channels)
         self.weights1 = nn.Parameter(scale * torch.randn(channels, channels, self.modes_h, self.modes_w, dtype=torch.cfloat))
         self.weights2 = nn.Parameter(scale * torch.randn(channels, channels, self.modes_h, self.modes_w, dtype=torch.cfloat))
-
+        
         self.norm = RMSNorm(channels)
         self.act = nn.SiLU()
-
+        
         self.mlp = nn.Sequential(
             nn.Conv3d(channels, channels * 2, 1),
             nn.SiLU(),
@@ -554,32 +554,32 @@ class SpectralGatedBlock(nn.Module):
         B, C, D, H, W = x.shape
         residual = x
         x = self.norm(x)
-
+        
         x_2d = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
         x_ft = torch.fft.rfft2(x_2d, norm="ortho")
-
+        
         out_ft = torch.zeros_like(x_ft)
-
+        
         out_ft[:, :, :self.modes_h, :self.modes_w] = torch.einsum(
-            "bixy,ioxy->boxy",
-            x_ft[:, :, :self.modes_h, :self.modes_w],
+            "bixy,ioxy->boxy", 
+            x_ft[:, :, :self.modes_h, :self.modes_w], 
             self.weights1
         )
         out_ft[:, :, -self.modes_h:, :self.modes_w] = torch.einsum(
-            "bixy,ioxy->boxy",
-            x_ft[:, :, -self.modes_h:, :self.modes_w],
+            "bixy,ioxy->boxy", 
+            x_ft[:, :, -self.modes_h:, :self.modes_w], 
             self.weights2
         )
-
+        
         x_2d = torch.fft.irfft2(out_ft, s=(H, W), norm="ortho")
         x = x_2d.view(B, D, C, H, W).permute(0, 2, 1, 3, 4)
-
+        
         x = self.act(x)
         x = self.mlp(x)
-
+        
         x = x * self.gamma.view(1, C, 1, 1, 1)
         x = self.drop_path(x)
-
+        
         return residual + x
 
 
@@ -588,12 +588,12 @@ class GatedConvBlock(nn.Module):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.use_ada_norm = use_ada_norm
-
+        
         self.H, self.W = hidden_size
         self.register_buffer("pos_embed", self._build_coords(self.H, self.W), persistent=False)
-
+        
         self.coord_fusion = nn.Conv3d(int(channels) + 2, int(channels), 1)
-
+        
         self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size)
         if self.use_ada_norm and ada_norm_cond_dim is not None:
             self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
@@ -606,7 +606,7 @@ class GatedConvBlock(nn.Module):
         self.fused_gate = FusedGatedSiLU()
         self.pw_conv_out = nn.Conv3d(int(channels), int(channels), kernel_size=1)
         self.cbam = CBAM2DPerStep(int(channels), reduction=16) if self.use_cbam else None
-
+        
         self.gamma = nn.Parameter(1e-6 * torch.ones(int(channels)), requires_grad=True)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
@@ -618,14 +618,14 @@ class GatedConvBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
-
+        
         B, C, D, H, W = x.shape
         pos = self.pos_embed.expand(B, -1, D, -1, -1).to(x.device, x.dtype)
         x = torch.cat([x, pos], dim=1)
         x = self.coord_fusion(x)
-
+        
         x = x.to(memory_format=torch.channels_last_3d)
-
+        
         x = self.dw_conv(x)
         if self.use_ada_norm:
             x = self.norm(x, time_emb)
@@ -648,11 +648,11 @@ class GatedConvBlock(nn.Module):
         if self.cbam is not None:
             x = self.cbam(x)
         x = self.pw_conv_out(x)
-
-        x = x.contiguous()
+        
+        x = x.contiguous() 
         x = x * self.gamma.view(1, C, 1, 1, 1)
         x = self.drop_path(x)
-
+        
         return residual + x
 
 
@@ -665,7 +665,7 @@ class SpatialPatchMoE(nn.Module):
         self.expert_hidden_size = (self.patch_size, self.patch_size)
         self.channels = int(channels)
         self.cond_channels = int(cond_channels) if cond_channels is not None else 0
-
+        
         expert_list = []
         kernel_sizes = [3, 7, 11]
         for i in range(self.num_experts):
@@ -678,7 +678,7 @@ class SpatialPatchMoE(nn.Module):
                 expert_list.append(
                     GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=k_size, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None), drop_path=0.1)
                 )
-
+        
         self.experts = nn.ModuleList(expert_list)
         self.shared_expert = GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=7, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None), drop_path=0.0)
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
@@ -716,15 +716,15 @@ class SpatialPatchMoE(nn.Module):
             )
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_input, router_cond], dim=1)
-
+        
         shared_out = self.shared_expert(x_patches, cond=cond_patches)
-
+        
         router_logits = self.router(router_input)
-
+        
         lse = torch.logsumexp(router_logits, dim=-1)
         z_loss = lse.pow(2).mean()
         router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
-
+        
         mean_probs = router_probs.mean(dim=0)
 
         N_total = router_logits.size(0)
@@ -748,7 +748,7 @@ class SpatialPatchMoE(nn.Module):
         topk_indices = topk_indices.long()
         topk_weights = torch.gather(router_probs, 1, topk_indices)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
+        
         flat_indices = topk_indices.view(-1)
         x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
         cond_repeated = None
@@ -776,12 +776,12 @@ class SpatialPatchMoE(nn.Module):
         flat_weights = topk_weights.view(-1)
         weights_sorted = flat_weights[sorted_args]
         y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1)
-
+        
         out_patches = shared_out
         token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
         sorted_token_ids = token_ids[sorted_args]
         out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted.to(out_patches.dtype))
-
+        
         out = (
             out_patches.view(B, nH, nW, C, L, P, P)
             .permute(0, 3, 4, 1, 5, 2, 6)
@@ -806,14 +806,14 @@ class ConvLRULayer(nn.Module):
         self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.W_freq = self.W // 2 + 1
-
+        
         dt_min = 0.001
         dt_max = 0.1
         self.log_dt_min = nn.Parameter(torch.log(torch.tensor(dt_min)))
         self.log_dt_max = nn.Parameter(torch.log(torch.tensor(dt_max)))
-
+        
         self.register_buffer("steps", torch.arange(self.rank, dtype=torch.float32) / (self.rank - 1))
-
+        
         nu = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
         nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
         nu_log = torch.log(nu)
@@ -901,18 +901,18 @@ class ConvLRULayer(nn.Module):
             zq = zq * scale_v
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
-
+            
             log_dt = self.log_dt_min + self.steps * (self.log_dt_max - self.log_dt_min)
             ts = torch.exp(log_dt)
             nu_init = 1.0 / ts
             nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
-
+            
             nu_log, theta_log = self.params_log_base.unbind(dim=0)
             disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-
+            
             nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
-
+            
             dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32)
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
@@ -1228,15 +1228,15 @@ class ConvLRUModel(nn.Module):
             if i < len(self.down_blocks) - 1:
                 skips.append(x)
                 x_s = x.permute(0, 2, 1, 3, 4).contiguous()
-
+                
                 D_s, H_s, W_s = x_s.shape[-3:]
                 kH = 2 if H_s > 1 else 1
                 kW = 2 if W_s > 1 else 1
                 sH = 2 if H_s > 1 else 1
                 sW = 2 if W_s > 1 else 1
-
+                
                 x_s = F.avg_pool3d(x_s, kernel_size=(1, kH, kW), stride=(1, sH, sW))
-
+                
                 x = x_s.permute(0, 2, 1, 3, 4).contiguous()
         if self.upsample is None or self.fusion is None:
             raise RuntimeError("UNet misconfigured")
