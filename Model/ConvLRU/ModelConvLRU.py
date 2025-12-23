@@ -1181,6 +1181,8 @@ class ConvLRUModel(nn.Module):
         self.down_blocks = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         self.csa_blocks = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
         C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
         if not self.use_unet:
@@ -1194,13 +1196,16 @@ class ConvLRUModel(nn.Module):
                 self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
                 encoder_res.append((curr_H, curr_W))
                 if i < layers - 1:
+                    # Learnable downsampling
+                    self.downsample_layers.append(nn.Conv3d(C, C, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)))
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
                 self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
                 self.csa_blocks.append(CrossScaleAttentionGate(C))
-            self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+                # Learnable upsampling
+                self.upsample_layers.append(nn.ConvTranspose3d(C, C, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1)))
             self.fusion = nn.Conv3d(C * 2, C, 1)
             self.convlru_blocks = None
 
@@ -1227,23 +1232,17 @@ class ConvLRUModel(nn.Module):
             last_hidden_outs.append(h_out)
             if i < len(self.down_blocks) - 1:
                 skips.append(x)
+                # Learnable downsampling
                 x_s = x.permute(0, 2, 1, 3, 4).contiguous()
-                
-                D_s, H_s, W_s = x_s.shape[-3:]
-                kH = 2 if H_s > 1 else 1
-                kW = 2 if W_s > 1 else 1
-                sH = 2 if H_s > 1 else 1
-                sW = 2 if W_s > 1 else 1
-                
-                x_s = F.avg_pool3d(x_s, kernel_size=(1, kH, kW), stride=(1, sH, sW))
-                
+                x_s = self.downsample_layers[i](x_s)
                 x = x_s.permute(0, 2, 1, 3, 4).contiguous()
-        if self.upsample is None or self.fusion is None:
+        if self.fusion is None:
             raise RuntimeError("UNet misconfigured")
         x = x.permute(0, 2, 1, 3, 4)
         for i, blk in enumerate(self.up_blocks):
             x_s = x.permute(0, 2, 1, 3, 4).contiguous()
-            x_s = self.upsample(x_s)
+            # Learnable upsampling
+            x_s = self.upsample_layers[i](x_s)
             x = x_s.permute(0, 2, 1, 3, 4).contiguous()
             skip = skips.pop()
             if x.shape[-2:] != skip.shape[-2:]:
