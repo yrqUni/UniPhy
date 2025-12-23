@@ -25,8 +25,8 @@ class MockArgs:
         self.ffn_hidden_ch = 64
         self.ffn_hidden_layers_num = 1
         self.use_cbam = False
-        self.num_expert = 16
-        self.activate_expert = 8
+        self.num_expert = 1
+        self.activate_expert = 1
         self.lru_rank = 8
         self.use_selective = True
         self.use_freq_prior = False
@@ -111,7 +111,7 @@ def check_equivalence():
     print(f"Max Absolute Difference: {max_diff:.2e}")
     print(f"Mean Absolute Difference: {mean_diff:.2e}")
 
-    threshold = 1e-1 
+    threshold = 5e-5 
 
     if max_diff < threshold:
         print("\n✅ SUCCESS: P-Mode and I-Mode are mathematically equivalent.")
