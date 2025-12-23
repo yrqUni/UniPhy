@@ -315,23 +315,41 @@ class FactorizedPeriodicConv3d(nn.Module):
 class DiscreteCosineTransform(nn.Module):
     def __init__(self, n: int, dim: int):
         super().__init__()
-        self.n = n
+        self.n_init = n
         self.dim = dim
+        self._cache_n = None
+        self._cache_dct = None
+        self._register_dct(n)
+
+    def _register_dct(self, n: int):
+        if self._cache_n == n:
+            return
         k = torch.arange(n).unsqueeze(1)
         i = torch.arange(n).unsqueeze(0)
         basis = torch.cos(math.pi * k * (2 * i + 1) / (2 * n))
         basis[0] = basis[0] * math.sqrt(1 / n)
         basis[1:] = basis[1:] * math.sqrt(2 / n)
-        self.register_buffer("dct_matrix", basis)
+        self._cache_dct = basis
+        self._cache_n = n
+
+    def _get_dct(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self._cache_n != n or self._cache_dct.device != device or self._cache_dct.dtype != dtype:
+            self._register_dct(n)
+            self._cache_dct = self._cache_dct.to(device=device, dtype=dtype)
+        return self._cache_dct
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n = x.size(self.dim)
+        dct_matrix = self._get_dct(n, x.device, x.dtype)
         x = x.transpose(self.dim, -1)
-        out = torch.matmul(x, self.dct_matrix.t())
+        out = torch.matmul(x, dct_matrix.t())
         return out.transpose(self.dim, -1)
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        n = x.size(self.dim)
+        dct_matrix = self._get_dct(n, x.device, x.dtype)
         x = x.transpose(self.dim, -1)
-        out = torch.matmul(x, self.dct_matrix)
+        out = torch.matmul(x, dct_matrix)
         return out.transpose(self.dim, -1)
 
 
@@ -1181,8 +1199,6 @@ class ConvLRUModel(nn.Module):
         self.down_blocks = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         self.csa_blocks = nn.ModuleList()
-        self.downsample_layers = nn.ModuleList()
-        self.upsample_layers = nn.ModuleList()
         C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
         if not self.use_unet:
@@ -1197,7 +1213,7 @@ class ConvLRUModel(nn.Module):
                 encoder_res.append((curr_H, curr_W))
                 if i < layers - 1:
                     # Learnable downsampling
-                    self.downsample_layers.append(nn.Conv3d(C, C, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)))
+                    # self.downsample_layers.append(nn.Conv3d(C, C, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)))
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
             for i in range(layers - 2, -1, -1):
@@ -1205,7 +1221,8 @@ class ConvLRUModel(nn.Module):
                 self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
                 self.csa_blocks.append(CrossScaleAttentionGate(C))
                 # Learnable upsampling
-                self.upsample_layers.append(nn.ConvTranspose3d(C, C, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1)))
+                # self.upsample_layers.append(nn.ConvTranspose3d(C, C, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1)))
+            self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
             self.fusion = nn.Conv3d(C * 2, C, 1)
             self.convlru_blocks = None
 
@@ -1234,7 +1251,15 @@ class ConvLRUModel(nn.Module):
                 skips.append(x)
                 # Learnable downsampling
                 x_s = x.permute(0, 2, 1, 3, 4).contiguous()
-                x_s = self.downsample_layers[i](x_s)
+                
+                D_s, H_s, W_s = x_s.shape[-3:]
+                kH = 2 if H_s > 1 else 1
+                kW = 2 if W_s > 1 else 1
+                sH = 2 if H_s > 1 else 1
+                sW = 2 if W_s > 1 else 1
+                
+                x_s = F.avg_pool3d(x_s, kernel_size=(1, kH, kW), stride=(1, sH, sW))
+                
                 x = x_s.permute(0, 2, 1, 3, 4).contiguous()
         if self.fusion is None:
             raise RuntimeError("UNet misconfigured")
@@ -1242,7 +1267,7 @@ class ConvLRUModel(nn.Module):
         for i, blk in enumerate(self.up_blocks):
             x_s = x.permute(0, 2, 1, 3, 4).contiguous()
             # Learnable upsampling
-            x_s = self.upsample_layers[i](x_s)
+            x_s = self.upsample(x_s)
             x = x_s.permute(0, 2, 1, 3, 4).contiguous()
             skip = skips.pop()
             if x.shape[-2:] != skip.shape[-2:]:
