@@ -134,6 +134,7 @@ class Args:
         self.use_tf32 = False
         self.use_compile = False
         self.lr = 1e-5
+        self.weight_decay = 0.05
         self.use_scheduler = False
         self.init_lr_scheduler = False
         self.loss = "lat"
@@ -389,6 +390,12 @@ def gradient_difference_loss(preds: torch.Tensor, targets: torch.Tensor) -> torc
     return loss_x + loss_y
 
 
+def spectral_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    fft_pred = torch.fft.rfft2(preds.float(), norm="ortho")
+    fft_target = torch.fft.rfft2(targets.float(), norm="ortho")
+    return (fft_pred.abs() - fft_target.abs()).abs().mean()
+
+
 def get_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor:
     total_aux_loss = torch.tensor(0.0, device=next(model.parameters()).device)
     model_to_search = model.module if isinstance(model, DDP) else model
@@ -554,7 +561,15 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     )
     len_train_dataloader = len(train_dataloader)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr))
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {"params": decay_params, "weight_decay": float(args.weight_decay)},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ]
+    opt = torch.optim.AdamW(optim_groups, lr=float(args.lr))
+
     scheduler = None
     if bool(args.use_scheduler):
         scheduler = lr_scheduler.OneCycleLR(
@@ -658,9 +673,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 metric_l1 = F.l1_loss(p_det, target)
                 gdl_loss = gradient_difference_loss(p_det, target)
+                spec_loss = spectral_loss(p_det, target)
 
                 moe_loss = get_moe_aux_loss(model)
-                loss = loss + 0.01 * moe_loss + 0.5 * gdl_loss
+                loss = loss + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss
 
             loss.backward()
 
@@ -689,6 +705,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             dist.all_reduce(gdl_tensor, op=dist.ReduceOp.SUM)
             avg_gdl_loss = (gdl_tensor / world_size).item()
 
+            spec_tensor = spec_loss.detach()
+            dist.all_reduce(spec_tensor, op=dist.ReduceOp.SUM)
+            avg_spec_loss = (spec_tensor / world_size).item()
+
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
                 gate_str = format_gate_means()
@@ -712,7 +732,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 message = (
                     f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
-                    f"- Loss: {avg_loss:.6f} - L1: {avg_l1:.6f} - GDL: {avg_gdl_loss:.6f} - LR: {current_lr:.6e} - {t_str} "
+                    f"- Loss: {avg_loss:.6f} - L1: {avg_l1:.6f} - GDL: {avg_gdl_loss:.6f} - Spec: {avg_spec_loss:.6f} - LR: {current_lr:.6e} - {t_str} "
                     f"- {gate_str}{grad_str} - MoE(n={int(args.num_expert)},k={int(args.activate_expert)})"
                 )
                 if isinstance(train_iter, tqdm):
@@ -727,6 +747,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/loss": avg_loss,
                         "train/loss_l1": avg_l1,
                         "train/loss_gdl": avg_gdl_loss,
+                        "train/loss_spec": avg_spec_loss,
                         "train/lr": float(current_lr),
                         "train/K": int(K),
                         "train/T_mean": float(current_T_mean),
@@ -757,7 +778,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor, gdl_loss, gdl_tensor
+            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor, gdl_loss, gdl_tensor, spec_loss, spec_tensor
             if train_step % 50 == 0:
                 gc.collect()
 
