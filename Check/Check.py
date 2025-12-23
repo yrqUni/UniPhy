@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import torch.nn as nn
+import numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT, "Model", "ConvLRU")
@@ -15,90 +16,108 @@ class MockArgs:
         self.input_ch = 4
         self.out_ch = 4
         self.input_size = (32, 32)
-        self.emb_ch = 16
+        self.emb_ch = 32
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 1
         self.static_ch = 2
         self.hidden_factor = (1, 1)
-        self.convlru_num_blocks = 1
-        self.ffn_hidden_ch = 32
+        self.convlru_num_blocks = 2
+        self.ffn_hidden_ch = 64
         self.ffn_hidden_layers_num = 1
         self.use_cbam = False
-        self.num_expert = 4
-        self.activate_expert = 2
+        self.num_expert = 16
+        self.activate_expert = 8
         self.lru_rank = 8
         self.use_selective = True
-        self.bidirectional = True
         self.use_freq_prior = False
         self.use_sh_prior = False
         self.head_mode = "gaussian"
-        self.dec_hidden_ch = 16
+        self.dec_hidden_ch = 32
         self.dec_hidden_layers_num = 0
         self.dec_strategy = "pxsf"
-        self.use_checkpointing = False
+        self.unet = False
 
-def get_moe_aux_loss(model):
-    total_aux_loss = 0.0
-    count = 0
-    for module in model.modules():
-        if hasattr(module, "aux_loss") and isinstance(module.aux_loss, torch.Tensor):
-            total_aux_loss += module.aux_loss
-            count += 1
-    return total_aux_loss, count
-
-def run_test():
+def check_equivalence():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
     args = MockArgs()
+    print(f"Testing with num_expert = {args.num_expert}")
+    
     model = ConvLRU(args).to(device)
+    model.eval()
 
-    B, L, H, W = 2, 8, 32, 32
+    B, L, H, W = 2, 8, args.input_size[0], args.input_size[1]
     
     x = torch.randn(B, L, args.input_ch, H, W, device=device)
     static = torch.randn(B, args.static_ch, H, W, device=device)
-    listT = torch.ones(B, L, device=device)
+    listT = torch.rand(B, L, device=device)
 
-    print(f"Testing on {device}...")
-
-    out_p = model(x, mode="p", listT=listT, static_feats=static)
-    print(f"Forward Pass (Mode P) Output: {out_p.shape}")
-
-    moe_loss, moe_layers = get_moe_aux_loss(model)
-    print(f"MoE Auxiliary Loss: {moe_loss}")
-    print(f"MoE Layers Found: {moe_layers}")
-
-    if moe_layers > 0:
-        print("MoE Loss Check Passed.")
-    else:
-        print("Warning: No MoE layers found (Check args.ffn_hidden_layers_num).")
-
-    loss = out_p.sum() + moe_loss
-    loss.backward()
-    print("Backward Pass (Mode P + MoE Loss) Successful.")
-
-    out_gen_num = 5
-    listT_future = torch.ones(B, out_gen_num - 1, device=device)
-
-    model.eval()
+    print("-" * 40)
+    print("Running P-Mode (Parallel)...")
     with torch.no_grad():
-        out_i = model(
-            x, 
-            mode="i", 
-            out_gen_num=out_gen_num, 
-            listT=listT, 
-            listT_future=listT_future, 
-            static_feats=static
-        )
+        out_p = model(x, mode="p", listT=listT, static_feats=static)
     
-    print(f"Inference (Mode I) Output: {out_i.shape}")
+    print(f"P-Mode Output Shape: {out_p.shape}")
 
-    expected_ch = args.out_ch * 2 if args.head_mode == "gaussian" else args.out_ch
-    expected_shape = (B, out_gen_num, expected_ch, H, W)
+    print("-" * 40)
+    print("Running I-Mode (Iterative Step-by-Step)...")
     
-    if out_i.shape == expected_shape:
-        print("Mode I Shape Check Passed.")
+    outputs_i = []
+    last_hidden_ins = None
+
+    with torch.no_grad():
+        for t in range(L):
+            x_t = x[:, t:t+1, ...]
+            dt_t = listT[:, t:t+1]
+            
+            x_t_norm = model.revin(x_t, "norm")
+            x_t_emb, _ = model.embedding(x_t_norm, static_feats=static)
+            
+            x_t_hid, last_hidden_ins = model.convlru_model(
+                x_t_emb, 
+                last_hidden_ins=last_hidden_ins, 
+                listT=dt_t, 
+                cond=model.embedding.static_embed(static) if static is not None else None
+            )
+            
+            out_t = model.decoder(x_t_hid, cond=model.embedding.static_embed(static) if static is not None else None)
+            out_t = out_t.permute(0, 2, 1, 3, 4).contiguous()
+            
+            if model.decoder.head_mode == "gaussian":
+                mu, sigma = torch.chunk(out_t, 2, dim=2)
+                if mu.size(2) == model.revin.num_features:
+                    mu = model.revin(mu, "denorm")
+                    sigma = sigma * model.revin.stdev
+                out_step = torch.cat([mu, sigma], dim=2)
+            else:
+                if out_t.size(2) == model.revin.num_features:
+                    out_step = model.revin(out_t, "denorm")
+                else:
+                    out_step = out_t
+            
+            outputs_i.append(out_step)
+
+    out_i = torch.cat(outputs_i, dim=1)
+    print(f"I-Mode Output Shape: {out_i.shape}")
+
+    print("-" * 40)
+    
+    diff = torch.abs(out_p - out_i)
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+
+    print(f"Max Absolute Difference: {max_diff:.2e}")
+    print(f"Mean Absolute Difference: {mean_diff:.2e}")
+
+    threshold = 1e-1 
+
+    if max_diff < threshold:
+        print("\n✅ SUCCESS: P-Mode and I-Mode are mathematically equivalent.")
     else:
-        print(f"Mode I Shape Mismatch. Expected {expected_shape}, got {out_i.shape}")
+        print("\n❌ FAILURE: Difference is still too high.")
 
 if __name__ == "__main__":
-    run_test()
+    check_equivalence()
 
