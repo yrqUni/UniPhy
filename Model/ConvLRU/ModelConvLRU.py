@@ -1083,10 +1083,16 @@ class Downsample(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.pool_mode == "avg":
-            if x.shape[-2] >= 2 and x.shape[-1] >= 2:
-                return F.avg_pool3d(x, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-            return x
+            pad_h = (2 - x.shape[-2] % 2) % 2
+            pad_w = (2 - x.shape[-1] % 2) % 2
+            if pad_h > 0 or pad_w > 0:
+                x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+            return F.avg_pool3d(x, kernel_size=(1, 2, 2), stride=(1, 2, 2))
         elif self.pool_mode == "pixel":
+            pad_h = (2 - x.shape[-2] % 2) % 2
+            pad_w = (2 - x.shape[-1] % 2) % 2
+            if pad_h > 0 or pad_w > 0:
+                x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
             B, C, L, H, W = x.shape
             x = x.permute(0, 2, 1, 3, 4).contiguous().view(B * L, C, H, W)
             x = F.pixel_unshuffle(x, 2)
@@ -1200,9 +1206,7 @@ class ConvLRUModel(nn.Module):
             skip = skips.pop()
             
             if x.shape[-2:] != skip.shape[-2:]:
-                diffY = skip.size(-2) - x.size(-2)
-                diffX = skip.size(-1) - x.size(-1)
-                x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+                x = F.interpolate(x, size=skip.shape[-2:], mode='trilinear', align_corners=False)
             
             skip = self.csa_blocks[i](skip, x)
             x = torch.cat([x, skip], dim=1)
