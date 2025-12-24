@@ -1082,27 +1082,27 @@ class Downsample(nn.Module):
             self.conv = nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, L, H, W = x.shape
+        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        if pad_h > 0 or pad_w > 0:
+            x_reshaped = F.pad(x_reshaped, (0, pad_w, 0, pad_h), mode="replicate")
+        
         if self.pool_mode == "avg":
-            pad_h = (2 - x.shape[-2] % 2) % 2
-            pad_w = (2 - x.shape[-1] % 2) % 2
-            if pad_h > 0 or pad_w > 0:
-                x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
-            return F.avg_pool3d(x, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+            x_down = F.avg_pool2d(x_reshaped, kernel_size=2, stride=2)
+            new_H, new_W = x_down.shape[-2:]
+            return x_down.view(B, L, C, new_H, new_W).permute(0, 2, 1, 3, 4)
         elif self.pool_mode == "pixel":
-            pad_h = (2 - x.shape[-2] % 2) % 2
-            pad_w = (2 - x.shape[-1] % 2) % 2
-            if pad_h > 0 or pad_w > 0:
-                x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
-            B, C, L, H, W = x.shape
-            x = x.permute(0, 2, 1, 3, 4).contiguous().view(B * L, C, H, W)
-            x = F.pixel_unshuffle(x, 2)
-            new_H, new_W = x.shape[-2:]
-            x = x.view(B, L, C * 4, new_H, new_W).permute(0, 2, 1, 3, 4)
-            return self.proj(x)
+            x_down = F.pixel_unshuffle(x_reshaped, 2)
+            new_H, new_W = x_down.shape[-2:]
+            x_5d = x_down.view(B, L, C * 4, new_H, new_W).permute(0, 2, 1, 3, 4)
+            return self.proj(x_5d)
         elif self.pool_mode == "conv":
-            return self.conv(x)
-        else:
-            return x
+            H_pad, W_pad = x_reshaped.shape[-2:]
+            x_padded = x_reshaped.view(B, L, C, H_pad, W_pad).permute(0, 2, 1, 3, 4)
+            return self.conv(x_padded)
+        return x
 
 
 class Upsample(nn.Module):
@@ -1123,14 +1123,13 @@ class Upsample(nn.Module):
         elif self.pool_mode == "pixel":
             x = self.proj(x)
             B, C, L, H, W = x.shape
-            x = x.permute(0, 2, 1, 3, 4).contiguous().view(B * L, C, H, W)
-            x = F.pixel_shuffle(x, 2)
-            new_H, new_W = x.shape[-2:]
-            return x.view(B, L, -1, new_H, new_W).permute(0, 2, 1, 3, 4)
+            x_reshaped = x.permute(0, 2, 1, 3, 4).contiguous().view(B * L, C, H, W)
+            x_up = F.pixel_shuffle(x_reshaped, 2)
+            new_H, new_W = x_up.shape[-2:]
+            return x_up.view(B, L, -1, new_H, new_W).permute(0, 2, 1, 3, 4)
         elif self.pool_mode == "conv":
             return self.conv(x)
-        else:
-            return x
+        return x
 
 
 class ConvLRUModel(nn.Module):
@@ -1160,8 +1159,8 @@ class ConvLRUModel(nn.Module):
                 self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
                 if i < layers - 1:
                     self.downsamples.append(Downsample(C, self.pool_mode))
-                    curr_H = max(1, curr_H // 2)
-                    curr_W = max(1, curr_W // 2)
+                    curr_H = (curr_H + 1) // 2
+                    curr_W = (curr_W + 1) // 2
             
             for i in range(layers - 1):
                 self.upsamples.append(Upsample(C, self.pool_mode))
@@ -1206,7 +1205,9 @@ class ConvLRUModel(nn.Module):
             skip = skips.pop()
             
             if x.shape[-2:] != skip.shape[-2:]:
-                x = F.interpolate(x, size=skip.shape[-2:], mode='trilinear', align_corners=False)
+                diffY = skip.size(-2) - x.size(-2)
+                diffX = skip.size(-1) - x.size(-1)
+                x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
             
             skip = self.csa_blocks[i](skip, x)
             x = torch.cat([x, skip], dim=1)
