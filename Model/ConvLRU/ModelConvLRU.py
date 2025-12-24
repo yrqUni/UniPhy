@@ -588,13 +588,13 @@ class SpatialPatchMoE(nn.Module):
                 cond = F.pad(cond, (0, pad_w, 0, pad_h))
         H_pad, W_pad = x.shape[-2:]
         nH, nW = H_pad // P, W_pad // P
-
+        
         x_patches = (
             x.view(B, C, L, nH, P, nW, P)
             .permute(0, 3, 5, 2, 1, 4, 6)
             .reshape(B * nH * nW * L, C, 1, P, P)
         )
-
+        
         cond_patches = None
         router_input = x_patches.mean(dim=(2, 3, 4))
         if self.cond_channels > 0 and cond is not None:
@@ -609,15 +609,15 @@ class SpatialPatchMoE(nn.Module):
             )
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_input, router_cond], dim=1)
-
+        
         shared_out = self.shared_expert(x_patches, cond=cond_patches)
-
+        
         router_logits = self.router(router_input)
-
+        
         lse = torch.logsumexp(router_logits, dim=-1)
         z_loss = lse.pow(2).mean()
         router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
-
+        
         mean_probs = router_probs.mean(dim=0)
 
         N_total = router_logits.size(0)
@@ -641,7 +641,7 @@ class SpatialPatchMoE(nn.Module):
         topk_indices = topk_indices.long()
         topk_weights = torch.gather(router_probs, 1, topk_indices)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
+        
         flat_indices = topk_indices.view(-1)
         x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
         cond_repeated = None
@@ -669,12 +669,12 @@ class SpatialPatchMoE(nn.Module):
         flat_weights = topk_weights.view(-1)
         weights_sorted = flat_weights[sorted_args]
         y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1)
-
+        
         out_patches = shared_out
         token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
         sorted_token_ids = token_ids[sorted_args]
         out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted.to(out_patches.dtype))
-
+        
         out = (
             out_patches.view(B, nH, nW, L, C, P, P)
             .permute(0, 4, 3, 1, 5, 2, 6)
@@ -699,14 +699,14 @@ class ConvLRULayer(nn.Module):
         self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.W_freq = self.W // 2 + 1
-
+        
         dt_min = 0.001
         dt_max = 0.1
         self.log_dt_min = nn.Parameter(torch.log(torch.tensor(dt_min)))
         self.log_dt_max = nn.Parameter(torch.log(torch.tensor(dt_max)))
-
+        
         self.register_buffer("steps", torch.arange(self.rank, dtype=torch.float32) / (self.rank - 1))
-
+        
         nu = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
         nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
         nu_log = torch.log(nu)
@@ -774,12 +774,12 @@ class ConvLRULayer(nn.Module):
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         x_perm = x.permute(0, 2, 1, 3, 4)
         B, L, C, S, W = x_perm.shape
-
+        
         if listT is None:
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
-
+        
         with torch.amp.autocast("cuda", enabled=False):
             x_in_fp32 = x_perm.float()
             dt_fp32 = dt.float()
@@ -797,18 +797,18 @@ class ConvLRULayer(nn.Module):
             zq = zq * scale_v
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
-
+            
             log_dt = self.log_dt_min + self.steps * (self.log_dt_max - self.log_dt_min)
             ts = torch.exp(log_dt)
             nu_init = 1.0 / ts
             nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
-
+            
             nu_log, theta_log = self.params_log_base.unbind(dim=0)
             disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-
+            
             nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
-
+            
             dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32)
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
@@ -848,21 +848,21 @@ class ConvLRULayer(nn.Module):
         feat_final = feat_final.to(x.dtype)
         feat_final_perm = feat_final.permute(0, 2, 1, 3, 4)
         h_final = self.post_ifft_proj(feat_final_perm)
-
+        
         if self.sh_prior is not None:
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-
+        
         x_local = self.local_conv(x)
         h_final = h_final + x_local
-
+        
         h_final = self.norm(h_final)
-
+        
         if self.gate_conv is not None:
             gate = self.gate_conv(h_final)
             x_out = (1 - gate) * x + gate * h_final
         else:
             x_out = x + h_final
-
+            
         return x_out, last_hidden_out
 
 
@@ -1071,65 +1071,14 @@ class Decoder(nn.Module):
         return x
 
 
-class Downsample(nn.Module):
-    def __init__(self, dim: int, pool_mode: str = "avg"):
+class ShuffleDownsample(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
-        self.pool_mode = pool_mode
-        self.dim = dim
-        if self.pool_mode == "pixel":
-            self.proj = nn.Conv3d(dim * 4, dim, kernel_size=1)
-        elif self.pool_mode == "conv":
-            self.conv = nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
+        self.proj = nn.Conv3d(channels * 4, channels, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, L, H, W = x.shape
-        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
-        pad_h = (2 - H % 2) % 2
-        pad_w = (2 - W % 2) % 2
-        if pad_h > 0 or pad_w > 0:
-            x_reshaped = F.pad(x_reshaped, (0, pad_w, 0, pad_h), mode="replicate")
-
-        if self.pool_mode == "avg":
-            x_down = F.avg_pool2d(x_reshaped, kernel_size=2, stride=2)
-            new_H, new_W = x_down.shape[-2:]
-            return x_down.view(B, L, C, new_H, new_W).permute(0, 2, 1, 3, 4)
-        elif self.pool_mode == "pixel":
-            x_down = F.pixel_unshuffle(x_reshaped, 2)
-            new_H, new_W = x_down.shape[-2:]
-            x_5d = x_down.view(B, L, C * 4, new_H, new_W).permute(0, 2, 1, 3, 4)
-            return self.proj(x_5d)
-        elif self.pool_mode == "conv":
-            H_pad, W_pad = x_reshaped.shape[-2:]
-            x_padded = x_reshaped.view(B, L, C, H_pad, W_pad).permute(0, 2, 1, 3, 4)
-            return self.conv(x_padded)
-        return x
-
-
-class Upsample(nn.Module):
-    def __init__(self, dim: int, pool_mode: str = "avg"):
-        super().__init__()
-        self.pool_mode = pool_mode
-        self.dim = dim
-        if self.pool_mode == "avg":
-            self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
-        elif self.pool_mode == "pixel":
-            self.proj = nn.Conv3d(dim, dim * 4, kernel_size=1)
-        elif self.pool_mode == "conv":
-            self.conv = nn.ConvTranspose3d(dim, dim, kernel_size=(1, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.pool_mode == "avg":
-            return self.upsample(x)
-        elif self.pool_mode == "pixel":
-            x = self.proj(x)
-            B, C, L, H, W = x.shape
-            x_reshaped = x.permute(0, 2, 1, 3, 4).contiguous().view(B * L, C, H, W)
-            x_up = F.pixel_shuffle(x_reshaped, 2)
-            new_H, new_W = x_up.shape[-2:]
-            return x_up.view(B, L, -1, new_H, new_W).permute(0, 2, 1, 3, 4)
-        elif self.pool_mode == "conv":
-            return self.conv(x)
-        return x
+        x = pixel_unshuffle_hw_3d(x, 2, 2)
+        return self.proj(x)
 
 
 class ConvLRUModel(nn.Module):
@@ -1137,90 +1086,88 @@ class ConvLRUModel(nn.Module):
         super().__init__()
         self.args = args
         self.use_unet = bool(getattr(args, "unet", False))
-        self.pool_mode = str(getattr(args, "pool_mode", "avg")).lower()
         layers = int(getattr(args, "convlru_num_blocks", 2))
-        C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
-        H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
-
+        self.down_mode = str(getattr(args, "down_mode", "avg")).lower()
         self.down_blocks = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         self.csa_blocks = nn.ModuleList()
         self.downsamples = nn.ModuleList()
-        self.upsamples = nn.ModuleList()
-        self.convlru_blocks = nn.ModuleList()
-
+        C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
+        H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
         if not self.use_unet:
-            for _ in range(layers):
-                self.convlru_blocks.append(ConvLRUBlock(self.args, (C, H, W)))
+            self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
+            self.upsample = None
             self.fusion = None
         else:
             curr_H, curr_W = H, W
+            encoder_res: List[Tuple[int, int]] = []
             for i in range(layers):
                 self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
+                encoder_res.append((curr_H, curr_W))
                 if i < layers - 1:
-                    self.downsamples.append(Downsample(C, self.pool_mode))
-                    curr_H = (curr_H + 1) // 2
-                    curr_W = (curr_W + 1) // 2
-
-            for i in range(layers - 1):
-                self.upsamples.append(Upsample(C, self.pool_mode))
-                h_up = H // (2 ** (layers - 2 - i))
-                w_up = W // (2 ** (layers - 2 - i))
+                    if self.down_mode == "conv":
+                        self.downsamples.append(nn.Conv3d(C, C, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)))
+                    elif self.down_mode == "shuffle":
+                        self.downsamples.append(ShuffleDownsample(C))
+                    else:
+                        self.downsamples.append(nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)))
+                    curr_H = max(1, curr_H // 2)
+                    curr_W = max(1, curr_W // 2)
+            for i in range(layers - 2, -1, -1):
+                h_up, w_up = encoder_res[i]
                 self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
                 self.csa_blocks.append(CrossScaleAttentionGate(C))
-
+            self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
             self.fusion = nn.Conv3d(C * 2, C, 1)
+            self.convlru_blocks = None
 
     def forward(self, x: torch.Tensor, last_hidden_ins: Optional[List[torch.Tensor]] = None, listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        last_hidden_outs: List[torch.Tensor] = []
-        global_residual = x
-
         if not self.use_unet:
+            if self.convlru_blocks is None:
+                raise RuntimeError("Model misconfigured")
+            last_hidden_outs: List[torch.Tensor] = []
             for idx, blk in enumerate(self.convlru_blocks):
                 h_in = last_hidden_ins[idx] if (last_hidden_ins is not None and idx < len(last_hidden_ins)) else None
                 x, h_out = blk(x, h_in, listT=listT, cond=cond)
                 last_hidden_outs.append(h_out)
-            x = x + global_residual
             return x, last_hidden_outs
-
         skips: List[torch.Tensor] = []
+        last_hidden_outs: List[torch.Tensor] = []
         num_down = len(self.down_blocks)
         hs_in_down = last_hidden_ins[:num_down] if last_hidden_ins is not None else [None] * num_down
         hs_in_up = last_hidden_ins[num_down:] if last_hidden_ins is not None else [None] * len(self.up_blocks)
-
         for i, blk in enumerate(self.down_blocks):
             curr_cond = cond
             if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
                 curr_cond = F.interpolate(curr_cond, size=x.shape[-2:], mode="bilinear", align_corners=False)
-
             x, h_out = blk(x, hs_in_down[i], listT=listT, cond=curr_cond)
             last_hidden_outs.append(h_out)
-
             if i < len(self.down_blocks) - 1:
                 skips.append(x)
-                x = self.downsamples[i](x)
-
+                x_s = x
+                if x_s.shape[-2] >= 2 and x_s.shape[-1] >= 2:
+                    x_s = self.downsamples[i](x_s)
+                x = x_s
+        if self.upsample is None or self.fusion is None:
+            raise RuntimeError("UNet misconfigured")
         for i, blk in enumerate(self.up_blocks):
-            x = self.upsamples[i](x)
+            x_s = x
+            x_s = self.upsample(x_s)
+            x = x_s
             skip = skips.pop()
-
             if x.shape[-2:] != skip.shape[-2:]:
                 diffY = skip.size(-2) - x.size(-2)
                 diffX = skip.size(-1) - x.size(-1)
                 x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-
             skip = self.csa_blocks[i](skip, x)
             x = torch.cat([x, skip], dim=1)
             x = self.fusion(x)
-
             curr_cond = cond
             if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
                 curr_cond = F.interpolate(curr_cond, size=x.shape[-2:], mode="bilinear", align_corners=False)
-
-            x, h_out = blk(x, hs_in_up[i], listT=listT, cond=curr_cond)
+            x_out, h_out = blk(x, hs_in_up[i], listT=listT, cond=curr_cond)
+            x = x_out
             last_hidden_outs.append(h_out)
-
-        x = x + global_residual
         return x, last_hidden_outs
 
 
