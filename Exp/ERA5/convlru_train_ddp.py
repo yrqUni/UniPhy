@@ -61,6 +61,7 @@ MODEL_ARG_KEYS = [
     "unet",
     "head_mode",
     "use_checkpointing",
+    "pool_mode",
 ]
 
 
@@ -92,12 +93,12 @@ class Args:
         self.output_activation = "Tanh"
         self.emb_strategy = "pxus"
         self.hidden_factor = (7, 12)
-        self.emb_ch = 90
-        self.emb_hidden_ch = 120
+        self.emb_ch = 120
+        self.emb_hidden_ch = 150
         self.emb_hidden_layers_num = 2
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.ffn_hidden_ch = 120
+        self.ffn_hidden_ch = 150
         self.ffn_hidden_layers_num = 2
         self.num_expert = 16
         self.activate_expert = 4
@@ -105,6 +106,7 @@ class Args:
         self.lru_rank = 32
         self.use_selective = True
         self.unet = True
+        self.pool_mode = "pixel"
         self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
