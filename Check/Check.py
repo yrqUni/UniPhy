@@ -15,12 +15,12 @@ class MockArgs:
     def __init__(self):
         self.input_ch = 4
         self.out_ch = 4
-        self.input_size = (32, 32)
+        self.input_size = (128, 128)
         self.emb_ch = 32
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 1
         self.static_ch = 2
-        self.hidden_factor = (1, 1)
+        self.hidden_factor = (2, 2)
         self.convlru_num_blocks = 2
         self.ffn_hidden_ch = 64
         self.ffn_hidden_layers_num = 1
