@@ -124,7 +124,7 @@ class Args:
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ""
-        self.train_batch_size = 1
+        self.train_batch_size = 2
         self.eval_batch_size = 1
         self.epochs = 128
         self.log_path = "./convlru_base/logs"

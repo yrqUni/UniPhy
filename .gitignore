@@ -11,3 +11,6 @@ __pycache__/
 *.jpg
 *.jpeg
 *.DS_Store
+wandb/
+convlru_base/
+
