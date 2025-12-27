@@ -106,7 +106,7 @@ class Args:
         self.lru_rank = 32
         self.use_selective = True
         self.unet = True
-        self.pool_mode = "pixel"
+        self.down_mode = "pixel"
         self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
@@ -143,7 +143,7 @@ class Args:
         self.T = 6
         self.use_amp = False
         self.amp_dtype = "fp16"
-        self.grad_clip = 0.30
+        self.grad_clip = 0.00
         self.sample_k = 9
         self.use_wandb = True
         self.wandb_project = "ERA5"
