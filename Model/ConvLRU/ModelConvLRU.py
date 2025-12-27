@@ -177,9 +177,11 @@ class RMSNorm(nn.Module):
         BLOCK_SIZE = triton.next_power_of_2(N)
         BLOCK_SIZE = max(1, min(BLOCK_SIZE, 4096))
         if N > 4096:
-            var = x.pow(2).mean(dim=-1, keepdim=True)
-            out_norm = x * torch.rsqrt(var + self.eps)
-            return out_norm * self.weight
+            with torch.amp.autocast("cuda", enabled=False):
+                x_f = x_flat.float()
+                var = x_f.pow(2).mean(dim=-1, keepdim=True)
+                out_norm = x_f * torch.rsqrt(var + self.eps)
+                return (out_norm * self.weight.float()).to(x.dtype).view(*x.shape)
         rms_norm_kernel[grid](
             x_flat,
             self.weight,
@@ -227,8 +229,10 @@ class RevIN(nn.Module):
 
     def _get_statistics(self, x: torch.Tensor) -> None:
         dim2reduce = (3, 4)
-        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
+        with torch.amp.autocast("cuda", enabled=False):
+            x_fp32 = x.float()
+            self.mean = torch.mean(x_fp32, dim=dim2reduce, keepdim=True).detach().to(x.dtype)
+            self.stdev = torch.sqrt(torch.var(x_fp32, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach().to(x.dtype)
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         x = x - self.mean
@@ -300,9 +304,9 @@ class DiscreteCosineTransform(nn.Module):
         super().__init__()
         self.n = n
         self.dim = dim
-        k = torch.arange(n).unsqueeze(1)
-        i = torch.arange(n).unsqueeze(0)
-        basis = torch.cos(math.pi * k * (2 * i + 1) / (2 * n))
+        self.k = torch.arange(n).unsqueeze(1)
+        self.i = torch.arange(n).unsqueeze(0)
+        basis = torch.cos(math.pi * self.k * (2 * self.i + 1) / (2 * n))
         basis[0] = basis[0] * math.sqrt(1 / n)
         basis[1:] = basis[1:] * math.sqrt(2 / n)
         self.register_buffer("dct_matrix", basis)
@@ -438,11 +442,12 @@ class SphericalHarmonicsPrior(nn.Module):
         Y = self.Y_real
         if Y.device != x.device or Y.dtype != x.dtype:
             Y = Y.to(device=x.device, dtype=x.dtype)
-        coeff = torch.matmul(self.W1, self.W2)
-        Yf = Y.view(self.K, H * W)
-        bias = torch.matmul(coeff, Yf).view(C, H, W)
-        bias = (self.gain.view(C, 1, 1) * bias).view(1, 1, C, H, W)
-        return x + bias
+        with torch.amp.autocast("cuda", enabled=False):
+            coeff = torch.matmul(self.W1.float(), self.W2.float())
+            Yf = Y.view(self.K, H * W).float()
+            bias = torch.matmul(coeff, Yf).view(C, H, W)
+            bias = (self.gain.view(C, 1, 1).float() * bias).view(1, 1, C, H, W)
+            return x + bias.to(x.dtype)
 
 
 class ChannelAttention2D(nn.Module):
@@ -614,33 +619,35 @@ class SpatialPatchMoE(nn.Module):
         
         router_logits = self.router(router_input)
         
-        lse = torch.logsumexp(router_logits, dim=-1)
-        z_loss = lse.pow(2).mean()
-        router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
-        
-        mean_probs = router_probs.mean(dim=0)
+        with torch.amp.autocast("cuda", enabled=False):
+            router_logits = router_logits.float()
+            lse = torch.logsumexp(router_logits, dim=-1)
+            z_loss = lse.pow(2).mean()
+            router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
+            
+            mean_probs = router_probs.mean(dim=0)
 
-        N_total = router_logits.size(0)
-        topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
-        BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
-        fused_moe_router_kernel[(N_total,)](
-            router_logits,
-            topk_indices,
-            self.num_experts,
-            self.active_experts,
-            BLOCK_SIZE,
-        )
+            N_total = router_logits.size(0)
+            topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
+            BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
+            fused_moe_router_kernel[(N_total,)](
+                router_logits,
+                topk_indices,
+                self.num_experts,
+                self.active_experts,
+                BLOCK_SIZE,
+            )
 
-        with torch.no_grad():
-            flat_indices_all = topk_indices.view(-1).long()
-            expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
-            fraction_selected = expert_counts / flat_indices_all.numel()
+            with torch.no_grad():
+                flat_indices_all = topk_indices.view(-1).long()
+                expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
+                fraction_selected = expert_counts / flat_indices_all.numel()
 
-        self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
+            self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
 
-        topk_indices = topk_indices.long()
-        topk_weights = torch.gather(router_probs, 1, topk_indices)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_indices = topk_indices.long()
+            topk_weights = torch.gather(router_probs, 1, topk_indices)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         
         flat_indices = topk_indices.view(-1)
         x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
@@ -668,12 +675,12 @@ class SpatialPatchMoE(nn.Module):
             start_idx = end_idx
         flat_weights = topk_weights.view(-1)
         weights_sorted = flat_weights[sorted_args]
-        y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1)
+        y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1).to(y_sorted.dtype)
         
         out_patches = shared_out
         token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
         sorted_token_ids = token_ids[sorted_args]
-        out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted.to(out_patches.dtype))
+        out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
         
         out = (
             out_patches.view(B, nH, nW, L, C, P, P)
@@ -1061,7 +1068,8 @@ class Decoder(nn.Module):
         x = self.c_out(x)
         if self.head_mode == "gaussian":
             mu, log_sigma = torch.chunk(x, 2, dim=1)
-            sigma = F.softplus(log_sigma) + 1e-6
+            with torch.amp.autocast("cuda", enabled=False):
+                sigma = F.softplus(log_sigma.float()).to(mu.dtype) + 1e-6
             return torch.cat([mu, sigma], dim=1)
         if self.head_mode == "token":
             if self.vq is None:
