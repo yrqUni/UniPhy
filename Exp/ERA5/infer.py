@@ -5,7 +5,6 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import imageio
-from typing import Optional, Dict, Any
 
 sys.path.append("/nfs/ConvLRU/Model/ConvLRU")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
@@ -15,59 +14,77 @@ from ERA5 import ERA5_Dataset
 from convlru_train_ddp import Args as TrainArgs
 from convlru_train_ddp import load_model_args_from_ckpt, apply_model_args
 
+
 class InferenceArgs:
     def __init__(self):
         self.ckpt_path = "/nfs/ConvLRU/Exp/ERA5/convlru_base/ckpt/e7_s570_l0.265707.pth"
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.output_dir = "./inference_results"
-        
         self.TS = 6.0
         self.ctx_len = 8
         self.gen_len = 40
-        self.fps = 4
-        
-        if torch.cuda.device_count() >= 2:
-            self.dev_in = "cuda:0"
-            self.dev_core = "cuda:1"
-        else:
-            self.dev_in = "cuda:0"
-            self.dev_core = "cuda:0"
+        self.fps = 1
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def save_all_channels_mp4(preds_list, output_dir, sample_idx, ts, fps=4):
-    if isinstance(preds_list, list):
-        preds_np = torch.cat(preds_list, dim=0).numpy()
-    else:
-        preds_np = preds_list.cpu().numpy()
-    
-    T, C, H, W = preds_np.shape
-    
-    for c in range(C):
-        vmin = preds_np[:, c].min()
-        vmax = preds_np[:, c].max()
+
+def save_vis_video(preds, save_dir, sample_idx, fps=1):
+    T, C, H, W = preds.shape
+    dpi = 150
+    figsize = (W / dpi, H / dpi)
+
+    for ch in range(C):
+        data_flat = preds[:, ch].flatten()
+        vmin = np.percentile(data_flat, 2)
+        vmax = np.percentile(data_flat, 98)
         
-        save_name = f"pred_sample_{sample_idx}_TS{int(ts)}_var{c}.mp4"
-        save_path = os.path.join(output_dir, save_name)
+        range_span = vmax - vmin
+        vmin -= range_span * 0.05
+        vmax += range_span * 0.05
+
+        save_name = f"pred_sample_{sample_idx}_ch{ch}_vis.mp4"
+        save_path = os.path.join(save_dir, save_name)
         
-        writer = imageio.get_writer(save_path, fps=fps, format='FFMPEG')
+        writer = imageio.get_writer(
+            save_path, 
+            fps=fps, 
+            codec='libx264',
+            pixelformat='yuv420p',
+            macro_block_size=None,
+            output_params=['-crf', '18', '-preset', 'slow']
+        )
+        
+        fig = plt.figure(figsize=figsize, dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.set_axis_off()
+        
+        im = ax.imshow(
+            preds[0, ch], 
+            cmap='magma', 
+            vmin=vmin, 
+            vmax=vmax, 
+            interpolation='bicubic'
+        )
         
         for t in range(T):
-            fig = plt.figure(figsize=(8, 8 * H / W), dpi=100)
-            ax = plt.Axes(fig, [0., 0., 1., 1.])
-            ax.set_axis_off()
-            fig.add_axes(ax)
-            
-            ax.imshow(preds_np[t, c], cmap='RdBu_r', vmin=vmin, vmax=vmax, aspect='auto')
-            
+            im.set_data(preds[t, ch])
             fig.canvas.draw()
+            
             image = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
             image = image.reshape(fig.canvas.get_width_height()[::-1] + (4,))
             image = image[:, :, :3]
             
+            h_curr, w_curr = image.shape[:2]
+            h_new = h_curr - (h_curr % 2)
+            w_new = w_curr - (w_curr % 2)
+            
+            if h_new != h_curr or w_new != w_curr:
+                image = image[:h_new, :w_new]
+
             writer.append_data(image)
-            plt.close(fig)
             
         writer.close()
-        print(f"Saved {save_path}")
+        plt.close(fig)
+
 
 def main():
     cfg = InferenceArgs()
@@ -77,21 +94,16 @@ def main():
     ckpt_args_dict = load_model_args_from_ckpt(cfg.ckpt_path, map_location="cpu")
     if ckpt_args_dict:
         apply_model_args(model_args, ckpt_args_dict, verbose=False)
+    
     model_args.data_root = cfg.data_root
     
-    model = ConvLRU(model_args)
+    model = ConvLRU(model_args).to(cfg.device)
+    model.eval()
     
-    checkpoint = torch.load(cfg.ckpt_path, map_location="cpu")
+    checkpoint = torch.load(cfg.ckpt_path, map_location=cfg.device)
     state_dict = checkpoint['model']
     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(new_state_dict, strict=False)
-    
-    model.revin.to(cfg.dev_in)
-    model.embedding.to(cfg.dev_in)
-    model.decoder.to(cfg.dev_in)
-    model.convlru_model.to(cfg.dev_core)
-    
-    model.eval()
 
     dataset = ERA5_Dataset(
         input_dir=cfg.data_root,
@@ -103,85 +115,44 @@ def main():
     )
     
     sample_idx = random.randint(0, len(dataset) - 1)
-    
     raw_sample = dataset[sample_idx] 
-    x_ctx = torch.from_numpy(raw_sample).unsqueeze(0).float()
+    raw_sample = torch.from_numpy(raw_sample).unsqueeze(0).to(cfg.device).float()
+    
+    x_ctx = raw_sample
     
     dt_native = 1.0
-    listT_ctx = torch.full((1, cfg.ctx_len), dt_native)
+    listT_ctx = torch.full((1, cfg.ctx_len), dt_native, device=cfg.device)
+    listT_future = torch.full((1, cfg.gen_len), float(cfg.TS), device=cfg.device)
     
     static_feats = None
     static_path = os.path.join(os.path.dirname(cfg.ckpt_path), "../../static_feats.pt")
     if not os.path.exists(static_path):
         static_path = "/nfs/ConvLRU/Exp/ERA5/static_feats.pt"
+        
     if os.path.exists(static_path) and model_args.static_ch > 0:
-        static_data = torch.load(static_path, map_location="cpu")
+        static_data = torch.load(static_path, map_location=cfg.device)
         static_feats = static_data.unsqueeze(0).repeat(1, 1, 1, 1).float()
 
-    out_frames = []
-    last_hidden_outs = None
-    
     with torch.no_grad():
-        x_ctx_in = x_ctx.to(cfg.dev_in)
-        s_in = static_feats.to(cfg.dev_in) if static_feats is not None else None
-        
-        x_norm = model.revin(x_ctx_in, "norm")
-        x_emb, cond_emb = model.embedding(x_norm, static_feats=s_in)
-        
-        x_emb_core = x_emb.to(cfg.dev_core)
-        cond_core = cond_emb.to(cfg.dev_core) if cond_emb is not None else None
-        listT_ctx_core = listT_ctx.to(cfg.dev_core)
-        
-        _, last_hidden_outs = model.convlru_model(
-            x_emb_core, 
-            last_hidden_ins=None, 
-            listT=listT_ctx_core, 
-            cond=cond_core
+        out_gen = model(
+            x_ctx,
+            mode="i",
+            out_gen_num=cfg.gen_len,
+            listT=listT_ctx,
+            listT_future=listT_future,
+            static_feats=static_feats,
+            timestep=None
         )
-        
-        current_x = x_ctx_in[:, -1:]
-        
-        for i in range(cfg.gen_len):
-            dt_step = torch.full((1, 1), float(cfg.TS), device=cfg.dev_core)
-            
-            x_norm_step = model.revin(current_x, "norm")
-            x_emb_step, cond_step = model.embedding(x_norm_step, static_feats=s_in)
-            
-            x_emb_step_core = x_emb_step.to(cfg.dev_core)
-            
-            x_hid_step_core, last_hidden_outs = model.convlru_model(
-                x_emb_step_core,
-                last_hidden_ins=last_hidden_outs,
-                listT=dt_step,
-                cond=cond_core
-            )
-            
-            x_hid_step_out = x_hid_step_core.to(cfg.dev_in)
-            cond_out = cond_emb.to(cfg.dev_in) if cond_emb is not None else None
-            
-            out_dec = model.decoder(x_hid_step_out, cond=cond_out, timestep=None)
-            
-            out_dec = out_dec.permute(0, 2, 1, 3, 4).contiguous()
-            
-            if model.decoder.head_mode == "gaussian":
-                mu, sigma = torch.chunk(out_dec, 2, dim=2)
-                if mu.size(2) == model.revin.num_features:
-                    pred_frame = model.revin(mu, "denorm")
-                else:
-                    pred_frame = mu
-            else:
-                if out_dec.size(2) == model.revin.num_features:
-                    pred_frame = model.revin(out_dec, "denorm")
-                else:
-                    pred_frame = out_dec
-            
-            out_frames.append(pred_frame.cpu())
-            
-            current_x = pred_frame
-            
-            print(f"Generated frame {i+1}/{cfg.gen_len}")
+    
+    preds_tensor = out_gen[0]
+    
+    if preds_tensor.dim() == 5:
+        preds_tensor = preds_tensor.squeeze(0)
+    
+    preds_np = preds_tensor.cpu().numpy()
+    
+    save_vis_video(preds_np, cfg.output_dir, sample_idx, fps=cfg.fps)
 
-    save_all_channels_mp4(out_frames, cfg.output_dir, sample_idx, cfg.TS, fps=cfg.fps)
 
 if __name__ == "__main__":
     main()

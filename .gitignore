@@ -13,4 +13,5 @@ __pycache__/
 *.DS_Store
 wandb/
 convlru_base/
+inference_results/
 
