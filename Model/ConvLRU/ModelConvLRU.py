@@ -1343,7 +1343,7 @@ class ConvLRU(nn.Module):
             future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype)
         for t in range(int(out_gen_num) - 1):
             dt = future[:, t : t + 1]
-            x_in, _ = self.embedding(x_step_mean, static_feats=None)
+            x_in, _ = self.embedding(x_step_mean, static_feats=static_feats)
             x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
             x_dec0 = x_dec[0] if isinstance(x_dec, tuple) else x_dec
