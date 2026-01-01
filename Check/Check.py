@@ -70,7 +70,7 @@ def check_equivalence():
         if hasattr(module, "forcing_scale") and isinstance(module.forcing_scale, torch.nn.Parameter):
             module.forcing_scale.data.fill_(0.0)
 
-    B, L, H, W = 2, 1, args.input_size[0], args.input_size[1]
+    B, L, H, W = 2, 4, args.input_size[0], args.input_size[1]
     x = torch.randn(B, L, args.input_ch, H, W, device=device)
     static = torch.randn(B, args.static_ch, H, W, device=device)
     listT = torch.rand(B, L, device=device)
