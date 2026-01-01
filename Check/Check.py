@@ -26,7 +26,7 @@ class MockArgs:
     def __init__(self, **kwargs):
         self.input_size = (32, 32)
         self.input_ch = 4
-        self.out_ch = 3 
+        self.out_ch = 4
         self.emb_ch = 16
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 1
@@ -159,7 +159,7 @@ def main():
     args_moe = MockArgs(num_expert=4, activate_expert=2)
     run_test_case("Mixture of Experts (MoE)", args_moe)
 
-    args_diff = MockArgs(head_mode="diffusion", out_ch=3, dec_hidden_layers_num=1)
+    args_diff = MockArgs(head_mode="diffusion", out_ch=4, dec_hidden_layers_num=1)
     run_test_case("Head: Diffusion", args_diff)
 
     args_token = MockArgs(head_mode="token", out_ch=16) 

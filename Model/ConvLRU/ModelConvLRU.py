@@ -1638,11 +1638,7 @@ class ConvLRU(nn.Module):
             if self.decoder.head_mode == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
-                    # [Fix]: Avoid denorm in P-mode for stability with Gaussian NLL
-                    # Let the loss function handle normalized targets if possible,
-                    # OR ensure sigma doesn't vanish. Here we add safety clamp.
                     mu = self.revin(mu, "denorm")
-                    # Clamp stdev to avoid vanishing variance
                     stdev = torch.clamp(self.revin.stdev, min=1e-5)
                     sigma = sigma * stdev
                 return torch.cat([mu, sigma], dim=2)
@@ -1717,15 +1713,9 @@ class ConvLRU(nn.Module):
             if curr_x.ndim == 5 and curr_x.shape[1] != 1:
                 curr_x = curr_x[:, -1:, :, :, :]
 
-            if curr_x.size(2) != self.embedding.input_ch:
-                 B_in, L_in, C_out, H_in, W_in = curr_x.shape
-                 C_target = self.embedding.input_ch
-                 if C_out > C_target:
-                      curr_x = curr_x[:, :, :C_target, :, :]
-                 else:
-                      diff = C_target - C_out
-                      zeros = torch.zeros(B_in, L_in, diff, H_in, W_in, device=curr_x.device, dtype=curr_x.dtype)
-                      curr_x = torch.cat([curr_x, zeros], dim=2)
+            if str(self.decoder.head_mode).lower() == "token":
+                if curr_x.size(2) > self.revin.num_features:
+                    curr_x = curr_x[:, :, :self.revin.num_features]
             
             if curr_x.size(2) == self.revin.num_features:
                 x_step_norm = self.revin(curr_x, "norm")
