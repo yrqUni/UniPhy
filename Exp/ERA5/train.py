@@ -133,7 +133,7 @@ class Args:
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = "e7_s570_l0.265707.pth"
+        self.ckpt = ""
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
