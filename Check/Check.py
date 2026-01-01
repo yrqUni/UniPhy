@@ -37,6 +37,9 @@ class MockArgs:
         self.use_spectral_mixing = True
         self.use_anisotropic_diffusion = True
         self.use_advection = True
+        self.use_graph_interaction = True
+        self.use_mamba_adaptivity = True
+        self.use_neural_operator = True
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True

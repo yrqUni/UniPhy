@@ -611,10 +611,11 @@ class WaveletBlock(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        pad_h = H % 2
-        pad_w = W % 2
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
         
         B, L, C, H_pad, W_pad = x.shape
         x_flat = x.reshape(B * L, C, H_pad, W_pad)
@@ -671,8 +672,9 @@ class GraphInteraction(nn.Module):
         B, L, C, H, W = x.shape
         x_flat = x.view(B * L, C, H, W)
         nodes = self.proj_to_nodes(x_flat) 
-        nodes = nodes.view(B * L, C, -1).permute(0, 2, 1) 
-        nodes = nodes + self.gnn(self.norm(nodes))
+        nodes = nodes.flatten(2).permute(0, 2, 1) 
+        nodes = self.norm(nodes)
+        nodes = nodes + self.gnn(nodes)
         nodes = nodes.permute(0, 2, 1).view(B * L, C, int(math.sqrt(self.nodes)), int(math.sqrt(self.nodes)))
         out_grid = F.interpolate(nodes, size=(H, W), mode='bilinear', align_corners=False)
         out_grid = self.proj_back(out_grid)
@@ -1063,7 +1065,7 @@ class ConvLRULayer(nn.Module):
                 z = mu + eps * std
                 self.latest_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
             else:
-                z = torch.randn(B, L, self.latent_dim, device=x.device, dtype=x_in_fp32.dtype)
+                z = torch.zeros(B, L, self.latent_dim, device=x.device, dtype=x_in_fp32.dtype)
                 self.latest_kl = 0.0
             h = self._hybrid_forward_transform(x_in_fp32)
             h = h.contiguous()
@@ -1106,6 +1108,8 @@ class ConvLRULayer(nn.Module):
             
             x_in_lru = zq
             
+            B_proj = None
+            C_proj = None
             if self.use_mamba_adaptivity:
                  B_proj = self.b_proj(ctx).view(B, L, 1, 1, self.rank)
                  C_proj = self.c_proj(ctx).view(B, L, 1, 1, self.rank)
@@ -1115,8 +1119,8 @@ class ConvLRULayer(nn.Module):
             x_in_lru = x_in_lru * gamma_t
             if L == 1 and last_hidden_in is not None:
                 h_prev = last_hidden_in.to(x_in_lru.dtype)
-                z_out = lamb * h_prev + x_in_lru
-                last_hidden_out = z_out
+                h_out = lamb * h_prev + x_in_lru
+                last_hidden_out = h_out
             else:
                 if last_hidden_in is not None:
                     h0_val = last_hidden_in.to(x_in_lru.dtype)
@@ -1132,11 +1136,13 @@ class ConvLRULayer(nn.Module):
                 x_scan = x_in_fwd.reshape(B_sz, L_sz, -1, R_sz)
                 l_scan = lamb_in_fwd.reshape(B_sz, L_sz, -1, R_sz)
                 z_scan = self.pscan(l_scan, x_scan)
-                z_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
-                last_hidden_out = z_out[:, -1:]
+                h_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
+                last_hidden_out = h_out[:, -1:]
             
-            if self.use_mamba_adaptivity:
-                 z_out = z_out * torch.sigmoid(C_proj)
+            if self.use_mamba_adaptivity and C_proj is not None:
+                 z_out = h_out * torch.sigmoid(C_proj)
+            else:
+                 z_out = h_out
             
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
                 z = z * sc_v
