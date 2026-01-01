@@ -1415,12 +1415,12 @@ class ConvLRUModel(nn.Module):
         self.downsamples = nn.ModuleList()
         C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
+        curr_H, curr_W = H, W
         if not self.use_unet:
             self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
             self.upsample = None
             self.fusion = None
         else:
-            curr_H, curr_W = H, W
             encoder_res: List[Tuple[int, int]] = []
             for i in range(layers):
                 self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
@@ -1432,8 +1432,12 @@ class ConvLRUModel(nn.Module):
                         self.downsamples.append(ShuffleDownsample(C))
                     else:
                         self.downsamples.append(nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)))
+                    
+                    if curr_H % 2 != 0: curr_H += 1
+                    if curr_W % 2 != 0: curr_W += 1
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
+
             self.mid_attention = BottleneckAttention(C, num_heads=8)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
