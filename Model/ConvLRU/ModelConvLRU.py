@@ -588,13 +588,25 @@ class WaveletBlock(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        x_flat = x.reshape(B * L, C, H, W)
+        pad_h = H % 2
+        pad_w = W % 2
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        
+        B, L, C, H_pad, W_pad = x.shape
+        x_flat = x.reshape(B * L, C, H_pad, W_pad)
         x_dwt = self.dwt_init(x_flat)
         x_feat = self.conv(x_dwt)
         x_feat = F.silu(x_feat)
         x_out_dwt = self.conv_out(x_feat)
         x_rec = self.idwt_init(x_out_dwt)
-        return x_rec.view(B, L, C, H, W)
+        
+        out = x_rec.view(B, L, C, H_pad, W_pad)
+        
+        if pad_h > 0 or pad_w > 0:
+            out = out[..., :H, :W]
+            
+        return out
 
 class SpectralInteraction(nn.Module):
     def __init__(self, emb_ch, rank):
