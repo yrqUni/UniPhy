@@ -9,10 +9,6 @@ import triton.language as tl
 
 from pscan import pscan
 
-# ==========================================
-# Utils & Init
-# ==========================================
-
 def _kaiming_like_(tensor: torch.Tensor) -> torch.Tensor:
     nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
     return tensor
@@ -62,10 +58,6 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
     x = x.view(N, C * rH * rW, D, H // rH, W // rW)
     return x
-
-# ==========================================
-# Triton Kernels (MoE, Gate, Norm)
-# ==========================================
 
 @triton.jit
 def fused_moe_router_kernel(
@@ -230,10 +222,6 @@ class RevIN(nn.Module):
         else:
             raise NotImplementedError
 
-# ==========================================
-# Convolutions & Transforms
-# ==========================================
-
 class PeriodicConv3d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
         super().__init__()
@@ -313,15 +301,7 @@ class SpectralConv2d(nn.Module):
                 out_ft[:, :, :, -m1:, :m2] = torch.einsum("blcxy,coxy->bloxy", x_ft[:, :, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
             return out_ft
 
-# ==========================================
-# New: Dynamic Spherical Harmonics
-# ==========================================
-
 class DynamicSphericalHarmonicsPrior(nn.Module):
-    """
-    Hypernetwork-based Spherical Harmonics.
-    Weights W1 and W2 are generated from the global context of input x.
-    """
     def __init__(self, channels: int, H: int, W: int, Lmax: int = 6, rank: int = 8, gain_init: float = 0.0):
         super().__init__()
         self.C = int(channels)
@@ -330,20 +310,15 @@ class DynamicSphericalHarmonicsPrior(nn.Module):
         self.Lmax = int(Lmax)
         self.R = int(rank)
         self.K = self.Lmax * self.Lmax
-        
-        # Hypernetwork to generate W1 (C x R) and W2 (R x K)
-        # Input: C (global average pooling of x)
         self.hypernet = nn.Sequential(
             nn.Linear(self.C, self.C // 2),
             nn.SiLU(),
             nn.Linear(self.C // 2, self.C * self.R + self.R * self.K)
         )
-        
         self.gain = nn.Parameter(torch.full((self.C,), float(gain_init)))
-        
         theta, phi = self._latlon_to_spherical(self.H, self.W, device=None)
         Y = self._real_sph_harm_basis(theta, phi, self.Lmax)
-        self.register_buffer("Y_real", Y, persistent=True) # K x H x W
+        self.register_buffer("Y_real", Y, persistent=True)
 
     @staticmethod
     def _latlon_to_spherical(H: int, W: int, device: Optional[torch.device]):
@@ -368,7 +343,6 @@ class DynamicSphericalHarmonicsPrior(nn.Module):
 
     @staticmethod
     def _real_sph_harm_basis(theta: torch.Tensor, phi: torch.Tensor, Lmax: int) -> torch.Tensor:
-        # Same implementation as original
         H, W = theta.shape
         device = theta.device
         dtype = theta.dtype
@@ -410,45 +384,23 @@ class DynamicSphericalHarmonicsPrior(nn.Module):
         return torch.stack(Ys, dim=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: B, L, C, H, W
         B, L, C, H, W = x.shape
         Y = self.Y_real
         if Y.device != x.device or Y.dtype != x.dtype:
             Y = Y.to(device=x.device, dtype=x.dtype)
-        
-        # Calculate global context: B, L, C
-        ctx = x.mean(dim=(-2, -1)) 
-        
-        # Generate weights from hypernet
-        # weights_flat: B, L, C*R + R*K
-        weights_flat = self.hypernet(ctx) 
-        
+        ctx = x.mean(dim=(-2, -1))
+        weights_flat = self.hypernet(ctx)
         w1_size = self.C * self.R
-        w2_size = self.R * self.K
-        
         w1_flat = weights_flat[..., :w1_size]
         w2_flat = weights_flat[..., w1_size:]
-        
         W1 = w1_flat.view(B, L, self.C, self.R)
         W2 = w2_flat.view(B, L, self.R, self.K)
-        
         with torch.amp.autocast("cuda", enabled=False):
-            # Dynamic bias generation
-            # W1 * W2 -> (B, L, C, K)
-            coeff = torch.matmul(W1.float(), W2.float()) 
-            
-            # Y: (K, H*W)
+            coeff = torch.matmul(W1.float(), W2.float())
             Yf = Y.view(self.K, H * W).float()
-            
-            # coeff (B, L, C, K) * Yf (K, HW) -> (B, L, C, HW)
             bias = torch.matmul(coeff, Yf).view(B, L, C, H, W)
-            
             bias = (self.gain.view(1, 1, C, 1, 1).float() * bias)
             return x + bias.to(x.dtype)
-
-# ==========================================
-# Attention & Gates
-# ==========================================
 
 class ChannelAttention2D(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
@@ -511,21 +463,12 @@ class CrossScaleAttentionGate(nn.Module):
         attn = self.sigmoid(self.psi(psi))
         return self.norm(local_x * attn)
 
-# ==========================================
-# New: Bottleneck Global Attention
-# ==========================================
-
 class BottleneckAttention(nn.Module):
-    """
-    Multi-Head Self Attention for global dependency (Teleconnections).
-    Used at the bottleneck of U-Net.
-    """
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
-
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -533,26 +476,19 @@ class BottleneckAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        # x: B, C, L, H, W
         B, C, L, H, W = x.shape
-        # Flatten spatial: B, L, H*W, C
         x_flat = x.permute(0, 2, 3, 4, 1).view(B*L, H*W, C)
-        
         B_N, N, C = x_flat.shape
         shortcut = x_flat
         x_norm = self.norm(x_flat)
-        
         qkv = self.qkv(x_norm).reshape(B_N, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-
         x_attn = (attn @ v).transpose(1, 2).reshape(B_N, N, C)
         x_attn = self.proj(x_attn)
         x_attn = self.proj_drop(x_attn)
-        
         out = shortcut + x_attn
         out = out.view(B, L, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
         return out
@@ -617,12 +553,10 @@ class SpatialPatchMoE(nn.Module):
                 for i in range(self.num_experts)
             ]
         )
-        # Improved Shared Expert: Deeper capacity
         self.shared_expert = nn.Sequential(
              GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=7, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None)),
              GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=3, use_cbam=False, cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
         )
-
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
         self.router = nn.Linear(router_in_dim, self.num_experts)
         self.aux_loss = 0.0
@@ -661,9 +595,6 @@ class SpatialPatchMoE(nn.Module):
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_input, router_cond], dim=1)
         
-        shared_out = self.shared_expert(x_patches, cond=cond_patches) # Note: cond passed to Sequential? GatedConvBlock handles cond=None gracefully? Yes, checking implementation
-        # Correction: Sequential call with extra args can be tricky.
-        # Let's manual call for shared expert to be safe
         s_out = x_patches
         for layer in self.shared_expert:
              s_out = layer(s_out, cond=cond_patches)
@@ -748,14 +679,11 @@ class ConvLRULayer(nn.Module):
         self.rank = int(getattr(args, "lru_rank", 32))
         self.is_selective = bool(getattr(args, "use_selective", False))
         self.W_freq = self.W // 2 + 1
-        
         dt_min = 0.001
         dt_max = 0.1
         self.log_dt_min = nn.Parameter(torch.log(torch.tensor(dt_min)))
         self.log_dt_max = nn.Parameter(torch.log(torch.tensor(dt_max)))
-        
         self.register_buffer("steps", torch.arange(self.rank, dtype=torch.float32) / (self.rank - 1))
-        
         nu = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
         nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
         nu_log = torch.log(nu)
@@ -764,22 +692,16 @@ class ConvLRULayer(nn.Module):
         self.params_log_base = nn.Parameter(torch.stack([nu_log, theta_log], dim=0))
         self.dispersion_mod = nn.Parameter(torch.zeros(2, self.emb_ch, self.rank) * 0.01)
         self.mod_hidden = 32
-        
-        # === Scheme A: Stochastic Forcing (Variational) ===
-        self.latent_dim = 16 # Latent variable dimension
+        self.latent_dim = 16
         in_dim = (self.emb_ch if self.is_selective else (self.emb_ch + 1)) + self.latent_dim
-        
         self.forcing_mlp = nn.Sequential(
             nn.Linear(in_dim, self.mod_hidden),
             nn.Tanh(),
             nn.Linear(self.mod_hidden, self.emb_ch * self.rank * 2),
         )
         self.forcing_scale = nn.Parameter(torch.tensor(0.1))
-        
-        # VAE Encoder for Z
         self.z_encoder = nn.Linear(self.emb_ch, self.latent_dim * 2)
         self.latest_kl = 0.0
-
         self.local_conv = PeriodicConv3d(self.emb_ch, self.emb_ch, kernel_size=3)
         self.dct_h = DiscreteCosineTransform(self.S, dim=-2)
         self.selection_net = nn.Sequential(
@@ -796,10 +718,7 @@ class ConvLRULayer(nn.Module):
         self.norm = RMSNorm(self.emb_ch)
         self.noise_level = nn.Parameter(torch.tensor(0.01))
         self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
-        
-        # Dynamic SH
         self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
-        
         if bool(getattr(args, "use_gate", False)):
             self.gate_conv = nn.Sequential(
                 nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
@@ -816,10 +735,7 @@ class ConvLRULayer(nn.Module):
         else:
             dt_feat = dt.view(x.size(0), x.size(1), 1)
             inp_base = torch.cat([ctx, dt_feat], dim=-1)
-        
-        # Concat latent variable z
         inp = torch.cat([inp_base, z], dim=-1)
-        
         mod = self.forcing_mlp(inp)
         mod = mod.view(x.size(0), x.size(1), self.emb_ch, self.rank, 2)
         dnu = self.forcing_scale * torch.tanh(mod[..., 0])
@@ -839,17 +755,13 @@ class ConvLRULayer(nn.Module):
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         x_perm = x.permute(0, 2, 1, 3, 4)
         B, L, C, S, W = x_perm.shape
-        
         if listT is None:
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
-        
         with torch.amp.autocast("cuda", enabled=False):
             x_in_fp32 = x_perm.float()
             dt_fp32 = dt.float()
-            
-            # === Stochastic Latent Sampling ===
             ctx_z = x_in_fp32.mean(dim=(-2, -1))
             if self.training:
                 z_params = self.z_encoder(ctx_z)
@@ -857,16 +769,10 @@ class ConvLRULayer(nn.Module):
                 std = torch.exp(0.5 * logvar)
                 eps = torch.randn_like(std)
                 z = mu + eps * std
-                # Calculate KL Divergence: 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-                # We average over batch and time in train loop, but here keep per-item
                 self.latest_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
             else:
-                # Inference: Sample from prior N(0,I) for variation, or 0 for mean
-                # For "ensemble", you should pass a noise seed or mode='gen'. 
-                # Here we default to sampling from prior.
                 z = torch.randn(B, L, self.latent_dim, device=x.device, dtype=x_in_fp32.dtype)
                 self.latest_kl = 0.0
-
             h = self._hybrid_forward_transform(x_in_fp32)
             h = h.contiguous()
             ctx = x_in_fp32.mean(dim=(-2, -1))
@@ -881,21 +787,15 @@ class ConvLRULayer(nn.Module):
             zq = zq * scale_v
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
-            
             log_dt = self.log_dt_min + self.steps * (self.log_dt_max - self.log_dt_min)
             ts = torch.exp(log_dt)
             nu_init = 1.0 / ts
             nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
-            
             nu_log, theta_log = self.params_log_base.unbind(dim=0)
             disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-            
             nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
-            
-            # Pass Z to forcing
             dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32, z)
-            
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
@@ -920,7 +820,6 @@ class ConvLRULayer(nn.Module):
                 z_scan = self.pscan(l_scan, x_scan)
                 z_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
                 last_hidden_out = z_out[:, -1:]
-
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
                 z = z * sc_v
                 t1 = torch.einsum("blcwr,cwr->blcwr", z, self.V_col.conj())
@@ -930,26 +829,19 @@ class ConvLRULayer(nn.Module):
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
             h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
             feat_final = self._hybrid_inverse_transform(h_rec_fwd)
-
         feat_final = feat_final.to(x.dtype)
         feat_final_perm = feat_final.permute(0, 2, 1, 3, 4)
         h_final = self.post_ifft_proj(feat_final_perm)
-        
         if self.sh_prior is not None:
-            # Dynamic SH call
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-        
         x_local = self.local_conv(x)
         h_final = h_final + x_local
-        
         h_final = self.norm(h_final)
-        
         if self.gate_conv is not None:
             gate = self.gate_conv(h_final)
             x_out = (1 - gate) * x + gate * h_final
         else:
             x_out = x + h_final
-            
         return x_out, last_hidden_out
 
 class FeedForward(nn.Module):
@@ -1180,11 +1072,7 @@ class ConvLRUModel(nn.Module):
                         self.downsamples.append(nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)))
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
-            
-            # === Global Attention at Bottleneck ===
-            # The bottleneck is after the last downsample.
             self.mid_attention = BottleneckAttention(C, num_heads=8)
-            
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
                 self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
@@ -1220,10 +1108,7 @@ class ConvLRUModel(nn.Module):
                 if x_s.shape[-2] >= 2 and x_s.shape[-1] >= 2:
                     x_s = self.downsamples[i](x_s)
                 x = x_s
-        
-        # Apply Global Attention at the bottom
         x = self.mid_attention(x)
-        
         if self.upsample is None or self.fusion is None:
             raise RuntimeError("UNet misconfigured")
         for i, blk in enumerate(self.up_blocks):
@@ -1337,7 +1222,6 @@ class ConvLRU(nn.Module):
                 count += 1
         if count == 0:
             return torch.tensor(0.0)
-        # Average KL over all layers, or sum, depending on preference. Here we sum.
         return kl_sum
 
     def forward(

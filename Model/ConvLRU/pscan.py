@@ -69,7 +69,6 @@ class PScanTriton(torch.autograd.Function):
         input_shape = X.shape
         L = input_shape[1]
 
-        # Fix: Explicit contiguous to avoid implicit copy warnings/errors
         A_in = A.transpose(1, -1).contiguous()
         X_in = X.transpose(1, -1).contiguous()
 
@@ -114,7 +113,6 @@ class PScanTriton(torch.autograd.Function):
         
         L = A.shape[1]
         
-        # Fix: Explicit contiguous
         A_in = A_prep.transpose(1, -1).contiguous()
         X_in = grad_output.transpose(1, -1).contiguous()
         
