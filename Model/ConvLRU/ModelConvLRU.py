@@ -1172,9 +1172,11 @@ class ConvLRULayer(nn.Module):
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
 
         if self.freq_prior is not None:
-            h_final_perm = h_final.permute(0, 2, 1, 3, 4).contiguous()
-            h_final_freq = self.freq_prior(h_final_perm)
-            h_final = h_final + h_final_freq.permute(0, 2, 1, 3, 4).real
+            h_spatial = h_final.permute(0, 2, 1, 3, 4).contiguous()
+            h_ft = torch.fft.rfft2(h_spatial.float(), norm="ortho")
+            h_ft_out = self.freq_prior(h_ft)
+            h_spatial_out = torch.fft.irfft2(h_ft_out, s=h_spatial.shape[-2:], norm="ortho")
+            h_final = h_final + h_spatial_out.permute(0, 2, 1, 3, 4).to(h_final.dtype)
         
         if self.use_wavelet_ssm:
             h_final = h_final + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
@@ -1689,8 +1691,7 @@ class ConvLRU(nn.Module):
             
             if mu.size(2) == self.revin.num_features:
                 mu_denorm = self.revin(mu, "denorm")
-                stdev = torch.clamp(self.revin.stdev, min=1e-5)
-                sigma_denorm = sigma * stdev
+                sigma_denorm = sigma * self.revin.stdev
             else:
                 mu_denorm = mu
                 sigma_denorm = sigma
