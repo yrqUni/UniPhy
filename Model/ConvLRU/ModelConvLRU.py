@@ -140,6 +140,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(self.channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_complex():
+            x = x.real
         orig_shape = x.shape
         if x.dim() == 5:
             x = x.permute(0, 2, 3, 4, 1).contiguous()
@@ -1165,7 +1167,9 @@ class ConvLRULayer(nn.Module):
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
 
         if self.freq_prior is not None:
-            h_final = self.freq_prior(h_final)
+            h_final_perm = h_final.permute(0, 2, 1, 3, 4).contiguous()
+            h_final_freq = self.freq_prior(h_final_perm)
+            h_final = h_final + h_final_freq.permute(0, 2, 1, 3, 4).real
         
         if self.use_wavelet_ssm:
             h_final = h_final + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
@@ -1268,10 +1272,11 @@ class DiffusionHead(nn.Module):
         if half_dim <= 0:
             raise ValueError("DiffusionHead invalid dim")
         scale = math.log(10000.0) / max(1, (half_dim - 1))
-        freqs = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float32) * (-scale))
-        tt = t.float().view(-1, 1) * freqs.view(1, -1)
+        t_float = t.float()
+        freqs = torch.exp(torch.arange(half_dim, device=device, dtype=t_float.dtype) * (-scale))
+        tt = t_float.view(-1, 1) * freqs.view(1, -1)
         emb = torch.cat([tt.sin(), tt.cos()], dim=-1)
-        return self.mlp(emb.to(dtype=t.dtype))
+        return self.mlp(emb.to(dtype=self.mlp[0].weight.dtype))
 
 class Decoder(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -1605,24 +1610,36 @@ class ConvLRU(nn.Module):
         cond = None
         if self.embedding.static_ch > 0 and self.embedding.static_embed is not None and static_feats is not None:
             cond = self.embedding.static_embed(static_feats)
+            
         if mode == "p":
             x = self.revin(x, "norm")
             x_emb, _ = self.embedding(x, static_feats=static_feats)
             x_hid, _ = self.convlru_model(x_emb, listT=listT, cond=cond, static_feats=static_feats)
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
-            out = out.permute(0, 2, 1, 3, 4).contiguous()
+            
+            if isinstance(out, tuple):
+                out_tensor = out[0]
+                rest = out[1:]
+            else:
+                out_tensor = out
+                rest = ()
+            
+            out_tensor = out_tensor.permute(0, 2, 1, 3, 4).contiguous()
+            
             if self.decoder.head_mode == "gaussian":
-                mu, sigma = torch.chunk(out, 2, dim=2)
+                mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm")
                     sigma = sigma * self.revin.stdev
                 return torch.cat([mu, sigma], dim=2)
             elif self.decoder.head_mode == "token":
-                return out
+                return (out_tensor,) + rest
             else:
-                if out.size(2) == self.revin.num_features:
-                    return self.revin(out, "denorm")
-                return out
+                if out_tensor.size(2) == self.revin.num_features:
+                    return self.revin(out_tensor, "denorm")
+                return out_tensor
+
+        # Inference Mode (I)
         if out_gen_num is None or int(out_gen_num) <= 0:
             raise ValueError("out_gen_num must be positive for inference mode")
         B = x.size(0)
@@ -1630,51 +1647,84 @@ class ConvLRU(nn.Module):
             listT0 = torch.ones(B, x.size(1), device=x.device, dtype=x.dtype)
         else:
             listT0 = listT
+            
         out_list: List[torch.Tensor] = []
         x_norm = self.revin(x, "norm")
+        # Ensure stats are broadcast-ready for L=1
+        if self.revin.mean is not None and self.revin.mean.ndim == 5:
+             self.revin.mean = self.revin.mean[:, -1:, :, :, :]
+        if self.revin.stdev is not None and self.revin.stdev.ndim == 5:
+             self.revin.stdev = self.revin.stdev[:, -1:, :, :, :]
+
         x_emb, _ = self.embedding(x_norm, static_feats=static_feats)
         x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT0, cond=cond, static_feats=static_feats)
         x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
+        
         if isinstance(x_dec, tuple):
             x_dec0 = x_dec[0]
         else:
             x_dec0 = x_dec
-        x_step_dist = x_dec0[:, :, -1:, :, :].permute(0, 2, 1, 3, 4).contiguous()
-        if str(self.decoder.head_mode).lower() == "gaussian":
-            out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
-            x_step_mean = x_step_dist[:, :, :out_ch, :, :]
-        else:
-            x_step_mean = x_step_dist
+            
+        x_step_dist = x_dec0.permute(0, 2, 1, 3, 4).contiguous()
+        x_step_dist = x_step_dist[:, -1:, :, :, :]
+        
         if str(self.decoder.head_mode).lower() == "gaussian":
             out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
             mu = x_step_dist[:, :, :out_ch, :, :]
             sigma = x_step_dist[:, :, out_ch:, :, :]
+            
             if mu.size(2) == self.revin.num_features:
-                mu = self.revin(mu, "denorm")
-                sigma = sigma * self.revin.stdev
-            out_list.append(torch.cat([mu, sigma], dim=2))
+                mu_denorm = self.revin(mu, "denorm")
+                sigma_denorm = sigma * self.revin.stdev
+            else:
+                mu_denorm = mu
+                sigma_denorm = sigma
+            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+            x_step_mean = mu_denorm 
+            
         elif str(self.decoder.head_mode).lower() == "token":
             out_list.append(x_step_dist)
+            x_step_mean = x_step_dist 
         else:
             if x_step_dist.size(2) == self.revin.num_features:
-                x_step_dist = self.revin(x_step_dist, "denorm")
-            out_list.append(x_step_dist)
+                x_step_dist_denorm = self.revin(x_step_dist, "denorm")
+            else:
+                x_step_dist_denorm = x_step_dist
+            out_list.append(x_step_dist_denorm)
+            x_step_mean = x_step_dist_denorm
+
         future = listT_future
         if future is None:
             future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype)
+            
         for t in range(int(out_gen_num) - 1):
             dt = future[:, t : t + 1]
-            x_step_norm = self.revin(x_step_mean, "norm")
+            
+            curr_x = x_step_mean
+            if curr_x.ndim == 5 and curr_x.shape[1] != 1:
+                curr_x = curr_x[:, -1:, :, :, :]
+
+            if str(self.decoder.head_mode).lower() == "token":
+                if curr_x.size(2) > self.revin.num_features:
+                    curr_x = curr_x[:, :, :self.revin.num_features]
+            
+            if curr_x.size(2) == self.revin.num_features:
+                x_step_norm = self.revin(curr_x, "norm")
+            else:
+                x_step_norm = curr_x
+                
             x_in, _ = self.embedding(x_step_norm, static_feats=static_feats)
             x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond, static_feats=static_feats)
             x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
-            x_dec0 = x_dec[0] if isinstance(x_dec, tuple) else x_dec
-            x_step_dist = x_dec0[:, :, -1:, :, :].permute(0, 2, 1, 3, 4).contiguous()
-            if str(self.decoder.head_mode).lower() == "gaussian":
-                out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
-                x_step_mean = x_step_dist[:, :, :out_ch, :, :]
+            
+            if isinstance(x_dec, tuple):
+                x_dec0 = x_dec[0]
             else:
-                x_step_mean = x_step_dist
+                x_dec0 = x_dec
+            
+            x_step_dist = x_dec0.permute(0, 2, 1, 3, 4).contiguous()
+            x_step_dist = x_step_dist[:, -1:, :, :, :]
+            
             if str(self.decoder.head_mode).lower() == "gaussian":
                 out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
                 mu = x_step_dist[:, :, :out_ch, :, :]
@@ -1683,11 +1733,17 @@ class ConvLRU(nn.Module):
                     mu = self.revin(mu, "denorm")
                     sigma = sigma * self.revin.stdev
                 out_list.append(torch.cat([mu, sigma], dim=2))
+                x_step_mean = mu
             elif str(self.decoder.head_mode).lower() == "token":
                 out_list.append(x_step_dist)
+                x_step_mean = x_step_dist
             else:
                 if x_step_dist.size(2) == self.revin.num_features:
-                    x_step_dist = self.revin(x_step_dist, "denorm")
-                out_list.append(x_step_dist)
+                    x_step_dist_denorm = self.revin(x_step_dist, "denorm")
+                else:
+                    x_step_dist_denorm = x_step_dist
+                out_list.append(x_step_dist_denorm)
+                x_step_mean = x_step_dist_denorm
+                
         return torch.cat(out_list, dim=1)
 

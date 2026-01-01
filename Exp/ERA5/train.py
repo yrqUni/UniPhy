@@ -59,12 +59,16 @@ MODEL_ARG_KEYS = [
     "static_ch",
     "use_selective",
     "unet",
+    "down_mode",
     "head_mode",
     "use_checkpointing",
     "pool_mode",
     "use_spectral_mixing",
     "use_anisotropic_diffusion",
     "use_advection",
+    "use_graph_interaction",
+    "use_mamba_adaptivity",
+    "use_neural_operator",
     "learnable_init_state",
     "use_wavelet_ssm",
     "use_cross_var_attn",
@@ -114,7 +118,7 @@ class Args:
         self.lru_rank = 32
         self.use_selective = True
         self.unet = True
-        self.down_mode = "pixel"
+        self.down_mode = "shuffle"
         self.use_freq_prior = False
         self.freq_rank = 8
         self.freq_gain_init = 0.0
@@ -163,6 +167,9 @@ class Args:
         self.use_spectral_mixing = True
         self.use_anisotropic_diffusion = True
         self.use_advection = True
+        self.use_graph_interaction = False
+        self.use_mamba_adaptivity = False
+        self.use_neural_operator = False
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
