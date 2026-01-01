@@ -934,7 +934,7 @@ class ConvLRULayer(nn.Module):
         self.use_anisotropic_diffusion = bool(getattr(args, "use_anisotropic_diffusion", False))
         self.use_advection = bool(getattr(args, "use_advection", False))
         self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
-        self.use_mamba_adaptivity = bool(getattr(args, "use_mamba_adaptivity", False))
+        self.use_mamba_adaptivity = bool(getattr(args, "use_adaptive_ssm", False))
         self.use_neural_operator = bool(getattr(args, "use_neural_operator", False))
         
         in_dim = (self.emb_ch if self.is_selective else (self.emb_ch + 1)) + self.latent_dim
@@ -1639,7 +1639,6 @@ class ConvLRU(nn.Module):
                     return self.revin(out_tensor, "denorm")
                 return out_tensor
 
-        # Inference Mode (I)
         if out_gen_num is None or int(out_gen_num) <= 0:
             raise ValueError("out_gen_num must be positive for inference mode")
         B = x.size(0)
@@ -1650,7 +1649,6 @@ class ConvLRU(nn.Module):
             
         out_list: List[torch.Tensor] = []
         x_norm = self.revin(x, "norm")
-        # Ensure stats are broadcast-ready for L=1
         if self.revin.mean is not None and self.revin.mean.ndim == 5:
              self.revin.mean = self.revin.mean[:, -1:, :, :, :]
         if self.revin.stdev is not None and self.revin.stdev.ndim == 5:
