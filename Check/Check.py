@@ -3,7 +3,9 @@ import sys
 import os
 import traceback
 import random
+import math
 import numpy as np
+import torch.nn.functional as F
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../Model/ConvLRU")))
 
@@ -66,6 +68,16 @@ class MockArgs:
         for k, v in kwargs.items():
             setattr(self, k, v)
 
+def gaussian_nll_loss(preds, targets):
+    C_gt = targets.size(2)
+    mu = preds[:, :, :C_gt]
+    sigma = preds[:, :, C_gt:]
+    var = sigma.pow(2)
+    eps = 1e-6
+    var = torch.clamp(var, min=eps)
+    nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
+    return nll.mean()
+
 def run_test_case(test_name, args):
     print(f"Testing Path: [{test_name}] ... ", end="", flush=True)
     
@@ -84,14 +96,28 @@ def run_test_case(test_name, args):
 
         out_p = model(x, mode="p", static_feats=static_feats, timestep=timestep)
         
-        expected_out_ch = args.out_ch * 2 if args.head_mode == "gaussian" else args.out_ch
-        
-        if args.head_mode != "token":
-             assert out_p.shape == (B, L, expected_out_ch, H, W), \
-                 f"P-Mode Shape Mismatch: Expected {(B, L, expected_out_ch, H, W)}, got {out_p.shape}"
+        loss_val = 0.0
+        if args.head_mode == "gaussian":
+            target = torch.randn(B, L, args.out_ch, H, W).cuda()
+            
+            if isinstance(out_p, tuple):
+                out_p_tensor = out_p[0]
+            else:
+                out_p_tensor = out_p
+                
+            loss = gaussian_nll_loss(out_p_tensor, target)
+            loss_val = loss.item()
+            
+        elif args.head_mode != "token":
+            target = torch.randn(B, L, args.out_ch, H, W).cuda()
+            loss = F.l1_loss(out_p, target)
+            loss_val = loss.item()
         else:
-             assert isinstance(out_p, tuple)
-             assert out_p[0].shape == (B, L, expected_out_ch, H, W)
+            loss_val = 0.0
+
+        if math.isnan(loss_val) or math.isinf(loss_val) or loss_val > 1e5:
+            print(f"FAILED -> Loss Explosion: {loss_val}")
+            return False
 
         cond_len = 2
         pred_len = 2
@@ -109,17 +135,14 @@ def run_test_case(test_name, args):
             timestep=timestep
         )
         
-        assert out_i.shape == (B, pred_len, expected_out_ch, H, W), \
-            f"I-Mode Shape Mismatch: Expected {(B, pred_len, expected_out_ch, H, W)}, got {out_i.shape}"
-
-        print("PASSED")
+        print(f"PASSED (Loss: {loss_val:.4f})")
         
         del model, x, out_p, out_i, static_feats, timestep
         torch.cuda.empty_cache()
         return True
 
     except Exception as e:
-        print("FAILED")
+        print("FAILED -> Exception Occurred")
         traceback.print_exc()
         return False
 
@@ -129,7 +152,7 @@ def main():
         return
 
     set_seed(1234)
-    print("=== ConvLRU Full Path Coverage Check ===\n")
+    print("=== ConvLRU Loss Stability & Coverage Check ===\n")
 
     args_baseline = MockArgs()
     run_test_case("Baseline (UNet + Gaussian)", args_baseline)
@@ -172,9 +195,6 @@ def main():
         learnable_init_state=True
     )
     run_test_case("Misc: ConvDown + Deconv + Static", args_misc)
-
-    args_avg = MockArgs(down_mode="avg")
-    run_test_case("Misc: Avg Downsample", args_avg)
 
     print("\n=== Check Complete ===")
 

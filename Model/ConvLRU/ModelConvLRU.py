@@ -1368,6 +1368,8 @@ class Decoder(nn.Module):
         if self.head_mode == "gaussian":
             mu, log_sigma = torch.chunk(x, 2, dim=1)
             with torch.amp.autocast("cuda", enabled=False):
+                # Clamp log_sigma for numerical stability
+                log_sigma = torch.clamp(log_sigma, min=-10.0, max=10.0)
                 sigma = F.softplus(log_sigma.float()).to(mu.dtype) + 1e-6
             return torch.cat([mu, sigma], dim=1)
         if self.head_mode == "token":
@@ -1437,7 +1439,7 @@ class ConvLRUModel(nn.Module):
                     if curr_W % 2 != 0: curr_W += 1
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
-
+                    
             self.mid_attention = BottleneckAttention(C, num_heads=8)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
@@ -1713,9 +1715,15 @@ class ConvLRU(nn.Module):
             if curr_x.ndim == 5 and curr_x.shape[1] != 1:
                 curr_x = curr_x[:, -1:, :, :, :]
 
-            if str(self.decoder.head_mode).lower() == "token":
-                if curr_x.size(2) > self.revin.num_features:
-                    curr_x = curr_x[:, :, :self.revin.num_features]
+            if curr_x.size(2) != self.embedding.input_ch:
+                 B_in, L_in, C_out, H_in, W_in = curr_x.shape
+                 C_target = self.embedding.input_ch
+                 if C_out > C_target:
+                      curr_x = curr_x[:, :, :C_target, :, :]
+                 else:
+                      diff = C_target - C_out
+                      zeros = torch.zeros(B_in, L_in, diff, H_in, W_in, device=curr_x.device, dtype=curr_x.dtype)
+                      curr_x = torch.cat([curr_x, zeros], dim=2)
             
             if curr_x.size(2) == self.revin.num_features:
                 x_step_norm = self.revin(curr_x, "norm")
