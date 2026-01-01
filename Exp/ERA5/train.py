@@ -130,7 +130,7 @@ class Args:
         self.dec_strategy = "pxsf"
         self.dec_hidden_ch = 0
         self.dec_hidden_layers_num = 0
-        self.head_mode = "diffusion"
+        self.head_mode = "gaussian"
         self.diffusion_steps = 1000
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
@@ -657,22 +657,18 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             if K == -1:
                 x = data[:, :L_eff].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
                 listT_vals = [float(args.T)] * x.shape[1]
-                target = data[:, 2 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+                target = data[:, 1 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
             else:
                 if K > L_eff:
-                    if rank == 0:
-                        msg = f"[Error] sample_k={K} > effective L={L_eff}. Fallback to -1."
-                        print(msg)
-                        logging.error(msg)
                     x = data[:, :L_eff].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
                     listT_vals = [float(args.T)] * x.shape[1]
-                    target = data[:, 2 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+                    target = data[:, 1 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
                     K = -1
                 else:
                     idxs = make_random_indices(L_eff, K)
                     x = data[:, idxs].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
                     listT_vals = build_dt_from_indices(idxs, float(args.T))
-                    tgt_idxs = np.clip(idxs[1:] + 1, 1, L_full - 1)
+                    tgt_idxs = np.clip(idxs + 1, 0, L_full - 1)
                     target = data[:, tgt_idxs].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
 
             listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
@@ -689,8 +685,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 if isinstance(preds, tuple):
                     preds = preds[0]
                 
-                preds = preds[:, 1:]
-
                 if preds.shape[2] == 2 * target.shape[2]:
                     loss = gaussian_nll_loss_weighted(preds, target)
                     p_det = preds[:, :, :target.shape[2]]
@@ -751,19 +745,15 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 if K == -1:
                     current_T_mean = float(args.T)
-                    current_T_min = float(args.T)
-                    current_T_max = float(args.T)
                     t_str = f"T={args.T}"
                 else:
                     if len(listT_vals) > 0:
                         current_T_mean = float(sum(listT_vals) / len(listT_vals))
                         current_T_min = float(min(listT_vals))
                         current_T_max = float(max(listT_vals))
+                        t_str = f"T~{current_T_mean:.2f}({current_T_min:.1f}-{current_T_max:.1f})"
                     else:
-                        current_T_mean = 0.0
-                        current_T_min = 0.0
-                        current_T_max = 0.0
-                    t_str = f"T~{current_T_mean:.2f}({current_T_min:.1f}-{current_T_max:.1f})"
+                        t_str = "T=NA"
 
                 message = (
                     f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
@@ -785,11 +775,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/loss_spec": avg_spec_loss,
                         "train/lr": float(current_lr),
                         "train/K": int(K),
-                        "train/T_mean": float(current_T_mean),
-                        "train/T_min": float(current_T_min),
-                        "train/T_max": float(current_T_max),
-                        "train/moe_num_expert": int(args.num_expert),
-                        "train/moe_active_expert": int(args.activate_expert),
                         "train/grad_norm": float(grad_norm),
                         "train/grad_max": float(grad_max),
                         "train/moe_aux_loss": avg_moe_loss,
