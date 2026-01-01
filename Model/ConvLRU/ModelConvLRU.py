@@ -537,7 +537,7 @@ class CrossVariableAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C, S, W = x.shape
-        x_reshaped = x.permute(0, 1, 3, 4, 2).contiguous()
+        x_reshaped = x.permute(0, 1, 3, 4, 2).contiguous() 
         x_flat = x_reshaped.view(B * L * S * W, C)
         shortcut = x_flat
         x_norm = self.norm(x_flat)
@@ -548,7 +548,7 @@ class CrossVariableAttention(nn.Module):
         x_attn = (attn @ v).transpose(1, 2).reshape(-1, C)
         x_attn = self.proj(x_attn)
         out = shortcut + x_attn
-        return out.view(B, L, S, W, C).permute(0, 1, 4, 2, 3).contiguous()
+        return out.view(B, L, S, W, C).permute(0, 1, 4, 2, 3).contiguous() 
 
 class WaveletBlock(nn.Module):
     def __init__(self, in_channels: int, hidden_channels: int):
@@ -595,6 +595,47 @@ class WaveletBlock(nn.Module):
         x_out_dwt = self.conv_out(x_feat)
         x_rec = self.idwt_init(x_out_dwt)
         return x_rec.view(B, L, C, H, W)
+
+class SpectralInteraction(nn.Module):
+    def __init__(self, emb_ch, rank):
+        super().__init__()
+        self.mix_real = nn.Sequential(
+            nn.Linear(rank, rank),
+            nn.Tanh(),
+            nn.Linear(rank, rank)
+        )
+        self.mix_imag = nn.Sequential(
+            nn.Linear(rank, rank),
+            nn.Tanh(),
+            nn.Linear(rank, rank)
+        )
+    def forward(self, z):
+        z_real = z.real
+        z_imag = z.imag
+        out_real = self.mix_real(z_real)
+        out_imag = self.mix_imag(z_imag)
+        return z + torch.complex(out_real, out_imag)
+
+class AdvectionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.flow_pred = nn.Sequential(
+            nn.Conv2d(channels, channels // 2, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(channels // 2, 2, 3, padding=1) 
+        )
+        nn.init.zeros_(self.flow_pred[-1].weight)
+        nn.init.zeros_(self.flow_pred[-1].bias)
+
+    def forward(self, x):
+        B, L, C, H, W = x.shape
+        x_flat = x.view(B * L, C, H, W)
+        flow = self.flow_pred(x_flat)
+        grid_y, grid_x = torch.meshgrid(torch.linspace(-1, 1, H, device=x.device), torch.linspace(-1, 1, W, device=x.device), indexing='ij')
+        grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).expand(B * L, -1, -1, -1)
+        grid_flow = grid - flow.permute(0, 2, 3, 1) 
+        x_warped = F.grid_sample(x_flat, grid_flow, mode='bilinear', padding_mode='border', align_corners=False)
+        return x_warped.view(B, L, C, H, W)
 
 class StaticInitState(nn.Module):
     def __init__(self, static_ch, emb_ch, rank, S, W_freq):
@@ -822,7 +863,15 @@ class ConvLRULayer(nn.Module):
         self.dispersion_mod = nn.Parameter(torch.zeros(2, self.emb_ch, self.rank) * 0.01)
         self.mod_hidden = 32
         self.latent_dim = 16
+        
+        self.use_spectral_mixing = bool(getattr(args, "use_spectral_mixing", False))
+        self.use_anisotropic_diffusion = bool(getattr(args, "use_anisotropic_diffusion", False))
+        self.use_advection = bool(getattr(args, "use_advection", False))
+        
         in_dim = (self.emb_ch if self.is_selective else (self.emb_ch + 1)) + self.latent_dim
+        if self.use_anisotropic_diffusion:
+            in_dim += self.emb_ch * 2
+            
         self.forcing_mlp = nn.Sequential(
             nn.Linear(in_dim, self.mod_hidden),
             nn.Tanh(),
@@ -872,15 +921,29 @@ class ConvLRULayer(nn.Module):
                 self.static_init = StaticInitState(self.static_ch, self.emb_ch, self.rank, self.S, self.W_freq)
             else:
                 self.static_init = None
+                
+        if self.use_spectral_mixing:
+            self.spec_mixer = SpectralInteraction(self.emb_ch, self.rank)
+        
+        if self.use_advection:
+            self.advection = AdvectionBlock(self.emb_ch)
 
     def _apply_forcing(self, x: torch.Tensor, dt: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         ctx = x.mean(dim=(-2, -1))
+        
         if self.is_selective:
             inp_base = ctx
         else:
             dt_feat = dt.view(x.size(0), x.size(1), 1)
             inp_base = torch.cat([ctx, dt_feat], dim=-1)
+            
         inp = torch.cat([inp_base, z], dim=-1)
+        
+        if self.use_anisotropic_diffusion:
+            grad_x = torch.mean(torch.abs(torch.diff(x, dim=-1, prepend=x[..., :1])), dim=(-2, -1))
+            grad_y = torch.mean(torch.abs(torch.diff(x, dim=-2, prepend=x[..., :1, :])), dim=(-2, -1))
+            inp = torch.cat([inp, grad_x, grad_y], dim=-1)
+
         mod = self.forcing_mlp(inp)
         mod = mod.view(x.size(0), x.size(1), self.emb_ch, self.rank, 2)
         dnu = self.forcing_scale * torch.tanh(mod[..., 0])
@@ -898,8 +961,6 @@ class ConvLRULayer(nn.Module):
         return x_out
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Input x: [B, C, L, H, W]
-        # Permute for temporal processing: [B, L, C, S, W]
         x_perm = x.permute(0, 2, 1, 3, 4)
         
         if self.use_cross_var_attn:
@@ -910,6 +971,10 @@ class ConvLRULayer(nn.Module):
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
         else:
             dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
+        
+        h_adv = None
+        if self.use_advection:
+            h_adv = self.advection(x_perm)
         
         with torch.amp.autocast("cuda", enabled=False):
             x_in_fp32 = x_perm.float()
@@ -939,6 +1004,10 @@ class ConvLRULayer(nn.Module):
             zq = zq * scale_v
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
+            
+            if self.use_spectral_mixing:
+                zq = self.spec_mixer(zq)
+
             log_dt = self.log_dt_min + self.steps * (self.log_dt_max - self.log_dt_min)
             ts = torch.exp(log_dt)
             nu_init = 1.0 / ts
@@ -947,7 +1016,9 @@ class ConvLRULayer(nn.Module):
             disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
             nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
+            
             dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32, z)
+            
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
@@ -984,16 +1055,18 @@ class ConvLRULayer(nn.Module):
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
             h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
             feat_final = self._hybrid_inverse_transform(h_rec_fwd)
+        
         feat_final = feat_final.to(x.dtype)
-        feat_final_perm = feat_final.permute(0, 2, 1, 3, 4)
+        feat_final_perm = feat_final.permute(0, 2, 1, 3, 4) 
         h_final = self.post_ifft_proj(feat_final_perm)
+        
+        if h_adv is not None:
+            h_final = h_final + h_adv.permute(0, 2, 1, 3, 4)
+
         if self.sh_prior is not None:
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         
         if self.use_wavelet_ssm:
-            # WaveletBlock output is [B, L, C, H, W]
-            # h_final is [B, C, L, H, W]
-            # Need to permute WaveletBlock output to match h_final
             h_final = h_final + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
         
         x_local = self.local_conv(x)

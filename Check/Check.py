@@ -34,17 +34,20 @@ class MockArgs:
         self.sh_Lmax = 2
         self.sh_rank = 4
         self.sh_gain_init = 0.0
+        self.use_spectral_mixing = True
+        self.use_anisotropic_diffusion = True
+        self.use_advection = True
+        self.learnable_init_state = True
+        self.use_wavelet_ssm = True
+        self.use_cross_var_attn = True
+        self.ConvType = "dcn"
+        self.Arch = "bifpn"
         self.head_mode = "flow"
         self.dec_hidden_ch = 32
         self.dec_hidden_layers_num = 1
         self.dec_strategy = "pxsf"
         self.unet = True
         self.down_mode = "shuffle"
-        self.ConvType = "dcn"
-        self.Arch = "bifpn"
-        self.learnable_init_state = True
-        self.use_wavelet_ssm = True
-        self.use_cross_var_attn = True
 
 def check_equivalence():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -122,7 +125,6 @@ def check_equivalence():
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
 
-    print(f"Config: DCN={args.ConvType}, BiFPN={args.Arch}, InitState={args.learnable_init_state}, Wavelet={args.use_wavelet_ssm}, CrossAttn={args.use_cross_var_attn}, Head={args.head_mode}")
     print(f"Max Absolute Difference: {max_diff:.6e}")
     print(f"Mean Absolute Difference: {mean_diff:.6e}")
 
