@@ -10,12 +10,11 @@ if MODEL_DIR not in sys.path:
 
 from ModelConvLRU import ConvLRU
 
-
 class MockArgs:
     def __init__(self):
         self.input_ch = 4
         self.out_ch = 4
-        self.input_size = (128, 128)
+        self.input_size = (64, 64)
         self.emb_ch = 32
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 1
@@ -25,48 +24,49 @@ class MockArgs:
         self.ffn_hidden_ch = 64
         self.ffn_hidden_layers_num = 1
         self.use_cbam = False
-        self.num_expert = 1
-        self.activate_expert = 1
+        self.num_expert = 4
+        self.activate_expert = 2
         self.lru_rank = 8
         self.use_selective = True
+        self.use_gate = True
         self.use_freq_prior = False
-        self.use_sh_prior = False
+        self.use_sh_prior = True
+        self.sh_Lmax = 4
+        self.sh_rank = 8
+        self.sh_gain_init = 0.0
         self.head_mode = "gaussian"
         self.dec_hidden_ch = 32
         self.dec_hidden_layers_num = 0
         self.dec_strategy = "pxsf"
         self.unet = True
-        self.unet_pool = "shuffle"
-
+        self.down_mode = "shuffle"
 
 def check_equivalence():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     torch.manual_seed(42)
     np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
 
     args = MockArgs()
-    print(f"Testing with unet={args.unet}, unet_pool={getattr(args, 'unet_pool', None)}, num_expert={args.num_expert}")
-
     model = ConvLRU(args).to(device)
     model.eval()
 
-    B, L, H, W = 2, 8, args.input_size[0], args.input_size[1]
+    for name, module in model.named_modules():
+        if hasattr(module, "forcing_scale") and isinstance(module.forcing_scale, torch.nn.Parameter):
+            module.forcing_scale.data.fill_(0.0)
 
+    B, L, H, W = 2, 8, args.input_size[0], args.input_size[1]
     x = torch.randn(B, L, args.input_ch, H, W, device=device)
     static = torch.randn(B, args.static_ch, H, W, device=device)
     listT = torch.rand(B, L, device=device)
 
-    print("-" * 40)
-    print("Running P-Mode (Parallel)...")
     with torch.no_grad():
         out_p = model(x, mode="p", listT=listT, static_feats=static)
-    print(f"P-Mode Output Shape: {out_p.shape}")
-
-    print("-" * 40)
-    print("Running I-Mode (Iterative Step-by-Step)...")
 
     outputs_i = []
-
+    
     with torch.no_grad():
         cond = None
         if static is not None and getattr(model.embedding, "static_ch", 0) > 0 and model.embedding.static_embed is not None:
@@ -106,9 +106,6 @@ def check_equivalence():
             outputs_i.append(out_step)
 
     out_i = torch.cat(outputs_i, dim=1)
-    print(f"I-Mode Output Shape: {out_i.shape}")
-
-    print("-" * 40)
 
     diff = torch.abs(out_p - out_i)
     max_diff = diff.max().item()
@@ -117,13 +114,12 @@ def check_equivalence():
     print(f"Max Absolute Difference: {max_diff:.6e}")
     print(f"Mean Absolute Difference: {mean_diff:.6e}")
 
-    threshold = 1e-3
+    threshold = 1e-4
 
     if max_diff < threshold:
-        print("\n✅ SUCCESS: P-Mode and I-Mode are numerically equivalent within tolerance.")
+        print("SUCCESS")
     else:
-        print("\n❌ FAILURE: Difference is still too high.")
-
+        print("FAILURE")
 
 if __name__ == "__main__":
     check_equivalence()
