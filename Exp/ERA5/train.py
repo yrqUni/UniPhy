@@ -67,7 +67,7 @@ MODEL_ARG_KEYS = [
     "use_anisotropic_diffusion",
     "use_advection",
     "use_graph_interaction",
-    "use_mamba_adaptivity",
+    "use_adaptive_ssm",
     "use_neural_operator",
     "learnable_init_state",
     "use_wavelet_ssm",
@@ -168,7 +168,7 @@ class Args:
         self.use_anisotropic_diffusion = True
         self.use_advection = True
         self.use_graph_interaction = False
-        self.use_mamba_adaptivity = False
+        self.use_adaptive_ssm = False
         self.use_neural_operator = False
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
@@ -685,6 +685,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
+                
+                if isinstance(preds, tuple):
+                    preds = preds[0]
+                
                 preds = preds[:, 1:]
 
                 if preds.shape[2] == 2 * target.shape[2]:
