@@ -1473,6 +1473,11 @@ class ConvLRUModel(nn.Module):
             if i < len(self.down_blocks) - 1:
                 skips.append(x)
                 x_s = x
+                if self.down_mode in ["shuffle", "avg", "conv"]:
+                    pad_h = x_s.shape[-2] % 2
+                    pad_w = x_s.shape[-1] % 2
+                    if pad_h > 0 or pad_w > 0:
+                        x_s = F.pad(x_s, (0, pad_w, 0, pad_h))
                 if x_s.shape[-2] >= 2 and x_s.shape[-1] >= 2:
                     x_s = self.downsamples[i](x_s)
                 x = x_s
