@@ -14,8 +14,8 @@ sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
 from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
-from convlru_train_ddp import Args as TrainArgs
-from convlru_train_ddp import load_model_args_from_ckpt, apply_model_args
+from train import Args as TrainArgs
+from train import load_model_args_from_ckpt, apply_model_args
 
 
 class InferenceArgs:
