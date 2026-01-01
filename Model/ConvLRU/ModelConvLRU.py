@@ -536,9 +536,8 @@ class CrossVariableAttention(nn.Module):
         self.norm = nn.LayerNorm(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input x: [B, L, C, H, W]
         B, L, C, S, W = x.shape
-        x_reshaped = x.permute(0, 1, 3, 4, 2).contiguous() # [B, L, S, W, C]
+        x_reshaped = x.permute(0, 1, 3, 4, 2).contiguous()
         x_flat = x_reshaped.view(B * L * S * W, C)
         shortcut = x_flat
         x_norm = self.norm(x_flat)
@@ -549,7 +548,7 @@ class CrossVariableAttention(nn.Module):
         x_attn = (attn @ v).transpose(1, 2).reshape(-1, C)
         x_attn = self.proj(x_attn)
         out = shortcut + x_attn
-        return out.view(B, L, S, W, C).permute(0, 1, 4, 2, 3).contiguous() # Return [B, L, C, S, W]
+        return out.view(B, L, S, W, C).permute(0, 1, 4, 2, 3).contiguous()
 
 class WaveletBlock(nn.Module):
     def __init__(self, in_channels: int, hidden_channels: int):
@@ -992,7 +991,9 @@ class ConvLRULayer(nn.Module):
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         
         if self.use_wavelet_ssm:
-            # Pass [B, L, C, S, W] directly
+            # WaveletBlock output is [B, L, C, H, W]
+            # h_final is [B, C, L, H, W]
+            # Need to permute WaveletBlock output to match h_final
             h_final = h_final + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
         
         x_local = self.local_conv(x)
