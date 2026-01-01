@@ -796,6 +796,7 @@ class SpatialPatchMoE(nn.Module):
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
         self.router = nn.Linear(router_in_dim, self.num_experts)
         self.aux_loss = 0.0
+        self.norm = RMSNorm(self.channels)
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         self.aux_loss = 0.0
@@ -892,6 +893,10 @@ class SpatialPatchMoE(nn.Module):
         sorted_token_ids = token_ids[sorted_args]
         out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
         
+        out_patches_reshaped = out_patches.view(B * nH * nW * L, C, 1, P, P).squeeze(2).permute(0, 2, 3, 1) 
+        out_patches_norm = self.norm(out_patches_reshaped)
+        out_patches = out_patches_norm.permute(0, 3, 1, 2).unsqueeze(2) 
+
         out = (
             out_patches.view(B, nH, nW, L, C, P, P)
             .permute(0, 4, 3, 1, 5, 2, 6)
@@ -1368,8 +1373,7 @@ class Decoder(nn.Module):
         if self.head_mode == "gaussian":
             mu, log_sigma = torch.chunk(x, 2, dim=1)
             with torch.amp.autocast("cuda", enabled=False):
-                # Clamp log_sigma for numerical stability
-                log_sigma = torch.clamp(log_sigma, min=-10.0, max=10.0)
+                log_sigma = torch.clamp(log_sigma, min=-5.0, max=5.0)
                 sigma = F.softplus(log_sigma.float()).to(mu.dtype) + 1e-6
             return torch.cat([mu, sigma], dim=1)
         if self.head_mode == "token":
@@ -1439,7 +1443,7 @@ class ConvLRUModel(nn.Module):
                     if curr_W % 2 != 0: curr_W += 1
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
-                    
+
             self.mid_attention = BottleneckAttention(C, num_heads=8)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
