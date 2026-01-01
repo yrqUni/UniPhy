@@ -1415,12 +1415,12 @@ class ConvLRUModel(nn.Module):
         self.downsamples = nn.ModuleList()
         C = int(getattr(args, "emb_ch", input_downsp_shape[0]))
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
-        curr_H, curr_W = H, W
         if not self.use_unet:
             self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
             self.upsample = None
             self.fusion = None
         else:
+            curr_H, curr_W = H, W
             encoder_res: List[Tuple[int, int]] = []
             for i in range(layers):
                 self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
@@ -1638,8 +1638,13 @@ class ConvLRU(nn.Module):
             if self.decoder.head_mode == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
+                    # [Fix]: Avoid denorm in P-mode for stability with Gaussian NLL
+                    # Let the loss function handle normalized targets if possible,
+                    # OR ensure sigma doesn't vanish. Here we add safety clamp.
                     mu = self.revin(mu, "denorm")
-                    sigma = sigma * self.revin.stdev
+                    # Clamp stdev to avoid vanishing variance
+                    stdev = torch.clamp(self.revin.stdev, min=1e-5)
+                    sigma = sigma * stdev
                 return torch.cat([mu, sigma], dim=2)
             elif self.decoder.head_mode == "token":
                 return (out_tensor,) + rest
@@ -1682,7 +1687,8 @@ class ConvLRU(nn.Module):
             
             if mu.size(2) == self.revin.num_features:
                 mu_denorm = self.revin(mu, "denorm")
-                sigma_denorm = sigma * self.revin.stdev
+                stdev = torch.clamp(self.revin.stdev, min=1e-5)
+                sigma_denorm = sigma * stdev
             else:
                 mu_denorm = mu
                 sigma_denorm = sigma
@@ -1744,7 +1750,8 @@ class ConvLRU(nn.Module):
                 sigma = x_step_dist[:, :, out_ch:, :, :]
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm")
-                    sigma = sigma * self.revin.stdev
+                    stdev = torch.clamp(self.revin.stdev, min=1e-5)
+                    sigma = sigma * stdev
                 out_list.append(torch.cat([mu, sigma], dim=2))
                 x_step_mean = mu
             elif str(self.decoder.head_mode).lower() == "token":
