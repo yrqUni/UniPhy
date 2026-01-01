@@ -14,32 +14,37 @@ class MockArgs:
     def __init__(self):
         self.input_ch = 4
         self.out_ch = 4
-        self.input_size = (64, 64)
+        self.input_size = (32, 32)
         self.emb_ch = 32
         self.emb_hidden_ch = 32
         self.emb_hidden_layers_num = 1
         self.static_ch = 2
-        self.hidden_factor = (2, 2)
+        self.hidden_factor = (1, 1)
         self.convlru_num_blocks = 2
         self.ffn_hidden_ch = 64
         self.ffn_hidden_layers_num = 1
         self.use_cbam = False
-        self.num_expert = 4
-        self.activate_expert = 2
-        self.lru_rank = 8
+        self.num_expert = 2
+        self.activate_expert = 1
+        self.lru_rank = 4
         self.use_selective = True
         self.use_gate = True
         self.use_freq_prior = False
         self.use_sh_prior = True
-        self.sh_Lmax = 4
-        self.sh_rank = 8
+        self.sh_Lmax = 2
+        self.sh_rank = 4
         self.sh_gain_init = 0.0
-        self.head_mode = "gaussian"
+        self.head_mode = "flow"
         self.dec_hidden_ch = 32
-        self.dec_hidden_layers_num = 0
+        self.dec_hidden_layers_num = 1
         self.dec_strategy = "pxsf"
         self.unet = True
         self.down_mode = "shuffle"
+        self.ConvType = "dcn"
+        self.Arch = "bifpn"
+        self.learnable_init_state = True
+        self.use_wavelet_ssm = True
+        self.use_cross_var_attn = True
 
 def check_equivalence():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -48,6 +53,8 @@ def check_equivalence():
     np.random.seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     args = MockArgs()
     model = ConvLRU(args).to(device)
@@ -57,13 +64,14 @@ def check_equivalence():
         if hasattr(module, "forcing_scale") and isinstance(module.forcing_scale, torch.nn.Parameter):
             module.forcing_scale.data.fill_(0.0)
 
-    B, L, H, W = 2, 8, args.input_size[0], args.input_size[1]
+    B, L, H, W = 2, 4, args.input_size[0], args.input_size[1]
     x = torch.randn(B, L, args.input_ch, H, W, device=device)
     static = torch.randn(B, args.static_ch, H, W, device=device)
     listT = torch.rand(B, L, device=device)
+    timestep = torch.rand(B, device=device)
 
     with torch.no_grad():
-        out_p = model(x, mode="p", listT=listT, static_feats=static)
+        out_p = model(x, mode="p", listT=listT, static_feats=static, timestep=timestep)
 
     outputs_i = []
     
@@ -86,9 +94,10 @@ def check_equivalence():
                 last_hidden_ins=last_hidden_ins,
                 listT=dt_t,
                 cond=cond,
+                static_feats=static
             )
 
-            out_t = model.decoder(x_t_hid, cond=cond, timestep=None)
+            out_t = model.decoder(x_t_hid, cond=cond, timestep=timestep)
             out_t = out_t.permute(0, 2, 1, 3, 4).contiguous()
 
             if model.decoder.head_mode == "gaussian":
@@ -97,6 +106,8 @@ def check_equivalence():
                     mu = model.revin(mu, "denorm")
                     sigma = sigma * model.revin.stdev
                 out_step = torch.cat([mu, sigma], dim=2)
+            elif model.decoder.head_mode == "token":
+                out_step = out_t
             else:
                 if out_t.size(2) == model.revin.num_features:
                     out_step = model.revin(out_t, "denorm")
@@ -111,6 +122,7 @@ def check_equivalence():
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
 
+    print(f"Config: DCN={args.ConvType}, BiFPN={args.Arch}, InitState={args.learnable_init_state}, Wavelet={args.use_wavelet_ssm}, CrossAttn={args.use_cross_var_attn}, Head={args.head_mode}")
     print(f"Max Absolute Difference: {max_diff:.6e}")
     print(f"Mean Absolute Difference: {mean_diff:.6e}")
 

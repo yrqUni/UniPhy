@@ -308,6 +308,31 @@ class DiscreteCosineTransform(nn.Module):
         out = torch.matmul(x, self.dct_matrix)
         return out.transpose(self.dim, -1)
 
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.modes1 = int(modes1)
+        self.modes2 = int(modes2)
+        scale = 1.0 / max(1, (self.in_channels * self.out_channels))
+        self.weights1 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+
+    def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
+        with torch.amp.autocast("cuda", enabled=False):
+            if not torch.is_complex(x_ft):
+                x_ft = x_ft.to(torch.cfloat)
+            B, L, C, H, W_freq = x_ft.shape
+            out_ft = torch.zeros(B, L, self.out_channels, H, W_freq, device=x_ft.device, dtype=torch.cfloat)
+            m1 = min(H, self.modes1)
+            m2 = min(W_freq, self.modes2)
+            if m1 > 0 and m2 > 0:
+                out_ft[:, :, :, :m1, :m2] = torch.einsum("blcxy,coxy->bloxy", x_ft[:, :, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
+            if m1 > 0 and m2 > 0 and H > 1:
+                out_ft[:, :, :, -m1:, :m2] = torch.einsum("blcxy,coxy->bloxy", x_ft[:, :, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
+            return out_ft
+
 class DynamicSphericalHarmonicsPrior(nn.Module):
     def __init__(self, channels: int, H: int, W: int, Lmax: int = 6, rank: int = 8, gain_init: float = 0.0):
         super().__init__()
@@ -511,8 +536,9 @@ class CrossVariableAttention(nn.Module):
         self.norm = nn.LayerNorm(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x: [B, L, C, H, W]
         B, L, C, S, W = x.shape
-        x_reshaped = x.permute(0, 1, 3, 4, 2).contiguous()
+        x_reshaped = x.permute(0, 1, 3, 4, 2).contiguous() # [B, L, S, W, C]
         x_flat = x_reshaped.view(B * L * S * W, C)
         shortcut = x_flat
         x_norm = self.norm(x_flat)
@@ -523,7 +549,7 @@ class CrossVariableAttention(nn.Module):
         x_attn = (attn @ v).transpose(1, 2).reshape(-1, C)
         x_attn = self.proj(x_attn)
         out = shortcut + x_attn
-        return out.view(B, L, S, W, C).permute(0, 1, 4, 2, 3).contiguous()
+        return out.view(B, L, S, W, C).permute(0, 1, 4, 2, 3).contiguous() # Return [B, L, C, S, W]
 
 class WaveletBlock(nn.Module):
     def __init__(self, in_channels: int, hidden_channels: int):
@@ -563,7 +589,7 @@ class WaveletBlock(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        x_flat = x.view(B * L, C, H, W)
+        x_flat = x.reshape(B * L, C, H, W)
         x_dwt = self.dwt_init(x_flat)
         x_feat = self.conv(x_dwt)
         x_feat = F.silu(x_feat)
@@ -582,18 +608,19 @@ class StaticInitState(nn.Module):
         self.mapper = nn.Sequential(
             nn.Conv2d(static_ch, emb_ch, kernel_size=3, padding=1),
             nn.SiLU(),
-            nn.AdaptiveAvgPool2d((S, W_freq)),
+            nn.AdaptiveAvgPool2d((1, W_freq)),
             nn.Conv2d(emb_ch, emb_ch * rank * 2, kernel_size=1) 
         )
 
     def forward(self, static_feats):
         B = static_feats.size(0)
         out = self.mapper(static_feats) 
-        out = out.view(B, self.emb_ch, self.rank * 2, self.S, self.W_freq)
-        out_real = out[:, :, :self.rank, :, :]
-        out_imag = out[:, :, self.rank:, :, :]
+        out = out.squeeze(2)
+        out = out.view(B, self.emb_ch, self.rank * 2, self.W_freq)
+        out_real = out[:, :, :self.rank, :]
+        out_imag = out[:, :, self.rank:, :]
         init_state = torch.complex(out_real, out_imag)
-        init_state = init_state.permute(0, 1, 3, 4, 2).contiguous()
+        init_state = init_state.permute(0, 1, 3, 2).contiguous()
         return init_state.unsqueeze(1) 
 
 class GatedConvBlock(nn.Module):
@@ -872,7 +899,10 @@ class ConvLRULayer(nn.Module):
         return x_out
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Input x: [B, C, L, H, W]
+        # Permute for temporal processing: [B, L, C, S, W]
         x_perm = x.permute(0, 2, 1, 3, 4)
+        
         if self.use_cross_var_attn:
             x_perm = self.cross_var_attn(x_perm)
         
@@ -962,7 +992,8 @@ class ConvLRULayer(nn.Module):
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         
         if self.use_wavelet_ssm:
-            h_final = h_final + self.wavelet_block(x_perm.permute(0, 2, 1, 3, 4))
+            # Pass [B, L, C, S, W] directly
+            h_final = h_final + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
         
         x_local = self.local_conv(x)
         h_final = h_final + x_local
