@@ -115,7 +115,7 @@ class Args:
         self.use_selective = True
         self.unet = True
         self.down_mode = "pixel"
-        self.use_freq_prior = True
+        self.use_freq_prior = False
         self.freq_rank = 8
         self.freq_gain_init = 0.0
         self.freq_mode = "linear"
@@ -141,7 +141,7 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
-        self.use_tf32 = False
+        self.use_tf32 = True
         self.use_compile = False
         self.lr = 1e-5
         self.weight_decay = 0.05
@@ -149,9 +149,9 @@ class Args:
         self.init_lr_scheduler = False
         self.loss = "lat"
         self.T = 6
-        self.use_amp = False
-        self.amp_dtype = "fp16"
-        self.grad_clip = 0.00
+        self.use_amp = True
+        self.amp_dtype = "bf16"
+        self.grad_clip = 1.0
         self.sample_k = 9
         self.use_wandb = True
         self.wandb_project = "ERA5"
@@ -171,13 +171,8 @@ class Args:
         self.check_args()
 
     def check_args(self) -> None:
-        if bool(self.use_amp):
-            print("[Warning] AMP is disabled by policy. Forcing use_amp=False.")
-            logging.warning("AMP is disabled by policy. Forcing use_amp=False.")
-            self.use_amp = False
         if bool(self.use_compile):
             print("[Warning] Torch Compile is experimental. Use with caution.")
-            logging.warning("Torch Compile is experimental. Use with caution.")
 
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
@@ -259,11 +254,6 @@ def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Opti
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    if not model_args:
-        print("[Args] Warning: no model_args found in ckpt, using code defaults.")
-        if dist.is_initialized() and dist.get_rank() == 0:
-            logging.warning("[Args] no model_args found in ckpt, using code defaults.")
-        return None
     return model_args
 
 
@@ -422,12 +412,14 @@ def get_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor:
             total_aux_loss = total_aux_loss + module.aux_loss
     return total_aux_loss
 
+
 def get_kl_loss(model: torch.nn.Module) -> torch.Tensor:
     total_kl_loss = torch.tensor(0.0, device=next(model.parameters()).device)
     model_to_search = model.module if isinstance(model, DDP) else model
     if hasattr(model_to_search, "get_total_kl_loss"):
         return model_to_search.get_total_kl_loss()
     return total_kl_loss
+
 
 _LRU_GATE_MEAN: Dict[Any, float] = {}
 
@@ -630,8 +622,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if int(args.static_ch) > 0 and static_data_cpu is not None:
         static_gpu = static_data_cpu.to(device=torch.device(f"cuda:{local_rank}"), dtype=torch.float32, non_blocking=True)
 
-    amp_dtype = torch.float16 if str(args.amp_dtype).lower() == "fp16" else torch.bfloat16
-    use_amp = False
+    amp_dtype = torch.bfloat16 if str(args.amp_dtype).lower() == "bf16" else torch.float16
+    use_amp = bool(args.use_amp)
 
     for ep in range(int(start_epoch), int(args.epochs)):
         train_sampler.set_epoch(ep)
