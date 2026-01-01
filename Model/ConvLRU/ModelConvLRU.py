@@ -1437,7 +1437,7 @@ class ConvLRUModel(nn.Module):
                     self.csa_blocks.append(BiFPNFusion(C))
                 else:
                     self.csa_blocks.append(CrossScaleAttentionGate(C))
-            self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+            self.upsample = nn.Upsample(scale_factor=(1, 2, 2), mode="nearest")
             if self.arch_mode == "unet":
                 self.fusion = nn.Conv3d(C * 2, C, 1)
             else:
