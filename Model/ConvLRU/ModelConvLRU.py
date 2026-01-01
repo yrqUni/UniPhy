@@ -145,7 +145,7 @@ class RMSNorm(nn.Module):
         orig_shape = x.shape
         if x.dim() == 5:
             x = x.permute(0, 2, 3, 4, 1).contiguous()
-        x_flat = x.view(-1, self.channels)
+        x_flat = x.reshape(-1, self.channels)
         if not x_flat.is_contiguous():
             x_flat = x_flat.contiguous()
         M, N = x_flat.shape
@@ -893,7 +893,7 @@ class SpatialPatchMoE(nn.Module):
         sorted_token_ids = token_ids[sorted_args]
         out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
         
-        out_patches_reshaped = out_patches.view(B * nH * nW * L, C, 1, P, P).squeeze(2).permute(0, 2, 3, 1) 
+        out_patches_reshaped = out_patches.view(B * nH * nW * L, C, 1, P, P).squeeze(2).permute(0, 2, 3, 1).contiguous()
         out_patches_norm = self.norm(out_patches_reshaped)
         out_patches = out_patches_norm.permute(0, 3, 1, 2).unsqueeze(2) 
 
@@ -1443,7 +1443,7 @@ class ConvLRUModel(nn.Module):
                     if curr_W % 2 != 0: curr_W += 1
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
-
+                    
             self.mid_attention = BottleneckAttention(C, num_heads=8)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
