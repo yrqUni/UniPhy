@@ -141,7 +141,7 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
-        self.use_tf32 = False
+        self.use_tf32 = True
         self.use_compile = False
         self.lr = 1e-5
         self.weight_decay = 0.05
@@ -149,7 +149,7 @@ class Args:
         self.init_lr_scheduler = False
         self.loss = "lat"
         self.T = 6
-        self.use_amp = False
+        self.use_amp = True
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
         self.sample_k = 9
@@ -695,7 +695,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 
                 loss = loss + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss + 1e-6 * kl_loss
                 
-                loss = loss + 0.0 * sum(p.sum() for p in model.parameters() if p.requires_grad)
+                # Dummy loss to include all parameters in the graph (crucial for complex parameters)
+                loss = loss + 0.0 * sum(p.abs().sum() for p in model.parameters() if p.requires_grad)
 
             loss.backward()
 
