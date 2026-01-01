@@ -1077,6 +1077,9 @@ class ConvLRULayer(nn.Module):
 
         if self.sh_prior is not None:
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+
+        if self.freq_prior is not None:
+            h_final = self.freq_prior(h_final)
         
         if self.use_wavelet_ssm:
             h_final = h_final + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
