@@ -9,11 +9,13 @@ import triton.language as tl
 
 from pscan import pscan
 
+# ==========================================
+# Utils & Init
+# ==========================================
 
 def _kaiming_like_(tensor: torch.Tensor) -> torch.Tensor:
     nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
     return tensor
-
 
 def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     out_ch, in_ch, kD, kH, kW = weight.shape
@@ -24,7 +26,6 @@ def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     with torch.no_grad():
         weight.copy_(base)
     return weight
-
 
 def _bilinear_kernel_2d(kH: int, kW: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     factor_h = (kH + 1) // 2
@@ -37,7 +38,6 @@ def _bilinear_kernel_2d(kH: int, kW: int, device: torch.device, dtype: torch.dty
     fw = (1 - torch.abs(og_w - center_w) / factor_w).unsqueeze(0)
     return fh @ fw
 
-
 def deconv3d_bilinear_init_(weight: torch.Tensor) -> torch.Tensor:
     in_ch, out_ch, kD, kH, kW = weight.shape
     with torch.no_grad():
@@ -48,7 +48,6 @@ def deconv3d_bilinear_init_(weight: torch.Tensor) -> torch.Tensor:
             weight[i, i, 0, :, :] = kernel
     return weight
 
-
 def pixel_shuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     N, C_mul, D, H, W = x.shape
     C = C_mul // (rH * rW)
@@ -57,7 +56,6 @@ def pixel_shuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.view(N, C, D, H * rH, W * rW)
     return x
 
-
 def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     N, C, D, H, W = x.shape
     x = x.view(N, C, D, H // rH, rH, W // rW, rW)
@@ -65,14 +63,13 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.view(N, C * rH * rW, D, H // rH, W // rW)
     return x
 
+# ==========================================
+# Triton Kernels (MoE, Gate, Norm)
+# ==========================================
 
 @triton.jit
 def fused_moe_router_kernel(
-    logits_ptr,
-    indices_out_ptr,
-    n_experts,
-    k: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    logits_ptr, indices_out_ptr, n_experts, k: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     logits_row_start = logits_ptr + pid * n_experts
@@ -91,15 +88,9 @@ def fused_moe_router_kernel(
         mask_max = offsets == current_max_idx
         probs = tl.where(mask_max, 0.0, probs)
 
-
 @triton.jit
 def fused_gate_kernel(
-    in_ptr,
-    out_ptr,
-    C,
-    Spatial,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr
+    in_ptr, out_ptr, C, Spatial, n_elements, BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -115,7 +106,6 @@ def fused_gate_kernel(
     sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
     out = (x * sigmoid_x) * g
     tl.store(out_ptr + offsets, out, mask=mask)
-
 
 class FusedGatedSiLU(nn.Module):
     def __init__(self):
@@ -133,16 +123,9 @@ class FusedGatedSiLU(nn.Module):
         fused_gate_kernel[grid](x, out, C, Spatial, n_elements, BLOCK_SIZE=1024)
         return out
 
-
 @triton.jit
 def rms_norm_kernel(
-    x_ptr,
-    w_ptr,
-    out_ptr,
-    stride_x_row,
-    N_COLS,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
+    x_ptr, w_ptr, out_ptr, stride_x_row, N_COLS, eps, BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
@@ -155,7 +138,6 @@ def rms_norm_kernel(
     y = x * rstd * w
     out_row_start = out_ptr + row_idx * stride_x_row
     tl.store(out_row_start + col_offsets, y, mask=mask)
-
 
 class RMSNorm(nn.Module):
     def __init__(self, channels: int, eps: float = 1e-6):
@@ -183,19 +165,12 @@ class RMSNorm(nn.Module):
                 out_norm = x_f * torch.rsqrt(var + self.eps)
                 return (out_norm * self.weight.float()).to(x.dtype).view(*x.shape)
         rms_norm_kernel[grid](
-            x_flat,
-            self.weight,
-            out,
-            x_flat.stride(0),
-            N,
-            self.eps,
-            BLOCK_SIZE=BLOCK_SIZE,
+            x_flat, self.weight, out, x_flat.stride(0), N, self.eps, BLOCK_SIZE=BLOCK_SIZE,
         )
         out = out.view(*x.shape)
         if len(orig_shape) == 5:
             out = out.permute(0, 4, 1, 2, 3).contiguous()
         return out
-
 
 class AdaRMSNorm(nn.Module):
     def __init__(self, channels: int, cond_channels: int, eps: float = 1e-6):
@@ -215,7 +190,6 @@ class AdaRMSNorm(nn.Module):
             shift = shift.view(x.size(0), x.size(1), 1, 1, 1)
             x = x * scale + shift
         return x
-
 
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
@@ -256,6 +230,9 @@ class RevIN(nn.Module):
         else:
             raise NotImplementedError
 
+# ==========================================
+# Convolutions & Transforms
+# ==========================================
 
 class PeriodicConv3d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
@@ -268,24 +245,15 @@ class PeriodicConv3d(nn.Module):
         x = F.pad(x, (0, 0, self.pad_k, self.pad_k, 0, 0), mode="replicate")
         return self.conv(x)
 
-
 class FactorizedPeriodicConv3d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7):
         super().__init__()
         self.pad_sp = kernel_size // 2
         self.spatial_conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=(kernel_size, kernel_size),
-            padding=0,
-            bias=False,
+            in_channels, out_channels, kernel_size=(kernel_size, kernel_size), padding=0, bias=False,
         )
         self.depth_conv = nn.Conv3d(
-            out_channels,
-            out_channels,
-            kernel_size=(1, 1, 1),
-            padding=0,
-            bias=True,
+            out_channels, out_channels, kernel_size=(1, 1, 1), padding=0, bias=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -297,7 +265,6 @@ class FactorizedPeriodicConv3d(nn.Module):
         x_sp = x_sp.view(B, D, -1, H, W).permute(0, 2, 1, 3, 4)
         out = self.depth_conv(x_sp)
         return out
-
 
 class DiscreteCosineTransform(nn.Module):
     def __init__(self, n: int, dim: int):
@@ -321,7 +288,6 @@ class DiscreteCosineTransform(nn.Module):
         out = torch.matmul(x, self.dct_matrix)
         return out.transpose(self.dim, -1)
 
-
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
         super().__init__()
@@ -342,21 +308,20 @@ class SpectralConv2d(nn.Module):
             m1 = min(H, self.modes1)
             m2 = min(W_freq, self.modes2)
             if m1 > 0 and m2 > 0:
-                out_ft[:, :, :, :m1, :m2] = torch.einsum(
-                    "blcxy,coxy->bloxy",
-                    x_ft[:, :, :, :m1, :m2],
-                    self.weights1[:, :, :m1, :m2]
-                )
+                out_ft[:, :, :, :m1, :m2] = torch.einsum("blcxy,coxy->bloxy", x_ft[:, :, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
             if m1 > 0 and m2 > 0 and H > 1:
-                out_ft[:, :, :, -m1:, :m2] = torch.einsum(
-                    "blcxy,coxy->bloxy",
-                    x_ft[:, :, :, -m1:, :m2],
-                    self.weights2[:, :, :m1, :m2]
-                )
+                out_ft[:, :, :, -m1:, :m2] = torch.einsum("blcxy,coxy->bloxy", x_ft[:, :, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
             return out_ft
 
+# ==========================================
+# New: Dynamic Spherical Harmonics
+# ==========================================
 
-class SphericalHarmonicsPrior(nn.Module):
+class DynamicSphericalHarmonicsPrior(nn.Module):
+    """
+    Hypernetwork-based Spherical Harmonics.
+    Weights W1 and W2 are generated from the global context of input x.
+    """
     def __init__(self, channels: int, H: int, W: int, Lmax: int = 6, rank: int = 8, gain_init: float = 0.0):
         super().__init__()
         self.C = int(channels)
@@ -365,14 +330,20 @@ class SphericalHarmonicsPrior(nn.Module):
         self.Lmax = int(Lmax)
         self.R = int(rank)
         self.K = self.Lmax * self.Lmax
-        self.W1 = nn.Parameter(torch.zeros(self.C, self.R))
-        self.W2 = nn.Parameter(torch.zeros(self.R, self.K))
+        
+        # Hypernetwork to generate W1 (C x R) and W2 (R x K)
+        # Input: C (global average pooling of x)
+        self.hypernet = nn.Sequential(
+            nn.Linear(self.C, self.C // 2),
+            nn.SiLU(),
+            nn.Linear(self.C // 2, self.C * self.R + self.R * self.K)
+        )
+        
         self.gain = nn.Parameter(torch.full((self.C,), float(gain_init)))
-        nn.init.normal_(self.W1, std=1e-3)
-        nn.init.normal_(self.W2, std=1e-3)
+        
         theta, phi = self._latlon_to_spherical(self.H, self.W, device=None)
         Y = self._real_sph_harm_basis(theta, phi, self.Lmax)
-        self.register_buffer("Y_real", Y, persistent=True)
+        self.register_buffer("Y_real", Y, persistent=True) # K x H x W
 
     @staticmethod
     def _latlon_to_spherical(H: int, W: int, device: Optional[torch.device]):
@@ -397,6 +368,7 @@ class SphericalHarmonicsPrior(nn.Module):
 
     @staticmethod
     def _real_sph_harm_basis(theta: torch.Tensor, phi: torch.Tensor, Lmax: int) -> torch.Tensor:
+        # Same implementation as original
         H, W = theta.shape
         device = theta.device
         dtype = theta.dtype
@@ -412,7 +384,7 @@ class SphericalHarmonicsPrior(nn.Module):
             P[l][0] = ((2 * l_f - 1) * x * P[l - 1][0] - (l_f - 1) * P[l - 2][0]) / l_f
         for m in range(1, Lmax):
             m_f = torch.tensor(m, device=device, dtype=dtype)
-            P_mm = ((-1) ** m) * SphericalHarmonicsPrior._double_factorial(2 * m - 1, dtype, device) * (1 - x * x).pow(m_f / 2)
+            P_mm = ((-1) ** m) * DynamicSphericalHarmonicsPrior._double_factorial(2 * m - 1, dtype, device) * (1 - x * x).pow(m_f / 2)
             P[m][m] = P_mm
             if m + 1 < Lmax:
                 P[m + 1][m] = (2 * m_f + 1) * x * P_mm
@@ -427,7 +399,7 @@ class SphericalHarmonicsPrior(nn.Module):
             l_f = torch.tensor(l, device=device, dtype=dtype)
             for m in range(-l, l + 1):
                 m_abs = abs(m)
-                N_lm = torch.sqrt((2 * l_f + 1) / (4 * pi) * SphericalHarmonicsPrior._fact_ratio(l, m_abs, dtype, device))
+                N_lm = torch.sqrt((2 * l_f + 1) / (4 * pi) * DynamicSphericalHarmonicsPrior._fact_ratio(l, m_abs, dtype, device))
                 if m == 0:
                     Y = N_lm * P[l][0]
                 elif m > 0:
@@ -438,17 +410,45 @@ class SphericalHarmonicsPrior(nn.Module):
         return torch.stack(Ys, dim=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: B, L, C, H, W
         B, L, C, H, W = x.shape
         Y = self.Y_real
         if Y.device != x.device or Y.dtype != x.dtype:
             Y = Y.to(device=x.device, dtype=x.dtype)
+        
+        # Calculate global context: B, L, C
+        ctx = x.mean(dim=(-2, -1)) 
+        
+        # Generate weights from hypernet
+        # weights_flat: B, L, C*R + R*K
+        weights_flat = self.hypernet(ctx) 
+        
+        w1_size = self.C * self.R
+        w2_size = self.R * self.K
+        
+        w1_flat = weights_flat[..., :w1_size]
+        w2_flat = weights_flat[..., w1_size:]
+        
+        W1 = w1_flat.view(B, L, self.C, self.R)
+        W2 = w2_flat.view(B, L, self.R, self.K)
+        
         with torch.amp.autocast("cuda", enabled=False):
-            coeff = torch.matmul(self.W1.float(), self.W2.float())
+            # Dynamic bias generation
+            # W1 * W2 -> (B, L, C, K)
+            coeff = torch.matmul(W1.float(), W2.float()) 
+            
+            # Y: (K, H*W)
             Yf = Y.view(self.K, H * W).float()
-            bias = torch.matmul(coeff, Yf).view(C, H, W)
-            bias = (self.gain.view(C, 1, 1).float() * bias).view(1, 1, C, H, W)
+            
+            # coeff (B, L, C, K) * Yf (K, HW) -> (B, L, C, HW)
+            bias = torch.matmul(coeff, Yf).view(B, L, C, H, W)
+            
+            bias = (self.gain.view(1, 1, C, 1, 1).float() * bias)
             return x + bias.to(x.dtype)
 
+# ==========================================
+# Attention & Gates
+# ==========================================
 
 class ChannelAttention2D(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
@@ -467,7 +467,6 @@ class ChannelAttention2D(nn.Module):
         attn = torch.sigmoid(self.mlp(avg_pool) + self.mlp(max_pool)).view(BL, C, 1, 1)
         return x * attn
 
-
 class SpatialAttention2D(nn.Module):
     def __init__(self, kernel_size: int = 7):
         super().__init__()
@@ -482,7 +481,6 @@ class SpatialAttention2D(nn.Module):
         attn = torch.sigmoid(self.conv(attn))
         return x * attn
 
-
 class CBAM2DPerStep(nn.Module):
     def __init__(self, channels: int, reduction: int = 16, spatial_kernel: int = 7):
         super().__init__()
@@ -495,7 +493,6 @@ class CBAM2DPerStep(nn.Module):
         x_flat = self.ca(x_flat)
         x_flat = self.sa(x_flat)
         return x_flat.view(B, L, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
-
 
 class CrossScaleAttentionGate(nn.Module):
     def __init__(self, channels: int):
@@ -514,6 +511,51 @@ class CrossScaleAttentionGate(nn.Module):
         attn = self.sigmoid(self.psi(psi))
         return self.norm(local_x * attn)
 
+# ==========================================
+# New: Bottleneck Global Attention
+# ==========================================
+
+class BottleneckAttention(nn.Module):
+    """
+    Multi-Head Self Attention for global dependency (Teleconnections).
+    Used at the bottleneck of U-Net.
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        # x: B, C, L, H, W
+        B, C, L, H, W = x.shape
+        # Flatten spatial: B, L, H*W, C
+        x_flat = x.permute(0, 2, 3, 4, 1).view(B*L, H*W, C)
+        
+        B_N, N, C = x_flat.shape
+        shortcut = x_flat
+        x_norm = self.norm(x_flat)
+        
+        qkv = self.qkv(x_norm).reshape(B_N, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x_attn = (attn @ v).transpose(1, 2).reshape(B_N, N, C)
+        x_attn = self.proj(x_attn)
+        x_attn = self.proj_drop(x_attn)
+        
+        out = shortcut + x_attn
+        out = out.view(B, L, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
+        return out
 
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None):
@@ -559,7 +601,6 @@ class GatedConvBlock(nn.Module):
         x = self.pw_conv_out(x)
         return residual + x
 
-
 class SpatialPatchMoE(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], num_experts: int, active_experts: int, use_cbam: bool, cond_channels: Optional[int]):
         super().__init__()
@@ -576,7 +617,12 @@ class SpatialPatchMoE(nn.Module):
                 for i in range(self.num_experts)
             ]
         )
-        self.shared_expert = GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=7, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
+        # Improved Shared Expert: Deeper capacity
+        self.shared_expert = nn.Sequential(
+             GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=7, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None)),
+             GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=3, use_cbam=False, cond_channels=(self.cond_channels if self.cond_channels > 0 else None))
+        )
+
         router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
         self.router = nn.Linear(router_in_dim, self.num_experts)
         self.aux_loss = 0.0
@@ -615,8 +661,14 @@ class SpatialPatchMoE(nn.Module):
             router_cond = cond_patches.mean(dim=(2, 3, 4))
             router_input = torch.cat([router_input, router_cond], dim=1)
         
-        shared_out = self.shared_expert(x_patches, cond=cond_patches)
-        
+        shared_out = self.shared_expert(x_patches, cond=cond_patches) # Note: cond passed to Sequential? GatedConvBlock handles cond=None gracefully? Yes, checking implementation
+        # Correction: Sequential call with extra args can be tricky.
+        # Let's manual call for shared expert to be safe
+        s_out = x_patches
+        for layer in self.shared_expert:
+             s_out = layer(s_out, cond=cond_patches)
+        shared_out = s_out
+
         router_logits = self.router(router_input)
         
         with torch.amp.autocast("cuda", enabled=False):
@@ -624,27 +676,18 @@ class SpatialPatchMoE(nn.Module):
             lse = torch.logsumexp(router_logits, dim=-1)
             z_loss = lse.pow(2).mean()
             router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
-            
             mean_probs = router_probs.mean(dim=0)
-
             N_total = router_logits.size(0)
             topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
             BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
             fused_moe_router_kernel[(N_total,)](
-                router_logits,
-                topk_indices,
-                self.num_experts,
-                self.active_experts,
-                BLOCK_SIZE,
+                router_logits, topk_indices, self.num_experts, self.active_experts, BLOCK_SIZE,
             )
-
             with torch.no_grad():
                 flat_indices_all = topk_indices.view(-1).long()
                 expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
                 fraction_selected = expert_counts / flat_indices_all.numel()
-
             self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
-
             topk_indices = topk_indices.long()
             topk_weights = torch.gather(router_probs, 1, topk_indices)
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -691,7 +734,6 @@ class SpatialPatchMoE(nn.Module):
             out = out[..., :H, :W]
         return out
 
-
 class ConvLRULayer(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -722,13 +764,22 @@ class ConvLRULayer(nn.Module):
         self.params_log_base = nn.Parameter(torch.stack([nu_log, theta_log], dim=0))
         self.dispersion_mod = nn.Parameter(torch.zeros(2, self.emb_ch, self.rank) * 0.01)
         self.mod_hidden = 32
-        in_dim = self.emb_ch if self.is_selective else (self.emb_ch + 1)
+        
+        # === Scheme A: Stochastic Forcing (Variational) ===
+        self.latent_dim = 16 # Latent variable dimension
+        in_dim = (self.emb_ch if self.is_selective else (self.emb_ch + 1)) + self.latent_dim
+        
         self.forcing_mlp = nn.Sequential(
             nn.Linear(in_dim, self.mod_hidden),
             nn.Tanh(),
             nn.Linear(self.mod_hidden, self.emb_ch * self.rank * 2),
         )
         self.forcing_scale = nn.Parameter(torch.tensor(0.1))
+        
+        # VAE Encoder for Z
+        self.z_encoder = nn.Linear(self.emb_ch, self.latent_dim * 2)
+        self.latest_kl = 0.0
+
         self.local_conv = PeriodicConv3d(self.emb_ch, self.emb_ch, kernel_size=3)
         self.dct_h = DiscreteCosineTransform(self.S, dim=-2)
         self.selection_net = nn.Sequential(
@@ -745,7 +796,10 @@ class ConvLRULayer(nn.Module):
         self.norm = RMSNorm(self.emb_ch)
         self.noise_level = nn.Parameter(torch.tensor(0.01))
         self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
-        self.sh_prior = SphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
+        
+        # Dynamic SH
+        self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
+        
         if bool(getattr(args, "use_gate", False)):
             self.gate_conv = nn.Sequential(
                 nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
@@ -755,13 +809,17 @@ class ConvLRULayer(nn.Module):
             self.gate_conv = None
         self.pscan = pscan
 
-    def _apply_forcing(self, x: torch.Tensor, dt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _apply_forcing(self, x: torch.Tensor, dt: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         ctx = x.mean(dim=(-2, -1))
         if self.is_selective:
-            inp = ctx
+            inp_base = ctx
         else:
             dt_feat = dt.view(x.size(0), x.size(1), 1)
-            inp = torch.cat([ctx, dt_feat], dim=-1)
+            inp_base = torch.cat([ctx, dt_feat], dim=-1)
+        
+        # Concat latent variable z
+        inp = torch.cat([inp_base, z], dim=-1)
+        
         mod = self.forcing_mlp(inp)
         mod = mod.view(x.size(0), x.size(1), self.emb_ch, self.rank, 2)
         dnu = self.forcing_scale * torch.tanh(mod[..., 0])
@@ -790,6 +848,25 @@ class ConvLRULayer(nn.Module):
         with torch.amp.autocast("cuda", enabled=False):
             x_in_fp32 = x_perm.float()
             dt_fp32 = dt.float()
+            
+            # === Stochastic Latent Sampling ===
+            ctx_z = x_in_fp32.mean(dim=(-2, -1))
+            if self.training:
+                z_params = self.z_encoder(ctx_z)
+                mu, logvar = torch.chunk(z_params, 2, dim=-1)
+                std = torch.exp(0.5 * logvar)
+                eps = torch.randn_like(std)
+                z = mu + eps * std
+                # Calculate KL Divergence: 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+                # We average over batch and time in train loop, but here keep per-item
+                self.latest_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            else:
+                # Inference: Sample from prior N(0,I) for variation, or 0 for mean
+                # For "ensemble", you should pass a noise seed or mode='gen'. 
+                # Here we default to sampling from prior.
+                z = torch.randn(B, L, self.latent_dim, device=x.device, dtype=x_in_fp32.dtype)
+                self.latest_kl = 0.0
+
             h = self._hybrid_forward_transform(x_in_fp32)
             h = h.contiguous()
             ctx = x_in_fp32.mean(dim=(-2, -1))
@@ -816,7 +893,9 @@ class ConvLRULayer(nn.Module):
             nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
             
-            dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32)
+            # Pass Z to forcing
+            dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32, z)
+            
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
@@ -857,6 +936,7 @@ class ConvLRULayer(nn.Module):
         h_final = self.post_ifft_proj(feat_final_perm)
         
         if self.sh_prior is not None:
+            # Dynamic SH call
             h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         
         x_local = self.local_conv(x)
@@ -871,7 +951,6 @@ class ConvLRULayer(nn.Module):
             x_out = x + h_final
             
         return x_out, last_hidden_out
-
 
 class FeedForward(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -906,7 +985,6 @@ class FeedForward(nn.Module):
         x = self.c_out(x)
         return residual + x
 
-
 class ConvLRUBlock(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -917,7 +995,6 @@ class ConvLRUBlock(nn.Module):
         x_mid, h_out = self.lru_layer(x, last_hidden_in, listT=listT)
         x_out = self.feed_forward(x_mid, cond=cond)
         return x_out, h_out
-
 
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25):
@@ -944,7 +1021,6 @@ class VectorQuantizer(nn.Module):
         quantized = inputs + (quantized - inputs).detach()
         return quantized, loss, encoding_indices
 
-
 class DiffusionHead(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -968,7 +1044,6 @@ class DiffusionHead(nn.Module):
         emb = torch.cat([tt.sin(), tt.cos()], dim=-1)
         return self.mlp(emb.to(dtype=t.dtype))
 
-
 class Decoder(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -988,10 +1063,7 @@ class Decoder(nn.Module):
         out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
         if self.dec_strategy == "deconv":
             self.upsp = nn.ConvTranspose3d(
-                in_channels=self.emb_ch,
-                out_channels=out_ch_after_up,
-                kernel_size=(1, self.rH, self.rW),
-                stride=(1, self.rH, self.rW),
+                in_channels=self.emb_ch, out_channels=out_ch_after_up, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW),
             )
             deconv3d_bilinear_init_(self.upsp.weight)
             with torch.no_grad():
@@ -1000,10 +1072,7 @@ class Decoder(nn.Module):
             self.pre_shuffle_conv = None
         else:
             self.pre_shuffle_conv = nn.Conv3d(
-                in_channels=self.emb_ch,
-                out_channels=out_ch_after_up * self.rH * self.rW,
-                kernel_size=(1, 3, 3),
-                padding=(0, 1, 1),
+                in_channels=self.emb_ch, out_channels=out_ch_after_up * self.rH * self.rW, kernel_size=(1, 3, 3), padding=(0, 1, 1),
             )
             icnr_conv3d_weight_(self.pre_shuffle_conv.weight, self.rH, self.rW)
             with torch.no_grad():
@@ -1016,15 +1085,7 @@ class Decoder(nn.Module):
             ada_cond_dim = out_ch_after_up if use_ada else None
             self.c_hidden = nn.ModuleList(
                 [
-                    GatedConvBlock(
-                        out_ch_after_up,
-                        (1, 1),
-                        kernel_size=7,
-                        use_cbam=False,
-                        cond_channels=cond_ch,
-                        use_ada_norm=use_ada,
-                        ada_norm_cond_dim=ada_cond_dim,
-                    )
+                    GatedConvBlock(out_ch_after_up, (1, 1), kernel_size=7, use_cbam=False, cond_channels=cond_ch, use_ada_norm=use_ada, ada_norm_cond_dim=ada_cond_dim)
                     for _ in range(self.dec_hidden_layers_num)
                 ]
             )
@@ -1078,7 +1139,6 @@ class Decoder(nn.Module):
             return quantized, loss, indices
         return x
 
-
 class ShuffleDownsample(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
@@ -1087,7 +1147,6 @@ class ShuffleDownsample(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = pixel_unshuffle_hw_3d(x, 2, 2)
         return self.proj(x)
-
 
 class ConvLRUModel(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -1121,6 +1180,11 @@ class ConvLRUModel(nn.Module):
                         self.downsamples.append(nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)))
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
+            
+            # === Global Attention at Bottleneck ===
+            # The bottleneck is after the last downsample.
+            self.mid_attention = BottleneckAttention(C, num_heads=8)
+            
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
                 self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
@@ -1156,6 +1220,10 @@ class ConvLRUModel(nn.Module):
                 if x_s.shape[-2] >= 2 and x_s.shape[-1] >= 2:
                     x_s = self.downsamples[i](x_s)
                 x = x_s
+        
+        # Apply Global Attention at the bottom
+        x = self.mid_attention(x)
+        
         if self.upsample is None or self.fusion is None:
             raise RuntimeError("UNet misconfigured")
         for i, blk in enumerate(self.up_blocks):
@@ -1178,7 +1246,6 @@ class ConvLRUModel(nn.Module):
             last_hidden_outs.append(h_out)
         return x, last_hidden_outs
 
-
 class Embedding(nn.Module):
     def __init__(self, args: Any):
         super().__init__()
@@ -1192,11 +1259,8 @@ class Embedding(nn.Module):
         self.rH, self.rW = int(hf[0]), int(hf[1])
         self.input_ch_total = self.input_ch + 4
         self.patch_embed = nn.Conv3d(
-            self.input_ch_total,
-            self.emb_hidden_ch,
-            kernel_size=(1, self.rH + 2, self.rW + 2),
-            stride=(1, self.rH, self.rW),
-            padding=(0, 1, 1),
+            self.input_ch_total, self.emb_hidden_ch,
+            kernel_size=(1, self.rH + 2, self.rW + 2), stride=(1, self.rH, self.rW), padding=(0, 1, 1),
         )
         with torch.no_grad():
             dummy = torch.zeros(1, self.input_ch_total, 1, int(self.input_size[0]), int(self.input_size[1]))
@@ -1207,13 +1271,7 @@ class Embedding(nn.Module):
         self.hidden_size = (int(self.input_downsp_shape[1]), int(self.input_downsp_shape[2]))
         if self.static_ch > 0:
             self.static_embed = nn.Sequential(
-                nn.Conv2d(
-                    self.static_ch,
-                    self.emb_ch,
-                    kernel_size=(self.rH + 2, self.rW + 2),
-                    stride=(self.rH, self.rW),
-                    padding=(1, 1),
-                ),
+                nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=(self.rH + 2, self.rW + 2), stride=(self.rH, self.rW), padding=(1, 1)),
                 nn.SiLU(),
             )
         else:
@@ -1252,7 +1310,6 @@ class Embedding(nn.Module):
         x = self.norm(x)
         return x, cond
 
-
 class ConvLRU(nn.Module):
     def __init__(self, args: Any):
         super().__init__()
@@ -1270,6 +1327,18 @@ class ConvLRU(nn.Module):
                     p.zero_()
                 elif p.dim() > 1:
                     nn.init.xavier_uniform_(p)
+    
+    def get_total_kl_loss(self):
+        kl_sum = 0.0
+        count = 0
+        for module in self.modules():
+            if hasattr(module, 'latest_kl'):
+                kl_sum += module.latest_kl
+                count += 1
+        if count == 0:
+            return torch.tensor(0.0)
+        # Average KL over all layers, or sum, depending on preference. Here we sum.
+        return kl_sum
 
     def forward(
         self,

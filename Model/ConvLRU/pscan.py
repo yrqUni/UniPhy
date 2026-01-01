@@ -60,7 +60,6 @@ class PScanTriton(torch.autograd.Function):
 
         if A.ndim == X.ndim - 1:
             A = A.unsqueeze(-1)
-
         if A.shape != X.shape:
             A, X = torch.broadcast_tensors(A, X)
         
@@ -70,11 +69,12 @@ class PScanTriton(torch.autograd.Function):
         input_shape = X.shape
         L = input_shape[1]
 
-        A_in = A.transpose(1, -1)
-        X_in = X.transpose(1, -1)
+        # Fix: Explicit contiguous to avoid implicit copy warnings/errors
+        A_in = A.transpose(1, -1).contiguous()
+        X_in = X.transpose(1, -1).contiguous()
 
-        A_flat = A_in.reshape(-1, L)
-        X_flat = X_in.reshape(-1, L)
+        A_flat = A_in.view(-1, L)
+        X_flat = X_in.view(-1, L)
 
         num_sequences = A_flat.shape[0]
 
@@ -114,11 +114,12 @@ class PScanTriton(torch.autograd.Function):
         
         L = A.shape[1]
         
-        A_in = A_prep.transpose(1, -1)
-        X_in = grad_output.transpose(1, -1)
+        # Fix: Explicit contiguous
+        A_in = A_prep.transpose(1, -1).contiguous()
+        X_in = grad_output.transpose(1, -1).contiguous()
         
-        A_flat = A_in.reshape(-1, L)
-        X_flat = X_in.reshape(-1, L)
+        A_flat = A_in.view(-1, L)
+        X_flat = X_in.view(-1, L)
         
         num_sequences = A_flat.shape[0]
         
