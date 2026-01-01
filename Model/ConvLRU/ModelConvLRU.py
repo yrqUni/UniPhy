@@ -308,21 +308,44 @@ class DiscreteCosineTransform(nn.Module):
         out = torch.matmul(x, self.dct_matrix)
         return out.transpose(self.dim, -1)
 
+class AdaptiveFreqGate(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        self.gate = nn.Sequential(
+            nn.Linear(channels, channels // 2),
+            nn.ReLU(),
+            nn.Linear(channels // 2, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
+        mag = torch.abs(x_ft).mean(dim=(-2, -1))
+        scale = self.gate(mag).unsqueeze(-1).unsqueeze(-1)
+        return x_ft * scale.to(x_ft.dtype)
+
 class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int, use_adaptive: bool = False):
         super().__init__()
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.modes1 = int(modes1)
         self.modes2 = int(modes2)
+        self.use_adaptive = use_adaptive
         scale = 1.0 / max(1, (self.in_channels * self.out_channels))
         self.weights1 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
         self.weights2 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
+        if self.use_adaptive:
+            self.adaptive_gate = AdaptiveFreqGate(in_channels)
 
     def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
         with torch.amp.autocast("cuda", enabled=False):
             if not torch.is_complex(x_ft):
                 x_ft = x_ft.to(torch.cfloat)
+            
+            if self.use_adaptive and hasattr(self, 'adaptive_gate'):
+                x_ft = self.adaptive_gate(x_ft)
+                
             B, L, C, H, W_freq = x_ft.shape
             out_ft = torch.zeros(B, L, self.out_channels, H, W_freq, device=x_ft.device, dtype=torch.cfloat)
             m1 = min(H, self.modes1)
@@ -628,6 +651,33 @@ class SpectralInteraction(nn.Module):
         out_imag = self.mix_imag(z_imag)
         return z + torch.complex(out_real, out_imag)
 
+class GraphInteraction(nn.Module):
+    def __init__(self, channels, nodes=256):
+        super().__init__()
+        self.nodes = nodes
+        self.proj_to_nodes = nn.Sequential(
+            nn.AdaptiveAvgPool2d((int(math.sqrt(nodes)), int(math.sqrt(nodes)))),
+            nn.Conv2d(channels, channels, 1)
+        )
+        self.gnn = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels)
+        )
+        self.proj_back = nn.Conv2d(channels, channels, 1)
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        B, L, C, H, W = x.shape
+        x_flat = x.view(B * L, C, H, W)
+        nodes = self.proj_to_nodes(x_flat) 
+        nodes = nodes.view(B * L, C, -1).permute(0, 2, 1) 
+        nodes = nodes + self.gnn(self.norm(nodes))
+        nodes = nodes.permute(0, 2, 1).view(B * L, C, int(math.sqrt(self.nodes)), int(math.sqrt(self.nodes)))
+        out_grid = F.interpolate(nodes, size=(H, W), mode='bilinear', align_corners=False)
+        out_grid = self.proj_back(out_grid)
+        return out_grid.view(B, L, C, H, W)
+
 class AdvectionBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -879,6 +929,9 @@ class ConvLRULayer(nn.Module):
         self.use_spectral_mixing = bool(getattr(args, "use_spectral_mixing", False))
         self.use_anisotropic_diffusion = bool(getattr(args, "use_anisotropic_diffusion", False))
         self.use_advection = bool(getattr(args, "use_advection", False))
+        self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
+        self.use_mamba_adaptivity = bool(getattr(args, "use_mamba_adaptivity", False))
+        self.use_neural_operator = bool(getattr(args, "use_neural_operator", False))
         
         in_dim = (self.emb_ch if self.is_selective else (self.emb_ch + 1)) + self.latent_dim
         if self.use_anisotropic_diffusion:
@@ -907,7 +960,7 @@ class ConvLRULayer(nn.Module):
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = RMSNorm(self.emb_ch)
         self.noise_level = nn.Parameter(torch.tensor(0.01))
-        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
+        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8, use_adaptive=self.use_neural_operator) if bool(getattr(args, "use_freq_prior", False)) else None
         self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
         if bool(getattr(args, "use_gate", False)):
             self.gate_conv = nn.Sequential(
@@ -939,6 +992,13 @@ class ConvLRULayer(nn.Module):
         
         if self.use_advection:
             self.advection = AdvectionBlock(self.emb_ch)
+            
+        if self.use_graph_interaction:
+            self.graph_block = GraphInteraction(self.emb_ch)
+            
+        if self.use_mamba_adaptivity:
+             self.b_proj = nn.Linear(self.emb_ch, self.rank)
+             self.c_proj = nn.Linear(self.emb_ch, self.rank)
 
     def _apply_forcing(self, x: torch.Tensor, dt: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         ctx = x.mean(dim=(-2, -1))
@@ -977,6 +1037,9 @@ class ConvLRULayer(nn.Module):
         
         if self.use_cross_var_attn:
             x_perm = self.cross_var_attn(x_perm)
+            
+        if self.use_graph_interaction:
+            x_perm = x_perm + self.graph_block(x_perm)
         
         B, L, C, S, W = x_perm.shape
         if listT is None:
@@ -1009,11 +1072,17 @@ class ConvLRULayer(nn.Module):
             sel_u, sel_v = torch.chunk(selection, 2, dim=-1)
             scale_u = torch.sigmoid(sel_u).view(B, L, 1, 1, self.rank)
             scale_v = torch.sigmoid(sel_v).view(B, L, 1, 1, self.rank)
+            
             h_perm = h.permute(0, 1, 2, 4, 3)
-            t0 = torch.einsum("blcws,csr->blcwr", h_perm, self.U_row)
+            
+            U = self.U_row
+            V = self.V_col
+            
+            t0 = torch.einsum("blcws,csr->blcwr", h_perm, U)
             t0 = t0 * scale_u
-            zq = torch.einsum("blcwr,cwr->blcwr", t0, self.V_col)
+            zq = torch.einsum("blcwr,cwr->blcwr", t0, V)
             zq = zq * scale_v
+            
             if self.proj_b is not None:
                 zq = zq + self.proj_b.view(1, 1, C, 1, 1)
             
@@ -1034,7 +1103,14 @@ class ConvLRULayer(nn.Module):
             nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
             th_t = th_base * dt_fp32 + dth_force
             lamb = torch.exp(torch.complex(-nu_t, th_t))
+            
             x_in_lru = zq
+            
+            if self.use_mamba_adaptivity:
+                 B_proj = self.b_proj(ctx).view(B, L, 1, 1, self.rank)
+                 C_proj = self.c_proj(ctx).view(B, L, 1, 1, self.rank)
+                 x_in_lru = x_in_lru * torch.sigmoid(B_proj)
+            
             gamma_t = torch.sqrt(torch.clamp(-torch.expm1(-2.0 * nu_t.real), min=1e-12))
             x_in_lru = x_in_lru * gamma_t
             if L == 1 and last_hidden_in is not None:
@@ -1058,11 +1134,15 @@ class ConvLRULayer(nn.Module):
                 z_scan = self.pscan(l_scan, x_scan)
                 z_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
                 last_hidden_out = z_out[:, -1:]
+            
+            if self.use_mamba_adaptivity:
+                 z_out = z_out * torch.sigmoid(C_proj)
+            
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
                 z = z * sc_v
-                t1 = torch.einsum("blcwr,cwr->blcwr", z, self.V_col.conj())
+                t1 = torch.einsum("blcwr,cwr->blcwr", z, V.conj())
                 t1 = t1 * sc_u
-                rec = torch.einsum("blcwr,csr->blcws", t1, self.U_row.conj())
+                rec = torch.einsum("blcwr,csr->blcws", t1, U.conj())
                 return rec
             h_rec_fwd = project_back(z_out, scale_u, scale_v)
             h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
