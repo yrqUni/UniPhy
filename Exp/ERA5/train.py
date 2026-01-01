@@ -550,7 +550,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if bool(args.use_compile):
         model = torch.compile(model, mode="default")
     
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     register_lru_gate_hooks(model)
     setup_wandb(rank, args, model)
@@ -695,8 +695,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 
                 loss = loss + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss + 1e-6 * kl_loss
                 
-                # Dummy loss to include all parameters in the graph (crucial for complex parameters)
-                loss = loss + 0.0 * sum(p.abs().sum() for p in model.parameters() if p.requires_grad)
+                if isinstance(model, DDP):
+                    dummy_loss = torch.tensor(0.0, device=loss.device)
+                    for p in model.parameters():
+                        if p.requires_grad:
+                            dummy_loss = dummy_loss + p.view(-1)[0].abs() * 0.0
+                    loss = loss + dummy_loss
 
             loss.backward()
 
