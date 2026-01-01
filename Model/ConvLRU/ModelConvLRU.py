@@ -477,7 +477,7 @@ class BottleneckAttention(nn.Module):
 
     def forward(self, x):
         B, C, L, H, W = x.shape
-        x_flat = x.permute(0, 2, 3, 4, 1).view(B*L, H*W, C)
+        x_flat = x.permute(0, 2, 3, 4, 1).contiguous().view(B*L, H*W, C)
         B_N, N, C = x_flat.shape
         shortcut = x_flat
         x_norm = self.norm(x_flat)
