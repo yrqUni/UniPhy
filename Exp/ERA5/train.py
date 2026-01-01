@@ -133,7 +133,7 @@ class Args:
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = ""
+        self.ckpt = "e7_s570_l0.265707.pth"
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
@@ -141,7 +141,7 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
-        self.use_tf32 = True
+        self.use_tf32 = False
         self.use_compile = False
         self.lr = 1e-5
         self.weight_decay = 0.05
@@ -149,7 +149,7 @@ class Args:
         self.init_lr_scheduler = False
         self.loss = "lat"
         self.T = 6
-        self.use_amp = True
+        self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
         self.sample_k = 9
@@ -549,6 +549,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     model = ConvLRU(args).cuda(local_rank)
     if bool(args.use_compile):
         model = torch.compile(model, mode="default")
+    
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     register_lru_gate_hooks(model)
@@ -693,6 +694,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 moe_loss = get_moe_aux_loss(model)
                 
                 loss = loss + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss + 1e-6 * kl_loss
+                
+                loss = loss + 0.0 * sum(p.sum() for p in model.parameters() if p.requires_grad)
 
             loss.backward()
 
