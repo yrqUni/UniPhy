@@ -934,7 +934,7 @@ class ConvLRULayer(nn.Module):
         self.use_anisotropic_diffusion = bool(getattr(args, "use_anisotropic_diffusion", False))
         self.use_advection = bool(getattr(args, "use_advection", False))
         self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
-        self.use_mamba_adaptivity = bool(getattr(args, "use_adaptive_ssm", False))
+        self.use_adaptive_ssm = bool(getattr(args, "use_adaptive_ssm", False))
         self.use_neural_operator = bool(getattr(args, "use_neural_operator", False))
         
         in_dim = (self.emb_ch if self.is_selective else (self.emb_ch + 1)) + self.latent_dim
@@ -1000,7 +1000,7 @@ class ConvLRULayer(nn.Module):
         if self.use_graph_interaction:
             self.graph_block = GraphInteraction(self.emb_ch)
             
-        if self.use_mamba_adaptivity:
+        if self.use_adaptive_ssm:
              self.b_proj = nn.Linear(self.emb_ch, self.rank)
              self.c_proj = nn.Linear(self.emb_ch, self.rank)
 
@@ -1112,7 +1112,7 @@ class ConvLRULayer(nn.Module):
             
             B_proj = None
             C_proj = None
-            if self.use_mamba_adaptivity:
+            if self.use_adaptive_ssm:
                  B_proj = self.b_proj(ctx).view(B, L, 1, 1, self.rank)
                  C_proj = self.c_proj(ctx).view(B, L, 1, 1, self.rank)
                  x_in_lru = x_in_lru * torch.sigmoid(B_proj)
@@ -1141,7 +1141,7 @@ class ConvLRULayer(nn.Module):
                 h_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
                 last_hidden_out = h_out[:, -1:]
             
-            if self.use_mamba_adaptivity and C_proj is not None:
+            if self.use_adaptive_ssm and C_proj is not None:
                  z_out = h_out * torch.sigmoid(C_proj)
             else:
                  z_out = h_out
@@ -1702,9 +1702,15 @@ class ConvLRU(nn.Module):
             if curr_x.ndim == 5 and curr_x.shape[1] != 1:
                 curr_x = curr_x[:, -1:, :, :, :]
 
-            if str(self.decoder.head_mode).lower() == "token":
-                if curr_x.size(2) > self.revin.num_features:
-                    curr_x = curr_x[:, :, :self.revin.num_features]
+            if curr_x.size(2) != self.embedding.input_ch:
+                 B_in, L_in, C_out, H_in, W_in = curr_x.shape
+                 C_target = self.embedding.input_ch
+                 if C_out > C_target:
+                      curr_x = curr_x[:, :, :C_target, :, :]
+                 else:
+                      diff = C_target - C_out
+                      zeros = torch.zeros(B_in, L_in, diff, H_in, W_in, device=curr_x.device, dtype=curr_x.dtype)
+                      curr_x = torch.cat([curr_x, zeros], dim=2)
             
             if curr_x.size(2) == self.revin.num_features:
                 x_step_norm = self.revin(curr_x, "norm")
