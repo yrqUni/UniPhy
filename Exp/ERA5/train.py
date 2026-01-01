@@ -141,7 +141,7 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
-        self.use_tf32 = True
+        self.use_tf32 = False
         self.use_compile = False
         self.lr = 1e-5
         self.weight_decay = 0.05
@@ -149,7 +149,7 @@ class Args:
         self.init_lr_scheduler = False
         self.loss = "lat"
         self.T = 6
-        self.use_amp = True
+        self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
         self.sample_k = 9
