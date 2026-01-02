@@ -104,7 +104,7 @@ class Args:
         self.hidden_factor = (7, 12)
         self.emb_ch = 96
         self.emb_hidden_ch = 128
-        self.emb_hidden_layers_num = 2
+        self.emb_hidden_layers_num = 1
         self.convlru_num_blocks = 6
         self.use_cbam = True
         self.ffn_hidden_ch = 128
