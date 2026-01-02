@@ -167,9 +167,9 @@ class Args:
         self.use_spectral_mixing = True
         self.use_anisotropic_diffusion = True
         self.use_advection = True
-        self.use_graph_interaction = True
-        self.use_adaptive_ssm = True
-        self.use_neural_operator = True
+        self.use_graph_interaction = False
+        self.use_adaptive_ssm = False
+        self.use_neural_operator = False
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
@@ -633,6 +633,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     amp_dtype = torch.bfloat16 if str(args.amp_dtype).lower() == "bf16" else torch.float16
     use_amp = bool(args.use_amp)
 
+    micro_steps = int(args.T) 
+    
     for ep in range(int(start_epoch), int(args.epochs)):
         train_sampler.set_epoch(ep)
         train_iter = tqdm(train_dataloader, desc=f"Epoch {ep + 1}/{args.epochs}") if rank == 0 else train_dataloader
@@ -643,34 +645,11 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             B_full, L_full, C, H, W = data.shape
             L_eff = L_full - 1
-
-            K = int(args.sample_k)
-            if K != -1 and K < 2:
-                K = -1
-            if K != -1 and K > L_full:
-                if rank == 0:
-                    msg = f"[Error] sample_k={K} > L={L_full}. Fallback to -1."
-                    print(msg)
-                    logging.error(msg)
-                K = -1
-
-            if K == -1:
-                x = data[:, :L_eff].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-                listT_vals = [float(args.T)] * x.shape[1]
-                target = data[:, 1 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-            else:
-                if K > L_eff:
-                    x = data[:, :L_eff].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-                    listT_vals = [float(args.T)] * x.shape[1]
-                    target = data[:, 1 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-                    K = -1
-                else:
-                    idxs = make_random_indices(L_eff, K)
-                    x = data[:, idxs].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-                    listT_vals = build_dt_from_indices(idxs, float(args.T))
-                    tgt_idxs = np.clip(idxs + 1, 0, L_full - 1)
-                    target = data[:, tgt_idxs].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-
+            
+            x = data[:, :L_eff].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+            target = data[:, 1 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+            
+            listT_vals = [float(args.T)] * x.shape[1]
             listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
 
             static_feats = None
@@ -680,25 +659,72 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             timestep = sample_timestep(args, x.size(0), x.device, x.dtype)
 
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                # 1. Main Loss (Parallel Mode, Coarse Scale)
                 preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
                 
                 if isinstance(preds, tuple):
                     preds = preds[0]
                 
-                if preds.shape[2] == 2 * target.shape[2]:
-                    loss = gaussian_nll_loss_weighted(preds, target)
-                    p_det = preds[:, :, :target.shape[2]]
+                # Handling Gaussian Output for Loss Calculation
+                C_gt = target.shape[2]
+                if preds.shape[2] == 2 * C_gt:
+                    loss_main = gaussian_nll_loss_weighted(preds, target)
+                    p_det = preds[:, :, :C_gt]
                 else:
-                    loss = latitude_weighted_l1(preds, target)
+                    loss_main = latitude_weighted_l1(preds, target)
                     p_det = preds
 
-                metric_l1 = F.l1_loss(p_det, target)
+                # 2. Solver-in-the-Loop Loss (Recursive Mode, Fine Scale)
+                # We apply recursive supervision only on the last transition of the batch to save memory.
+                # x_seed: Last input frame [B, 1, C, H, W]
+                # target_last: Last target frame [B, 1, C, H, W]
+                x_seed = x[:, -1:]
+                target_last = target[:, -1:]
+                
+                # Generate micro-steps (dt=1.0)
+                # Note: listT for first step, listT_future for subsequent steps
+                dt_micro_val = 1.0
+                listT_seed = torch.full((x.size(0), 1), dt_micro_val, device=x.device, dtype=x.dtype)
+                listT_future = torch.full((x.size(0), micro_steps - 1), dt_micro_val, device=x.device, dtype=x.dtype)
+                
+                # Recursive generation: returns sequence of length `micro_steps`
+                # We expect the last frame of this sequence to match `target_last` (t + 6)
+                preds_recursive_seq = model(
+                    x_seed, 
+                    mode="i", 
+                    out_gen_num=micro_steps, 
+                    listT=listT_seed, 
+                    listT_future=listT_future,
+                    static_feats=static_feats,
+                    timestep=timestep
+                )
+                
+                # Extract last frame from recursive sequence
+                preds_recursive_last = preds_recursive_seq[:, -1:]
+                
+                if preds_recursive_last.shape[2] == 2 * C_gt:
+                    # Using L1 for recursive constraint is usually more stable than NLL
+                    loss_solver = F.l1_loss(preds_recursive_last[:, :, :C_gt], target_last)
+                    p_rec_det = preds_recursive_last[:, :, :C_gt]
+                else:
+                    loss_solver = F.l1_loss(preds_recursive_last, target_last)
+                    p_rec_det = preds_recursive_last
+
+                # 3. Consistency Loss
+                # Enforce that "Direct Prediction (t+6)" matches "Recursive Prediction (t+6)"
+                # p_det is [B, L, C, H, W], we need p_det[:, -1:]
+                p_direct_last = p_det[:, -1:].detach() # Detach one branch to avoid fighting
+                loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
+
+                # Auxiliary Losses
                 gdl_loss = gradient_difference_loss(p_det, target)
                 spec_loss = spectral_loss(p_det, target)
                 kl_loss = get_kl_loss(model)
                 moe_loss = get_moe_aux_loss(model)
                 
-                loss = loss + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss + 1e-6 * kl_loss
+                # Total Loss Combination
+                # Main Task + Solver Constraint + Consistency + Regularization
+                loss = loss_main + 0.5 * loss_solver + 0.1 * loss_consistency + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss + 1e-6 * kl_loss
                 
                 if isinstance(model, DDP):
                     dummy_loss = torch.tensor(0.0, device=loss.device)
@@ -718,47 +744,28 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             if bool(args.use_scheduler) and scheduler is not None:
                 scheduler.step()
 
+            # Reduce metrics
             loss_tensor = loss.detach()
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             avg_loss = (loss_tensor / world_size).item()
+            
+            solver_tensor = loss_solver.detach()
+            dist.all_reduce(solver_tensor, op=dist.ReduceOp.SUM)
+            avg_solver = (solver_tensor / world_size).item()
 
+            metric_l1 = F.l1_loss(p_det, target)
             l1_tensor = metric_l1.detach()
             dist.all_reduce(l1_tensor, op=dist.ReduceOp.SUM)
             avg_l1 = (l1_tensor / world_size).item()
-
-            moe_tensor = moe_loss.detach()
-            dist.all_reduce(moe_tensor, op=dist.ReduceOp.SUM)
-            avg_moe_loss = (moe_tensor / world_size).item()
-
-            gdl_tensor = gdl_loss.detach()
-            dist.all_reduce(gdl_tensor, op=dist.ReduceOp.SUM)
-            avg_gdl_loss = (gdl_tensor / world_size).item()
-
-            spec_tensor = spec_loss.detach()
-            dist.all_reduce(spec_tensor, op=dist.ReduceOp.SUM)
-            avg_spec_loss = (spec_tensor / world_size).item()
 
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
                 gate_str = format_gate_means()
                 grad_str = f" |grad|={grad_norm:.4e}"
 
-                if K == -1:
-                    current_T_mean = float(args.T)
-                    t_str = f"T={args.T}"
-                else:
-                    if len(listT_vals) > 0:
-                        current_T_mean = float(sum(listT_vals) / len(listT_vals))
-                        current_T_min = float(min(listT_vals))
-                        current_T_max = float(max(listT_vals))
-                        t_str = f"T~{current_T_mean:.2f}({current_T_min:.1f}-{current_T_max:.1f})"
-                    else:
-                        t_str = "T=NA"
-
                 message = (
-                    f"Epoch {ep + 1}/{args.epochs} - Step {train_step} "
-                    f"- Loss: {avg_loss:.6f} - L1: {avg_l1:.6f} - GDL: {avg_gdl_loss:.6f} - Spec: {avg_spec_loss:.6f} - LR: {current_lr:.6e} - {t_str} "
-                    f"- {gate_str}{grad_str} - MoE(n={int(args.num_expert)},k={int(args.activate_expert)})"
+                    f"Ep {ep + 1} - L: {avg_loss:.4f} - L1: {avg_l1:.4f} - Solv: {avg_solver:.4f} - LR: {current_lr:.2e} "
+                    f"- {gate_str}"
                 )
                 if isinstance(train_iter, tqdm):
                     train_iter.set_description(message)
@@ -771,19 +778,17 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/step": global_step,
                         "train/loss": avg_loss,
                         "train/loss_l1": avg_l1,
-                        "train/loss_gdl": avg_gdl_loss,
-                        "train/loss_spec": avg_spec_loss,
+                        "train/loss_solver": avg_solver,
+                        "train/loss_consistency": loss_consistency.item(),
+                        "train/loss_gdl": gdl_loss.item(),
+                        "train/loss_spec": spec_loss.item(),
                         "train/lr": float(current_lr),
-                        "train/K": int(K),
                         "train/grad_norm": float(grad_norm),
-                        "train/grad_max": float(grad_max),
-                        "train/moe_aux_loss": avg_moe_loss,
+                        "train/moe_aux_loss": moe_loss.item(),
                     }
                     for k, v in _LRU_GATE_MEAN.items():
                         g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
                         log_dict[g_key] = float(v)
-                    if timestep is not None:
-                        log_dict["train/timestep_mean"] = float(timestep.float().mean().item())
                     wandb.log(log_dict, step=int(global_step))
 
                 ckpt_every = max(1, int(len_train_dataloader * float(args.ckpt_step)))
@@ -798,7 +803,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, moe_loss, moe_tensor, gdl_loss, gdl_tensor, spec_loss, spec_tensor, kl_loss
+            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, solver_tensor
             if train_step % 50 == 0:
                 gc.collect()
 
@@ -833,21 +838,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     half = int(args.eval_data_n_frames) // 2
                     cond_data = data[:, :half].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
 
-                    K_eval = int(args.sample_k)
-                    if K_eval != -1 and K_eval < 2:
-                        K_eval = -1
-                    if K_eval != -1 and K_eval > cond_data.shape[1]:
-                        K_eval = -1
-
-                    if K_eval == -1:
-                        cond_eff = cond_data
-                        listT_cond_vals = [float(args.T)] * cond_eff.shape[1]
-                    else:
-                        idxs_c = make_random_indices(cond_data.shape[1], K_eval)
-                        cond_eff = cond_data[:, idxs_c]
-                        listT_cond_vals = build_dt_from_indices(idxs_c, float(args.T))
-
+                    cond_eff = cond_data
+                    listT_cond_vals = [float(args.T)] * cond_eff.shape[1]
                     listT_cond = torch.tensor(listT_cond_vals, device=cond_eff.device, dtype=cond_eff.dtype).view(1, -1).repeat(cond_eff.size(0), 1)
+                    
                     out_gen_num = int(L_full - cond_eff.shape[1])
                     listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_eff.device, cond_eff.dtype, float(args.T))
                     target = data[:, cond_eff.shape[1] : cond_eff.shape[1] + out_gen_num].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
