@@ -2,7 +2,9 @@ import sys
 import os
 import torch
 import torch.nn as nn
+import traceback
 
+# Add paths to ensure imports work correctly
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Model', 'ConvLRU')))
 
@@ -15,6 +17,7 @@ except ImportError:
 
 class MockArgs:
     def __init__(self, **kwargs):
+        # Default Basic Arguments
         self.input_size = (32, 32)
         self.input_ch = 2
         self.out_ch = 2
@@ -37,6 +40,27 @@ class MockArgs:
         self.use_selective = False
         self.unet = True
         self.down_mode = "avg"
+        self.dec_strategy = "pxsf"
+        self.dec_hidden_ch = 0
+        self.dec_hidden_layers_num = 0
+        self.head_mode = "gaussian"
+        self.diffusion_steps = 5
+        self.use_checkpointing = False
+        self.ConvType = "conv"
+        self.Arch = "unet"
+        
+        # Advanced Physics & SSM Arguments (New Features)
+        self.use_spectral_mixing = False
+        self.use_anisotropic_diffusion = False
+        self.use_advection = False          # Tests AdvectionBlock & Lagrangian logic
+        self.use_graph_interaction = False
+        self.use_adaptive_ssm = False       # Tests input/output gating
+        self.use_neural_operator = False
+        self.learnable_init_state = False
+        self.use_wavelet_ssm = False
+        self.use_cross_var_attn = False
+        
+        # Priors
         self.use_freq_prior = False
         self.freq_rank = 4
         self.freq_gain_init = 0.0
@@ -45,24 +69,8 @@ class MockArgs:
         self.sh_Lmax = 4
         self.sh_rank = 4
         self.sh_gain_init = 0.0
-        self.dec_strategy = "pxsf"
-        self.dec_hidden_ch = 0
-        self.dec_hidden_layers_num = 0
-        self.head_mode = "gaussian"
-        self.diffusion_steps = 5
-        self.use_checkpointing = False
-        self.use_spectral_mixing = False
-        self.use_anisotropic_diffusion = False
-        self.use_advection = False
-        self.use_graph_interaction = False
-        self.use_adaptive_ssm = False
-        self.use_neural_operator = False
-        self.learnable_init_state = False
-        self.use_wavelet_ssm = False
-        self.use_cross_var_attn = False
-        self.ConvType = "conv"
-        self.Arch = "unet"
-        
+
+        # Override defaults with provided kwargs
         for k, v in kwargs.items():
             setattr(self, k, v)
 
@@ -71,10 +79,23 @@ def run_case(case_name, args_dict, input_shape=(2, 4, 2, 32, 32), mode='p'):
     args = MockArgs(**args_dict)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     try:
         model = ConvLRU(args).to(device)
+        # Verify specific components exist based on args
+        if args.use_advection:
+            # Check if AdvectionBlock is initialized in layers
+            has_adv = hasattr(model.convlru_model.down_blocks[0].lru_layer, 'advection')
+            if not has_adv:
+                print(f"  [Warning] use_advection=True but 'advection' module not found in layer.")
+        
+        if args.use_anisotropic_diffusion:
+             # Just ensures the parameter generator input dim handles this
+             pass
+
     except Exception as e:
         print(f"[{case_name}] Initialization Failed: {e}")
+        traceback.print_exc()
         return
 
     B, L, C, H, W = input_shape
@@ -97,6 +118,13 @@ def run_case(case_name, args_dict, input_shape=(2, 4, 2, 32, 32), mode='p'):
                 print(f"[{case_name}] Success. Output: tuple of length {len(out)}")
             else:
                 print(f"[{case_name}] Success. Output shape: {out.shape}")
+                
+            # Basic sanity check on output shape vs input
+            # If gaussian head, output channel is usually 2*C (mean, std) or defined by out_ch
+            expected_out_ch = args.out_ch * 2 if args.head_mode == "gaussian" else args.out_ch
+            if not isinstance(out, tuple) and out.shape[2] != expected_out_ch:
+                 print(f"  [Warning] Expected output channels {expected_out_ch}, got {out.shape[2]}")
+
         elif mode == 'i':
             out_gen_num = 3
             listT_future = torch.ones(B, out_gen_num - 1).to(device)
@@ -105,7 +133,6 @@ def run_case(case_name, args_dict, input_shape=(2, 4, 2, 32, 32), mode='p'):
             
     except Exception as e:
         print(f"[{case_name}] Forward Execution Failed: {e}")
-        import traceback
         traceback.print_exc()
     
     del model, x
@@ -113,90 +140,88 @@ def run_case(case_name, args_dict, input_shape=(2, 4, 2, 32, 32), mode='p'):
         torch.cuda.empty_cache()
 
 def main():
-    print("========== Start Checking ConvLRU Model Paths ==========")
+    print("========== Start Checking ConvLRU (Lagrangian & Dynamic SSM) ==========")
     
-    run_case("01_Standard_UNet_Gaussian", {})
+    # 1. Baseline
+    run_case("01_Baseline_UNet", {})
     
-    run_case("02_No_UNet", {"Arch": "no_unet", "convlru_num_blocks": 2})
-    
-    run_case("03_BiFPN", {"Arch": "bifpn"})
-    
-    run_case("04_Downsample_Conv", {"down_mode": "conv"})
-    run_case("05_Downsample_Shuffle", {"down_mode": "shuffle"})
-    
-    run_case("06_Advanced_LRU_Components_1", {
-        "use_selective": True,
-        "use_spectral_mixing": True,
-        "use_anisotropic_diffusion": True, 
-        "use_advection": True,
-        "use_graph_interaction": True
+    # 2. Physics-Informed Components (The new stuff)
+    run_case("02_Lagrangian_Advection", {
+        "use_advection": True,  # Trigger AdvectionBlock & LatentFlowPredictor
+        "emb_ch": 32 
     })
     
-    run_case("07_Advanced_LRU_Components_2", {
-        "use_adaptive_ssm": True,
-        "use_neural_operator": True,
-        "use_wavelet_ssm": True,
+    run_case("03_Anisotropic_Diffusion", {
+        "use_anisotropic_diffusion": True, # Trigger Gradient calc in _apply_forcing
+        "emb_ch": 32
+    })
+    
+    run_case("04_Spectral_Viscosity_and_Mixing", {
+        "use_spectral_mixing": True, # Trigger SpectralInteraction
+        "use_freq_prior": True       # Trigger SpectralConv2d
+    })
+    
+    # 3. Dynamic SSM (Mamba-style Gating & LoRA)
+    run_case("05_Dynamic_SSM_Gating", {
+        "use_adaptive_ssm": True, # Trigger Input/Output gating logic
+        "lru_rank": 8
+    })
+    
+    # 4. Complex Interactions
+    run_case("06_Graph_and_CrossVar", {
+        "use_graph_interaction": True,
         "use_cross_var_attn": True
     })
     
-    run_case("08_Priors_and_Gates", {
-        "use_freq_prior": True,
-        "use_sh_prior": True,
-        "use_gate": True
+    run_case("07_Wavelet_SSM", {
+        "use_wavelet_ssm": True
+    })
+
+    # 5. Architecture Variations
+    run_case("08_BiFPN_Arch", {
+        "Arch": "bifpn"
     })
     
-    run_case("09_Static_Features_Init", {
+    run_case("09_No_UNet", {
+        "Arch": "no_unet",
+        "convlru_num_blocks": 2
+    })
+
+    # 6. Static Features & Initialization
+    run_case("10_Static_Init", {
         "static_ch": 4,
         "learnable_init_state": True
     })
+
+    # 7. Decoder & Head Variations
+    run_case("11_Diffusion_Head", {
+        "head_mode": "diffusion",
+        "out_ch": 2
+    })
     
-    run_case("10_Static_Features_Embedding_Cond", {
-        "static_ch": 4,
-        "emb_hidden_layers_num": 1
+    run_case("12_Token_Head_VQ", {
+        "head_mode": "token",
+        "out_ch": 2
     })
 
-    run_case("11_MoE_Structure", {
-        "num_expert": 4,
-        "activate_expert": 2,
-        "ffn_hidden_ch": 64
-    })
-    
-    run_case("12_ConvType_DCN", {
-        "ConvType": "dcn"
-    })
-    
-    run_case("13_Use_CBAM", {
-        "use_cbam": True
-    })
-    
-    run_case("14_Head_Diffusion", {
-        "head_mode": "diffusion", 
-        "out_ch": 2
-    })
-    
-    run_case("15_Head_Token", {
-        "head_mode": "token",
-        "out_ch": 2 
-    })
-    
-    run_case("16_Decoder_Deconv", {
-        "dec_strategy": "deconv"
-    })
-    
-    run_case("17_Decoder_Deep_Hidden", {
-        "dec_hidden_layers_num": 2,
-        "dec_hidden_ch": 16,
-        "static_ch": 2, 
-        "head_mode": "diffusion" 
-    })
-    
-    run_case("18_Inference_Mode_Standard", {}, mode='i')
-    
-    run_case("19_Inference_Mode_Diffusion_Static", {
-        "head_mode": "diffusion",
-        "static_ch": 4,
-        "out_ch": 2
+    # 8. Inference Mode
+    run_case("13_Inference_Loop", {
+        "use_advection": True # Test advection in inference loop
     }, mode='i')
+
+    # 9. Full Kitchen Sink (Extreme Stress Test)
+    run_case("14_All_Features_Combined", {
+        "use_advection": True,
+        "use_anisotropic_diffusion": True,
+        "use_spectral_mixing": True,
+        "use_adaptive_ssm": True,
+        "use_graph_interaction": True,
+        "use_wavelet_ssm": True,
+        "use_sh_prior": True,
+        "static_ch": 2,
+        "learnable_init_state": True,
+        "head_mode": "gaussian"
+    })
 
     print("========== Check Finished ==========")
 

@@ -763,6 +763,209 @@ class AdvectionBlock(nn.Module):
         x_warped = F.grid_sample(x_flat, grid_flow, mode='bilinear', padding_mode='border', align_corners=False)
         return x_warped.reshape(B, L, C, H, W)
 
+class StaticInitState(nn.Module):
+    def __init__(self, static_ch, emb_ch, rank, S, W_freq):
+        super().__init__()
+        self.static_ch = static_ch
+        self.emb_ch = emb_ch
+        self.rank = rank
+        self.S = S
+        self.W_freq = W_freq
+        self.mapper = nn.Sequential(
+            nn.Conv2d(static_ch, emb_ch, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((1, W_freq)),
+            nn.Conv2d(emb_ch, emb_ch * rank * 2, kernel_size=1) 
+        )
+
+    def forward(self, static_feats):
+        B = static_feats.size(0)
+        out = self.mapper(static_feats) 
+        out = out.squeeze(2)
+        out = out.view(B, self.emb_ch, self.rank * 2, self.W_freq)
+        out_real = out[:, :, :self.rank, :]
+        out_imag = out[:, :, self.rank:, :]
+        init_state = torch.complex(out_real, out_imag)
+        init_state = init_state.permute(0, 1, 3, 2).contiguous()
+        return init_state.unsqueeze(1) 
+
+class GatedConvBlock(nn.Module):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None, conv_type: str = "conv"):
+        super().__init__()
+        self.use_cbam = bool(use_cbam)
+        self.use_ada_norm = use_ada_norm
+        self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size, conv_type=conv_type)
+        if self.use_ada_norm and ada_norm_cond_dim is not None:
+            self.norm = AdaRMSNorm(int(channels), int(ada_norm_cond_dim))
+            self.cond_proj = None
+        else:
+            self.norm = RMSNorm(int(channels))
+            self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
+            self.cond_proj = nn.Conv3d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
+        self.pw_conv_in = nn.Conv3d(int(channels), int(channels) * 2, kernel_size=1)
+        self.fused_gate = FusedGatedSiLU()
+        self.pw_conv_out = nn.Conv3d(int(channels), int(channels), kernel_size=1)
+        self.cbam = CBAM2DPerStep(int(channels), reduction=16) if self.use_cbam else None
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        residual = x
+        x = self.dw_conv(x)
+        if self.use_ada_norm:
+            x = self.norm(x, time_emb)
+        else:
+            x = self.norm(x)
+        if self.cond_proj is not None and cond is not None:
+            if cond.dim() == 4:
+                cond_in = cond.unsqueeze(2)
+            else:
+                cond_in = cond
+            if cond_in.shape[-2:] != x.shape[-2:]:
+                cond_rs = F.interpolate(cond_in.squeeze(2), size=x.shape[-2:], mode="bilinear", align_corners=False).unsqueeze(2)
+            else:
+                cond_rs = cond_in
+            affine = self.cond_proj(cond_rs)
+            gamma, beta = torch.chunk(affine, 2, dim=1)
+            x = x * (1 + gamma) + beta
+        x = self.pw_conv_in(x)
+        x = self.fused_gate(x)
+        if self.cbam is not None:
+            x = self.cbam(x)
+        x = self.pw_conv_out(x)
+        return residual + x
+
+class SpatialPatchMoE(nn.Module):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], num_experts: int, active_experts: int, use_cbam: bool, cond_channels: Optional[int], conv_type: str = "conv"):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.active_experts = int(active_experts)
+        self.patch_size = 8
+        self.expert_hidden_size = (self.patch_size, self.patch_size)
+        self.channels = int(channels)
+        self.cond_channels = int(cond_channels) if cond_channels is not None else 0
+        expert_kernel_sizes = [3, 7, 11]
+        self.experts = nn.ModuleList(
+            [
+                GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=expert_kernel_sizes[i % len(expert_kernel_sizes)], use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None), conv_type=conv_type)
+                for i in range(self.num_experts)
+            ]
+        )
+        self.shared_expert = nn.Sequential(
+             GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=7, use_cbam=bool(use_cbam), cond_channels=(self.cond_channels if self.cond_channels > 0 else None), conv_type=conv_type),
+             GatedConvBlock(self.channels, self.expert_hidden_size, kernel_size=3, use_cbam=False, cond_channels=(self.cond_channels if self.cond_channels > 0 else None), conv_type=conv_type)
+        )
+        router_in_dim = self.channels + (self.cond_channels if self.cond_channels > 0 else 0)
+        self.router = nn.Linear(router_in_dim, self.num_experts)
+        self.aux_loss = 0.0
+        self.norm = RMSNorm(self.channels)
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self.aux_loss = 0.0
+        B, C, L, H, W = x.shape
+        P = self.patch_size
+        pad_h = (P - (H % P)) % P
+        pad_w = (P - (W % P)) % P
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+            if cond is not None:
+                cond = F.pad(cond, (0, pad_w, 0, pad_h))
+        H_pad, W_pad = x.shape[-2:]
+        nH, nW = H_pad // P, W_pad // P
+        
+        x_patches = (
+            x.view(B, C, L, nH, P, nW, P)
+            .permute(0, 3, 5, 2, 1, 4, 6)
+            .reshape(B * nH * nW * L, C, 1, P, P)
+        )
+        
+        cond_patches = None
+        router_input = x_patches.mean(dim=(2, 3, 4))
+        if self.cond_channels > 0 and cond is not None:
+            if cond.dim() == 4:
+                cond_l = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
+            else:
+                cond_l = cond
+            cond_patches = (
+                cond_l.view(B, self.cond_channels, L, nH, P, nW, P)
+                .permute(0, 3, 5, 2, 1, 4, 6)
+                .reshape(B * nH * nW * L, self.cond_channels, 1, P, P)
+            )
+            router_cond = cond_patches.mean(dim=(2, 3, 4))
+            router_input = torch.cat([router_input, router_cond], dim=1)
+        
+        s_out = x_patches
+        for layer in self.shared_expert:
+             s_out = layer(s_out, cond=cond_patches)
+        shared_out = s_out
+
+        router_logits = self.router(router_input)
+        
+        with torch.amp.autocast("cuda", enabled=False):
+            router_logits = router_logits.float()
+            lse = torch.logsumexp(router_logits, dim=-1)
+            z_loss = lse.pow(2).mean()
+            router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
+            mean_probs = router_probs.mean(dim=0)
+            N_total = router_logits.size(0)
+            topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
+            BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
+            fused_moe_router_kernel[(N_total,)](
+                router_logits, topk_indices, self.num_experts, self.active_experts, BLOCK_SIZE,
+            )
+            with torch.no_grad():
+                flat_indices_all = topk_indices.view(-1).long()
+                expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
+                fraction_selected = expert_counts / flat_indices_all.numel()
+            self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
+            topk_indices = topk_indices.long()
+            topk_weights = torch.gather(router_probs, 1, topk_indices)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        
+        flat_indices = topk_indices.view(-1)
+        x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
+        cond_repeated = None
+        if cond_patches is not None:
+            cond_repeated = cond_patches.repeat_interleave(self.active_experts, dim=0)
+        sorted_expert_ids, sorted_args = torch.sort(flat_indices)
+        x_sorted = x_repeated[sorted_args]
+        cond_sorted = None
+        if cond_repeated is not None:
+            cond_sorted = cond_repeated[sorted_args]
+        expert_counts = torch.bincount(sorted_expert_ids, minlength=self.num_experts).tolist()
+        y_sorted = torch.empty_like(x_sorted)
+        start_idx = 0
+        for i, count in enumerate(expert_counts):
+            if count == 0:
+                continue
+            end_idx = start_idx + count
+            inp_slice = x_sorted[start_idx:end_idx]
+            c_slice = None
+            if cond_sorted is not None:
+                c_slice = cond_sorted[start_idx:end_idx]
+            out_slice = self.experts[i](inp_slice, cond=c_slice)
+            y_sorted[start_idx:end_idx] = out_slice
+            start_idx = end_idx
+        flat_weights = topk_weights.view(-1)
+        weights_sorted = flat_weights[sorted_args]
+        y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1).to(y_sorted.dtype)
+        
+        out_patches = shared_out
+        token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
+        sorted_token_ids = token_ids[sorted_args]
+        out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
+        
+        out_patches_reshaped = out_patches.view(B * nH * nW * L, C, 1, P, P).squeeze(2).permute(0, 2, 3, 1).contiguous()
+        out_patches_norm = self.norm(out_patches_reshaped)
+        out_patches = out_patches_norm.permute(0, 3, 1, 2).unsqueeze(2) 
+
+        out = (
+            out_patches.view(B, nH, nW, L, C, P, P)
+            .permute(0, 4, 3, 1, 5, 2, 6)
+            .reshape(B, C, L, H_pad, W_pad)
+        )
+        if pad_h > 0 or pad_w > 0:
+            out = out[..., :H, :W]
+        return out
+
 class ConvLRULayer(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -953,6 +1156,8 @@ class ConvLRULayer(nn.Module):
             
             if L == 1 and last_hidden_in is not None:
                 h_prev = last_hidden_in.to(x_in_lru.dtype)
+                # Lagrangian advection applied implicitly via AdvectionBlock on inputs
+                # and residual correction via SSM.
                 h_out = lamb * h_prev + x_in_lru
                 last_hidden_out = h_out
             else:
