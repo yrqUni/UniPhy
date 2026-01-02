@@ -1,413 +1,442 @@
+import argparse
+import datetime
+import logging
 import os
-import sys
 import random
-import csv
-from typing import Dict, List, Tuple, Optional
+import sys
+import warnings
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-import imageio
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.append("/nfs/ConvLRU/Model/ConvLRU")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
-from ModelConvLRU import ConvLRU
 from ERA5 import ERA5_Dataset
-from train import Args as TrainArgs
-from train import load_model_args_from_ckpt, apply_model_args
+from ModelConvLRU import ConvLRU
 
+warnings.filterwarnings("ignore")
 
-class InferenceArgs:
-    def __init__(self):
-        self.ckpt_path = "/nfs/ConvLRU/Exp/ERA5/convlru_base/ckpt/e29_s570_l0.249103.pth"
+MODEL_ARG_KEYS = [
+    "input_size",
+    "input_ch",
+    "out_ch",
+    "hidden_activation",
+    "output_activation",
+    "emb_strategy",
+    "hidden_factor",
+    "emb_ch",
+    "emb_hidden_ch",
+    "emb_hidden_layers_num",
+    "convlru_num_blocks",
+    "use_cbam",
+    "use_gate",
+    "lru_rank",
+    "use_freq_prior",
+    "freq_rank",
+    "freq_gain_init",
+    "freq_mode",
+    "use_sh_prior",
+    "sh_Lmax",
+    "sh_rank",
+    "sh_gain_init",
+    "ffn_hidden_ch",
+    "ffn_hidden_layers_num",
+    "num_expert",
+    "activate_expert",
+    "dec_strategy",
+    "dec_hidden_ch",
+    "dec_hidden_layers_num",
+    "static_ch",
+    "use_selective",
+    "unet",
+    "down_mode",
+    "head_mode",
+    "use_checkpointing",
+    "pool_mode",
+    "use_spectral_mixing",
+    "use_anisotropic_diffusion",
+    "use_advection",
+    "use_graph_interaction",
+    "use_adaptive_ssm",
+    "use_neural_operator",
+    "learnable_init_state",
+    "use_wavelet_ssm",
+    "use_cross_var_attn",
+    "ConvType",
+    "Arch",
+]
+
+def set_random_seed(seed: int, deterministic: bool = False) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+
+set_random_seed(1017, deterministic=False)
+
+class Args:
+    def __init__(self) -> None:
+        self.input_size = (721, 1440)
+        self.input_ch = 30
+        self.out_ch = 30
+        self.static_ch = 6
+        self.hidden_activation = "SiLU"
+        self.output_activation = "Tanh"
+        self.emb_strategy = "pxus"
+        self.hidden_factor = (7, 12)
+        self.emb_ch = 120
+        self.emb_hidden_ch = 150
+        self.emb_hidden_layers_num = 2
+        self.convlru_num_blocks = 6
+        self.use_cbam = True
+        self.ffn_hidden_ch = 150
+        self.ffn_hidden_layers_num = 2
+        self.num_expert = 16
+        self.activate_expert = 4
+        self.use_gate = True
+        self.lru_rank = 32
+        self.use_selective = True
+        self.unet = True
+        self.down_mode = "shuffle"
+        self.use_freq_prior = False
+        self.freq_rank = 8
+        self.freq_gain_init = 0.0
+        self.freq_mode = "linear"
+        self.use_sh_prior = True
+        self.sh_Lmax = 6
+        self.sh_rank = 8
+        self.sh_gain_init = 0.0
+        self.dec_strategy = "pxsf"
+        self.dec_hidden_ch = 0
+        self.dec_hidden_layers_num = 0
+        self.head_mode = "gaussian"
+        self.diffusion_steps = 1000
         self.data_root = "/nfs/ERA5_data/data_norm"
-        self.output_dir = "./inference_results/1"
-        self.TS = 1.0
-        self.ctx_len = 8
-        self.gen_len = 32
-        self.fps = 1
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.year_range = [2022, 2022]
+        self.train_data_n_frames = 27
+        self.eval_data_n_frames = 20
+        self.eval_sample_num = 100
+        self.ckpt = "e7_s570_l0.265707.pth"
+        self.train_batch_size = 1
+        self.eval_batch_size = 1
+        self.epochs = 128
+        self.log_path = "./convlru_base/logs"
+        self.ckpt_dir = "./convlru_base/ckpt"
+        self.ckpt_step = 0.25
+        self.do_eval = True
+        self.use_tf32 = False
+        self.use_compile = False
+        self.lr = 1e-5
+        self.weight_decay = 0.05
+        self.use_scheduler = False
+        self.init_lr_scheduler = False
+        self.loss = "lat"
+        self.T = 6
+        self.use_amp = False
+        self.amp_dtype = "bf16"
+        self.grad_clip = 1.0
+        self.sample_k = 9
+        self.use_wandb = False
+        self.wandb_project = "ERA5"
+        self.wandb_entity = "ConvLRU"
+        self.wandb_run_name = "Infer"
+        self.wandb_group = "Infer"
+        self.wandb_mode = "offline"
+        self.use_checkpointing = True
+        self.use_spectral_mixing = True
+        self.use_anisotropic_diffusion = True
+        self.use_advection = True
+        self.use_graph_interaction = False
+        self.use_adaptive_ssm = True
+        self.use_neural_operator = False
+        self.learnable_init_state = True
+        self.use_wavelet_ssm = True
+        self.use_cross_var_attn = True
+        self.ConvType = "dcn"
+        self.Arch = "bifpn"
 
-
-def save_vis_video(preds: np.ndarray, save_dir: str, sample_idx: int, fps: int = 1) -> None:
-    T, C, H, W = preds.shape
-    dpi = 150
-    figsize = (W / dpi, H / dpi)
-
-    for ch in range(C):
-        data_flat = preds[:, ch].flatten()
-        vmin = np.percentile(data_flat, 2)
-        vmax = np.percentile(data_flat, 98)
-
-        range_span = vmax - vmin
-        vmin -= range_span * 0.05
-        vmax += range_span * 0.05
-
-        save_name = f"pred_sample_{sample_idx}_ch{ch}_vis.mp4"
-        save_path = os.path.join(save_dir, save_name)
-
-        writer = imageio.get_writer(
-            save_path,
-            fps=fps,
-            codec="libx264",
-            pixelformat="yuv420p",
-            macro_block_size=None,
-            output_params=["-crf", "18", "-preset", "slow"],
-        )
-
-        fig = plt.figure(figsize=figsize, dpi=dpi)
-        ax = fig.add_axes([0, 0, 1, 1])
-        ax.set_axis_off()
-
-        im = ax.imshow(
-            preds[0, ch],
-            cmap="magma",
-            vmin=vmin,
-            vmax=vmax,
-            interpolation="bicubic",
-        )
-
-        for t in range(T):
-            im.set_data(preds[t, ch])
-            fig.canvas.draw()
-
-            image = np.frombuffer(fig.canvas.buffer_rgba(), dtype="uint8")
-            image = image.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-            image = image[:, :, :3]
-
-            h_curr, w_curr = image.shape[:2]
-            h_new = h_curr - (h_curr % 2)
-            w_new = w_curr - (w_curr % 2)
-
-            if h_new != h_curr or w_new != w_curr:
-                image = image[:h_new, :w_new]
-
-            writer.append_data(image)
-
-        writer.close()
-        plt.close(fig)
-
-
-def _safe_makedirs(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _tensor_sample_flat(x: torch.Tensor, max_elems: int) -> np.ndarray:
-    x = x.detach()
-    numel = x.numel()
-    if numel == 0:
-        return np.array([], dtype=np.float32)
-    if numel <= max_elems:
-        return x.float().reshape(-1).cpu().numpy()
-    idx = torch.randint(0, numel, (max_elems,), device=x.device)
-    flat = x.float().reshape(-1)
-    return flat[idx].cpu().numpy()
-
-
-def collect_weight_stats(
-    model: torch.nn.Module,
-    eps: float = 1e-6,
-    global_sample_hist: int = 1_000_000,
-) -> Tuple[List[Dict], Dict, np.ndarray]:
-    rows: List[Dict] = []
-    per_param_samples: List[np.ndarray] = []
-
-    total_params = 0
-    total_trainable = 0
-
-    with torch.no_grad():
-        for name, p in model.named_parameters():
-            if p is None:
-                continue
-
-            numel = int(p.numel())
-            total_params += numel
-            if p.requires_grad:
-                total_trainable += numel
-
-            if numel == 0:
-                continue
-
-            p_f = p.detach().float().reshape(-1)
-
-            mean = float(p_f.mean().item())
-            std = float(p_f.std(unbiased=False).item())
-            minv = float(p_f.min().item())
-            maxv = float(p_f.max().item())
-            abs_mean = float(p_f.abs().mean().item())
-            abs_max = float(p_f.abs().max().item())
-            l2 = float(torch.linalg.vector_norm(p_f, ord=2).item())
-            l1 = float(torch.linalg.vector_norm(p_f, ord=1).item())
-            sparsity = float((p_f.abs() < eps).float().mean().item())
-
-            rows.append(
-                {
-                    "name": name,
-                    "shape": str(tuple(p.shape)),
-                    "dtype": str(p.dtype).replace("torch.", ""),
-                    "device": str(p.device),
-                    "requires_grad": int(bool(p.requires_grad)),
-                    "numel": numel,
-                    "mean": mean,
-                    "std": std,
-                    "min": minv,
-                    "max": maxv,
-                    "abs_mean": abs_mean,
-                    "abs_max": abs_max,
-                    "l2_norm": l2,
-                    "l1_norm": l1,
-                    "sparsity(|w|<eps)": sparsity,
-                }
-            )
-
-            per_param_budget = max(10_000, min(global_sample_hist // 10, 200_000))
-            per_param_samples.append(_tensor_sample_flat(p.detach(), per_param_budget))
-
-    if per_param_samples:
-        all_samples = np.concatenate(per_param_samples, axis=0)
-        if all_samples.size > global_sample_hist:
-            sel = np.random.randint(0, all_samples.size, size=(global_sample_hist,))
-            all_samples = all_samples[sel]
-    else:
-        all_samples = np.array([], dtype=np.float32)
-
-    summary = {
-        "total_params": int(total_params),
-        "total_trainable_params": int(total_trainable),
-        "global_sample_count": int(all_samples.size),
-        "global_mean": float(all_samples.mean()) if all_samples.size else 0.0,
-        "global_std": float(all_samples.std()) if all_samples.size else 0.0,
-        "global_min": float(all_samples.min()) if all_samples.size else 0.0,
-        "global_max": float(all_samples.max()) if all_samples.size else 0.0,
-    }
-    return rows, summary, all_samples
-
-
-def save_stats_csv(rows: List[Dict], out_csv: str) -> None:
-    if not rows:
-        return
-    fieldnames = list(rows[0].keys())
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
-
-def plot_hist_all_weights(all_samples: np.ndarray, out_path: str, bins: int = 200) -> None:
-    if all_samples.size == 0:
-        return
-    plt.figure(figsize=(10, 6), dpi=150)
-    plt.hist(all_samples, bins=bins)
-    plt.title("Histogram of sampled model weights")
-    plt.xlabel("weight value")
-    plt.ylabel("count")
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-
-
-def plot_topk_bars(rows: List[Dict], key: str, out_path: str, topk: int, title: str) -> None:
-    if not rows:
-        return
-    rows_f = [r for r in rows if int(r.get("numel", 0)) > 0]
-    rows_sorted = sorted(rows_f, key=lambda r: abs(float(r.get(key, 0.0))), reverse=True)[:topk]
-
-    names = [r["name"] for r in rows_sorted][::-1]
-    vals = [float(r[key]) for r in rows_sorted][::-1]
-
-    height = max(6.0, 0.25 * len(names))
-    plt.figure(figsize=(12, height), dpi=150)
-    y = np.arange(len(names))
-    plt.barh(y, vals)
-    plt.yticks(y, names, fontsize=7)
-    plt.xlabel(key)
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-
-
-def _is_conv_weight(name: str, p: torch.Tensor) -> bool:
-    if "weight" not in name:
-        return False
-    return p.dim() in (4, 5)
-
-
-def visualize_conv_kernels(
-    model: torch.nn.Module,
-    out_dir: str,
-    max_layers: int = 6,
-    max_out_ch: int = 16,
-) -> None:
-    _safe_makedirs(out_dir)
-
-    picked: List[Tuple[str, torch.Tensor]] = []
-    for name, p in model.named_parameters():
-        if _is_conv_weight(name, p):
-            picked.append((name, p.detach().float().cpu()))
-
-    if not picked:
-        return
-
-    def score(item: Tuple[str, torch.Tensor]) -> int:
-        _, w = item
-        out_ch = int(w.shape[0])
-        if w.dim() == 4:
-            k = int(w.shape[-1] * w.shape[-2])
-        else:
-            k = int(w.shape[-1] * w.shape[-2] * w.shape[-3])
-        return out_ch * k
-
-    picked = sorted(picked, key=score, reverse=True)[:max_layers]
-
-    for li, (name, w) in enumerate(picked):
-        out_ch = int(w.shape[0])
-        n_show = min(out_ch, max_out_ch)
-
-        if w.dim() == 5:
-            w2 = w[:n_show].mean(dim=1).mean(dim=1)
-        else:
-            w2 = w[:n_show].mean(dim=1)
-
-        w2_np = w2.numpy()
-
-        cols = int(np.ceil(np.sqrt(n_show)))
-        rows = int(np.ceil(n_show / cols))
-
-        plt.figure(figsize=(cols * 2.2, rows * 2.2), dpi=150)
-        for i in range(n_show):
-            ax = plt.subplot(rows, cols, i + 1)
-            k = w2_np[i]
-            vmin = np.percentile(k, 2)
-            vmax = np.percentile(k, 98)
-            ax.imshow(k, vmin=vmin, vmax=vmax, interpolation="nearest")
-            ax.set_axis_off()
-            ax.set_title(f"out{i}", fontsize=7)
-
-        plt.suptitle(name, fontsize=10)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f"conv_kernels_{li:02d}.png"))
-        plt.close()
-
-
-def analyze_and_visualize_weights(
-    model: torch.nn.Module,
-    out_dir: str,
-    load_info: Optional[object] = None,
-) -> None:
-    _safe_makedirs(out_dir)
-
-    rows, summary, all_samples = collect_weight_stats(model)
-
-    save_stats_csv(rows, os.path.join(out_dir, "weights_stats.csv"))
-
-    overview_path = os.path.join(out_dir, "weights_overview.txt")
-    with open(overview_path, "w") as f:
-        for k, v in summary.items():
-            f.write(f"{k}: {v}\n")
-
-        if load_info is not None and hasattr(load_info, "missing_keys") and hasattr(load_info, "unexpected_keys"):
-            missing_keys = list(getattr(load_info, "missing_keys"))
-            unexpected_keys = list(getattr(load_info, "unexpected_keys"))
-            f.write(f"missing_keys_count: {len(missing_keys)}\n")
-            f.write(f"unexpected_keys_count: {len(unexpected_keys)}\n")
-            if missing_keys:
-                f.write("missing_keys:\n")
-                for k in missing_keys:
-                    f.write(f"{k}\n")
-            if unexpected_keys:
-                f.write("unexpected_keys:\n")
-                for k in unexpected_keys:
-                    f.write(f"{k}\n")
-
-    plot_hist_all_weights(all_samples, os.path.join(out_dir, "hist_all_weights.png"), bins=200)
-    plot_topk_bars(
-        rows,
-        key="abs_mean",
-        out_path=os.path.join(out_dir, "layer_absmean_top.png"),
-        topk=40,
-        title="Top layers by abs_mean(weight)",
+def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=1800),
     )
-    plot_topk_bars(
-        rows,
-        key="l2_norm",
-        out_path=os.path.join(out_dir, "layer_l2norm_top.png"),
-        topk=40,
-        title="Top layers by L2 norm(weight)",
+    torch.cuda.set_device(local_rank)
+
+def cleanup_ddp() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def setup_logging(args: Args) -> None:
+    if not dist.is_initialized() or dist.get_rank() != 0:
+        return
+    os.makedirs(args.log_path, exist_ok=True)
+    log_filename = os.path.join(args.log_path, f"inference_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        filename=log_filename,
+        level=logging.INFO,
+        format="%(asctime)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    visualize_conv_kernels(model, os.path.join(out_dir, "conv_kernels"), max_layers=6, max_out_ch=16)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    logging.getLogger("").addHandler(console)
 
+def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
+    if not os.path.isfile(ckpt_path):
+        return None
+    ckpt = torch.load(ckpt_path, map_location=map_location)
+    model_args = ckpt.get("model_args", None)
+    if model_args is None:
+        args_all = ckpt.get("args_all", None)
+        if isinstance(args_all, dict):
+            model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
+    del ckpt
+    return model_args
 
-def main() -> None:
-    cfg = InferenceArgs()
-    _safe_makedirs(cfg.output_dir)
+def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], verbose: bool = True) -> None:
+    if not model_args_dict:
+        return
+    for k, v in model_args_dict.items():
+        if hasattr(args_obj, k):
+            old = getattr(args_obj, k)
+            if verbose and old != v:
+                if dist.get_rank() == 0:
+                    logging.info(f"[Args] restore '{k}': {old} -> {v}")
+            setattr(args_obj, k, v)
 
-    model_args = TrainArgs()
-    ckpt_args_dict = load_model_args_from_ckpt(cfg.ckpt_path, map_location="cpu")
-    if ckpt_args_dict:
-        apply_model_args(model_args, ckpt_args_dict, verbose=False)
+def get_prefix(keys: List[str]) -> str:
+    if not keys:
+        return ""
+    key = keys[0]
+    if key.startswith("module._orig_mod."):
+        return "module._orig_mod."
+    if key.startswith("module."):
+        return "module."
+    return ""
 
-    model_args.data_root = cfg.data_root
+def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(state_dict.keys())
+    ckpt_prefix = get_prefix(ckpt_keys)
+    model_prefix = get_prefix(model_keys)
+    new_state_dict: Dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        new_k = k
+        if ckpt_prefix:
+            new_k = new_k[len(ckpt_prefix) :]
+        if model_prefix:
+            new_k = model_prefix + new_k
+        new_state_dict[new_k] = v
+    return new_state_dict
 
-    model = ConvLRU(model_args).to(cfg.device)
+def load_ckpt(model: torch.nn.Module, ckpt_path: str, map_location: str = "cpu") -> None:
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=map_location)
+    state_dict = adapt_state_dict_keys(checkpoint["model"], model)
+    model.load_state_dict(state_dict, strict=False)
+    del checkpoint
+    del state_dict
+    if dist.get_rank() == 0:
+        logging.info(f"Loaded checkpoint from {ckpt_path}")
+
+_LAT_WEIGHT_CACHE: Dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
+
+def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (H, device, dtype)
+    if key in _LAT_WEIGHT_CACHE:
+        return _LAT_WEIGHT_CACHE[key]
+    lat_edges = torch.linspace(-90, 90, steps=H + 1, device=device, dtype=dtype)
+    lat_centers = 0.5 * (lat_edges[:-1] + lat_edges[1:])
+    w = torch.cos(lat_centers * torch.pi / 180.0).clamp_min(0)
+    w = w / w.mean()
+    _LAT_WEIGHT_CACHE[key] = w
+    return w
+
+def weighted_rmse(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    B, L, C, H, W = preds.shape
+    w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
+    err = (preds - targets).pow(2)
+    weighted_err = err * w
+    mse = weighted_err.mean()
+    return torch.sqrt(mse)
+
+def weighted_acc(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    B, L, C, H, W = preds.shape
+    w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
+    
+    preds_mean = torch.mean(preds, dim=(3, 4), keepdim=True)
+    targets_mean = torch.mean(targets, dim=(3, 4), keepdim=True)
+    
+    preds_anom = preds - preds_mean
+    targets_anom = targets - targets_mean
+    
+    cov = torch.sum(w * preds_anom * targets_anom, dim=(3, 4))
+    var_pred = torch.sum(w * preds_anom * preds_anom, dim=(3, 4))
+    var_target = torch.sum(w * targets_anom * targets_anom, dim=(3, 4))
+    
+    acc = cov / torch.sqrt(var_pred * var_target + 1e-6)
+    return acc.mean()
+
+def run_inference(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
+    setup_ddp(rank, world_size, master_addr, master_port, local_rank)
+    if rank == 0:
+        setup_logging(args)
+
+    static_pt_path = "/nfs/ConvLRU/Exp/ERA5/static_feats.pt"
+    static_data_cpu = None
+    if int(args.static_ch) > 0:
+        if os.path.isfile(static_pt_path):
+            if rank == 0:
+                logging.info(f"Loading static features from {static_pt_path}")
+            static_data_cpu = torch.load(static_pt_path, map_location="cpu")
+        else:
+            if rank == 0:
+                logging.warning(f"Static features enabled but {static_pt_path} not found!")
+
+    ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f"cuda:{local_rank}")
+    if ckpt_model_args:
+        apply_model_args(args, ckpt_model_args, verbose=True)
+
+    model = ConvLRU(args).cuda(local_rank)
+    load_ckpt(model, args.ckpt, map_location=f"cuda:{local_rank}")
+    
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     model.eval()
 
-    checkpoint = torch.load(cfg.ckpt_path, map_location=cfg.device)
-    state_dict = checkpoint["model"]
-    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    load_info = model.load_state_dict(new_state_dict, strict=False)
-
-    analyze_and_visualize_weights(model, cfg.output_dir, load_info=load_info)
-
-    dataset = ERA5_Dataset(
-        input_dir=cfg.data_root,
-        year_range=model_args.year_range,
+    eval_dataset = ERA5_Dataset(
+        input_dir=args.data_root,
+        year_range=args.year_range,
         is_train=False,
-        sample_len=cfg.ctx_len,
-        eval_sample=8,
-        max_cache_size=128,
+        sample_len=args.eval_data_n_frames,
+        eval_sample=args.eval_sample_num,
+        max_cache_size=8,
+        rank=dist.get_rank(),
+        gpus=dist.get_world_size(),
+    )
+    eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False, drop_last=False)
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        sampler=eval_sampler,
+        batch_size=args.eval_batch_size,
+        num_workers=2,
+        pin_memory=True,
     )
 
-    sample_idx = random.randint(0, len(dataset) - 1)
-    raw_sample = dataset[sample_idx]
-    raw_sample = torch.from_numpy(raw_sample).unsqueeze(0).to(cfg.device).float()
+    static_gpu: Optional[torch.Tensor] = None
+    if int(args.static_ch) > 0 and static_data_cpu is not None:
+        static_gpu = static_data_cpu.to(device=torch.device(f"cuda:{local_rank}"), dtype=torch.float32)
 
-    x_ctx = raw_sample
+    amp_dtype = torch.bfloat16 if str(args.amp_dtype).lower() == "bf16" else torch.float16
+    use_amp = bool(args.use_amp)
 
-    dt_native = 1.0
-    listT_ctx = torch.full((1, cfg.ctx_len), dt_native, device=cfg.device)
-    listT_future = torch.full((1, cfg.gen_len), float(cfg.TS), device=cfg.device)
-
-    static_feats = None
-    static_path = os.path.join(os.path.dirname(cfg.ckpt_path), "../../static_feats.pt")
-    if not os.path.exists(static_path):
-        static_path = "/nfs/ConvLRU/Exp/ERA5/static_feats.pt"
-
-    if os.path.exists(static_path) and getattr(model_args, "static_ch", 0) > 0:
-        static_data = torch.load(static_path, map_location=cfg.device)
-        static_feats = static_data.unsqueeze(0).repeat(1, 1, 1, 1).float()
+    eval_iter = tqdm(eval_dataloader, desc="Inference") if rank == 0 else eval_dataloader
+    
+    total_rmse = 0.0
+    total_acc = 0.0
+    count = 0
 
     with torch.no_grad():
-        out_gen = model(
-            x_ctx,
-            mode="i",
-            out_gen_num=cfg.gen_len,
-            listT=listT_ctx,
-            listT_future=listT_future,
-            static_feats=static_feats,
-            timestep=None,
-        )
+        for i, data in enumerate(eval_iter):
+            B_full, L_full, C, H, W = data.shape
+            
+            cond_len = 2 
+            pred_len = L_full - cond_len
+            
+            cond_data = data[:, :cond_len].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+            target_data = data[:, cond_len:].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+            
+            dt_step = float(args.T)
+            
+            listT_cond = torch.full((B_full, cond_len), dt_step, device=cond_data.device, dtype=cond_data.dtype)
+            listT_future = torch.full((B_full, pred_len - 1), dt_step, device=cond_data.device, dtype=cond_data.dtype)
+            
+            static_feats = None
+            if static_gpu is not None:
+                static_feats = static_gpu.unsqueeze(0).repeat(B_full, 1, 1, 1)
 
-    preds_tensor = out_gen[0]
-    if preds_tensor.dim() == 5:
-        preds_tensor = preds_tensor.squeeze(0)
+            timestep = None
+            if str(args.head_mode).lower() in ["diffusion", "flow"]:
+                timestep = torch.zeros(B_full, device=cond_data.device, dtype=torch.long)
 
-    preds_np = preds_tensor.cpu().numpy()
-    save_vis_video(preds_np, cfg.output_dir, sample_idx, fps=cfg.fps)
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                preds = model(
+                    cond_data,
+                    mode="i",
+                    out_gen_num=pred_len,
+                    listT=listT_cond,
+                    listT_future=listT_future,
+                    static_feats=static_feats,
+                    timestep=timestep
+                )
 
+                C_gt = target_data.shape[2]
+                if preds.shape[2] == 2 * C_gt:
+                    preds_det = preds[:, :, :C_gt]
+                else:
+                    preds_det = preds
+
+                rmse_val = weighted_rmse(preds_det, target_data)
+                acc_val = weighted_acc(preds_det, target_data)
+
+            total_rmse += rmse_val.item()
+            total_acc += acc_val.item()
+            count += 1
+            
+            if rank == 0:
+                eval_iter.set_description(f"RMSE: {rmse_val.item():.4f} | ACC: {acc_val.item():.4f}")
+
+    # Synchronize metrics
+    metrics_tensor = torch.tensor([total_rmse, total_acc, count], device=torch.device(f"cuda:{local_rank}"))
+    dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+    
+    final_rmse = metrics_tensor[0] / metrics_tensor[2]
+    final_acc = metrics_tensor[1] / metrics_tensor[2]
+
+    if rank == 0:
+        logging.info(f"Final Inference Results:")
+        logging.info(f"  Weighted RMSE: {final_rmse.item():.5f}")
+        logging.info(f"  Weighted ACC : {final_acc.item():.5f}")
+        print(f"\nFinal Inference Results:\n  Weighted RMSE: {final_rmse.item():.5f}\n  Weighted ACC : {final_acc.item():.5f}")
+
+    cleanup_ddp()
 
 if __name__ == "__main__":
-    main()
+    args = Args()
+    
+    if "RANK" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_RANK"] = "0"
+
+    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    master_port = os.environ.get("MASTER_PORT", "12356")
+    
+    run_inference(rank, world_size, local_rank, master_addr, master_port, args)
 

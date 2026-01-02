@@ -76,7 +76,6 @@ MODEL_ARG_KEYS = [
     "Arch",
 ]
 
-
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -91,9 +90,7 @@ def set_random_seed(seed: int, deterministic: bool = False) -> None:
             torch.backends.cudnn.deterministic = False
             torch.backends.cudnn.benchmark = True
 
-
 set_random_seed(1017, deterministic=False)
-
 
 class Args:
     def __init__(self) -> None:
@@ -105,12 +102,12 @@ class Args:
         self.output_activation = "Tanh"
         self.emb_strategy = "pxus"
         self.hidden_factor = (7, 12)
-        self.emb_ch = 120
-        self.emb_hidden_ch = 150
+        self.emb_ch = 90
+        self.emb_hidden_ch = 120
         self.emb_hidden_layers_num = 2
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.ffn_hidden_ch = 150
+        self.ffn_hidden_ch = 120
         self.ffn_hidden_layers_num = 2
         self.num_expert = 16
         self.activate_expert = 4
@@ -161,14 +158,14 @@ class Args:
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
         self.wandb_run_name = self.ckpt
-        self.wandb_group = "v2.1.0"
+        self.wandb_group = "v2.2.0"
         self.wandb_mode = "online"
         self.use_checkpointing = True
         self.use_spectral_mixing = True
         self.use_anisotropic_diffusion = True
         self.use_advection = True
         self.use_graph_interaction = False
-        self.use_adaptive_ssm = False
+        self.use_adaptive_ssm = True
         self.use_neural_operator = False
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
@@ -181,7 +178,6 @@ class Args:
         if bool(self.use_compile):
             print("[Warning] Torch Compile is experimental. Use with caution.")
 
-
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
@@ -193,11 +189,9 @@ def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, lo
     )
     torch.cuda.set_device(local_rank)
 
-
 def cleanup_ddp() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
-
 
 def setup_logging(args: Args) -> None:
     if not dist.is_initialized() or dist.get_rank() != 0:
@@ -211,7 +205,6 @@ def setup_logging(args: Args) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-
 def keep_latest_ckpts(ckpt_dir: str) -> None:
     ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
     if len(ckpt_files) <= 64:
@@ -223,10 +216,8 @@ def keep_latest_ckpts(ckpt_dir: str) -> None:
         except Exception:
             pass
 
-
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
     return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
-
 
 def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], verbose: bool = True) -> None:
     if not model_args_dict:
@@ -240,7 +231,6 @@ def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], v
                 if dist.is_initialized() and dist.get_rank() == 0:
                     logging.info(msg)
             setattr(args_obj, k, v)
-
 
 def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
     if not os.path.isfile(ckpt_path):
@@ -263,7 +253,6 @@ def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Opti
         torch.cuda.empty_cache()
     return model_args
 
-
 def get_prefix(keys: List[str]) -> str:
     if not keys:
         return ""
@@ -273,7 +262,6 @@ def get_prefix(keys: List[str]) -> str:
     if key.startswith("module."):
         return "module."
     return ""
-
 
 def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     model_keys = list(model.state_dict().keys())
@@ -289,7 +277,6 @@ def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.M
             new_k = model_prefix + new_k
         new_state_dict[new_k] = v
     return new_state_dict
-
 
 def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -311,7 +298,6 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
 
 def load_ckpt(
     model: torch.nn.Module,
@@ -359,9 +345,7 @@ def load_ckpt(
         logging.info(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
     return epoch, step
 
-
 _LAT_WEIGHT_CACHE: Dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
-
 
 def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     key = (H, device, dtype)
@@ -374,7 +358,6 @@ def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> to
     _LAT_WEIGHT_CACHE[key] = w
     return w
 
-
 def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     B, L, C2, H, W = preds.shape
     C_gt = targets.size(2)
@@ -385,7 +368,6 @@ def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> to
     nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
     return (nll * w).mean()
 
-
 def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     _, _, C_pred, H, _ = preds.shape
     _, _, C_gt, _, _ = targets.shape
@@ -393,7 +375,6 @@ def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Te
         preds = preds[:, :, :C_gt]
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
-
 
 def gradient_difference_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     diff_y_pred = preds[:, :, :, 1:, :] - preds[:, :, :, :-1, :]
@@ -404,12 +385,10 @@ def gradient_difference_loss(preds: torch.Tensor, targets: torch.Tensor) -> torc
     loss_x = torch.mean(torch.abs(diff_x_pred - diff_x_gt))
     return loss_x + loss_y
 
-
 def spectral_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     fft_pred = torch.fft.rfft2(preds.float(), norm="ortho")
     fft_target = torch.fft.rfft2(targets.float(), norm="ortho")
     return (fft_pred.abs() - fft_target.abs()).abs().mean()
-
 
 def get_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor:
     total_aux_loss = torch.tensor(0.0, device=next(model.parameters()).device)
@@ -419,7 +398,6 @@ def get_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor:
             total_aux_loss = total_aux_loss + module.aux_loss
     return total_aux_loss
 
-
 def get_kl_loss(model: torch.nn.Module) -> torch.Tensor:
     total_kl_loss = torch.tensor(0.0, device=next(model.parameters()).device)
     model_to_search = model.module if isinstance(model, DDP) else model
@@ -427,9 +405,7 @@ def get_kl_loss(model: torch.nn.Module) -> torch.Tensor:
         return model_to_search.get_total_kl_loss()
     return total_kl_loss
 
-
 _LRU_GATE_MEAN: Dict[Any, float] = {}
-
 
 def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
@@ -449,13 +425,11 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
 
             module.register_forward_hook(_hook)
 
-
 def format_gate_means() -> str:
     if not _LRU_GATE_MEAN:
         return "g=NA"
     keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: (0, k) if isinstance(k, int) else (1, str(k)))
     return " ".join([f"g[b{k}]={_LRU_GATE_MEAN[k]:.4f}" if isinstance(k, int) else f"g[{k}]={_LRU_GATE_MEAN[k]:.4f}" for k in keys])
-
 
 def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
     total_norm_sq = 0.0
@@ -471,32 +445,10 @@ def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
         max_abs = max(max_abs, g.abs().max().item())
     return float(total_norm_sq**0.5 if cnt > 0 else 0.0), float(max_abs), int(cnt)
 
-
-def make_random_indices(L_eff: int, K: int) -> np.ndarray:
-    if K <= 0:
-        return np.array([], dtype=int)
-    if K == 1:
-        return np.array([0], dtype=int)
-    idx = np.random.choice(L_eff, size=K, replace=False)
-    idx.sort()
-    return idx
-
-
-def build_dt_from_indices(idxs: np.ndarray, base_T: float) -> List[float]:
-    if len(idxs) == 0:
-        return []
-    dt = [float(base_T)]
-    for i in range(1, len(idxs)):
-        gap = int(idxs[i] - idxs[i - 1])
-        dt.append(float(base_T) * max(1, gap))
-    return dt
-
-
 def make_listT_from_arg_T(B: int, L: int, device: torch.device, dtype: torch.dtype, T: Optional[float]) -> Optional[torch.Tensor]:
     if T is None or T < 0:
         return None
     return torch.full((B, L), float(T), device=device, dtype=dtype)
-
 
 def setup_wandb(rank: int, args: Args, model: torch.nn.Module) -> None:
     if rank != 0 or not bool(getattr(args, "use_wandb", False)):
@@ -512,14 +464,12 @@ def setup_wandb(rank: int, args: Args, model: torch.nn.Module) -> None:
         wandb_kwargs["mode"] = args.wandb_mode
     wandb.init(**wandb_kwargs)
 
-
 def sample_timestep(args: Args, batch_size: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
     if str(getattr(args, "head_mode", "gaussian")).lower() not in ["diffusion", "flow"]:
         return None
     steps = int(getattr(args, "diffusion_steps", 1000))
     t = torch.randint(0, max(1, steps), (batch_size,), device=device)
     return t.to(dtype=dtype)
-
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
@@ -659,13 +609,11 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             timestep = sample_timestep(args, x.size(0), x.device, x.dtype)
 
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                # 1. Main Loss (Parallel Mode, Coarse Scale)
                 preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
                 
                 if isinstance(preds, tuple):
                     preds = preds[0]
                 
-                # Handling Gaussian Output for Loss Calculation
                 C_gt = target.shape[2]
                 if preds.shape[2] == 2 * C_gt:
                     loss_main = gaussian_nll_loss_weighted(preds, target)
@@ -674,21 +622,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     loss_main = latitude_weighted_l1(preds, target)
                     p_det = preds
 
-                # 2. Solver-in-the-Loop Loss (Recursive Mode, Fine Scale)
-                # We apply recursive supervision only on the last transition of the batch to save memory.
-                # x_seed: Last input frame [B, 1, C, H, W]
-                # target_last: Last target frame [B, 1, C, H, W]
                 x_seed = x[:, -1:]
                 target_last = target[:, -1:]
                 
-                # Generate micro-steps (dt=1.0)
-                # Note: listT for first step, listT_future for subsequent steps
                 dt_micro_val = 1.0
                 listT_seed = torch.full((x.size(0), 1), dt_micro_val, device=x.device, dtype=x.dtype)
                 listT_future = torch.full((x.size(0), micro_steps - 1), dt_micro_val, device=x.device, dtype=x.dtype)
                 
-                # Recursive generation: returns sequence of length `micro_steps`
-                # We expect the last frame of this sequence to match `target_last` (t + 6)
                 preds_recursive_seq = model(
                     x_seed, 
                     mode="i", 
@@ -699,31 +639,23 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     timestep=timestep
                 )
                 
-                # Extract last frame from recursive sequence
                 preds_recursive_last = preds_recursive_seq[:, -1:]
                 
                 if preds_recursive_last.shape[2] == 2 * C_gt:
-                    # Using L1 for recursive constraint is usually more stable than NLL
                     loss_solver = F.l1_loss(preds_recursive_last[:, :, :C_gt], target_last)
                     p_rec_det = preds_recursive_last[:, :, :C_gt]
                 else:
                     loss_solver = F.l1_loss(preds_recursive_last, target_last)
                     p_rec_det = preds_recursive_last
 
-                # 3. Consistency Loss
-                # Enforce that "Direct Prediction (t+6)" matches "Recursive Prediction (t+6)"
-                # p_det is [B, L, C, H, W], we need p_det[:, -1:]
-                p_direct_last = p_det[:, -1:].detach() # Detach one branch to avoid fighting
+                p_direct_last = p_det[:, -1:].detach()
                 loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
 
-                # Auxiliary Losses
                 gdl_loss = gradient_difference_loss(p_det, target)
                 spec_loss = spectral_loss(p_det, target)
                 kl_loss = get_kl_loss(model)
                 moe_loss = get_moe_aux_loss(model)
                 
-                # Total Loss Combination
-                # Main Task + Solver Constraint + Consistency + Regularization
                 loss = loss_main + 0.5 * loss_solver + 0.1 * loss_consistency + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss + 1e-6 * kl_loss
                 
                 if isinstance(model, DDP):
@@ -744,7 +676,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             if bool(args.use_scheduler) and scheduler is not None:
                 scheduler.step()
 
-            # Reduce metrics
             loss_tensor = loss.detach()
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             avg_loss = (loss_tensor / world_size).item()
@@ -761,8 +692,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
                 gate_str = format_gate_means()
-                grad_str = f" |grad|={grad_norm:.4e}"
-
+                
                 message = (
                     f"Ep {ep + 1} - L: {avg_loss:.4f} - L1: {avg_l1:.4f} - Solv: {avg_solver:.4f} - LR: {current_lr:.2e} "
                     f"- {gate_str}"
@@ -896,7 +826,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if rank == 0 and bool(getattr(args, "use_wandb", False)):
         wandb.finish()
     cleanup_ddp()
-
 
 if __name__ == "__main__":
     args = Args()
