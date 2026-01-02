@@ -1,4 +1,3 @@
-import argparse
 import datetime
 import logging
 import os
@@ -113,7 +112,7 @@ class Args:
         self.use_selective = True
         self.unet = True
         self.down_mode = "shuffle"
-        self.use_freq_prior = False
+        self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
         self.freq_mode = "linear"
@@ -139,9 +138,9 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = True
-        self.use_tf32 = False
+        self.use_tf32 = True
         self.use_compile = False
-        self.lr = 1e-5
+        self.lr = 1e-4
         self.weight_decay = 0.05
         self.use_scheduler = False
         self.init_lr_scheduler = False
@@ -283,17 +282,13 @@ def weighted_rmse(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 def weighted_acc(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     B, L, C, H, W = preds.shape
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
-    
     preds_mean = torch.mean(preds, dim=(3, 4), keepdim=True)
     targets_mean = torch.mean(targets, dim=(3, 4), keepdim=True)
-    
     preds_anom = preds - preds_mean
     targets_anom = targets - targets_mean
-    
     cov = torch.sum(w * preds_anom * targets_anom, dim=(3, 4))
     var_pred = torch.sum(w * preds_anom * preds_anom, dim=(3, 4))
     var_target = torch.sum(w * targets_anom * targets_anom, dim=(3, 4))
-    
     acc = cov / torch.sqrt(var_pred * var_target + 1e-6)
     return acc.mean()
 
@@ -318,7 +313,8 @@ def run_inference(rank: int, world_size: int, local_rank: int, master_addr: str,
         apply_model_args(args, ckpt_model_args, verbose=True)
 
     model = ConvLRU(args).cuda(local_rank)
-    load_ckpt(model, args.ckpt, map_location=f"cuda:{local_rank}")
+    if os.path.isfile(args.ckpt):
+        load_ckpt(model, args.ckpt, map_location=f"cuda:{local_rank}")
     
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     model.eval()
@@ -405,18 +401,22 @@ def run_inference(rank: int, world_size: int, local_rank: int, master_addr: str,
             if rank == 0:
                 eval_iter.set_description(f"RMSE: {rmse_val.item():.4f} | ACC: {acc_val.item():.4f}")
 
-    # Synchronize metrics
     metrics_tensor = torch.tensor([total_rmse, total_acc, count], device=torch.device(f"cuda:{local_rank}"))
     dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
     
-    final_rmse = metrics_tensor[0] / metrics_tensor[2]
-    final_acc = metrics_tensor[1] / metrics_tensor[2]
+    total_count = metrics_tensor[2].item()
+    if total_count > 0:
+        final_rmse = metrics_tensor[0] / total_count
+        final_acc = metrics_tensor[1] / total_count
+    else:
+        final_rmse = 0.0
+        final_acc = 0.0
 
     if rank == 0:
         logging.info(f"Final Inference Results:")
-        logging.info(f"  Weighted RMSE: {final_rmse.item():.5f}")
-        logging.info(f"  Weighted ACC : {final_acc.item():.5f}")
-        print(f"\nFinal Inference Results:\n  Weighted RMSE: {final_rmse.item():.5f}\n  Weighted ACC : {final_acc.item():.5f}")
+        logging.info(f"  Weighted RMSE: {final_rmse:.5f}")
+        logging.info(f"  Weighted ACC : {final_acc:.5f}")
+        print(f"\nFinal Inference Results:\n  Weighted RMSE: {final_rmse:.5f}\n  Weighted ACC : {final_acc:.5f}")
 
     cleanup_ddp()
 
