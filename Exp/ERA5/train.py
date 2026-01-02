@@ -102,13 +102,13 @@ class Args:
         self.output_activation = "Tanh"
         self.emb_strategy = "pxus"
         self.hidden_factor = (7, 12)
-        self.emb_ch = 96
-        self.emb_hidden_ch = 96
-        self.emb_hidden_layers_num = 1
+        self.emb_ch = 120
+        self.emb_hidden_ch = 150
+        self.emb_hidden_layers_num = 2
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.ffn_hidden_ch = 96
-        self.ffn_hidden_layers_num = 1
+        self.ffn_hidden_ch = 150
+        self.ffn_hidden_layers_num = 2
         self.num_expert = 16
         self.activate_expert = 4
         self.use_gate = True
@@ -116,7 +116,7 @@ class Args:
         self.use_selective = True
         self.unet = True
         self.down_mode = "shuffle"
-        self.use_freq_prior = False
+        self.use_freq_prior = True
         self.freq_rank = 8
         self.freq_gain_init = 0.0
         self.freq_mode = "linear"
@@ -142,12 +142,12 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
-        self.use_tf32 = False
+        self.use_tf32 = True
         self.use_compile = False
-        self.lr = 1e-5
+        self.lr = 1e-4
         self.weight_decay = 0.05
-        self.use_scheduler = False
-        self.init_lr_scheduler = False
+        self.use_scheduler = True
+        self.init_lr_scheduler = True
         self.loss = "lat"
         self.T = 6
         self.use_amp = False
@@ -157,10 +157,11 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
-        self.wandb_run_name = self.ckpt
-        self.wandb_group = "v2.2.0"
+        self.wandb_run_name = "PhyConvLRU_Lagrangian"
+        self.wandb_group = "v3.0.0"
         self.wandb_mode = "online"
         self.use_checkpointing = True
+        
         self.use_spectral_mixing = True
         self.use_anisotropic_diffusion = True
         self.use_advection = True
@@ -170,13 +171,14 @@ class Args:
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
+        
         self.ConvType = "dcn"
         self.Arch = "bifpn"
         self.check_args()
 
     def check_args(self) -> None:
         if bool(self.use_compile):
-            print("[Warning] Torch Compile is experimental. Use with caution.")
+            print("[Warning] Torch Compile is experimental.")
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
@@ -235,8 +237,6 @@ def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], v
 def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
     if not os.path.isfile(ckpt_path):
         print(f"[Args] ckpt not found: {ckpt_path}")
-        if dist.is_initialized() and dist.get_rank() == 0:
-            logging.warning(f"[Args] ckpt not found: {ckpt_path}")
         return None
     ckpt = torch.load(ckpt_path, map_location=map_location)
     model_args = ckpt.get("model_args", None)
@@ -244,13 +244,9 @@ def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Opti
         args_all = ckpt.get("args_all", None)
         if isinstance(args_all, dict):
             model_args = {k: args_all[k] for k in MODEL_ARG_KEYS if k in args_all}
-    for k in ["model", "optimizer", "scheduler"]:
-        if k in ckpt:
-            del ckpt[k]
     del ckpt
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     return model_args
 
 def get_prefix(keys: List[str]) -> str:
@@ -296,8 +292,7 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
     keep_latest_ckpts(args.ckpt_dir)
     del state
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
 def load_ckpt(
     model: torch.nn.Module,
@@ -310,11 +305,6 @@ def load_ckpt(
 ) -> Tuple[int, int]:
     if not os.path.isfile(ckpt_path):
         print("No checkpoint Found")
-        if dist.is_initialized() and dist.get_rank() == 0:
-            logging.warning(f"No checkpoint Found at {ckpt_path}")
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         return 0, 0
     checkpoint = torch.load(ckpt_path, map_location=map_location)
     if restore_model_args and args is not None:
@@ -333,14 +323,9 @@ def load_ckpt(
     epoch = int(checkpoint.get("epoch", 0))
     step = int(checkpoint.get("step", 0))
     del state_dict
-    for k in ["model", "optimizer", "scheduler"]:
-        if k in checkpoint:
-            del checkpoint[k]
     del checkpoint
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
+    torch.cuda.empty_cache()
     if dist.is_initialized() and dist.get_rank() == 0:
         logging.info(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
     return epoch, step
@@ -418,11 +403,9 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
                     tag = name
             else:
                 tag = name
-
             def _hook(mod: torch.nn.Module, inp: Tuple[Any, ...], out: torch.Tensor, tag_local: Any = tag) -> None:
                 with torch.no_grad():
                     _LRU_GATE_MEAN[tag_local] = float(out.mean().detach())
-
             module.register_forward_hook(_hook)
 
 def format_gate_means() -> str:
@@ -493,7 +476,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 print(f"Loading static features from {static_pt_path}")
             static_data_cpu = torch.load(static_pt_path, map_location="cpu")
         else:
-            raise FileNotFoundError(f"Static features enabled (ch={args.static_ch}) but {static_pt_path} not found!")
+            raise FileNotFoundError(f"Static features enabled but {static_pt_path} not found!")
 
     if args.ckpt and os.path.isfile(args.ckpt):
         ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f"cuda:{local_rank}")
@@ -582,7 +565,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
     amp_dtype = torch.bfloat16 if str(args.amp_dtype).lower() == "bf16" else torch.float16
     use_amp = bool(args.use_amp)
-
+    
     micro_steps = int(args.T) 
     
     for ep in range(int(start_epoch), int(args.epochs)):
@@ -610,7 +593,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
-                
                 if isinstance(preds, tuple):
                     preds = preds[0]
                 
