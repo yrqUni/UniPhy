@@ -1042,7 +1042,17 @@ class ConvLRULayer(nn.Module):
         
         self.use_cross_var_attn = bool(getattr(args, "use_cross_var_attn", False))
         if self.use_cross_var_attn:
-            self.cross_var_attn = CrossVariableAttention(self.emb_ch)
+            heads = 4
+            if self.emb_ch % heads != 0:
+                found = False
+                for h in [4, 2]:
+                    if self.emb_ch % h == 0:
+                        heads = h
+                        found = True
+                        break
+                if not found:
+                    heads = 1
+            self.cross_var_attn = CrossVariableAttention(self.emb_ch, num_heads=heads)
         
         self.use_wavelet_ssm = bool(getattr(args, "use_wavelet_ssm", False))
         if self.use_wavelet_ssm:
@@ -1154,10 +1164,11 @@ class ConvLRULayer(nn.Module):
             gamma_t = torch.sqrt(torch.clamp(-torch.expm1(-2.0 * nu_t.real), min=1e-12))
             x_in_lru = x_in_lru * gamma_t
             
+            x_spatial_curr = x_in_fp32.reshape(B*L, C, S, W)
+            flow = self.latent_flow_net(x_spatial_curr)
+            
             if L == 1 and last_hidden_in is not None:
                 h_prev = last_hidden_in.to(x_in_lru.dtype)
-                # Lagrangian advection applied implicitly via AdvectionBlock on inputs
-                # and residual correction via SSM.
                 h_out = lamb * h_prev + x_in_lru
                 last_hidden_out = h_out
             else:
@@ -1468,8 +1479,14 @@ class ConvLRUModel(nn.Module):
                     if curr_W % 2 != 0: curr_W += 1
                     curr_H = max(1, curr_H // 2)
                     curr_W = max(1, curr_W // 2)
-                    
-            self.mid_attention = BottleneckAttention(C, num_heads=8)
+            
+            heads = 8
+            possible_heads = [8, 4, 2, 1]
+            for h in possible_heads:
+                if C % h == 0:
+                    heads = h
+                    break
+            self.mid_attention = BottleneckAttention(C, num_heads=heads)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
                 self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))

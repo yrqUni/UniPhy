@@ -102,12 +102,12 @@ class Args:
         self.output_activation = "Tanh"
         self.emb_strategy = "pxus"
         self.hidden_factor = (7, 12)
-        self.emb_ch = 90
-        self.emb_hidden_ch = 120
+        self.emb_ch = 128
+        self.emb_hidden_ch = 150
         self.emb_hidden_layers_num = 2
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.ffn_hidden_ch = 120
+        self.ffn_hidden_ch = 150
         self.ffn_hidden_layers_num = 2
         self.num_expert = 16
         self.activate_expert = 4
