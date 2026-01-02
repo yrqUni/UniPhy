@@ -672,7 +672,7 @@ class GraphInteraction(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        x_flat = x.view(B * L, C, H, W)
+        x_flat = x.reshape(B * L, C, H, W)
         nodes = self.proj_to_nodes(x_flat) 
         nodes = nodes.flatten(2).permute(0, 2, 1) 
         nodes = self.norm(nodes)
@@ -695,7 +695,7 @@ class AdvectionBlock(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        x_flat = x.view(B * L, C, H, W)
+        x_flat = x.reshape(B * L, C, H, W)
         flow = self.flow_pred(x_flat)
         grid_y, grid_x = torch.meshgrid(torch.linspace(-1, 1, H, device=x.device), torch.linspace(-1, 1, W, device=x.device), indexing='ij')
         grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).expand(B * L, -1, -1, -1)
