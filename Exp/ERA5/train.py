@@ -104,7 +104,7 @@ class Args:
         self.hidden_factor = (7, 12)
         self.emb_ch = 96
         self.emb_hidden_ch = 128
-        self.emb_hidden_layers_num = 1
+        self.emb_hidden_layers_num = 2
         self.convlru_num_blocks = 6
         self.use_cbam = True
         self.ffn_hidden_ch = 128
@@ -161,6 +161,7 @@ class Args:
         self.wandb_group = "v3.0.0"
         self.wandb_mode = "online"
         self.use_checkpointing = True
+        self.train_mode = "alignment"
         
         self.use_spectral_mixing = True
         self.use_anisotropic_diffusion = True
@@ -604,34 +605,38 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     loss_main = latitude_weighted_l1(preds, target)
                     p_det = preds
 
-                x_seed = x[:, -1:]
-                target_last = target[:, -1:]
+                loss_solver = torch.tensor(0.0, device=x.device)
+                loss_consistency = torch.tensor(0.0, device=x.device)
                 
-                dt_micro_val = 1.0
-                listT_seed = torch.full((x.size(0), 1), dt_micro_val, device=x.device, dtype=x.dtype)
-                listT_future = torch.full((x.size(0), micro_steps - 1), dt_micro_val, device=x.device, dtype=x.dtype)
-                
-                preds_recursive_seq = model(
-                    x_seed, 
-                    mode="i", 
-                    out_gen_num=micro_steps, 
-                    listT=listT_seed, 
-                    listT_future=listT_future,
-                    static_feats=static_feats,
-                    timestep=timestep
-                )
-                
-                preds_recursive_last = preds_recursive_seq[:, -1:]
-                
-                if preds_recursive_last.shape[2] == 2 * C_gt:
-                    loss_solver = F.l1_loss(preds_recursive_last[:, :, :C_gt], target_last)
-                    p_rec_det = preds_recursive_last[:, :, :C_gt]
-                else:
-                    loss_solver = F.l1_loss(preds_recursive_last, target_last)
-                    p_rec_det = preds_recursive_last
+                if str(args.train_mode).lower() == "alignment":
+                    x_seed = x[:, -1:]
+                    target_last = target[:, -1:]
+                    
+                    dt_micro_val = 1.0
+                    listT_seed = torch.full((x.size(0), 1), dt_micro_val, device=x.device, dtype=x.dtype)
+                    listT_future = torch.full((x.size(0), micro_steps - 1), dt_micro_val, device=x.device, dtype=x.dtype)
+                    
+                    preds_recursive_seq = model(
+                        x_seed, 
+                        mode="i", 
+                        out_gen_num=micro_steps, 
+                        listT=listT_seed, 
+                        listT_future=listT_future,
+                        static_feats=static_feats,
+                        timestep=timestep
+                    )
+                    
+                    preds_recursive_last = preds_recursive_seq[:, -1:]
+                    
+                    if preds_recursive_last.shape[2] == 2 * C_gt:
+                        loss_solver = F.l1_loss(preds_recursive_last[:, :, :C_gt], target_last)
+                        p_rec_det = preds_recursive_last[:, :, :C_gt]
+                    else:
+                        loss_solver = F.l1_loss(preds_recursive_last, target_last)
+                        p_rec_det = preds_recursive_last
 
-                p_direct_last = p_det[:, -1:].detach()
-                loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
+                    p_direct_last = p_det[:, -1:].detach()
+                    loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
 
                 gdl_loss = gradient_difference_loss(p_det, target)
                 spec_loss = spectral_loss(p_det, target)
