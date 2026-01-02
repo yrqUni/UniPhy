@@ -942,7 +942,7 @@ class ConvLRULayer(nn.Module):
         self.use_adaptive_ssm = bool(getattr(args, "use_adaptive_ssm", False))
         self.use_neural_operator = bool(getattr(args, "use_neural_operator", False))
         
-        in_dim = (self.emb_ch if self.is_selective else (self.emb_ch + 1)) + self.latent_dim
+        in_dim = self.emb_ch + self.latent_dim
         if self.use_anisotropic_diffusion:
             in_dim += self.emb_ch * 2
             
@@ -1009,14 +1009,10 @@ class ConvLRULayer(nn.Module):
              self.b_proj = nn.Linear(self.emb_ch, self.rank)
              self.c_proj = nn.Linear(self.emb_ch, self.rank)
 
-    def _apply_forcing(self, x: torch.Tensor, dt: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _apply_forcing(self, x: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         ctx = x.mean(dim=(-2, -1))
         
-        if self.is_selective:
-            inp_base = ctx
-        else:
-            dt_feat = dt.view(x.size(0), x.size(1), 1)
-            inp_base = torch.cat([ctx, dt_feat], dim=-1)
+        inp_base = ctx
             
         inp = torch.cat([inp_base, z], dim=-1)
         
@@ -1107,10 +1103,14 @@ class ConvLRULayer(nn.Module):
             nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
             
-            dnu_force, dth_force = self._apply_forcing(x_in_fp32, dt_fp32, z)
+            dnu_force, dth_force = self._apply_forcing(x_in_fp32, z)
             
-            nu_t = torch.clamp(nu_base * dt_fp32 + dnu_force, min=1e-6)
-            th_t = th_base * dt_fp32 + dth_force
+            nu_continuous = nu_base + dnu_force
+            th_continuous = th_base + dth_force
+
+            nu_t = torch.clamp(nu_continuous * dt_fp32, min=1e-6)
+            th_t = th_continuous * dt_fp32
+            
             lamb = torch.exp(torch.complex(-nu_t, th_t))
             
             x_in_lru = zq
