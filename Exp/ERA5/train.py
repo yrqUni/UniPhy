@@ -56,6 +56,7 @@ MODEL_ARG_KEYS = [
     "use_graph_interaction",
     "ConvType",
     "Arch",
+    "loss",
 ]
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
@@ -123,8 +124,8 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
-        self.wandb_run_name = "PhyConvLRU_Lagrangian"
-        self.wandb_group = "v3.0.0"
+        self.wandb_run_name = "PhyConvLRU_HKLF"
+        self.wandb_group = "v4.0.0"
         self.wandb_mode = "online"
         self.use_checkpointing = True
         self.train_mode = "alignment"
