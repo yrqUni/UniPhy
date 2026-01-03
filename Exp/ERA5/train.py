@@ -132,7 +132,7 @@ class Args:
         self.use_spectral_mixing = True
         self.use_advection = True
         self.use_spatial_ssm = True
-        self.use_stochastic = True
+        self.use_stochastic = False
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
