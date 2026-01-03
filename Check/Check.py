@@ -46,6 +46,7 @@ class MockArgs:
         self.sh_Lmax = 4
         self.sh_rank = 4
         self.sh_gain_init = 0.0
+        self.use_graph_interaction = False
         
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -57,7 +58,12 @@ def run_case(case_name, args_dict, mode='p'):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = ConvLRU(args).to(device)
         
-        B, L, C, H, W = 2, 4, args.input_ch, 32, 32
+        H, W = args.input_size
+        B, L, C = 2, 4, args.input_ch
+        
+        if "Full_ERA5" in case_name:
+            B = 1 # 进一步降低 batch size 保证安全
+            
         x = torch.randn(B, L, C, H, W).to(device)
         static_feats = None
         if args.static_ch > 0:
@@ -98,13 +104,15 @@ def main():
     run_case("04_Advection", {"use_advection": True})
     run_case("05_Spectral_SH", {"use_spectral_mixing": True, "use_freq_prior": True, "use_sh_prior": True})
     run_case("06_Wavelet_CrossVar", {"use_wavelet_ssm": True, "use_cross_var_attn": True})
-    run_case("07_BiFPN", {"Arch": "bifpn"})
-    run_case("08_No_UNet", {"Arch": "no_unet"})
-    run_case("09_MoE", {"num_expert": 4, "activate_expert": 2})
-    run_case("10_Diffusion_Head", {"head_mode": "diffusion", "out_ch": 2})
-    run_case("11_Token_Head", {"head_mode": "token", "out_ch": 2})
-    run_case("12_Static_Init", {"static_ch": 4, "learnable_init_state": True})
-    run_case("13_Inference", {"use_spatial_ssm": True}, mode='i')
+    run_case("07_Graph_Interaction", {"use_graph_interaction": True})
+    run_case("08_BiFPN", {"Arch": "bifpn"})
+    run_case("09_No_UNet", {"Arch": "no_unet"})
+    run_case("10_MoE", {"num_expert": 4, "activate_expert": 2})
+    run_case("11_Diffusion_Head", {"head_mode": "diffusion", "out_ch": 2})
+    run_case("12_Token_Head", {"head_mode": "token", "out_ch": 2})
+    run_case("13_Static_Init", {"static_ch": 4, "learnable_init_state": True})
+    run_case("14_Inference", {"use_spatial_ssm": True}, mode='i')
+    run_case("15_Full_ERA5_Size", {"input_size": (721, 1440), "input_ch": 2, "emb_ch": 16, "hidden_factor": (7, 12)}, mode='p')
     print("========== Check Done ==========")
 
 if __name__ == "__main__":

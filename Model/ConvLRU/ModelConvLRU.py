@@ -1012,11 +1012,19 @@ class ConvLRULayer(nn.Module):
         self.log_dt_min = nn.Parameter(torch.log(torch.tensor(dt_min)))
         self.log_dt_max = nn.Parameter(torch.log(torch.tensor(dt_max)))
         self.register_buffer("steps", torch.arange(self.rank, dtype=torch.float32) / (self.rank - 1))
-        nu = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
-        nu = nu.unsqueeze(0).repeat(self.emb_ch, 1)
-        nu_log = torch.log(nu)
+        
+        nu_init = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
+        nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
+        
+        nu_log = torch.log(nu_init)
+        
+        half_c = self.emb_ch // 2
+        with torch.no_grad():
+             nu_log[half_c:] -= 2.0 
+        
         u2 = torch.rand(self.emb_ch, self.rank)
         theta_log = torch.log(u2 * (2 * torch.tensor(math.pi)))
+        
         self.params_log_base = nn.Parameter(torch.stack([nu_log, theta_log], dim=0))
         self.dispersion_mod = nn.Parameter(torch.zeros(2, self.emb_ch, self.rank) * 0.01)
         
