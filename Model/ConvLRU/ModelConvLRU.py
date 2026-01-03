@@ -648,6 +648,34 @@ class WaveletBlock(nn.Module):
             out = out[..., :H, :W]
         return out
 
+class GraphInteraction(nn.Module):
+    def __init__(self, channels, nodes=256):
+        super().__init__()
+        self.nodes = nodes
+        self.proj_to_nodes = nn.Sequential(
+            nn.AdaptiveAvgPool2d((int(math.sqrt(nodes)), int(math.sqrt(nodes)))),
+            nn.Conv2d(channels, channels, 1)
+        )
+        self.gnn = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels)
+        )
+        self.proj_back = nn.Conv2d(channels, channels, 1)
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        B, L, C, H, W = x.shape
+        x_flat = x.reshape(B * L, C, H, W)
+        nodes = self.proj_to_nodes(x_flat)
+        nodes = nodes.flatten(2).permute(0, 2, 1)
+        nodes = self.norm(nodes)
+        nodes = nodes + self.gnn(nodes)
+        nodes = nodes.permute(0, 2, 1).reshape(B * L, C, int(math.sqrt(self.nodes)), int(math.sqrt(self.nodes)))
+        out_grid = F.interpolate(nodes, size=(H, W), mode='bilinear', align_corners=False)
+        out_grid = self.proj_back(out_grid)
+        return out_grid.reshape(B, L, C, H, W)
+
 class SpectralInteraction(nn.Module):
     def __init__(self, emb_ch, rank):
         super().__init__()
@@ -996,6 +1024,7 @@ class ConvLRULayer(nn.Module):
         self.use_advection = bool(getattr(args, "use_advection", False))
         self.use_spatial_ssm = bool(getattr(args, "use_spatial_ssm", True)) 
         self.use_stochastic = bool(getattr(args, "use_stochastic", False))
+        self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
         
         self.stochastic_injector = StochasticInjector(self.emb_ch) if self.use_stochastic else None
         self.ctx_extractor = ContextExtractor(self.emb_ch)
@@ -1004,6 +1033,9 @@ class ConvLRULayer(nn.Module):
             self.param_generator = SpatialSSMParameterGenerator(self.emb_ch, self.emb_ch, self.rank, self.W_freq)
         else:
             self.param_generator = None 
+        
+        if self.use_graph_interaction:
+            self.graph_block = GraphInteraction(self.emb_ch)
 
         self.forcing_scale = nn.Parameter(torch.tensor(0.1))
         self.freq_decay_curve = nn.Parameter(torch.zeros(1, 1, 1, self.W_freq, 1))
@@ -1083,6 +1115,8 @@ class ConvLRULayer(nn.Module):
         x_perm = x.permute(0, 2, 1, 3, 4)
         if self.use_cross_var_attn:
             x_perm = self.cross_var_attn(x_perm)
+        if self.use_graph_interaction:
+            x_perm = x_perm + self.graph_block(x_perm)
         B, L, C, S, W = x_perm.shape
         if listT is None:
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
