@@ -54,9 +54,9 @@ MODEL_ARG_KEYS = [
     "use_wavelet_ssm",
     "use_cross_var_attn",
     "use_graph_interaction",
+    "ffn_ratio",
     "ConvType",
     "Arch",
-    "loss",
 ]
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
@@ -137,6 +137,7 @@ class Args:
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
         self.use_graph_interaction = True
+        self.ffn_ratio = 4.0
         self.ConvType = "dcn"
         self.Arch = "bifpn"
         self.check_args()

@@ -23,7 +23,6 @@ class MockArgs:
         self.static_ch = 0
         self.hidden_factor = (2, 2)
         self.emb_ch = 16
-        self.emb_hidden_layers_num = 1
         self.convlru_num_blocks = 2
         self.use_cbam = False
         self.num_expert = 1
@@ -47,6 +46,8 @@ class MockArgs:
         self.sh_rank = 4
         self.sh_gain_init = 0.0
         self.use_graph_interaction = False
+        self.ffn_ratio = 4.0
+        self.loss = ["lat"]
         
         for k, v in kwargs.items():
             setattr(self, k, v)

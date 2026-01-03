@@ -886,133 +886,6 @@ class StaticInitState(nn.Module):
         out = out.view(B, self.emb_ch, self.rank, self.S, self.W_freq)
         return out.permute(0, 1, 3, 4, 2) 
 
-class ContinuousHKLFLayer(nn.Module):
-    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
-        super().__init__()
-        self.emb_ch = int(getattr(args, "emb_ch", 32))
-        H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
-        self.rank = int(getattr(args, "lru_rank", 32))
-        self.W_freq = W // 2 + 1
-        
-        self.hamiltonian = HamiltonianGenerator(self.emb_ch)
-        self.lie_transport = LieTransport()
-        self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq)
-        self.proj_out = nn.Linear(self.rank, 1)
-        
-        if bool(getattr(args, "learnable_init_state", False)) and int(getattr(args, "static_ch", 0)) > 0:
-            self.init_state = StaticInitState(int(args.static_ch), self.emb_ch, self.rank, H, W)
-        else:
-            self.init_state = None
-        
-        self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
-        if self.use_graph_interaction:
-            self.graph_block = GraphInteraction(self.emb_ch)
-        
-        self.use_cross_var_attn = bool(getattr(args, "use_cross_var_attn", False))
-        if self.use_cross_var_attn:
-            self.cross_var_attn = CrossVariableAttention(self.emb_ch)
-        
-        self.use_stochastic = bool(getattr(args, "use_stochastic", False))
-        if self.use_stochastic:
-            self.stochastic_injector = StochasticInjector(self.emb_ch)
-            
-        self.use_wavelet_ssm = bool(getattr(args, "use_wavelet_ssm", False))
-        if self.use_wavelet_ssm:
-            self.wavelet_block = WaveletBlock(self.emb_ch, self.emb_ch)
-            
-        self.use_spectral_mixing = bool(getattr(args, "use_spectral_mixing", False))
-        if self.use_spectral_mixing:
-            self.spec_mixer = SpectralInteraction(self.emb_ch, self.rank)
-            
-        self.use_sh_prior = bool(getattr(args, "use_sh_prior", False))
-        if self.use_sh_prior:
-            self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, H, W)
-            
-        self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
-        if self.use_freq_prior:
-            self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8)
-            
-        self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-        self.norm = RMSNorm(self.emb_ch)
-        self.gate_conv = nn.Sequential(
-            nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_perm = x.permute(0, 2, 1, 3, 4)
-        if self.use_cross_var_attn:
-            x_perm = self.cross_var_attn(x_perm)
-        if self.use_graph_interaction:
-            x_perm = x_perm + self.graph_block(x_perm)
-            
-        B, L, C, H, W = x_perm.shape
-        
-        if last_hidden_in is None:
-            if self.init_state is not None and static_feats is not None:
-                h_prev = self.init_state(static_feats).unsqueeze(1).repeat(1, L, 1, 1, 1, 1) 
-                h_prev = h_prev[:, 0] 
-            else:
-                h_prev = torch.zeros(B, C, H, W, self.rank, device=x.device, dtype=x.dtype)
-        else:
-            h_prev = last_hidden_in
-
-        if listT is None:
-            dt_seq = torch.ones(B, L, device=x.device, dtype=x.dtype)
-        else:
-            dt_seq = listT.to(x.device, x.dtype)
-
-        h_states = []
-        curr_h = h_prev
-        self.latest_kl = 0.0
-        
-        for t in range(L):
-            x_t = x_perm[:, t] 
-            if self.use_stochastic and hasattr(self, 'stochastic_injector'):
-                x_t = self.stochastic_injector(x_t)
-                self.latest_kl += self.stochastic_injector.latest_kl
-
-            dt_t = dt_seq[:, t].view(B, 1)
-            
-            flow = self.hamiltonian(x_t.unsqueeze(1)).squeeze(1)
-            
-            B_h, C_h, H_h, W_h, R_h = curr_h.shape
-            curr_h_flat = curr_h.permute(0, 4, 1, 2, 3).reshape(B_h, R_h * C_h, H_h, W_h)
-            h_trans_flat = self.lie_transport(curr_h_flat, flow, dt_t)
-            h_trans = h_trans_flat.reshape(B_h, R_h, C_h, H_h, W_h).permute(0, 2, 3, 4, 1)
-
-            h_next = self.koopman(h_trans, x_t, dt_t)
-
-            x_inject = x_t.unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
-            curr_h = h_next + x_inject
-            h_states.append(curr_h)
-            
-        h_stack = torch.stack(h_states, dim=1)
-        out = self.proj_out(h_stack).squeeze(-1)
-        
-        out = out.permute(0, 2, 1, 3, 4) 
-        
-        out = self.post_ifft_proj(out)
-
-        if self.use_sh_prior:
-            out = self.sh_prior(out.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-            
-        if self.use_freq_prior:
-            out_spatial = out.permute(0, 2, 1, 3, 4).contiguous()
-            out_ft = torch.fft.rfft2(out_spatial.float(), norm="ortho")
-            out_ft_res = self.freq_prior(out_ft)
-            out_spatial_res = torch.fft.irfft2(out_ft_res, s=out_spatial.shape[-2:], norm="ortho")
-            out = out + out_spatial_res.permute(0, 2, 1, 3, 4).to(out.dtype)
-
-        if self.use_wavelet_ssm:
-            out = out + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
-
-        out = self.norm(out)
-        gate = self.gate_conv(out)
-        x_out = (1 - gate) * x + gate * out
-        
-        return x_out, curr_h
-
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None, conv_type: str = "conv"):
         super().__init__()
@@ -1190,12 +1063,140 @@ class SpatialPatchMoE(nn.Module):
             out = out[..., :H, :W]
         return out
 
+class ContinuousHKLFLayer(nn.Module):
+    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
+        super().__init__()
+        self.emb_ch = int(getattr(args, "emb_ch", 32))
+        H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
+        self.rank = int(getattr(args, "lru_rank", 32))
+        self.W_freq = W // 2 + 1
+        
+        self.hamiltonian = HamiltonianGenerator(self.emb_ch)
+        self.lie_transport = LieTransport()
+        self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq)
+        self.proj_out = nn.Linear(self.rank, 1)
+        
+        if bool(getattr(args, "learnable_init_state", False)) and int(getattr(args, "static_ch", 0)) > 0:
+            self.init_state = StaticInitState(int(args.static_ch), self.emb_ch, self.rank, H, W)
+        else:
+            self.init_state = None
+        
+        self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
+        if self.use_graph_interaction:
+            self.graph_block = GraphInteraction(self.emb_ch)
+        
+        self.use_cross_var_attn = bool(getattr(args, "use_cross_var_attn", False))
+        if self.use_cross_var_attn:
+            self.cross_var_attn = CrossVariableAttention(self.emb_ch)
+        
+        self.use_stochastic = bool(getattr(args, "use_stochastic", False))
+        if self.use_stochastic:
+            self.stochastic_injector = StochasticInjector(self.emb_ch)
+            
+        self.use_wavelet_ssm = bool(getattr(args, "use_wavelet_ssm", False))
+        if self.use_wavelet_ssm:
+            self.wavelet_block = WaveletBlock(self.emb_ch, self.emb_ch)
+            
+        self.use_spectral_mixing = bool(getattr(args, "use_spectral_mixing", False))
+        if self.use_spectral_mixing:
+            self.spec_mixer = SpectralInteraction(self.emb_ch, self.rank)
+            
+        self.use_sh_prior = bool(getattr(args, "use_sh_prior", False))
+        if self.use_sh_prior:
+            self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, H, W)
+            
+        self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
+        if self.use_freq_prior:
+            self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8)
+            
+        self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
+        self.norm = RMSNorm(self.emb_ch)
+        self.gate_conv = nn.Sequential(
+            nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_perm = x.permute(0, 2, 1, 3, 4)
+        if self.use_cross_var_attn:
+            x_perm = self.cross_var_attn(x_perm)
+        if self.use_graph_interaction:
+            x_perm = x_perm + self.graph_block(x_perm)
+            
+        B, L, C, H, W = x_perm.shape
+        
+        if last_hidden_in is None:
+            if self.init_state is not None and static_feats is not None:
+                h_prev = self.init_state(static_feats).unsqueeze(1).repeat(1, L, 1, 1, 1, 1) 
+                h_prev = h_prev[:, 0] 
+            else:
+                h_prev = torch.zeros(B, C, H, W, self.rank, device=x.device, dtype=x.dtype)
+        else:
+            h_prev = last_hidden_in
+
+        if listT is None:
+            dt_seq = torch.ones(B, L, device=x.device, dtype=x.dtype)
+        else:
+            dt_seq = listT.to(x.device, x.dtype)
+
+        h_states = []
+        curr_h = h_prev
+        self.latest_kl = 0.0
+        
+        for t in range(L):
+            x_t = x_perm[:, t] 
+            if self.use_stochastic and hasattr(self, 'stochastic_injector'):
+                x_t = self.stochastic_injector(x_t)
+                self.latest_kl += self.stochastic_injector.latest_kl
+
+            dt_t = dt_seq[:, t].view(B, 1)
+            
+            flow = self.hamiltonian(x_t.unsqueeze(1)).squeeze(1)
+            
+            B_h, C_h, H_h, W_h, R_h = curr_h.shape
+            curr_h_flat = curr_h.permute(0, 4, 1, 2, 3).reshape(B_h, R_h * C_h, H_h, W_h)
+            h_trans_flat = self.lie_transport(curr_h_flat, flow, dt_t)
+            h_trans = h_trans_flat.reshape(B_h, R_h, C_h, H_h, W_h).permute(0, 2, 3, 4, 1)
+
+            h_next = self.koopman(h_trans, x_t.unsqueeze(1), dt_t)
+
+            x_inject = x_t.unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
+            curr_h = h_next + x_inject
+            h_states.append(curr_h)
+            
+        h_stack = torch.stack(h_states, dim=1)
+        out = self.proj_out(h_stack).squeeze(-1)
+        
+        out = out.permute(0, 2, 1, 3, 4) 
+        
+        out = self.post_ifft_proj(out)
+
+        if self.use_sh_prior:
+            out = self.sh_prior(out.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            
+        if self.use_freq_prior:
+            out_spatial = out.permute(0, 2, 1, 3, 4).contiguous()
+            out_ft = torch.fft.rfft2(out_spatial.float(), norm="ortho")
+            out_ft_res = self.freq_prior(out_ft)
+            out_spatial_res = torch.fft.irfft2(out_ft_res, s=out_spatial.shape[-2:], norm="ortho")
+            out = out + out_spatial_res.permute(0, 2, 1, 3, 4).to(out.dtype)
+
+        if self.use_wavelet_ssm:
+            out = out + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
+
+        out = self.norm(out)
+        gate = self.gate_conv(out)
+        x_out = (1 - gate) * x + gate * out
+        
+        return x_out, curr_h
+
 class FeedForward(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
         self.args = args
         self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.ffn_hidden_ch = self.emb_ch 
+        self.ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
+        self.hidden_dim = int(self.emb_ch * self.ffn_ratio)
         self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
         self.layers_num = 1
         self.use_cbam = bool(getattr(args, "use_cbam", False))
@@ -1203,16 +1204,16 @@ class FeedForward(nn.Module):
         self.num_expert = int(getattr(args, "num_expert", -1))
         self.activate_expert = int(getattr(args, "activate_expert", 2))
         self.conv_type = str(getattr(args, "ConvType", "conv"))
-        self.c_in = nn.Conv3d(self.emb_ch, self.ffn_hidden_ch, kernel_size=(1, 1, 1), padding="same")
+        self.c_in = nn.Conv3d(self.emb_ch, self.hidden_dim, kernel_size=(1, 1, 1), padding="same")
         blocks: List[nn.Module] = []
         cond_ch = self.emb_ch if self.static_ch > 0 else None
         for _ in range(self.layers_num):
             if self.num_expert > 1:
-                blocks.append(SpatialPatchMoE(self.ffn_hidden_ch, self.hidden_size, self.num_expert, self.activate_expert, self.use_cbam, cond_ch, conv_type=self.conv_type))
+                blocks.append(SpatialPatchMoE(self.hidden_dim, self.hidden_size, self.num_expert, self.activate_expert, self.use_cbam, cond_ch, conv_type=self.conv_type))
             else:
-                blocks.append(GatedConvBlock(self.ffn_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=self.use_cbam, cond_channels=cond_ch, conv_type=self.conv_type))
+                blocks.append(GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, use_cbam=self.use_cbam, cond_channels=cond_ch, conv_type=self.conv_type))
         self.blocks = nn.ModuleList(blocks)
-        self.c_out = nn.Conv3d(self.ffn_hidden_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
+        self.c_out = nn.Conv3d(self.hidden_dim, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
