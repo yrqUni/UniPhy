@@ -30,50 +30,32 @@ MODEL_ARG_KEYS = [
     "input_size",
     "input_ch",
     "out_ch",
-    "hidden_activation",
-    "output_activation",
-    "emb_strategy",
     "hidden_factor",
     "emb_ch",
-    "emb_hidden_ch",
-    "emb_hidden_layers_num",
     "convlru_num_blocks",
     "use_cbam",
-    "use_gate",
     "lru_rank",
     "use_freq_prior",
-    "freq_rank",
-    "freq_gain_init",
-    "freq_mode",
     "use_sh_prior",
     "sh_Lmax",
     "sh_rank",
     "sh_gain_init",
-    "ffn_hidden_ch",
-    "ffn_hidden_layers_num",
     "num_expert",
     "activate_expert",
-    "dec_strategy",
-    "dec_hidden_ch",
-    "dec_hidden_layers_num",
     "static_ch",
-    "use_selective",
-    "unet",
     "down_mode",
     "head_mode",
     "use_checkpointing",
-    "pool_mode",
     "use_spectral_mixing",
-    "use_anisotropic_diffusion",
     "use_advection",
-    "use_graph_interaction",
-    "use_adaptive_ssm",
-    "use_neural_operator",
+    "use_spatial_ssm",
+    "use_stochastic",
     "learnable_init_state",
     "use_wavelet_ssm",
     "use_cross_var_attn",
     "ConvType",
     "Arch",
+    "loss",
 ]
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
@@ -98,43 +80,27 @@ class Args:
         self.input_ch = 30
         self.out_ch = 30
         self.static_ch = 6
-        self.hidden_activation = "SiLU"
-        self.output_activation = "Tanh"
-        self.emb_strategy = "pxus"
         self.hidden_factor = (7, 12)
         self.emb_ch = 96
-        self.emb_hidden_ch = 128
-        self.emb_hidden_layers_num = 2
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.ffn_hidden_ch = 128
-        self.ffn_hidden_layers_num = 2
-        self.num_expert = 8
+        self.num_expert = 16
         self.activate_expert = 4
-        self.use_gate = True
         self.lru_rank = 32
-        self.use_selective = True
-        self.unet = True
         self.down_mode = "shuffle"
         self.use_freq_prior = True
-        self.freq_rank = 8
-        self.freq_gain_init = 0.0
-        self.freq_mode = "linear"
         self.use_sh_prior = True
         self.sh_Lmax = 6
         self.sh_rank = 8
         self.sh_gain_init = 0.0
-        self.dec_strategy = "pxsf"
-        self.dec_hidden_ch = 0
-        self.dec_hidden_layers_num = 0
         self.head_mode = "gaussian"
         self.diffusion_steps = 1000
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 18
+        self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = ""
+        self.ckpt = "e7_s570_l0.265707.pth"
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
@@ -148,7 +114,7 @@ class Args:
         self.weight_decay = 0.05
         self.use_scheduler = True
         self.init_lr_scheduler = True
-        self.loss = "lat"
+        self.loss = ["lat", "gdl", "spec"]
         self.T = 6
         self.use_amp = False
         self.amp_dtype = "bf16"
@@ -161,18 +127,14 @@ class Args:
         self.wandb_group = "v3.0.0"
         self.wandb_mode = "online"
         self.use_checkpointing = True
-        self.train_mode = "p_only"
-        
+        self.train_mode = "alignment"
         self.use_spectral_mixing = True
-        self.use_anisotropic_diffusion = True
-        self.use_advection = False
-        self.use_graph_interaction = True
-        self.use_adaptive_ssm = True
-        self.use_neural_operator = True
+        self.use_advection = True
+        self.use_spatial_ssm = True
+        self.use_stochastic = False
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
-        
         self.ConvType = "dcn"
         self.Arch = "bifpn"
         self.check_args()
@@ -638,12 +600,25 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     p_direct_last = p_det[:, -1:].detach()
                     loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
 
-                gdl_loss = gradient_difference_loss(p_det, target)
-                spec_loss = spectral_loss(p_det, target)
+                loss = torch.tensor(0.0, device=x.device)
+                
+                if "lat" in args.loss:
+                    loss = loss + loss_main
+                
+                gdl_loss = torch.tensor(0.0, device=x.device)
+                if "gdl" in args.loss:
+                    gdl_loss = gradient_difference_loss(p_det, target)
+                    loss = loss + 0.5 * gdl_loss
+                    
+                spec_loss = torch.tensor(0.0, device=x.device)
+                if "spec" in args.loss:
+                    spec_loss = spectral_loss(p_det, target)
+                    loss = loss + 0.1 * spec_loss
+                
                 kl_loss = get_kl_loss(model)
                 moe_loss = get_moe_aux_loss(model)
                 
-                loss = loss_main + 0.5 * loss_solver + 0.1 * loss_consistency + 0.01 * moe_loss + 0.5 * gdl_loss + 0.1 * spec_loss + 1e-6 * kl_loss
+                loss = loss + 0.5 * loss_solver + 0.1 * loss_consistency + 0.01 * moe_loss + 1e-6 * kl_loss
                 
                 if isinstance(model, DDP):
                     dummy_loss = torch.tensor(0.0, device=loss.device)
