@@ -308,7 +308,7 @@ class FactorizedPeriodicConv3d(nn.Module):
         x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
         x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
         x_sp = self.spatial_conv(x_sp)
-        x_sp = x_sp.reshape(B, D, C, H, W).permute(0, 2, 1, 3, 4)
+        x_sp = x_sp.reshape(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
         out = self.depth_conv(x_sp)
         return out
 
@@ -760,8 +760,9 @@ class SpatialSSMParameterGenerator(nn.Module):
         feat = self.pool(feat)
         feat = feat.permute(0, 2, 3, 1).contiguous().reshape(B, L, 1, self.w_freq, self.emb_ch)
         params = self.head(feat)
-        params = params.view(B, L, 1, self.w_freq, self.emb_ch, self.rank, 4)
-        params = params.permute(0, 1, 4, 3, 5, 6, 2).contiguous()
+        params = params.squeeze(2)
+        params = params.view(B, L, self.w_freq, self.emb_ch, self.rank, 4)
+        params = params.permute(0, 1, 3, 2, 4, 5).contiguous()
         return torch.tanh(params[..., 0]), torch.tanh(params[..., 1]), torch.sigmoid(params[..., 2]), torch.sigmoid(params[..., 3])
 
 class StaticInitState(nn.Module):
