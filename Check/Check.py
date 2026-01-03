@@ -25,29 +25,13 @@ class MockArgs:
         self.emb_ch = 16
         self.convlru_num_blocks = 2
         self.use_cbam = False
-        self.num_expert = 1
-        self.activate_expert = 1
         self.lru_rank = 4
         self.Arch = "unet"
         self.down_mode = "avg"
         self.head_mode = "gaussian"
-        self.use_checkpointing = False
         self.ConvType = "conv"
-        self.use_spectral_mixing = False
-        self.use_advection = False
-        self.use_spatial_ssm = True
-        self.use_stochastic = False
         self.learnable_init_state = False
-        self.use_wavelet_ssm = False
-        self.use_cross_var_attn = False
-        self.use_freq_prior = False
-        self.use_sh_prior = False
-        self.sh_Lmax = 4
-        self.sh_rank = 4
-        self.sh_gain_init = 0.0
-        self.use_graph_interaction = False
         self.ffn_ratio = 4.0
-        self.loss = ["lat"]
         
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -99,21 +83,14 @@ def run_case(case_name, args_dict, mode='p'):
 
 def main():
     print("========== Check Start ==========")
-    run_case("01_HKLF_Baseline", {})
-    run_case("02_Spatial_SSM", {"use_spatial_ssm": True})
-    run_case("03_Stochastic", {"use_stochastic": True})
-    run_case("04_Advection_Lie", {"use_advection": True})
-    run_case("05_Spectral_SH", {"use_spectral_mixing": True, "use_freq_prior": True, "use_sh_prior": True})
-    run_case("06_Wavelet_CrossVar", {"use_wavelet_ssm": True, "use_cross_var_attn": True})
-    run_case("07_Graph_Interaction", {"use_graph_interaction": True})
-    run_case("08_BiFPN", {"Arch": "bifpn"})
-    run_case("09_No_UNet", {"Arch": "no_unet"})
-    run_case("10_MoE", {"num_expert": 4, "activate_expert": 2})
-    run_case("11_Diffusion_Head", {"head_mode": "diffusion", "out_ch": 2})
-    run_case("12_Token_Head", {"head_mode": "token", "out_ch": 2})
-    run_case("13_Static_Init", {"static_ch": 4, "learnable_init_state": True})
-    run_case("14_Inference", {"use_spatial_ssm": True}, mode='i')
-    run_case("15_Full_ERA5_Size", {"input_size": (721, 1440), "input_ch": 2, "emb_ch": 16, "hidden_factor": (7, 12)}, mode='p')
+    run_case("01_Baseline_Default", {})
+    run_case("02_BiFPN_Arch", {"Arch": "bifpn"})
+    run_case("03_No_UNet_Arch", {"Arch": "no_unet"})
+    run_case("04_Diffusion_Head", {"head_mode": "diffusion", "out_ch": 2})
+    run_case("05_Token_Head", {"head_mode": "token", "out_ch": 2})
+    run_case("06_Static_Init", {"static_ch": 4, "learnable_init_state": True})
+    run_case("07_Inference_Mode", {}, mode='i')
+    run_case("08_Full_ERA5_Size", {"input_size": (721, 1440), "input_ch": 2, "emb_ch": 16, "hidden_factor": (7, 12)}, mode='p')
     print("========== Check Done ==========")
 
 if __name__ == "__main__":

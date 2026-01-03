@@ -85,7 +85,7 @@ class Args:
         self.emb_ch = 64
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.num_expert = 16
+        self.num_expert = 8
         self.activate_expert = 4
         self.lru_rank = 32
         self.down_mode = "shuffle"
