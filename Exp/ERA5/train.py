@@ -35,25 +35,10 @@ MODEL_ARG_KEYS = [
     "convlru_num_blocks",
     "use_cbam",
     "lru_rank",
-    "use_freq_prior",
-    "use_sh_prior",
-    "sh_Lmax",
-    "sh_rank",
-    "sh_gain_init",
-    "num_expert",
-    "activate_expert",
     "static_ch",
     "down_mode",
     "head_mode",
-    "use_checkpointing",
-    "use_spectral_mixing",
-    "use_advection",
-    "use_spatial_ssm",
-    "use_stochastic",
     "learnable_init_state",
-    "use_wavelet_ssm",
-    "use_cross_var_attn",
-    "use_graph_interaction",
     "ffn_ratio",
     "ConvType",
     "Arch",
@@ -82,18 +67,11 @@ class Args:
         self.out_ch = 30
         self.static_ch = 6
         self.hidden_factor = (7, 12)
-        self.emb_ch = 64
+        self.emb_ch = 96
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.num_expert = 8
-        self.activate_expert = 4
         self.lru_rank = 32
         self.down_mode = "shuffle"
-        self.use_freq_prior = True
-        self.use_sh_prior = True
-        self.sh_Lmax = 6
-        self.sh_rank = 8
-        self.sh_gain_init = 0.0
         self.head_mode = "gaussian"
         self.diffusion_steps = 1000
         self.data_root = "/nfs/ERA5_data/data_norm"
@@ -120,23 +98,15 @@ class Args:
         self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
-        self.sample_k = 8
+        self.sample_k = 9
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
         self.wandb_run_name = "PhyConvLRU_HKLF"
         self.wandb_group = "v4.0.0"
         self.wandb_mode = "online"
-        self.use_checkpointing = True
         self.train_mode = "alignment"
-        self.use_spectral_mixing = True
-        self.use_advection = True
-        self.use_spatial_ssm = True
-        self.use_stochastic = True
         self.learnable_init_state = True
-        self.use_wavelet_ssm = True
-        self.use_cross_var_attn = True
-        self.use_graph_interaction = False
         self.ffn_ratio = 1.0
         self.ConvType = "dcn"
         self.Arch = "bifpn"
@@ -340,21 +310,6 @@ def spectral_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     fft_pred = torch.fft.rfft2(preds.float(), norm="ortho")
     fft_target = torch.fft.rfft2(targets.float(), norm="ortho")
     return (fft_pred.abs() - fft_target.abs()).abs().mean()
-
-def get_moe_aux_loss(model: torch.nn.Module) -> torch.Tensor:
-    total_aux_loss = torch.tensor(0.0, device=next(model.parameters()).device)
-    model_to_search = model.module if isinstance(model, DDP) else model
-    for module in model_to_search.modules():
-        if hasattr(module, "aux_loss") and isinstance(module.aux_loss, torch.Tensor):
-            total_aux_loss = total_aux_loss + module.aux_loss
-    return total_aux_loss
-
-def get_kl_loss(model: torch.nn.Module) -> torch.Tensor:
-    total_kl_loss = torch.tensor(0.0, device=next(model.parameters()).device)
-    model_to_search = model.module if isinstance(model, DDP) else model
-    if hasattr(model_to_search, "get_total_kl_loss"):
-        return model_to_search.get_total_kl_loss()
-    return total_kl_loss
 
 _LRU_GATE_MEAN: Dict[Any, float] = {}
 
@@ -628,10 +583,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     spec_loss = spectral_loss(p_det, target)
                     loss = loss + 0.1 * spec_loss
                 
-                kl_loss = get_kl_loss(model)
-                moe_loss = get_moe_aux_loss(model)
-                
-                loss = loss + 0.5 * loss_solver + 0.1 * loss_consistency + 0.01 * moe_loss + 1e-6 * kl_loss
+                loss = loss + 0.5 * loss_solver + 0.1 * loss_consistency
                 
                 if isinstance(model, DDP):
                     dummy_loss = torch.tensor(0.0, device=loss.device)
@@ -689,7 +641,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/loss_spec": spec_loss.item(),
                         "train/lr": float(current_lr),
                         "train/grad_norm": float(grad_norm),
-                        "train/moe_aux_loss": moe_loss.item(),
                     }
                     for k, v in _LRU_GATE_MEAN.items():
                         g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
