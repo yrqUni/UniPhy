@@ -82,10 +82,10 @@ class Args:
         self.out_ch = 30
         self.static_ch = 6
         self.hidden_factor = (7, 12)
-        self.emb_ch = 96
-        self.convlru_num_blocks = 6
+        self.emb_ch = 48
+        self.convlru_num_blocks = 5
         self.use_cbam = True
-        self.num_expert = 16
+        self.num_expert = 8
         self.activate_expert = 4
         self.lru_rank = 32
         self.down_mode = "shuffle"
@@ -101,7 +101,7 @@ class Args:
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = "e7_s570_l0.265707.pth"
+        self.ckpt = ""
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
@@ -132,7 +132,7 @@ class Args:
         self.use_spectral_mixing = True
         self.use_advection = True
         self.use_spatial_ssm = True
-        self.use_stochastic = False
+        self.use_stochastic = True
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
