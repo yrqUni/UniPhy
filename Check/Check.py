@@ -3,14 +3,17 @@ import os
 import torch
 import traceback
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Model', 'ConvLRU')))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+model_dir = os.path.join(project_root, 'Model', 'ConvLRU')
+sys.path.insert(0, model_dir)
+sys.path.insert(0, project_root)
 
 try:
     from ModelConvLRU import ConvLRU
 except ImportError:
-    sys.path.append(os.path.abspath(os.path.join(os.getcwd(), 'Model', 'ConvLRU')))
-    from ModelConvLRU import ConvLRU
+    print(f"[Error] Could not import ConvLRU from {model_dir}")
+    sys.exit(1)
 
 class MockArgs:
     def __init__(self, **kwargs):
@@ -29,6 +32,8 @@ class MockArgs:
         self.Arch = "unet"
         self.down_mode = "avg"
         self.head_mode = "gaussian"
+        self.use_checkpointing = False
+        self.ConvType = "conv"
         self.use_spectral_mixing = False
         self.use_advection = False
         self.use_spatial_ssm = True
@@ -41,47 +46,49 @@ class MockArgs:
         self.sh_Lmax = 4
         self.sh_rank = 4
         self.sh_gain_init = 0.0
-        self.ConvType = "conv"
         
         for k, v in kwargs.items():
             setattr(self, k, v)
 
 def run_case(case_name, args_dict, mode='p'):
     print(f"[{case_name}] Setting up...")
-    args = MockArgs(**args_dict)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     try:
+        args = MockArgs(**args_dict)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = ConvLRU(args).to(device)
-    except Exception as e:
-        print(f"[{case_name}] Init Failed: {e}")
-        traceback.print_exc()
-        return
+        
+        B, L, C, H, W = 2, 4, args.input_ch, 32, 32
+        x = torch.randn(B, L, C, H, W).to(device)
+        static_feats = None
+        if args.static_ch > 0:
+            static_feats = torch.randn(B, args.static_ch, H, W).to(device)
+        
+        timestep = None
+        if args.head_mode in ["diffusion", "flow"]:
+            timestep = torch.randint(0, 5, (B,)).to(device)
+            
+        listT = torch.ones(B, L).to(device)
 
-    B, L, C, H, W = 2, 4, args.input_ch, 32, 32
-    x = torch.randn(B, L, C, H, W).to(device)
-    static_feats = torch.randn(B, args.static_ch, H, W).to(device) if args.static_ch > 0 else None
-    listT = torch.ones(B, L).to(device)
-    timestep = torch.randint(0, 5, (B,)).to(device) if args.head_mode in ["diffusion", "flow"] else None
-    
-    try:
         if mode == 'p':
             out = model(x, mode='p', listT=listT, static_feats=static_feats, timestep=timestep)
             if isinstance(out, tuple):
                 out = out[0]
             print(f"[{case_name}] Success. Output: {out.shape}")
+            
         elif mode == 'i':
             out_gen_num = 3
             listT_future = torch.ones(B, out_gen_num - 1).to(device)
             out = model(x, mode='i', out_gen_num=out_gen_num, listT=listT, listT_future=listT_future, static_feats=static_feats, timestep=timestep)
             print(f"[{case_name}] Inference Success. Output: {out.shape}")
+
     except Exception as e:
         print(f"[{case_name}] Failed: {e}")
         traceback.print_exc()
-    
-    del model, x
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    finally:
+        if 'model' in locals(): del model
+        if 'x' in locals(): del x
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def main():
     print("========== Check Start ==========")
