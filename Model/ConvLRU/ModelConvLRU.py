@@ -5,15 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-def _kaiming_like_(tensor: torch.Tensor) -> torch.Tensor:
-    nn.init.kaiming_normal_(tensor, a=0, mode="fan_in", nonlinearity="relu")
-    return tensor
-
 def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     out_ch, in_ch, kD, kH, kW = weight.shape
     base_out = out_ch // (rH * rW)
     base = weight.new_zeros((base_out, in_ch, 1, kH, kW))
-    _kaiming_like_(base)
+    nn.init.kaiming_normal_(base, a=0, mode="fan_in", nonlinearity="relu")
     base = base.repeat_interleave(rH * rW, dim=0)
     with torch.no_grad():
         weight.copy_(base)
@@ -33,64 +29,6 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
     x = x.reshape(N, C * rH * rW, D, H // rH, W // rW)
     return x
-
-class RMSNorm(nn.Module):
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.channels = int(channels)
-        self.eps = float(eps)
-        self.weight = nn.Parameter(torch.ones(self.channels))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 5:
-            x = x.permute(0, 2, 3, 4, 1)
-            x = F.rms_norm(x, (self.channels,), self.weight, self.eps)
-            return x.permute(0, 4, 1, 2, 3)
-        elif x.dim() == 4:
-            x = x.permute(0, 2, 3, 1)
-            x = F.rms_norm(x, (self.channels,), self.weight, self.eps)
-            return x.permute(0, 3, 1, 2)
-        else:
-             return F.rms_norm(x, (self.channels,), self.weight, self.eps)
-
-class RevIN(nn.Module):
-    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
-        super().__init__()
-        self.num_features = int(num_features)
-        self.eps = float(eps)
-        self.affine = bool(affine)
-        if self.affine:
-            self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
-            self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
-
-    def _get_statistics(self, x: torch.Tensor) -> None:
-        dim2reduce = (3, 4)
-        with torch.amp.autocast("cuda", enabled=False):
-            x_fp32 = x.float()
-            self.mean = torch.mean(x_fp32, dim=dim2reduce, keepdim=True).detach().to(x.dtype)
-            self.stdev = torch.sqrt(torch.var(x_fp32, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach().to(x.dtype)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight + self.affine_bias
-        return x
-
-    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.affine:
-            x = (x - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
-        x = x * self.stdev + self.mean
-        return x
-
-    def forward(self, x: torch.Tensor, mode: str) -> torch.Tensor:
-        if mode == "norm":
-            self._get_statistics(x)
-            return self._normalize(x)
-        elif mode == "denorm":
-            return self._denormalize(x)
-        else:
-            raise NotImplementedError
 
 class DeformConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, bias=False):
@@ -131,7 +69,7 @@ class FactorizedPeriodicConv3d(nn.Module):
         if self.conv_type == "dcn":
             self.spatial_conv = DeformConv2d(in_channels, out_channels, kernel_size=kernel_size, padding=0, bias=False)
         else:
-            self.spatial_conv = nn.Conv2d(in_channels, out_channels, kernel_size=(kernel_size, kernel_size), padding=0, bias=False)
+            self.spatial_conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=0, bias=False)
         self.depth_conv = nn.Conv3d(out_channels, out_channels, kernel_size=(1, 1, 1), padding=0, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -141,8 +79,7 @@ class FactorizedPeriodicConv3d(nn.Module):
         x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
         x_sp = self.spatial_conv(x_sp)
         x_sp = x_sp.reshape(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
-        out = self.depth_conv(x_sp)
-        return out
+        return self.depth_conv(x_sp)
 
 class ChannelAttention2D(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
@@ -196,8 +133,8 @@ class HamiltonianGenerator(nn.Module):
             nn.SiLU(),
             nn.Conv2d(channels // 2, 1, 3, padding=1)
         )
-        self.sobel_x = nn.Parameter(torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3), requires_grad=False)
-        self.sobel_y = nn.Parameter(torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3), requires_grad=False)
+        self.register_buffer("sobel_x", torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
         nn.init.zeros_(self.conv[-1].weight)
         nn.init.zeros_(self.conv[-1].bias)
 
@@ -274,13 +211,14 @@ class KoopmanParamEstimator(nn.Module):
         self.head = nn.Linear(in_ch, emb_ch * rank * 3)
 
     def forward(self, x):
-        B, L, C, H, W = x.shape
-        x_flat = x.reshape(B * L, C, H, W)
+        # x: (B, C, 1, H, W)
+        B, C, _, H, W = x.shape
+        x_flat = x.squeeze(2) # (B, C, H, W)
         feat = self.conv(x_flat)
         feat = self.pool(feat)
-        feat = feat.permute(0, 2, 3, 1).contiguous().reshape(B, L, 1, self.w_freq, C)
+        feat = feat.permute(0, 2, 3, 1).reshape(B, 1, self.w_freq, C)
         params = self.head(feat)
-        params = params.view(B, L, self.w_freq, self.emb_ch, self.rank, 3)
+        params = params.view(B, 1, self.w_freq, self.emb_ch, self.rank, 3)
         params = params.permute(0, 1, 3, 2, 4, 5).contiguous()
         nu = F.softplus(params[..., 0])
         theta = torch.tanh(params[..., 1]) * math.pi
@@ -296,13 +234,8 @@ class SpectralKoopmanSDE(nn.Module):
         
     def forward(self, h_trans, x_curr, dt):
         B, C, H, W, R = h_trans.shape 
-        h_trans_perm = h_trans.permute(0, 4, 1, 2, 3) 
-        h_freq = torch.fft.rfft2(h_trans_perm.float(), norm="ortho")
+        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho")
         
-        is_x_4d = x_curr.dim() == 4
-        if is_x_4d:
-             x_curr = x_curr.unsqueeze(1)
-
         nu, theta, sigma = self.estimator(x_curr)
         
         dt_expanded = dt.view(dt.shape[0], dt.shape[1], 1, 1, 1, 1)
@@ -366,7 +299,7 @@ class SimplifiedHKLFLayer(nn.Module):
             self.init_state = None
             
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-        self.norm = RMSNorm(self.emb_ch)
+        self.norm = nn.GroupNorm(4, self.emb_ch)
         self.gate_conv = nn.Sequential(
             nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
             nn.Sigmoid(),
@@ -392,17 +325,19 @@ class SimplifiedHKLFLayer(nn.Module):
         h_states = []
         curr_h = h_prev
         
+        x_perm = x.permute(0, 2, 1, 3, 4)
+        
         for t in range(L):
-            x_t = x[:, :, t] 
+            x_t = x[:, :, t:t+1] 
             dt_t = dt_seq[:, t].view(B, 1)
             
-            flow = self.hamiltonian(x_t.unsqueeze(1)).squeeze(1)
+            flow = self.hamiltonian(x_perm[:, t:t+1])
             
-            h_trans = self.lie_transport(curr_h, flow, dt_t)
+            h_trans = self.lie_transport(curr_h, flow.squeeze(1), dt_t)
 
-            h_next = self.koopman(h_trans, x_t.unsqueeze(1), dt_t)
+            h_next = self.koopman(h_trans, x_t, dt_t)
 
-            x_inject = x_t.unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
+            x_inject = x_t.squeeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
             curr_h = h_next + x_inject
             h_states.append(curr_h)
             
@@ -423,7 +358,7 @@ class GatedConvBlock(nn.Module):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size, conv_type=conv_type)
-        self.norm = RMSNorm(int(channels))
+        self.norm = nn.GroupNorm(4, int(channels))
         
         self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
@@ -538,7 +473,7 @@ class CrossScaleAttentionGate(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.psi = nn.Conv3d(channels, 1, kernel_size=1, bias=True)
         self.sigmoid = nn.Sigmoid()
-        self.norm = RMSNorm(channels)
+        self.norm = nn.GroupNorm(4, channels)
 
     def forward(self, local_x: torch.Tensor, global_x: torch.Tensor) -> torch.Tensor:
         g = self.conv_g(global_x)
@@ -717,7 +652,7 @@ class Embedding(nn.Module):
         self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch)])
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
-        self.norm = RMSNorm(self.emb_ch)
+        self.norm = nn.GroupNorm(4, self.emb_ch)
 
     def _make_grid(self, args):
         H, W = tuple(getattr(args, "input_size", (64, 64)))
@@ -817,6 +752,45 @@ class Decoder(nn.Module):
             return torch.cat([mu, sigma], dim=1)
         return x
 
+class RevIN(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
+        super().__init__()
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.affine = bool(affine)
+        if self.affine:
+            self.affine_weight = nn.Parameter(torch.ones(1, 1, self.num_features, 1, 1))
+            self.affine_bias = nn.Parameter(torch.zeros(1, 1, self.num_features, 1, 1))
+
+    def _get_statistics(self, x: torch.Tensor) -> None:
+        dim2reduce = (3, 4)
+        with torch.amp.autocast("cuda", enabled=False):
+            x_fp32 = x.float()
+            self.mean = torch.mean(x_fp32, dim=dim2reduce, keepdim=True).detach().to(x.dtype)
+            self.stdev = torch.sqrt(torch.var(x_fp32, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach().to(x.dtype)
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        x = x - self.mean
+        x = x / self.stdev
+        if self.affine:
+            x = x * self.affine_weight + self.affine_bias
+        return x
+
+    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.affine:
+            x = (x - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
+        x = x * self.stdev + self.mean
+        return x
+
+    def forward(self, x: torch.Tensor, mode: str) -> torch.Tensor:
+        if mode == "norm":
+            self._get_statistics(x)
+            return self._normalize(x)
+        elif mode == "denorm":
+            return self._denormalize(x)
+        else:
+            raise NotImplementedError
+
 class ConvLRU(nn.Module):
     def __init__(self, args: Any):
         super().__init__()
@@ -857,8 +831,10 @@ class ConvLRU(nn.Module):
             
             if isinstance(out, tuple):
                 out_tensor = out[0]
+                rest = out[1:]
             else:
                 out_tensor = out
+                rest = ()
             
             out_tensor = out_tensor.permute(0, 2, 1, 3, 4).contiguous()
             
@@ -867,8 +843,10 @@ class ConvLRU(nn.Module):
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm")
                     stdev = torch.clamp(self.revin.stdev, min=1e-5)
-                    sigma = sigma * stdev
+                    sigma = sigma * self.revin.stdev
                 return torch.cat([mu, sigma], dim=2)
+            elif self.decoder.head_mode == "token":
+                return (out_tensor,) + rest
             else:
                 if out_tensor.size(2) == self.revin.num_features:
                     return self.revin(out_tensor, "denorm")
@@ -905,6 +883,7 @@ class ConvLRU(nn.Module):
             out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
             mu = x_step_dist[:, :, :out_ch, :, :]
             sigma = x_step_dist[:, :, out_ch:, :, :]
+            
             if mu.size(2) == self.revin.num_features:
                 mu_denorm = self.revin(mu, "denorm")
                 sigma_denorm = sigma * self.revin.stdev
@@ -913,6 +892,9 @@ class ConvLRU(nn.Module):
                 sigma_denorm = sigma
             out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
             x_step_mean = mu_denorm 
+        elif str(self.decoder.head_mode).lower() == "token":
+            out_list.append(x_step_dist)
+            x_step_mean = x_step_dist 
         else:
             if x_step_dist.size(2) == self.revin.num_features:
                 x_step_dist_denorm = self.revin(x_step_dist, "denorm")
@@ -969,6 +951,9 @@ class ConvLRU(nn.Module):
                     sigma = sigma * self.revin.stdev
                 out_list.append(torch.cat([mu, sigma], dim=2))
                 x_step_mean = mu
+            elif str(self.decoder.head_mode).lower() == "token":
+                out_list.append(x_step_dist)
+                x_step_mean = x_step_dist
             else:
                 if x_step_dist.size(2) == self.revin.num_features:
                     x_step_dist_denorm = self.revin(x_step_dist, "denorm")
