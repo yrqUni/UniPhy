@@ -62,7 +62,7 @@ def run_case(case_name, args_dict, mode='p'):
         B, L, C = 2, 4, args.input_ch
         
         if "Full_ERA5" in case_name:
-            B = 1 # 进一步降低 batch size 保证安全
+            B = 1
             
         x = torch.randn(B, L, C, H, W).to(device)
         static_feats = None
@@ -98,10 +98,10 @@ def run_case(case_name, args_dict, mode='p'):
 
 def main():
     print("========== Check Start ==========")
-    run_case("01_Baseline", {})
+    run_case("01_HKLF_Baseline", {})
     run_case("02_Spatial_SSM", {"use_spatial_ssm": True})
     run_case("03_Stochastic", {"use_stochastic": True})
-    run_case("04_Advection", {"use_advection": True})
+    run_case("04_Advection_Lie", {"use_advection": True})
     run_case("05_Spectral_SH", {"use_spectral_mixing": True, "use_freq_prior": True, "use_sh_prior": True})
     run_case("06_Wavelet_CrossVar", {"use_wavelet_ssm": True, "use_cross_var_attn": True})
     run_case("07_Graph_Interaction", {"use_graph_interaction": True})

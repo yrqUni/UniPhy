@@ -47,16 +47,12 @@ def rms_norm_kernel(
     row_idx = tl.program_id(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < N_COLS
-    
     x_ptr_row = x_ptr + row_idx * stride_row
     x = tl.load(x_ptr_row + col_offsets * stride_col, mask=mask, other=0.0).to(tl.float32)
-    
     mean_sq = tl.sum(x * x, axis=0) / N_COLS
     rstd = tl.rsqrt(mean_sq + eps)
-    
     w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
     y = x * rstd * w
-    
     out_ptr_row = out_ptr + row_idx * stride_row
     tl.store(out_ptr_row + col_offsets * stride_col, y, mask=mask)
 
@@ -70,7 +66,6 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.is_complex():
             x = x.real
-        
         permuted = False
         if x.shape[-1] != self.channels:
             if x.dim() == 5 and x.shape[1] == self.channels:
@@ -81,18 +76,14 @@ class RMSNorm(nn.Module):
                 permuted = True
             else:
                  return F.rms_norm(x, (self.channels,), self.weight, self.eps)
-
         shape_permuted = x.shape
         x_flat = x.reshape(-1, self.channels)
         M, N = x_flat.shape
         out = torch.empty_like(x_flat)
-        
         BLOCK_SIZE = triton.next_power_of_2(N)
         BLOCK_SIZE = max(1, min(BLOCK_SIZE, 4096))
-        
         if N > 4096: 
              return F.rms_norm(x, (self.channels,), self.weight, self.eps)
-
         grid = (M,)
         rms_norm_kernel[grid](
             x_flat, self.weight, out,
@@ -100,15 +91,12 @@ class RMSNorm(nn.Module):
             N, self.eps,
             BLOCK_SIZE=BLOCK_SIZE
         )
-        
         out = out.reshape(*shape_permuted)
-        
         if permuted:
             if out.dim() == 5: 
                 out = out.permute(0, 4, 1, 2, 3).contiguous()
             elif out.dim() == 4:
                 out = out.permute(0, 3, 1, 2).contiguous()
-                
         return out
 
 class AdaRMSNorm(nn.Module):
@@ -141,14 +129,11 @@ def gated_silu_kernel(
     row_idx = tl.program_id(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < C_half
-    
     base_in = x_ptr + row_idx * stride_row_in
     val = tl.load(base_in + col_offsets * stride_col_in, mask=mask, other=0.0)
     gate = tl.load(base_in + (col_offsets + C_half) * stride_col_in, mask=mask, other=0.0)
-    
     sig_gate = 1.0 / (1.0 + tl.exp(-gate))
     res = val * sig_gate
-    
     base_out = out_ptr + row_idx * stride_row_out
     tl.store(base_out + col_offsets * stride_col_out, res, mask=mask)
 
@@ -166,21 +151,17 @@ class FusedGatedSiLU(nn.Module):
         else:
              chunk1, chunk2 = torch.chunk(x, 2, dim=1)
              return chunk1 * F.sigmoid(chunk2)
-
         N_rows, C2 = x_reshaped.shape
         C = C2 // 2
         out = torch.empty((N_rows, C), device=x.device, dtype=x.dtype)
-        
         BLOCK_SIZE = triton.next_power_of_2(C)
         grid = (N_rows,)
-        
         gated_silu_kernel[grid](
             x_reshaped, out,
             x_reshaped.stride(0), x_reshaped.stride(1),
             out.stride(0), out.stride(1),
             C, BLOCK_SIZE=BLOCK_SIZE
         )
-        
         if x.dim() == 5:
             B, _, L, H, W = x.shape
             return out.view(B, L, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
@@ -710,39 +691,6 @@ class ContextExtractor(nn.Module):
             max_val, _ = x_fp.view(x.size(0), x.size(1), x.size(2), -1).max(dim=-1)
         return torch.cat([mean, std, max_val], dim=-1).to(x.dtype)
 
-class AdvectionBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.flow_pred = nn.Sequential(
-            nn.Conv2d(channels, channels // 2, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(channels // 2, 2, 3, padding=1)
-        )
-        nn.init.zeros_(self.flow_pred[-1].weight)
-        nn.init.zeros_(self.flow_pred[-1].bias)
-
-    def forward(self, x):
-        B, L, C, H, W = x.shape
-        x_flat = x.reshape(B * L, C, H, W)
-        flow = self.flow_pred(x_flat)
-        pad_w = W // 8
-        x_padded = F.pad(x_flat, (pad_w, pad_w, 0, 0), mode="circular")
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=x.device),
-            torch.linspace(-1, 1, W, device=x.device),
-            indexing="ij"
-        )
-        base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).expand(B * L, -1, -1, -1)
-        final_grid = base_grid - flow.permute(0, 2, 3, 1)
-        W_new = W + 2 * pad_w
-        grid_x_orig = final_grid[..., 0]
-        x_pixel = (grid_x_orig + 1) * 0.5 * (W - 1)
-        x_pixel_new = x_pixel + pad_w
-        grid_x_new = (x_pixel_new / (W_new - 1)) * 2.0 - 1.0
-        final_grid_new = torch.stack((grid_x_new, final_grid[..., 1]), dim=-1)
-        x_warped = F.grid_sample(x_padded, final_grid_new, mode="bilinear", padding_mode="border", align_corners=False)
-        return x_warped.reshape(B, L, C, H, W)
-
 class StochasticInjector(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -754,6 +702,9 @@ class StochasticInjector(nn.Module):
         self.latest_kl = 0.0
 
     def forward(self, x):
+        is_4d = x.dim() == 4
+        if is_4d:
+            x = x.unsqueeze(1)
         B, L, C, H, W = x.shape
         x_flat = x.reshape(B * L, C, H, W)
         stats = self.conv(x_flat)
@@ -764,14 +715,96 @@ class StochasticInjector(nn.Module):
         kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         self.latest_kl = kl / (B * L)
         z = z.view(B, L, C, H, W)
-        return x + z
+        out = x + z
+        if is_4d:
+            return out.squeeze(1)
+        return out
 
-class SpatialSSMParameterGenerator(nn.Module):
+class HamiltonianGenerator(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels // 2, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(channels // 2, 1, 3, padding=1)
+        )
+        self.sobel_x = nn.Parameter(torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3), requires_grad=False)
+        self.sobel_y = nn.Parameter(torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3), requires_grad=False)
+        nn.init.zeros_(self.conv[-1].weight)
+        nn.init.zeros_(self.conv[-1].bias)
+
+    def forward(self, x):
+        B, L, C, H, W = x.shape
+        x_flat = x.reshape(B * L, C, H, W)
+        H_field = self.conv(x_flat)
+        
+        lat = torch.linspace(-math.pi / 2, math.pi / 2, H, device=x.device).view(1, 1, H, 1)
+        metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
+        
+        H_padded = F.pad(H_field, (1, 1, 0, 0), mode='circular')
+        H_padded = F.pad(H_padded, (0, 0, 1, 1), mode='replicate')
+        
+        grad_x = F.conv2d(H_padded, self.sobel_x.to(x.device))
+        grad_y = F.conv2d(H_padded, self.sobel_y.to(x.device))
+        
+        u = grad_y 
+        v = -grad_x * metric_correction
+        
+        flow = torch.cat([u, v], dim=1)
+        flow = torch.tanh(flow) 
+        
+        return flow.view(B, L, 2, H, W)
+
+class LieTransport(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, h_prev, flow, dt):
+        original_dim = h_prev.dim()
+        if original_dim == 4:
+             h_prev = h_prev.unsqueeze(1)
+             if flow.dim() == 4:
+                 flow = flow.unsqueeze(1)
+             if dt.dim() == 2:
+                 dt = dt.unsqueeze(2).unsqueeze(3)
+             elif dt.dim() == 1:
+                  dt = dt.view(-1, 1, 1, 1)
+             if dt.dim() == 2 and dt.shape[1] == 1:
+                  dt = dt.view(dt.shape[0], 1, 1, 1)
+        
+        B, L, C, H, W = h_prev.shape
+        flow_flat = flow.reshape(B * L, 2, H, W)
+        h_flat = h_prev.reshape(B * L, C, H, W)
+        
+        if dt.dim() == 2 and dt.shape[1] == 1:
+             dt_flat = dt.expand(B, L).reshape(B * L, 1, 1, 1)
+        else:
+             dt_flat = dt.view(B * L, 1, 1, 1)
+
+        flow_dt = flow_flat * dt_flat
+        
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=h_prev.device),
+            torch.linspace(-1, 1, W, device=h_prev.device),
+            indexing="ij"
+        )
+        base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).expand(B * L, -1, -1, -1)
+        
+        flow_perm = flow_dt.permute(0, 2, 3, 1)
+        sampling_grid = base_grid - flow_perm
+        
+        h_warped = F.grid_sample(h_flat, sampling_grid, mode='bilinear', padding_mode='border', align_corners=False)
+        
+        if original_dim == 4:
+             return h_warped.squeeze(1)
+        return h_warped.reshape(B, L, C, H, W)
+
+class KoopmanParamEstimator(nn.Module):
     def __init__(self, in_ch, emb_ch, rank, w_freq):
         super().__init__()
+        self.w_freq = w_freq
         self.emb_ch = emb_ch
         self.rank = rank
-        self.w_freq = w_freq
         self.conv = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, 1, 1),
             nn.SiLU(),
@@ -779,19 +812,58 @@ class SpatialSSMParameterGenerator(nn.Module):
             nn.SiLU()
         )
         self.pool = nn.AdaptiveAvgPool2d((1, w_freq))
-        self.head = nn.Linear(in_ch, emb_ch * rank * 4)
+        self.head = nn.Linear(in_ch, emb_ch * rank * 3)
 
     def forward(self, x):
         B, L, C, H, W = x.shape
         x_flat = x.reshape(B * L, C, H, W)
         feat = self.conv(x_flat)
         feat = self.pool(feat)
-        feat = feat.permute(0, 2, 3, 1).contiguous().reshape(B, L, 1, self.w_freq, self.emb_ch)
+        feat = feat.permute(0, 2, 3, 1).contiguous().reshape(B, L, 1, self.w_freq, C)
         params = self.head(feat)
-        params = params.squeeze(2)
-        params = params.view(B, L, self.w_freq, self.emb_ch, self.rank, 4)
+        params = params.view(B, L, self.w_freq, self.emb_ch, self.rank, 3)
         params = params.permute(0, 1, 3, 2, 4, 5).contiguous()
-        return torch.tanh(params[..., 0]), torch.tanh(params[..., 1]), torch.sigmoid(params[..., 2]), torch.sigmoid(params[..., 3])
+        nu = F.softplus(params[..., 0])
+        theta = torch.tanh(params[..., 1]) * math.pi
+        sigma = torch.sigmoid(params[..., 2])
+        return nu, theta, sigma
+
+class SpectralKoopmanSDE(nn.Module):
+    def __init__(self, channels, rank, w_freq):
+        super().__init__()
+        self.estimator = KoopmanParamEstimator(channels, channels, rank, w_freq)
+        self.channels = channels
+        self.rank = rank
+        
+    def forward(self, h_trans, x_curr, dt):
+        h_trans_perm = h_trans.permute(0, 4, 1, 2, 3)
+        h_freq = torch.fft.rfft2(h_trans_perm.float(), norm="ortho")
+        
+        is_x_4d = x_curr.dim() == 4
+        if is_x_4d:
+             x_curr = x_curr.unsqueeze(1)
+
+        nu, theta, sigma = self.estimator(x_curr)
+        
+        dt_expanded = dt.view(dt.shape[0], dt.shape[1], 1, 1, 1)
+        nu = nu * dt_expanded
+        theta = theta * dt_expanded
+        
+        decay = torch.exp(-nu)
+        rotate = torch.exp(1j * theta)
+        lambda_k = decay * rotate
+        
+        B, R, C, H, W_freq = h_freq.shape
+        
+        lambda_k = lambda_k.squeeze(1).permute(0, 3, 1, 2).unsqueeze(3)
+        
+        noise = torch.randn_like(h_freq) * sigma.squeeze(1).permute(0, 3, 1, 2).unsqueeze(3).mean(dim=-1, keepdim=True)
+        
+        h_evolved = h_freq * lambda_k + noise
+        
+        W = (W_freq - 1) * 2
+        h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
+        return h_out.permute(0, 2, 3, 4, 1)
 
 class StaticInitState(nn.Module):
     def __init__(self, static_ch, emb_ch, rank, S, W_freq):
@@ -804,20 +876,142 @@ class StaticInitState(nn.Module):
         self.mapper = nn.Sequential(
             nn.Conv2d(static_ch, emb_ch, kernel_size=3, padding=1),
             nn.SiLU(),
-            nn.AdaptiveAvgPool2d((1, W_freq)),
-            nn.Conv2d(emb_ch, emb_ch * rank * 2, kernel_size=1) 
+            nn.AdaptiveAvgPool2d((S, W_freq)),
+            nn.Conv2d(emb_ch, emb_ch * rank, kernel_size=1) 
         )
 
     def forward(self, static_feats):
         B = static_feats.size(0)
         out = self.mapper(static_feats) 
-        out = out.squeeze(2)
-        out = out.view(B, self.emb_ch, self.rank * 2, self.W_freq)
-        out_real = out[:, :, :self.rank, :]
-        out_imag = out[:, :, self.rank:, :]
-        init_state = torch.complex(out_real, out_imag)
-        init_state = init_state.permute(0, 1, 3, 2).contiguous()
-        return init_state.unsqueeze(1) 
+        out = out.view(B, self.emb_ch, self.rank, self.S, self.W_freq)
+        return out.permute(0, 1, 3, 4, 2) 
+
+class ContinuousHKLFLayer(nn.Module):
+    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
+        super().__init__()
+        self.emb_ch = int(getattr(args, "emb_ch", 32))
+        H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
+        self.rank = int(getattr(args, "lru_rank", 32))
+        self.W_freq = W // 2 + 1
+        
+        self.hamiltonian = HamiltonianGenerator(self.emb_ch)
+        self.lie_transport = LieTransport()
+        self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq)
+        self.proj_out = nn.Linear(self.rank, 1)
+        
+        if bool(getattr(args, "learnable_init_state", False)) and int(getattr(args, "static_ch", 0)) > 0:
+            self.init_state = StaticInitState(int(args.static_ch), self.emb_ch, self.rank, H, W)
+        else:
+            self.init_state = None
+        
+        self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
+        if self.use_graph_interaction:
+            self.graph_block = GraphInteraction(self.emb_ch)
+        
+        self.use_cross_var_attn = bool(getattr(args, "use_cross_var_attn", False))
+        if self.use_cross_var_attn:
+            self.cross_var_attn = CrossVariableAttention(self.emb_ch)
+        
+        self.use_stochastic = bool(getattr(args, "use_stochastic", False))
+        if self.use_stochastic:
+            self.stochastic_injector = StochasticInjector(self.emb_ch)
+            
+        self.use_wavelet_ssm = bool(getattr(args, "use_wavelet_ssm", False))
+        if self.use_wavelet_ssm:
+            self.wavelet_block = WaveletBlock(self.emb_ch, self.emb_ch)
+            
+        self.use_spectral_mixing = bool(getattr(args, "use_spectral_mixing", False))
+        if self.use_spectral_mixing:
+            self.spec_mixer = SpectralInteraction(self.emb_ch, self.rank)
+            
+        self.use_sh_prior = bool(getattr(args, "use_sh_prior", False))
+        if self.use_sh_prior:
+            self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, H, W)
+            
+        self.use_freq_prior = bool(getattr(args, "use_freq_prior", False))
+        if self.use_freq_prior:
+            self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8)
+            
+        self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
+        self.norm = RMSNorm(self.emb_ch)
+        self.gate_conv = nn.Sequential(
+            nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_perm = x.permute(0, 2, 1, 3, 4)
+        if self.use_cross_var_attn:
+            x_perm = self.cross_var_attn(x_perm)
+        if self.use_graph_interaction:
+            x_perm = x_perm + self.graph_block(x_perm)
+            
+        B, L, C, H, W = x_perm.shape
+        
+        if last_hidden_in is None:
+            if self.init_state is not None and static_feats is not None:
+                h_prev = self.init_state(static_feats).unsqueeze(1).repeat(1, L, 1, 1, 1, 1) 
+                h_prev = h_prev[:, 0] 
+            else:
+                h_prev = torch.zeros(B, C, H, W, self.rank, device=x.device, dtype=x.dtype)
+        else:
+            h_prev = last_hidden_in
+
+        if listT is None:
+            dt_seq = torch.ones(B, L, device=x.device, dtype=x.dtype)
+        else:
+            dt_seq = listT.to(x.device, x.dtype)
+
+        h_states = []
+        curr_h = h_prev
+        self.latest_kl = 0.0
+        
+        for t in range(L):
+            x_t = x_perm[:, t] 
+            if self.use_stochastic and hasattr(self, 'stochastic_injector'):
+                x_t = self.stochastic_injector(x_t)
+                self.latest_kl += self.stochastic_injector.latest_kl
+
+            dt_t = dt_seq[:, t].view(B, 1)
+            
+            flow = self.hamiltonian(x_t.unsqueeze(1)).squeeze(1)
+            
+            B_h, C_h, H_h, W_h, R_h = curr_h.shape
+            curr_h_flat = curr_h.permute(0, 4, 1, 2, 3).reshape(B_h, R_h * C_h, H_h, W_h)
+            h_trans_flat = self.lie_transport(curr_h_flat, flow, dt_t)
+            h_trans = h_trans_flat.reshape(B_h, R_h, C_h, H_h, W_h).permute(0, 2, 3, 4, 1)
+
+            h_next = self.koopman(h_trans, x_t, dt_t)
+
+            x_inject = x_t.unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
+            curr_h = h_next + x_inject
+            h_states.append(curr_h)
+            
+        h_stack = torch.stack(h_states, dim=1)
+        out = self.proj_out(h_stack).squeeze(-1)
+        
+        out = out.permute(0, 2, 1, 3, 4) 
+        
+        out = self.post_ifft_proj(out)
+
+        if self.use_sh_prior:
+            out = self.sh_prior(out.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
+            
+        if self.use_freq_prior:
+            out_spatial = out.permute(0, 2, 1, 3, 4).contiguous()
+            out_ft = torch.fft.rfft2(out_spatial.float(), norm="ortho")
+            out_ft_res = self.freq_prior(out_ft)
+            out_spatial_res = torch.fft.irfft2(out_ft_res, s=out_spatial.shape[-2:], norm="ortho")
+            out = out + out_spatial_res.permute(0, 2, 1, 3, 4).to(out.dtype)
+
+        if self.use_wavelet_ssm:
+            out = out + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
+
+        out = self.norm(out)
+        gate = self.gate_conv(out)
+        x_out = (1 - gate) * x + gate * out
+        
+        return x_out, curr_h
 
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, use_ada_norm: bool = False, ada_norm_cond_dim: Optional[int] = None, conv_type: str = "conv"):
@@ -996,253 +1190,6 @@ class SpatialPatchMoE(nn.Module):
             out = out[..., :H, :W]
         return out
 
-class ConvLRULayer(nn.Module):
-    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
-        super().__init__()
-        self.args = args
-        self.use_bias = True
-        self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
-        self.S = int(self.hidden_size[0])
-        self.W = int(self.hidden_size[1])
-        self.rank = int(getattr(args, "lru_rank", 32))
-        self.W_freq = self.W // 2 + 1
-        dt_min = 0.001
-        dt_max = 0.1
-        self.log_dt_min = nn.Parameter(torch.log(torch.tensor(dt_min)))
-        self.log_dt_max = nn.Parameter(torch.log(torch.tensor(dt_max)))
-        self.register_buffer("steps", torch.arange(self.rank, dtype=torch.float32) / (self.rank - 1))
-        
-        nu_init = 1.0 / torch.exp(torch.linspace(math.log(dt_min), math.log(dt_max), self.rank))
-        nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
-        
-        nu_log = torch.log(nu_init)
-        
-        half_c = self.emb_ch // 2
-        with torch.no_grad():
-             nu_log[half_c:] -= 2.0 
-        
-        u2 = torch.rand(self.emb_ch, self.rank)
-        theta_log = torch.log(u2 * (2 * torch.tensor(math.pi)))
-        
-        self.params_log_base = nn.Parameter(torch.stack([nu_log, theta_log], dim=0))
-        self.dispersion_mod = nn.Parameter(torch.zeros(2, self.emb_ch, self.rank) * 0.01)
-        
-        self.use_spectral_mixing = bool(getattr(args, "use_spectral_mixing", False))
-        self.use_advection = bool(getattr(args, "use_advection", False))
-        self.use_spatial_ssm = bool(getattr(args, "use_spatial_ssm", True)) 
-        self.use_stochastic = bool(getattr(args, "use_stochastic", False))
-        self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
-        
-        self.stochastic_injector = StochasticInjector(self.emb_ch) if self.use_stochastic else None
-        self.ctx_extractor = ContextExtractor(self.emb_ch)
-        
-        if self.use_spatial_ssm:
-            self.param_generator = SpatialSSMParameterGenerator(self.emb_ch, self.emb_ch, self.rank, self.W_freq)
-        else:
-            self.param_generator = None 
-        
-        if self.use_graph_interaction:
-            self.graph_block = GraphInteraction(self.emb_ch)
-
-        self.forcing_scale = nn.Parameter(torch.tensor(0.1))
-        self.freq_decay_curve = nn.Parameter(torch.zeros(1, 1, 1, self.W_freq, 1))
-
-        self.latest_kl = 0.0
-        self.local_conv = PeriodicConv3d(self.emb_ch, self.emb_ch, kernel_size=3)
-        self.dct_h = DiscreteCosineTransform(self.S, dim=-2)
-        self.selection_net = nn.Sequential(
-            nn.Linear(self.emb_ch, self.emb_ch),
-            nn.SiLU(),
-            nn.Linear(self.emb_ch, self.rank * 2),
-        )
-        self.U_row = nn.Parameter(torch.randn(self.emb_ch, self.S, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.S)))
-        self.V_col = nn.Parameter(torch.randn(self.emb_ch, self.W_freq, self.rank, dtype=torch.cfloat) / math.sqrt(max(1, self.W_freq)))
-        C = self.emb_ch
-        self.proj_W = nn.Parameter(torch.randn(C, C, dtype=torch.cfloat) / math.sqrt(max(1, C)))
-        self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
-        self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-        self.norm = RMSNorm(self.emb_ch)
-        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
-        self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
-        self.gate_conv = nn.Sequential(
-            nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
-            nn.Sigmoid(),
-        )
-        self.pscan = pscan
-        
-        self.use_cross_var_attn = bool(getattr(args, "use_cross_var_attn", False))
-        if self.use_cross_var_attn:
-            heads = 4
-            if self.emb_ch % heads != 0:
-                found = False
-                for h in [4, 2]:
-                    if self.emb_ch % h == 0:
-                        heads = h
-                        found = True
-                        break
-                if not found:
-                    heads = 1
-            self.cross_var_attn = CrossVariableAttention(self.emb_ch, num_heads=heads)
-        
-        self.use_wavelet_ssm = bool(getattr(args, "use_wavelet_ssm", False))
-        if self.use_wavelet_ssm:
-            self.wavelet_block = WaveletBlock(self.emb_ch, self.emb_ch)
-
-        self.learnable_init_state = bool(getattr(args, "learnable_init_state", False))
-        if self.learnable_init_state:
-            self.static_ch = int(getattr(args, "static_ch", 0))
-            if self.static_ch > 0:
-                self.static_init = StaticInitState(self.static_ch, self.emb_ch, self.rank, self.S, self.W_freq)
-            else:
-                self.static_init = None
-                
-        if self.use_spectral_mixing:
-            self.spec_mixer = SpectralInteraction(self.emb_ch, self.rank)
-        
-        if self.use_advection:
-            self.advection = AdvectionBlock(self.emb_ch)
-            
-    def _apply_forcing(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        dnu, dth, gate_B, gate_C = self.param_generator(x)
-        dnu = self.forcing_scale * dnu
-        dth = self.forcing_scale * dth
-        return dnu, dth, gate_B, gate_C
-
-    def _hybrid_forward_transform(self, x: torch.Tensor) -> torch.Tensor:
-        x_dct = self.dct_h(x.float())
-        x_hybrid = torch.fft.rfft(x_dct, dim=-1, norm="ortho")
-        return x_hybrid
-
-    def _hybrid_inverse_transform(self, h: torch.Tensor) -> torch.Tensor:
-        x_dct = torch.fft.irfft(h, dim=-1, n=self.W, norm="ortho")
-        x_out = self.dct_h.inverse(x_dct)
-        return x_out
-
-    def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_perm = x.permute(0, 2, 1, 3, 4)
-        if self.use_cross_var_attn:
-            x_perm = self.cross_var_attn(x_perm)
-        if self.use_graph_interaction:
-            x_perm = x_perm + self.graph_block(x_perm)
-        B, L, C, S, W = x_perm.shape
-        if listT is None:
-            dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
-        else:
-            dt = listT.view(B, L, 1, 1, 1).to(device=x.device, dtype=x.dtype)
-        
-        h_adv = None
-        if self.use_advection:
-            h_adv = self.advection(x_perm)
-        
-        with torch.amp.autocast("cuda", enabled=False):
-            x_in_fp32 = x_perm.float()
-            dt_fp32 = dt.float()
-            
-            if self.use_stochastic and self.stochastic_injector is not None:
-                x_in_fp32 = self.stochastic_injector(x_in_fp32)
-                self.latest_kl = self.stochastic_injector.latest_kl
-            else:
-                self.latest_kl = 0.0
-            
-            h = self._hybrid_forward_transform(x_in_fp32)
-            h = h.contiguous()
-            ctx_mean = x_in_fp32.mean(dim=(-2, -1))
-            selection = self.selection_net(ctx_mean)
-            sel_u, sel_v = torch.chunk(selection, 2, dim=-1)
-            scale_u = torch.sigmoid(sel_u).view(B, L, 1, 1, self.rank)
-            scale_v = torch.sigmoid(sel_v).view(B, L, 1, 1, self.rank)
-            h_perm = h.permute(0, 1, 2, 4, 3)
-            U = self.U_row
-            V = self.V_col
-            t0 = torch.einsum("blcws,csr->blcwr", h_perm, U)
-            t0 = t0 * scale_u
-            zq = torch.einsum("blcwr,cwr->blcwr", t0, V)
-            zq = zq * scale_v
-            if self.proj_b is not None:
-                zq = zq + self.proj_b.view(1, 1, C, 1, 1)
-            if self.use_spectral_mixing:
-                zq = self.spec_mixer(zq)
-            log_dt = self.log_dt_min + self.steps * (self.log_dt_max - self.log_dt_min)
-            ts = torch.exp(log_dt)
-            nu_init = 1.0 / ts
-            nu_init = nu_init.unsqueeze(0).repeat(self.emb_ch, 1)
-            nu_log, theta_log = self.params_log_base.unbind(dim=0)
-            disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
-            nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
-            th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
-            
-            gate_B = 1.0
-            gate_C = 1.0
-            if self.use_spatial_ssm and self.param_generator is not None:
-                dnu_force, dth_force, gate_B, gate_C = self._apply_forcing(x_in_fp32)
-                nu_continuous = nu_base + dnu_force
-                th_continuous = th_base + dth_force
-            else:
-                nu_continuous = nu_base
-                th_continuous = th_base
-
-            nu_spatial_freq = nu_continuous + F.softplus(self.freq_decay_curve)
-            nu_t = torch.clamp(nu_spatial_freq * dt_fp32, min=1e-6)
-            th_t = th_continuous * dt_fp32
-            lamb = torch.exp(torch.complex(-nu_t, th_t))
-            x_in_lru = zq * gate_B
-            gamma_t = torch.sqrt(torch.clamp(-torch.expm1(-2.0 * nu_t.real), min=1e-12))
-            x_in_lru = x_in_lru * gamma_t
-            
-            if L == 1 and last_hidden_in is not None:
-                h_prev = last_hidden_in.to(x_in_lru.dtype)
-                h_out = lamb * h_prev + x_in_lru
-                last_hidden_out = h_out
-            else:
-                if last_hidden_in is not None:
-                    h0_val = last_hidden_in.to(x_in_lru.dtype)
-                elif self.learnable_init_state and self.static_init is not None and static_feats is not None:
-                    h0_val = self.static_init(static_feats).to(x_in_lru.dtype)
-                else:
-                    h0_val = torch.zeros_like(x_in_lru[:, :1])
-                x_in_fwd = torch.cat([h0_val, x_in_lru], dim=1)
-                lamb_fwd = torch.cat([lamb[:, :1], lamb], dim=1)
-                lamb_in_fwd = lamb_fwd.expand_as(x_in_fwd)
-                B_sz, L_sz, C_sz, W_sz, R_sz = x_in_fwd.shape
-                x_scan = x_in_fwd.reshape(B_sz, L_sz, -1, R_sz)
-                l_scan = lamb_in_fwd.reshape(B_sz, L_sz, -1, R_sz)
-                z_scan = self.pscan(l_scan, x_scan)
-                h_out = z_scan.view(B_sz, L_sz, C_sz, W_sz, R_sz)[:, 1:]
-                last_hidden_out = h_out[:, -1:]
-            
-            z_out = h_out * gate_C
-            def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
-                z = z * sc_v
-                t1 = torch.einsum("blcwr,cwr->blcwr", z, V.conj())
-                t1 = t1 * sc_u
-                rec = torch.einsum("blcwr,csr->blcws", t1, U.conj())
-                return rec
-            h_rec_fwd = project_back(z_out, scale_u, scale_v)
-            h_rec_fwd = h_rec_fwd.permute(0, 1, 2, 4, 3)
-            feat_final = self._hybrid_inverse_transform(h_rec_fwd)
-        feat_final = feat_final.to(x.dtype)
-        feat_final_perm = feat_final.permute(0, 2, 1, 3, 4) 
-        h_final = self.post_ifft_proj(feat_final_perm)
-        if h_adv is not None:
-            h_final = h_final + h_adv.permute(0, 2, 1, 3, 4)
-        if self.sh_prior is not None:
-            h_final = self.sh_prior(h_final.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
-        if self.freq_prior is not None:
-            h_spatial = h_final.permute(0, 2, 1, 3, 4).contiguous()
-            h_ft = torch.fft.rfft2(h_spatial.float(), norm="ortho")
-            h_ft_out = self.freq_prior(h_ft)
-            h_spatial_out = torch.fft.irfft2(h_ft_out, s=h_spatial.shape[-2:], norm="ortho")
-            h_final = h_final + h_spatial_out.permute(0, 2, 1, 3, 4).to(h_final.dtype)
-        if self.use_wavelet_ssm:
-            h_final = h_final + self.wavelet_block(x_perm).permute(0, 2, 1, 3, 4)
-        x_local = self.local_conv(x)
-        h_final = h_final + x_local
-        h_final = self.norm(h_final)
-        gate = self.gate_conv(h_final)
-        x_out = (1 - gate) * x + gate * h_final
-        return x_out, last_hidden_out
-
 class FeedForward(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -1280,7 +1227,7 @@ class FeedForward(nn.Module):
 class ConvLRUBlock(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
-        self.lru_layer = ConvLRULayer(args, input_downsp_shape)
+        self.lru_layer = ContinuousHKLFLayer(args, input_downsp_shape)
         self.feed_forward = FeedForward(args, input_downsp_shape)
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, cond: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1612,7 +1559,7 @@ class ConvLRU(nn.Module):
         self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
         self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
         self.revin = RevIN(int(getattr(args, "input_ch", 1)), affine=True)
-        skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion", "dct_matrix", "grid_embed"]
+        skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion", "dct_matrix", "grid_embed", "sobel"]
         with torch.no_grad():
             for n, p in self.named_parameters():
                 if any(tok in n for tok in skip_contains):
