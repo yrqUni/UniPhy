@@ -71,16 +71,24 @@ class RMSNorm(nn.Module):
         if x.is_complex():
             x = x.real
         
-        dim_to_norm = -1
+        # 记录原始形状
+        shape_orig = x.shape
+        permuted = False
+        
+        # 将通道维移到最后 (B, ..., C)
         if x.shape[-1] != self.channels:
             if x.dim() == 5 and x.shape[1] == self.channels:
                 x = x.permute(0, 2, 3, 4, 1).contiguous()
+                permuted = True
             elif x.dim() == 4 and x.shape[1] == self.channels:
                 x = x.permute(0, 2, 3, 1).contiguous()
+                permuted = True
             else:
                  return F.rms_norm(x, (self.channels,), self.weight, self.eps)
 
-        shape_orig = x.shape
+        # 此时 x 的形状是 (..., C)，记录这个形状用于恢复
+        shape_permuted = x.shape
+        
         x_flat = x.view(-1, self.channels)
         M, N = x_flat.shape
         out = torch.empty_like(x_flat)
@@ -99,9 +107,18 @@ class RMSNorm(nn.Module):
             BLOCK_SIZE=BLOCK_SIZE
         )
         
-        out = out.view(*shape_orig)
-        if len(shape_orig) == 5: 
-            out = out.permute(0, 4, 1, 2, 3).contiguous()
+        # 恢复到 (..., C)
+        out = out.view(*shape_permuted)
+        
+        # 如果之前 permute 过，现在 permute 回去
+        if permuted:
+            if len(shape_orig) == 5: 
+                # (B, L, H, W, C) -> (B, C, L, H, W)
+                out = out.permute(0, 4, 1, 2, 3).contiguous()
+            elif len(shape_orig) == 4:
+                # (B, H, W, C) -> (B, C, H, W)
+                out = out.permute(0, 3, 1, 2).contiguous()
+                
         return out
 
 class AdaRMSNorm(nn.Module):
@@ -297,12 +314,13 @@ class FactorizedPeriodicConv3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, D, H, W = x.shape
-        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
-        x_padded = F.pad(x_reshaped, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
-        x_padded = F.pad(x_padded, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
-        x_conv = self.spatial_conv(x_padded)
-        x_out = x_conv.reshape(B, D, C, H, W).permute(0, 2, 1, 3, 4)
-        return self.depth_conv(x_out)
+        x_sp = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
+        x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
+        x_sp = self.spatial_conv(x_sp)
+        x_sp = x_sp.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+        out = self.depth_conv(x_sp)
+        return out
 
 class DiscreteCosineTransform(nn.Module):
     def __init__(self, n: int, dim: int):
