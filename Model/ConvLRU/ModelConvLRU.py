@@ -767,29 +767,36 @@ class LieTransport(nn.Module):
 
     def forward(self, h_prev, flow, dt):
         B, C, H, W, R = h_prev.shape
+        chunk_size = 4
+        h_warped_list = []
         
-        h_flat = h_prev.permute(0, 4, 1, 2, 3).reshape(B * R, C, H, W)
-        
-        flow_flat = flow.reshape(B * 1, 2, H, W) 
-        flow_repeated = flow_flat.repeat_interleave(R, dim=0) 
-        
-        dt_flat = dt.view(B, 1, 1, 1).repeat_interleave(R, dim=0) 
-        
-        flow_dt = flow_repeated * dt_flat
-        
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=h_prev.device),
-            torch.linspace(-1, 1, W, device=h_prev.device),
-            indexing="ij"
-        )
-        base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).expand(B * R, -1, -1, -1)
-        
-        flow_perm = flow_dt.permute(0, 2, 3, 1)
-        sampling_grid = base_grid - flow_perm
-        
-        h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode='bilinear', padding_mode='border', align_corners=False)
-        
-        return h_warped_flat.reshape(B, R, C, H, W).permute(0, 2, 3, 4, 1) 
+        for i in range(0, R, chunk_size):
+            r_end = min(i + chunk_size, R)
+            curr_R = r_end - i
+            
+            h_chunk = h_prev[..., i:r_end]
+            h_flat = h_chunk.permute(0, 4, 1, 2, 3).reshape(B * curr_R, C, H, W)
+            
+            flow_chunk = flow.unsqueeze(1).repeat(1, curr_R, 1, 1, 1).reshape(B * curr_R, 2, H, W)
+            dt_chunk = dt.view(B, 1, 1, 1).repeat_interleave(curr_R, dim=0)
+            
+            flow_dt = flow_chunk * dt_chunk
+            
+            grid_y, grid_x = torch.meshgrid(
+                torch.linspace(-1, 1, H, device=h_prev.device),
+                torch.linspace(-1, 1, W, device=h_prev.device),
+                indexing="ij"
+            )
+            base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).expand(B * curr_R, -1, -1, -1)
+            
+            flow_perm = flow_dt.permute(0, 2, 3, 1)
+            sampling_grid = base_grid - flow_perm
+            
+            h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode='bilinear', padding_mode='border', align_corners=False)
+            
+            h_warped_list.append(h_warped_flat.reshape(B, curr_R, C, H, W).permute(0, 2, 3, 4, 1))
+            
+        return torch.cat(h_warped_list, dim=4)
 
 class KoopmanParamEstimator(nn.Module):
     def __init__(self, in_ch, emb_ch, rank, w_freq):
@@ -953,110 +960,125 @@ class SpatialPatchMoE(nn.Module):
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         self.aux_loss = 0.0
         B, C, L, H, W = x.shape
-        P = self.patch_size
-        pad_h = (P - (H % P)) % P
-        pad_w = (P - (W % P)) % P
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-            if cond is not None:
-                cond = F.pad(cond, (0, pad_w, 0, pad_h))
-        H_pad, W_pad = x.shape[-2:]
-        nH, nW = H_pad // P, W_pad // P
+        out_frames = []
+        total_aux_loss = 0.0
         
-        x_patches = (
-            x.view(B, C, L, nH, P, nW, P)
-            .permute(0, 3, 5, 2, 1, 4, 6)
-            .reshape(B * nH * nW * L, C, 1, P, P)
-        )
-        
-        cond_patches = None
-        router_input = x_patches.mean(dim=(2, 3, 4))
-        if self.cond_channels > 0 and cond is not None:
-            if cond.dim() == 4:
-                cond_l = cond.unsqueeze(2).expand(-1, -1, L, -1, -1)
-            else:
-                cond_l = cond
-            cond_patches = (
-                cond_l.view(B, self.cond_channels, L, nH, P, nW, P)
+        for t in range(L):
+            xt = x[:, :, t:t+1]
+            ct = cond[:, :, t:t+1] if cond is not None else None
+            
+            P = self.patch_size
+            pad_h = (P - (H % P)) % P
+            pad_w = (P - (W % P)) % P
+            if pad_h > 0 or pad_w > 0:
+                xt = F.pad(xt, (0, pad_w, 0, pad_h))
+                if ct is not None:
+                    ct = F.pad(ct, (0, pad_w, 0, pad_h))
+            
+            H_pad, W_pad = xt.shape[-2:]
+            nH, nW = H_pad // P, W_pad // P
+            
+            x_patches = (
+                xt.view(B, C, 1, nH, P, nW, P)
                 .permute(0, 3, 5, 2, 1, 4, 6)
-                .reshape(B * nH * nW * L, self.cond_channels, 1, P, P)
+                .reshape(B * nH * nW * 1, C, 1, P, P)
             )
-            router_cond = cond_patches.mean(dim=(2, 3, 4))
-            router_input = torch.cat([router_input, router_cond], dim=1)
-        
-        s_out = x_patches
-        for layer in self.shared_expert:
-             s_out = layer(s_out, cond=cond_patches)
-        shared_out = s_out
+            
+            cond_patches = None
+            router_input = x_patches.mean(dim=(2, 3, 4))
+            
+            if self.cond_channels > 0 and ct is not None:
+                if ct.dim() == 4:
+                    cond_l = ct.unsqueeze(2)
+                else:
+                    cond_l = ct
+                cond_patches = (
+                    cond_l.view(B, self.cond_channels, 1, nH, P, nW, P)
+                    .permute(0, 3, 5, 2, 1, 4, 6)
+                    .reshape(B * nH * nW * 1, self.cond_channels, 1, P, P)
+                )
+                router_cond = cond_patches.mean(dim=(2, 3, 4))
+                router_input = torch.cat([router_input, router_cond], dim=1)
 
-        router_logits = self.router(router_input)
-        
-        with torch.amp.autocast("cuda", enabled=False):
-            router_logits = router_logits.float()
-            lse = torch.logsumexp(router_logits, dim=-1)
-            z_loss = lse.pow(2).mean()
-            router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
-            mean_probs = router_probs.mean(dim=0)
-            N_total = router_logits.size(0)
-            topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
-            BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
-            fused_moe_router_kernel[(N_total,)](
-                router_logits, topk_indices, self.num_experts, self.active_experts, BLOCK_SIZE,
+            s_out = x_patches
+            for layer in self.shared_expert:
+                 s_out = layer(s_out, cond=cond_patches)
+            shared_out = s_out
+
+            router_logits = self.router(router_input)
+            
+            with torch.amp.autocast("cuda", enabled=False):
+                router_logits = router_logits.float()
+                lse = torch.logsumexp(router_logits, dim=-1)
+                z_loss = lse.pow(2).mean()
+                router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
+                mean_probs = router_probs.mean(dim=0)
+                N_total = router_logits.size(0)
+                topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
+                BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
+                fused_moe_router_kernel[(N_total,)](
+                    router_logits, topk_indices, self.num_experts, self.active_experts, BLOCK_SIZE,
+                )
+                with torch.no_grad():
+                    flat_indices_all = topk_indices.view(-1).long()
+                    expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
+                    fraction_selected = expert_counts / flat_indices_all.numel()
+                
+                step_aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
+                total_aux_loss += step_aux_loss
+                
+                topk_indices = topk_indices.long()
+                topk_weights = torch.gather(router_probs, 1, topk_indices)
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            
+            flat_indices = topk_indices.view(-1)
+            x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
+            cond_repeated = None
+            if cond_patches is not None:
+                cond_repeated = cond_patches.repeat_interleave(self.active_experts, dim=0)
+            
+            sorted_expert_ids, sorted_args = torch.sort(flat_indices)
+            x_sorted = x_repeated[sorted_args]
+            cond_sorted = None
+            if cond_repeated is not None:
+                cond_sorted = cond_repeated[sorted_args]
+            
+            expert_counts = torch.bincount(sorted_expert_ids, minlength=self.num_experts).tolist()
+            y_sorted = torch.empty_like(x_sorted)
+            start_idx = 0
+            for i, count in enumerate(expert_counts):
+                if count == 0: continue
+                end_idx = start_idx + count
+                inp_slice = x_sorted[start_idx:end_idx]
+                c_slice = cond_sorted[start_idx:end_idx] if cond_sorted is not None else None
+                y_sorted[start_idx:end_idx] = self.experts[i](inp_slice, cond=c_slice)
+                start_idx = end_idx
+            
+            flat_weights = topk_weights.view(-1)
+            weights_sorted = flat_weights[sorted_args]
+            y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1).to(y_sorted.dtype)
+            
+            out_patches = shared_out
+            token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
+            sorted_token_ids = token_ids[sorted_args]
+            out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
+            
+            out_patches_reshaped = out_patches.view(B * nH * nW * 1, C, 1, P, P).squeeze(2).permute(0, 2, 3, 1).contiguous()
+            out_patches_norm = self.norm(out_patches_reshaped)
+            out_patches = out_patches_norm.permute(0, 3, 1, 2).unsqueeze(2)
+            
+            out_t = (
+                out_patches.view(B, nH, nW, 1, C, P, P)
+                .permute(0, 4, 3, 1, 5, 2, 6)
+                .reshape(B, C, 1, H_pad, W_pad)
             )
-            with torch.no_grad():
-                flat_indices_all = topk_indices.view(-1).long()
-                expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
-                fraction_selected = expert_counts / flat_indices_all.numel()
-            self.aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
-            topk_indices = topk_indices.long()
-            topk_weights = torch.gather(router_probs, 1, topk_indices)
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        
-        flat_indices = topk_indices.view(-1)
-        x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
-        cond_repeated = None
-        if cond_patches is not None:
-            cond_repeated = cond_patches.repeat_interleave(self.active_experts, dim=0)
-        sorted_expert_ids, sorted_args = torch.sort(flat_indices)
-        x_sorted = x_repeated[sorted_args]
-        cond_sorted = None
-        if cond_repeated is not None:
-            cond_sorted = cond_repeated[sorted_args]
-        expert_counts = torch.bincount(sorted_expert_ids, minlength=self.num_experts).tolist()
-        y_sorted = torch.empty_like(x_sorted)
-        start_idx = 0
-        for i, count in enumerate(expert_counts):
-            if count == 0:
-                continue
-            end_idx = start_idx + count
-            inp_slice = x_sorted[start_idx:end_idx]
-            c_slice = None
-            if cond_sorted is not None:
-                c_slice = cond_sorted[start_idx:end_idx]
-            out_slice = self.experts[i](inp_slice, cond=c_slice)
-            y_sorted[start_idx:end_idx] = out_slice
-            start_idx = end_idx
-        flat_weights = topk_weights.view(-1)
-        weights_sorted = flat_weights[sorted_args]
-        y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1).to(y_sorted.dtype)
-        
-        out_patches = shared_out
-        token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
-        sorted_token_ids = token_ids[sorted_args]
-        out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
-        
-        out_patches_reshaped = out_patches.view(B * nH * nW * L, C, 1, P, P).squeeze(2).permute(0, 2, 3, 1).contiguous()
-        out_patches_norm = self.norm(out_patches_reshaped)
-        out_patches = out_patches_norm.permute(0, 3, 1, 2).unsqueeze(2) 
+            if pad_h > 0 or pad_w > 0:
+                out_t = out_t[..., :H, :W]
+            
+            out_frames.append(out_t)
 
-        out = (
-            out_patches.view(B, nH, nW, L, C, P, P)
-            .permute(0, 4, 3, 1, 5, 2, 6)
-            .reshape(B, C, L, H_pad, W_pad)
-        )
-        if pad_h > 0 or pad_w > 0:
-            out = out[..., :H, :W]
-        return out
+        self.aux_loss = total_aux_loss / L
+        return torch.cat(out_frames, dim=2)
 
 class ContinuousHKLFLayer(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
