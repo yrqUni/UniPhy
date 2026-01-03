@@ -82,7 +82,7 @@ class Args:
         self.out_ch = 30
         self.static_ch = 6
         self.hidden_factor = (7, 12)
-        self.emb_ch = 96
+        self.emb_ch = 64
         self.convlru_num_blocks = 6
         self.use_cbam = True
         self.num_expert = 16
@@ -120,7 +120,7 @@ class Args:
         self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
-        self.sample_k = 9
+        self.sample_k = 8
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"

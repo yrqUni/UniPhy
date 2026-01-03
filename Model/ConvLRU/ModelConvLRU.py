@@ -176,27 +176,6 @@ class FusedGatedSiLU(nn.Module):
             return out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
         return out
 
-@triton.jit
-def fused_moe_router_kernel(
-    logits_ptr, indices_out_ptr, n_experts, k: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    logits_row_start = logits_ptr + pid * n_experts
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_experts
-    logits = tl.load(logits_row_start + offsets, mask=mask, other=-float("inf"))
-    logits_max = tl.max(logits, 0)
-    logits = logits - logits_max
-    numerator = tl.exp(logits)
-    denominator = tl.sum(numerator, 0)
-    probs = numerator / denominator
-    indices_row_start = indices_out_ptr + pid * k
-    for i in range(k):
-        current_max_idx = tl.argmax(probs, 0)
-        tl.store(indices_row_start + i, current_max_idx)
-        mask_max = offsets == current_max_idx
-        probs = tl.where(mask_max, 0.0, probs)
-
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
         super().__init__()
@@ -1014,28 +993,27 @@ class SpatialPatchMoE(nn.Module):
             
             with torch.amp.autocast("cuda", enabled=False):
                 router_logits = router_logits.float()
-                lse = torch.logsumexp(router_logits, dim=-1)
-                z_loss = lse.pow(2).mean()
-                router_probs = torch.exp(router_logits - lse.unsqueeze(-1))
+                
+                # Replace Triton Kernel with PyTorch Native TopK
+                router_probs = F.softmax(router_logits, dim=-1)
+                topk_weights, topk_indices = torch.topk(router_probs, self.active_experts, dim=-1)
+                
+                # Aux Loss calculation
                 mean_probs = router_probs.mean(dim=0)
-                N_total = router_logits.size(0)
-                topk_indices = torch.empty((N_total, self.active_experts), device=x.device, dtype=torch.int32)
-                BLOCK_SIZE = max(32, triton.next_power_of_2(self.num_experts))
-                fused_moe_router_kernel[(N_total,)](
-                    router_logits, topk_indices, self.num_experts, self.active_experts, BLOCK_SIZE,
-                )
-                with torch.no_grad():
-                    flat_indices_all = topk_indices.view(-1).long()
-                    expert_counts = torch.bincount(flat_indices_all, minlength=self.num_experts).float()
-                    fraction_selected = expert_counts / flat_indices_all.numel()
+                flat_indices = topk_indices.view(-1)
+                expert_counts = torch.bincount(flat_indices, minlength=self.num_experts).float()
+                # Ensure it doesn't exceed num_experts size in rare cases
+                if expert_counts.size(0) > self.num_experts:
+                    expert_counts = expert_counts[:self.num_experts]
                 
-                step_aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts + 1e-3 * z_loss
-                total_aux_loss += step_aux_loss
+                fraction_selected = expert_counts / flat_indices.numel()
+                step_aux_loss = (mean_probs * fraction_selected).sum() * self.num_experts
                 
-                topk_indices = topk_indices.long()
-                topk_weights = torch.gather(router_probs, 1, topk_indices)
+                # Normalize weights
                 topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            
+                
+                total_aux_loss += step_aux_loss
+
             flat_indices = topk_indices.view(-1)
             x_repeated = x_patches.repeat_interleave(self.active_experts, dim=0)
             cond_repeated = None
@@ -1053,6 +1031,7 @@ class SpatialPatchMoE(nn.Module):
             start_idx = 0
             for i, count in enumerate(expert_counts):
                 if count == 0: continue
+                if i >= self.num_experts: break # Safety break
                 end_idx = start_idx + count
                 inp_slice = x_sorted[start_idx:end_idx]
                 c_slice = cond_sorted[start_idx:end_idx] if cond_sorted is not None else None
@@ -1064,6 +1043,7 @@ class SpatialPatchMoE(nn.Module):
             y_sorted_weighted = y_sorted * weights_sorted.view(-1, 1, 1, 1, 1).to(y_sorted.dtype)
             
             out_patches = shared_out
+            N_total = x_patches.shape[0]
             token_ids = torch.arange(N_total, device=x.device).repeat_interleave(self.active_experts)
             sorted_token_ids = token_ids[sorted_args]
             out_patches.index_add_(0, sorted_token_ids, y_sorted_weighted)
