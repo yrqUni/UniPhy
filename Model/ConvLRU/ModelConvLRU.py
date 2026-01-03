@@ -3,7 +3,6 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
 
 def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     out_ch, in_ch, kD, kH, kW = weight.shape
@@ -29,6 +28,17 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
     x = x.reshape(N, C * rH * rW, D, H // rH, W // rW)
     return x
+
+class SpatialGroupNorm(nn.GroupNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 5:
+            B, C, L, H, W = x.shape
+            x = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
+            x = super().forward(x)
+            x = x.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+        else:
+            x = super().forward(x)
+        return x
 
 class DeformConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, bias=False):
@@ -142,19 +152,14 @@ class HamiltonianGenerator(nn.Module):
         B, L, C, H, W = x.shape
         x_flat = x.reshape(B * L, C, H, W)
         H_field = self.conv(x_flat)
-        
         lat = torch.linspace(-math.pi / 2, math.pi / 2, H, device=x.device).view(1, 1, H, 1)
         metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
-        
         H_padded = F.pad(H_field, (1, 1, 0, 0), mode='circular')
         H_padded = F.pad(H_padded, (0, 0, 1, 1), mode='replicate')
-        
         grad_x = F.conv2d(H_padded, self.sobel_x.to(x.device))
         grad_y = F.conv2d(H_padded, self.sobel_y.to(x.device))
-        
         u = grad_y 
         v = -grad_x * metric_correction
-        
         flow = torch.cat([u, v], dim=1)
         flow = torch.tanh(flow) 
         return flow.view(B, L, 2, H, W)
@@ -167,32 +172,24 @@ class LieTransport(nn.Module):
         B, C, H, W, R = h_prev.shape
         chunk_size = 4 
         h_warped_list = []
-        
         for i in range(0, R, chunk_size):
             r_end = min(i + chunk_size, R)
             curr_R = r_end - i
-            
             h_chunk = h_prev[..., i:r_end]
             h_flat = h_chunk.permute(0, 4, 1, 2, 3).reshape(B * curr_R, C, H, W)
-            
             flow_chunk = flow.unsqueeze(1).repeat(1, curr_R, 1, 1, 1).reshape(B * curr_R, 2, H, W)
             dt_chunk = dt.view(B, 1, 1, 1).repeat_interleave(curr_R, dim=0)
-            
             flow_dt = flow_chunk * dt_chunk
-            
             grid_y, grid_x = torch.meshgrid(
                 torch.linspace(-1, 1, H, device=h_prev.device),
                 torch.linspace(-1, 1, W, device=h_prev.device),
                 indexing="ij"
             )
             base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).expand(B * curr_R, -1, -1, -1)
-            
             flow_perm = flow_dt.permute(0, 2, 3, 1)
             sampling_grid = base_grid - flow_perm
-            
             h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode='bilinear', padding_mode='border', align_corners=False)
             h_warped_list.append(h_warped_flat.reshape(B, curr_R, C, H, W).permute(0, 2, 3, 4, 1))
-            
         return torch.cat(h_warped_list, dim=4)
 
 class KoopmanParamEstimator(nn.Module):
@@ -211,9 +208,8 @@ class KoopmanParamEstimator(nn.Module):
         self.head = nn.Linear(in_ch, emb_ch * rank * 3)
 
     def forward(self, x):
-        # x: (B, C, 1, H, W)
         B, C, _, H, W = x.shape
-        x_flat = x.squeeze(2) # (B, C, H, W)
+        x_flat = x.squeeze(2)
         feat = self.conv(x_flat)
         feat = self.pool(feat)
         feat = feat.permute(0, 2, 3, 1).reshape(B, 1, self.w_freq, C)
@@ -235,27 +231,20 @@ class SpectralKoopmanSDE(nn.Module):
     def forward(self, h_trans, x_curr, dt):
         B, C, H, W, R = h_trans.shape 
         h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho")
-        
         nu, theta, sigma = self.estimator(x_curr)
-        
         dt_expanded = dt.view(dt.shape[0], dt.shape[1], 1, 1, 1, 1)
         nu = nu.unsqueeze(4) 
         theta = theta.unsqueeze(4)
         sigma = sigma.unsqueeze(4)
-        
         nu = nu * dt_expanded
         theta = theta * dt_expanded
-        
         decay = torch.exp(-nu)
         rotate = torch.exp(1j * theta)
         lambda_k = decay * rotate
-        
         lambda_k = lambda_k.squeeze(1).permute(0, 4, 1, 3, 2)
         sigma_b = sigma.squeeze(1).permute(0, 4, 1, 3, 2)
-
         noise = torch.randn_like(h_freq) * sigma_b.mean(dim=-1, keepdim=True)
         h_evolved = h_freq * lambda_k + noise
-        
         h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
         return h_out.permute(0, 2, 3, 4, 1) 
 
@@ -299,7 +288,7 @@ class SimplifiedHKLFLayer(nn.Module):
             self.init_state = None
             
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-        self.norm = nn.GroupNorm(4, self.emb_ch)
+        self.norm = SpatialGroupNorm(4, self.emb_ch)
         self.gate_conv = nn.Sequential(
             nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
             nn.Sigmoid(),
@@ -307,7 +296,6 @@ class SimplifiedHKLFLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], listT: Optional[torch.Tensor] = None, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, L, H, W = x.shape
-        
         if last_hidden_in is None:
             if self.init_state is not None and static_feats is not None:
                 h_prev = self.init_state(static_feats).unsqueeze(1).repeat(1, L, 1, 1, 1, 1) 
@@ -324,19 +312,14 @@ class SimplifiedHKLFLayer(nn.Module):
 
         h_states = []
         curr_h = h_prev
-        
         x_perm = x.permute(0, 2, 1, 3, 4)
         
         for t in range(L):
             x_t = x[:, :, t:t+1] 
             dt_t = dt_seq[:, t].view(B, 1)
-            
             flow = self.hamiltonian(x_perm[:, t:t+1])
-            
             h_trans = self.lie_transport(curr_h, flow.squeeze(1), dt_t)
-
             h_next = self.koopman(h_trans, x_t, dt_t)
-
             x_inject = x_t.squeeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
             curr_h = h_next + x_inject
             h_states.append(curr_h)
@@ -344,13 +327,10 @@ class SimplifiedHKLFLayer(nn.Module):
         h_stack = torch.stack(h_states, dim=2)
         out = self.proj_out(h_stack.permute(0, 2, 3, 4, 1, 5)).squeeze(-1)
         out = out.permute(0, 4, 1, 2, 3) 
-        
         out = self.post_ifft_proj(out)
         out = self.norm(out)
-        
         gate = self.gate_conv(out)
         x_out = (1 - gate) * x + gate * out
-        
         return x_out, curr_h
 
 class GatedConvBlock(nn.Module):
@@ -358,11 +338,9 @@ class GatedConvBlock(nn.Module):
         super().__init__()
         self.use_cbam = bool(use_cbam)
         self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=kernel_size, conv_type=conv_type)
-        self.norm = nn.GroupNorm(4, int(channels))
-        
+        self.norm = SpatialGroupNorm(4, int(channels))
         self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
-        
         self.pw_conv_in = nn.Conv3d(int(channels), int(channels) * 2, kernel_size=1)
         self.pw_conv_out = nn.Conv3d(int(channels), int(channels), kernel_size=1)
         self.cbam = CBAM2DPerStep(int(channels), reduction=16) if self.use_cbam else None
@@ -371,22 +349,18 @@ class GatedConvBlock(nn.Module):
         residual = x
         x = self.dw_conv(x)
         x = self.norm(x)
-        
         if self.cond_proj is not None and cond is not None:
             if cond.dim() == 4:
                 cond_in = cond.unsqueeze(2)
             else:
                 cond_in = cond
-                
             if cond_in.shape[-2:] != x.shape[-2:]:
                 cond_rs = F.interpolate(cond_in.squeeze(2), size=x.shape[-2:], mode="bilinear", align_corners=False).unsqueeze(2)
             else:
                 cond_rs = cond_in
-            
             affine = self.cond_proj(cond_rs)
             gamma, beta = torch.chunk(affine, 2, dim=1)
             x = x * (1 + gamma) + beta
-
         x = self.pw_conv_in(x)
         x1, x2 = torch.chunk(x, 2, dim=1)
         x = x1 * F.sigmoid(x2) 
@@ -402,17 +376,12 @@ class FeedForward(nn.Module):
         self.ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
         self.hidden_dim = int(self.emb_ch * self.ffn_ratio)
         self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
-        
         self.use_cbam = bool(getattr(args, "use_cbam", False))
         self.static_ch = int(getattr(args, "static_ch", 0))
         self.conv_type = str(getattr(args, "ConvType", "conv"))
-        
         self.c_in = nn.Conv3d(self.emb_ch, self.hidden_dim, kernel_size=(1, 1, 1), padding="same")
-        
         cond_ch = self.emb_ch if self.static_ch > 0 else None
-        
         self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, use_cbam=self.use_cbam, cond_channels=cond_ch, conv_type=self.conv_type)
-        
         self.c_out = nn.Conv3d(self.hidden_dim, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.act = nn.SiLU()
 
@@ -473,7 +442,7 @@ class CrossScaleAttentionGate(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.psi = nn.Conv3d(channels, 1, kernel_size=1, bias=True)
         self.sigmoid = nn.Sigmoid()
-        self.norm = nn.GroupNorm(4, channels)
+        self.norm = SpatialGroupNorm(4, channels)
 
     def forward(self, local_x: torch.Tensor, global_x: torch.Tensor) -> torch.Tensor:
         g = self.conv_g(global_x)
@@ -652,7 +621,7 @@ class Embedding(nn.Module):
         self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch)])
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
-        self.norm = nn.GroupNorm(4, self.emb_ch)
+        self.norm = SpatialGroupNorm(4, self.emb_ch)
 
     def _make_grid(self, args):
         H, W = tuple(getattr(args, "input_size", (64, 64)))
