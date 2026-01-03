@@ -297,13 +297,12 @@ class FactorizedPeriodicConv3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, D, H, W = x.shape
-        x_sp = x.permute(0, 2, 1, 3, 4).contiguous().view(B * D, C, H, W)
-        x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
-        x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
-        x_sp = self.spatial_conv(x_sp)
-        x_sp = x_sp.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
-        out = self.depth_conv(x_sp)
-        return out
+        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        x_padded = F.pad(x_reshaped, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
+        x_padded = F.pad(x_padded, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
+        x_conv = self.spatial_conv(x_padded)
+        x_out = x_conv.reshape(B, D, C, H, W).permute(0, 2, 1, 3, 4)
+        return self.depth_conv(x_out)
 
 class DiscreteCosineTransform(nn.Module):
     def __init__(self, n: int, dim: int):
