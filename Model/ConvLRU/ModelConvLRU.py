@@ -297,11 +297,11 @@ class FactorizedPeriodicConv3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, D, H, W = x.shape
-        x_sp = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        x_sp = x.permute(0, 2, 1, 3, 4).contiguous().view(B * D, C, H, W)
         x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
         x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
         x_sp = self.spatial_conv(x_sp)
-        x_sp = x_sp.view(B, D, C, H, W).permute(0, 2, 1, 3, 4)
+        x_sp = x_sp.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
         out = self.depth_conv(x_sp)
         return out
 
