@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -134,6 +134,8 @@ class CBAM2DPerStep(nn.Module):
 
 
 class HamiltonianGenerator(nn.Module):
+    _metric_cache: Dict[Tuple[str, str, int], torch.Tensor] = {}
+
     def __init__(self, channels: int):
         super().__init__()
         ch = int(channels)
@@ -148,52 +150,68 @@ class HamiltonianGenerator(nn.Module):
         nn.init.zeros_(self.conv[-1].weight)
         nn.init.zeros_(self.conv[-1].bias)
 
+    @classmethod
+    def _get_metric(cls, H: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (str(device), str(dtype), int(H))
+        v = cls._metric_cache.get(key, None)
+        if v is not None:
+            return v
+        lat = torch.linspace(-math.pi / 2, math.pi / 2, int(H), device=device, dtype=dtype).view(1, 1, H, 1)
+        metric = (1.0 / (torch.cos(lat) + 1e-6)).contiguous()
+        cls._metric_cache[key] = metric
+        return metric
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C, H, W = x.shape
         x_flat = x.reshape(B * L, C, H, W)
         H_field = self.conv(x_flat)
-        lat = torch.linspace(-math.pi / 2, math.pi / 2, H, device=x.device).view(1, 1, H, 1)
-        metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
+        metric_correction = self._get_metric(H, x.device, x.dtype)
         H_padded = F.pad(H_field, (1, 1, 0, 0), mode="circular")
         H_padded = F.pad(H_padded, (0, 0, 1, 1), mode="replicate")
-        grad_x = F.conv2d(H_padded, self.sobel_x.to(x.device))
-        grad_y = F.conv2d(H_padded, self.sobel_y.to(x.device))
+        grad_x = F.conv2d(H_padded, self.sobel_x.to(device=x.device, dtype=H_padded.dtype))
+        grad_y = F.conv2d(H_padded, self.sobel_y.to(device=x.device, dtype=H_padded.dtype))
         u = grad_y
         v = -grad_x * metric_correction
         flow = torch.cat([u, v], dim=1)
         flow = torch.tanh(flow)
-        return flow.view(B, L, 2, H, W)
+        return flow.view(B, L, 2, H, W).contiguous()
 
 
 class LieTransport(nn.Module):
+    _grid_cache: Dict[Tuple[str, str, int, int], torch.Tensor] = {}
+
     def __init__(self):
         super().__init__()
+
+    @classmethod
+    def _get_base_grid(cls, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (str(device), str(dtype), int(H), int(W))
+        g = cls._grid_cache.get(key, None)
+        if g is not None:
+            return g
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, int(H), device=device, dtype=dtype),
+            torch.linspace(-1, 1, int(W), device=device, dtype=dtype),
+            indexing="ij",
+        )
+        base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0).contiguous()
+        cls._grid_cache[key] = base_grid
+        return base_grid
 
     def forward(self, h_prev: torch.Tensor, flow: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         B, C, H, W, R = h_prev.shape
         if flow.dim() == 5:
             flow = flow[:, 0]
-        dt = dt.view(B, 1)
-        chunk_size = 4
-        h_warped_list: List[torch.Tensor] = []
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=h_prev.device),
-            torch.linspace(-1, 1, W, device=h_prev.device),
-            indexing="ij",
-        )
-        base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0)
-        for i in range(0, R, chunk_size):
-            r_end = min(i + chunk_size, R)
-            curr_R = r_end - i
-            h_chunk = h_prev[..., i:r_end]
-            h_flat = h_chunk.permute(0, 4, 1, 2, 3).reshape(B * curr_R, C, H, W)
-            flow_chunk = flow.unsqueeze(1).repeat(1, curr_R, 1, 1, 1).reshape(B * curr_R, 2, H, W)
-            dt_chunk = dt.repeat_interleave(curr_R, dim=0).view(B * curr_R, 1, 1, 1)
-            flow_dt = flow_chunk * dt_chunk
-            sampling_grid = base_grid.expand(B * curr_R, -1, -1, -1) - flow_dt.permute(0, 2, 3, 1)
-            h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode="bilinear", padding_mode="border", align_corners=False)
-            h_warped_list.append(h_warped_flat.reshape(B, curr_R, C, H, W).permute(0, 2, 3, 4, 1))
-        return torch.cat(h_warped_list, dim=4)
+        dt2 = dt.view(B, 1)
+        base_grid = self._get_base_grid(H, W, h_prev.device, h_prev.dtype)
+        h_flat = h_prev.permute(0, 4, 1, 2, 3).reshape(B * R, C, H, W)
+        flow_flat = flow.unsqueeze(1).expand(B, R, 2, H, W).reshape(B * R, 2, H, W)
+        dt_flat = dt2.unsqueeze(1).expand(B, R, 1).reshape(B * R, 1, 1, 1)
+        flow_dt = flow_flat * dt_flat
+        grid = base_grid.expand(B * R, -1, -1, -1)
+        sampling_grid = grid - flow_dt.permute(0, 2, 3, 1)
+        h_warped = F.grid_sample(h_flat, sampling_grid, mode="bilinear", padding_mode="border", align_corners=False)
+        return h_warped.view(B, R, C, H, W).permute(0, 2, 3, 4, 1).contiguous()
 
 
 class KoopmanParamEstimator(nn.Module):
@@ -216,10 +234,9 @@ class KoopmanParamEstimator(nn.Module):
         B, C, H, W = x.shape
         feat = self.conv(x)
         feat = self.pool(feat)
-        feat = feat.permute(0, 2, 3, 1).reshape(B, 1, self.w_freq, C)
+        feat = feat.squeeze(2).permute(0, 2, 1).contiguous().reshape(B * self.w_freq, C)
         params = self.head(feat)
-        params = params.view(B, 1, self.w_freq, self.emb_ch, self.rank, 3)
-        params = params.permute(0, 1, 3, 2, 4, 5).contiguous()
+        params = params.view(B, self.w_freq, self.emb_ch, self.rank, 3).permute(0, 2, 1, 3, 4).contiguous()
         nu = F.softplus(params[..., 0])
         theta = torch.tanh(params[..., 1]) * math.pi
         sigma = torch.sigmoid(params[..., 2])
@@ -235,27 +252,29 @@ class SpectralKoopmanSDE(nn.Module):
         self.use_noise = bool(use_noise)
         self.noise_scale = float(noise_scale)
 
-    def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+    def evolve(self, h_trans: torch.Tensor, dt: torch.Tensor, nu: torch.Tensor, theta: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         B, C, H, W, R = h_trans.shape
-        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho")
-        x_flat = x_curr.squeeze(2)
-        nu, theta, sigma = self.estimator(x_flat)
-        dt_expanded = dt.view(dt.shape[0], dt.shape[1], 1, 1, 1, 1)
-        nu = nu.unsqueeze(4) * dt_expanded
-        theta = theta.unsqueeze(4) * dt_expanded
-        sigma = sigma.unsqueeze(4)
-        decay = torch.exp(-nu)
-        rotate = torch.exp(1j * theta)
-        lambda_k = decay * rotate
-        lambda_k = lambda_k.squeeze(1).permute(0, 4, 1, 3, 2)
-        sigma_b = sigma.squeeze(1).permute(0, 4, 1, 3, 2)
+        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3), norm="ortho")
+        dt2 = dt.view(B, 1, 1, 1)
+        nu_dt = nu * dt2
+        theta_dt = theta * dt2
+        decay = torch.exp(-nu_dt)
+        rotate = torch.exp(1j * theta_dt)
+        lambda_k = (decay * rotate).permute(0, 3, 1, 2).unsqueeze(3).contiguous()
         if self.use_noise:
-            noise = torch.randn_like(h_freq) * (sigma_b.mean(dim=-1, keepdim=True) * self.noise_scale)
+            sigma_b = sigma.permute(0, 3, 1, 2).unsqueeze(3).contiguous()
+            sigma_e = sigma_b.expand(-1, -1, -1, H, -1)
+            noise = torch.randn_like(h_freq) * (sigma_e * self.noise_scale)
         else:
-            noise = torch.zeros_like(h_freq)
+            noise = 0.0
         h_evolved = h_freq * lambda_k + noise
         h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
-        return h_out.permute(0, 2, 3, 4, 1)
+        return h_out.permute(0, 2, 3, 4, 1).contiguous()
+
+    def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        x_flat = x_curr.squeeze(2)
+        nu, theta, sigma = self.estimator(x_flat)
+        return self.evolve(h_trans, dt, nu, theta, sigma)
 
 
 class StaticInitState(nn.Module):
@@ -277,7 +296,7 @@ class StaticInitState(nn.Module):
         B = static_feats.size(0)
         out = self.mapper(static_feats)
         out = out.view(B, self.emb_ch, self.rank, self.S, self.W_freq)
-        return out.permute(0, 1, 3, 4, 2)
+        return out.permute(0, 1, 3, 4, 2).contiguous()
 
 
 class SpatialGroupNorm(nn.GroupNorm):
@@ -286,7 +305,7 @@ class SpatialGroupNorm(nn.GroupNorm):
             B, C, L, H, W = x.shape
             y = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
             y = super().forward(y)
-            return y.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+            return y.view(B, L, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
         return super().forward(x)
 
 
@@ -337,8 +356,7 @@ class SimplifiedHKLFLayer(nn.Module):
         B, C, L, H, W = x.shape
         if last_hidden_in is None:
             if self.init_state is not None and static_feats is not None:
-                h0 = self.init_state(static_feats).unsqueeze(1).repeat(1, L, 1, 1, 1, 1)
-                curr_h = h0[:, 0]
+                curr_h = self.init_state(static_feats)
             else:
                 curr_h = torch.zeros(B, C, H, W, self.rank, device=x.device, dtype=x.dtype)
         else:
@@ -346,22 +364,27 @@ class SimplifiedHKLFLayer(nn.Module):
         if listT is None:
             dt_seq = torch.ones(B, L, device=x.device, dtype=x.dtype)
         else:
-            dt_seq = _match_dt_seq(listT.to(x.device, x.dtype), L)
-        h_states: List[torch.Tensor] = []
-        x_perm = x.permute(0, 2, 1, 3, 4)
+            dt_seq = _match_dt_seq(listT.to(device=x.device, dtype=x.dtype), L)
+        x_perm = x.permute(0, 2, 1, 3, 4).contiguous()
+        flow_all = self.hamiltonian(x_perm)
+        x_all = x_perm.reshape(B * L, C, H, W)
+        nu_all, theta_all, sigma_all = self.koopman.estimator(x_all)
+        nu_all = nu_all.view(B, L, C, self.W_freq, self.rank)
+        theta_all = theta_all.view(B, L, C, self.W_freq, self.rank)
+        sigma_all = sigma_all.view(B, L, C, self.W_freq, self.rank)
+        y_seq = torch.empty((B, C, L, H, W), device=x.device, dtype=x.dtype)
+        w = self.proj_out.weight.to(dtype=x.dtype).view(1, 1, 1, 1, self.rank)
+        b = self.proj_out.bias.to(dtype=x.dtype).view(1, 1, 1, 1)
         for t in range(L):
             x_t = x[:, :, t : t + 1]
             dt_t = dt_seq[:, t : t + 1]
-            flow = self.hamiltonian(x_perm[:, t : t + 1])
-            h_trans = self.lie_transport(curr_h, flow.squeeze(1), dt_t)
-            h_next = self.koopman(h_trans, x_t, dt_t)
+            flow_t = flow_all[:, t]
+            h_trans = self.lie_transport(curr_h, flow_t, dt_t)
+            h_next = self.koopman.evolve(h_trans, dt_t, nu_all[:, t], theta_all[:, t], sigma_all[:, t])
             x_inject = x_t.squeeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
             curr_h = h_next + x_inject
-            h_states.append(curr_h)
-        h_stack = torch.stack(h_states, dim=2)
-        out = self.proj_out(h_stack.permute(0, 2, 3, 4, 1, 5)).squeeze(-1)
-        out = out.permute(0, 4, 1, 2, 3)
-        out = self.post_ifft_proj(out)
+            y_seq[:, :, t] = (curr_h * w).sum(-1) + b
+        out = self.post_ifft_proj(y_seq)
         out = self.norm(out)
         gate = self.gate_conv(out)
         x_out = (1 - gate) * x + gate * out
@@ -662,6 +685,7 @@ class Embedding(nn.Module):
             _, _, _, H, W = out_dummy.shape
             self.input_downsp_shape = (self.emb_ch, int(H), int(W))
         self.register_buffer("grid_embed", self._make_grid(args), persistent=False)
+        self._grid_cache: Dict[Tuple[str, str], torch.Tensor] = {}
         self.hidden_size = (int(self.input_downsp_shape[1]), int(self.input_downsp_shape[2]))
         if self.static_ch > 0:
             self.static_embed = nn.Sequential(
@@ -682,14 +706,23 @@ class Embedding(nn.Module):
         lon = torch.linspace(0, 2 * math.pi, int(W))
         grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
         emb = torch.stack([torch.sin(grid_lat), torch.cos(grid_lat), torch.sin(grid_lon), torch.cos(grid_lon)], dim=0)
-        return emb.unsqueeze(0).unsqueeze(2)
+        return emb.unsqueeze(0).unsqueeze(2).contiguous()
+
+    def _get_grid(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (str(device), str(dtype))
+        g = self._grid_cache.get(key, None)
+        if g is not None:
+            return g
+        gg = self.grid_embed.to(device=device, dtype=dtype)
+        self._grid_cache[key] = gg
+        return gg
 
     def forward(self, x: torch.Tensor, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if x.dim() != 5:
             raise ValueError(f"Embedding expects [B,L,C,H,W], got {tuple(x.shape)}")
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         B, C, L, H, W = x.shape
-        grid = self.grid_embed.expand(B, -1, L, -1, -1).to(x.device, x.dtype)
+        grid = self._get_grid(x.device, x.dtype).expand(B, -1, L, -1, -1)
         x = torch.cat([x, grid], dim=1)
         x = self.patch_embed(x)
         x = self.activation(x)
@@ -800,43 +833,21 @@ class RevIN(nn.Module):
             stdev = torch.sqrt(torch.var(x_fp32, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).to(x.dtype)
         return RevINStats(mean=mean.detach(), stdev=stdev.detach())
 
-    def _match_stats(self, stats: RevINStats, L: int) -> RevINStats:
-        m = stats.mean
-        s = stats.stdev
-        if m.dim() != 5 or s.dim() != 5:
-            raise ValueError(f"RevINStats mean/stdev must be 5D [B,L,C,1,1], got mean={tuple(m.shape)} stdev={tuple(s.shape)}")
-        if m.size(1) == L and s.size(1) == L:
-            return stats
-        if m.size(1) == 1 and s.size(1) == 1:
-            return stats
-        if m.size(1) > L and s.size(1) > L:
-            return RevINStats(mean=m[:, :L], stdev=s[:, :L])
-        if m.size(1) < L and s.size(1) < L:
-            pad_m = m[:, -1:].repeat(1, L - m.size(1), 1, 1, 1)
-            pad_s = s[:, -1:].repeat(1, L - s.size(1), 1, 1, 1)
-            return RevINStats(mean=torch.cat([m, pad_m], dim=1), stdev=torch.cat([s, pad_s], dim=1))
-        if L == 1:
-            return RevINStats(mean=m[:, -1:], stdev=s[:, -1:])
-        raise ValueError(f"RevINStats time dim mismatch: stats.L={m.size(1)} input.L={L}")
-
     def normalize(self, x: torch.Tensor, stats: RevINStats) -> torch.Tensor:
-        st = self._match_stats(stats, x.size(1))
-        y = (x - st.mean) / st.stdev
+        y = (x - stats.mean) / stats.stdev
         if self.affine:
             y = y * self.affine_weight + self.affine_bias
         return y
 
     def denormalize(self, x: torch.Tensor, stats: RevINStats) -> torch.Tensor:
-        st = self._match_stats(stats, x.size(1))
         y = x
         if self.affine:
             y = (y - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
-        return y * st.stdev + st.mean
+        return y * stats.stdev + stats.mean
 
     def forward(self, x: torch.Tensor, mode: str, stats: Optional[RevINStats] = None) -> torch.Tensor:
         if mode == "norm":
             st = stats if stats is not None else self.stats(x)
-            st = self._match_stats(st, x.size(1))
             self._last_stats = st
             return self.normalize(x, st)
         if mode == "denorm":
@@ -844,7 +855,6 @@ class RevIN(nn.Module):
             if st is None:
                 st = self.stats(x)
                 self._last_stats = st
-            st = self._match_stats(st, x.size(1))
             return self.denormalize(x, st)
         raise NotImplementedError
 
@@ -892,7 +902,7 @@ class ConvLRU(nn.Module):
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm", stats=stats)
-                    sigma = sigma * self.revin._match_stats(stats, sigma.size(1)).stdev
+                    sigma = sigma * stats.stdev
                 return torch.cat([mu, sigma], dim=2), last_hidden_outs
             if out_tensor.size(2) == self.revin.num_features:
                 return self.revin(out_tensor, "denorm", stats=stats), last_hidden_outs
@@ -919,7 +929,7 @@ class ConvLRU(nn.Module):
             sigma = x_step_dist[:, :, out_ch:, :, :]
             if mu.size(2) == self.revin.num_features:
                 mu_denorm = self.revin(mu, "denorm", stats=stats)
-                sigma_denorm = sigma * self.revin._match_stats(stats, sigma.size(1)).stdev
+                sigma_denorm = sigma * stats.stdev
             else:
                 mu_denorm = mu
                 sigma_denorm = sigma
@@ -963,7 +973,7 @@ class ConvLRU(nn.Module):
                 sigma = x_step_dist[:, :, out_ch:, :, :]
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm", stats=stats)
-                    sigma = sigma * self.revin._match_stats(stats, sigma.size(1)).stdev
+                    sigma = sigma * stats.stdev
                 out_list.append(torch.cat([mu, sigma], dim=2))
                 x_step_mean = mu
             else:

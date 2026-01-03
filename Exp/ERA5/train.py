@@ -73,7 +73,7 @@ class Args:
         self.emb_ch = 96
         self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.lru_rank = 32
+        self.lru_rank = 48
         self.down_mode = "shuffle"
         self.head_mode = "gaussian"
         self.diffusion_steps = 1000
@@ -100,15 +100,15 @@ class Args:
         self.T = 6
         self.use_amp = False
         self.amp_dtype = "bf16"
-        self.grad_clip = 1.0
-        self.sample_k = 9
+        self.grad_clip = 0.0
+        self.sample_k = 8
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
         self.wandb_run_name = "PhyConvLRU_HKLF"
         self.wandb_group = "v4.0.0"
         self.wandb_mode = "online"
-        self.train_mode = "alignment"
+        self.train_mode = "p_only"
         self.learnable_init_state = True
         self.ffn_ratio = 1.5
         self.ConvType = "dcn"
@@ -490,7 +490,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         is_train=True,
         sample_len=args.train_data_n_frames,
         eval_sample=args.eval_sample_num,
-        max_cache_size=8,
+        max_cache_size=32,
         rank=dist.get_rank(),
         gpus=dist.get_world_size(),
     )
@@ -743,7 +743,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 is_train=False,
                 sample_len=args.eval_data_n_frames,
                 eval_sample=args.eval_sample_num,
-                max_cache_size=8,
+                max_cache_size=32,
                 rank=dist.get_rank(),
                 gpus=dist.get_world_size(),
             )
