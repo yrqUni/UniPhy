@@ -22,27 +22,6 @@ def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
         weight.copy_(base)
     return weight
 
-def _bilinear_kernel_2d(kH: int, kW: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    factor_h = (kH + 1) // 2
-    factor_w = (kW + 1) // 2
-    center_h = factor_h - 1 if kH % 2 == 1 else factor_h - 0.5
-    center_w = factor_w - 1 if kW % 2 == 1 else factor_w - 0.5
-    og_h = torch.arange(kH, device=device, dtype=dtype)
-    og_w = torch.arange(kW, device=device, dtype=dtype)
-    fh = (1 - torch.abs(og_h - center_h) / factor_h).unsqueeze(1)
-    fw = (1 - torch.abs(og_w - center_w) / factor_w).unsqueeze(0)
-    return fh @ fw
-
-def deconv3d_bilinear_init_(weight: torch.Tensor) -> torch.Tensor:
-    in_ch, out_ch, kD, kH, kW = weight.shape
-    with torch.no_grad():
-        weight.zero_()
-        kernel = _bilinear_kernel_2d(kH, kW, weight.device, weight.dtype)
-        c = min(in_ch, out_ch)
-        for i in range(c):
-            weight[i, i, 0, :, :] = kernel
-    return weight
-
 def pixel_shuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     N, C_mul, D, H, W = x.shape
     C = C_mul // (rH * rW)
@@ -325,27 +304,22 @@ class AdaptiveFreqGate(nn.Module):
         return x_ft * scale.to(x_ft.dtype)
 
 class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int, use_adaptive: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
         super().__init__()
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.modes1 = int(modes1)
         self.modes2 = int(modes2)
-        self.use_adaptive = use_adaptive
         scale = 1.0 / max(1, (self.in_channels * self.out_channels))
         self.weights1 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
         self.weights2 = nn.Parameter(scale * torch.randn(self.in_channels, self.out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
-        if self.use_adaptive:
-            self.adaptive_gate = AdaptiveFreqGate(in_channels)
+        self.adaptive_gate = AdaptiveFreqGate(in_channels)
 
     def forward(self, x_ft: torch.Tensor) -> torch.Tensor:
         with torch.amp.autocast("cuda", enabled=False):
             if not torch.is_complex(x_ft):
                 x_ft = x_ft.to(torch.cfloat)
-            
-            if self.use_adaptive and hasattr(self, 'adaptive_gate'):
-                x_ft = self.adaptive_gate(x_ft)
-                
+            x_ft = self.adaptive_gate(x_ft)
             B, L, C, H, W_freq = x_ft.shape
             out_ft = torch.zeros(B, L, self.out_channels, H, W_freq, device=x_ft.device, dtype=torch.cfloat)
             m1 = min(H, self.modes1)
@@ -613,10 +587,8 @@ class WaveletBlock(nn.Module):
         B, L, C, H, W = x.shape
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
-        
         if pad_h > 0 or pad_w > 0:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
-        
         B, L, C, H_pad, W_pad = x.shape
         x_flat = x.reshape(B * L, C, H_pad, W_pad)
         x_dwt = self.dwt_init(x_flat)
@@ -624,12 +596,9 @@ class WaveletBlock(nn.Module):
         x_feat = F.silu(x_feat)
         x_out_dwt = self.conv_out(x_feat)
         x_rec = self.idwt_init(x_out_dwt)
-        
         out = x_rec.view(B, L, C, H_pad, W_pad)
-        
         if pad_h > 0 or pad_w > 0:
             out = out[..., :H, :W]
-            
         return out
 
 class SpectralInteraction(nn.Module):
@@ -652,34 +621,6 @@ class SpectralInteraction(nn.Module):
         out_imag = self.mix_imag(z_imag)
         return z + torch.complex(out_real, out_imag)
 
-class GraphInteraction(nn.Module):
-    def __init__(self, channels, nodes=256):
-        super().__init__()
-        self.nodes = nodes
-        self.proj_to_nodes = nn.Sequential(
-            nn.AdaptiveAvgPool2d((int(math.sqrt(nodes)), int(math.sqrt(nodes)))),
-            nn.Conv2d(channels, channels, 1)
-        )
-        self.gnn = nn.Sequential(
-            nn.Linear(channels, channels),
-            nn.GELU(),
-            nn.Linear(channels, channels)
-        )
-        self.proj_back = nn.Conv2d(channels, channels, 1)
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x):
-        B, L, C, H, W = x.shape
-        x_flat = x.reshape(B * L, C, H, W)
-        nodes = self.proj_to_nodes(x_flat) 
-        nodes = nodes.flatten(2).permute(0, 2, 1) 
-        nodes = self.norm(nodes)
-        nodes = nodes + self.gnn(nodes)
-        nodes = nodes.permute(0, 2, 1).reshape(B * L, C, int(math.sqrt(self.nodes)), int(math.sqrt(self.nodes)))
-        out_grid = F.interpolate(nodes, size=(H, W), mode='bilinear', align_corners=False)
-        out_grid = self.proj_back(out_grid)
-        return out_grid.reshape(B, L, C, H, W)
-
 class ContextExtractor(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
@@ -693,37 +634,6 @@ class ContextExtractor(nn.Module):
             std = torch.sqrt(var + 1e-6)
             max_val, _ = x_fp.view(x.size(0), x.size(1), x.size(2), -1).max(dim=-1)
         return torch.cat([mean, std, max_val], dim=-1).to(x.dtype)
-
-class DynamicSSMParameterGenerator(nn.Module):
-    def __init__(self, in_dim: int, embed_dim: int, rank: int, lora_rank: int = 16):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.rank = rank
-        self.lora_rank = lora_rank
-        self.pre_proj = nn.Sequential(
-            nn.Linear(in_dim, lora_rank * 4),
-            nn.SiLU()
-        )
-        self.lora_A = nn.Linear(lora_rank * 4, lora_rank)
-        self.lora_B_forcing = nn.Linear(lora_rank, embed_dim * rank * 2)
-        self.lora_B_gateB = nn.Linear(lora_rank, embed_dim * rank)
-        self.lora_B_gateC = nn.Linear(lora_rank, embed_dim * rank)
-        
-    def forward(self, inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        feat = self.pre_proj(inp)
-        low_rank = self.lora_A(feat)
-        
-        params_forcing = self.lora_B_forcing(low_rank)
-        params_B = self.lora_B_gateB(low_rank)
-        params_C = self.lora_B_gateC(low_rank)
-        
-        B, L, _ = feat.shape
-        mod_forcing = params_forcing.view(B, L, self.embed_dim, self.rank, 2)
-        dnu = torch.tanh(mod_forcing[..., 0])
-        dth = torch.tanh(mod_forcing[..., 1])
-        gate_B = torch.sigmoid(params_B.view(B, L, self.embed_dim, self.rank))
-        gate_C = torch.sigmoid(params_C.view(B, L, self.embed_dim, self.rank))
-        return dnu.unsqueeze(-2), dth.unsqueeze(-2), gate_B.unsqueeze(-2), gate_C.unsqueeze(-2)
 
 class AdvectionBlock(nn.Module):
     def __init__(self, channels):
@@ -757,6 +667,55 @@ class AdvectionBlock(nn.Module):
         final_grid_new = torch.stack((grid_x_new, final_grid[..., 1]), dim=-1)
         x_warped = F.grid_sample(x_padded, final_grid_new, mode="bilinear", padding_mode="border", align_corners=False)
         return x_warped.reshape(B, L, C, H, W)
+
+class StochasticInjector(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels * 2, 3, 1, 1)
+        )
+        self.latest_kl = 0.0
+
+    def forward(self, x):
+        B, L, C, H, W = x.shape
+        x_flat = x.view(B * L, C, H, W)
+        stats = self.conv(x_flat)
+        mu, logvar = torch.chunk(stats, 2, dim=1)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + std * eps
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        self.latest_kl = kl / (B * L)
+        z = z.view(B, L, C, H, W)
+        return x + z
+
+class SpatialSSMParameterGenerator(nn.Module):
+    def __init__(self, in_ch, emb_ch, rank, w_freq):
+        super().__init__()
+        self.emb_ch = emb_ch
+        self.rank = rank
+        self.w_freq = w_freq
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, 1, 1),
+            nn.SiLU(),
+            nn.Conv2d(in_ch, in_ch, 3, 1, 1),
+            nn.SiLU()
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, w_freq))
+        self.head = nn.Linear(in_ch, emb_ch * rank * 4)
+
+    def forward(self, x):
+        B, L, C, H, W = x.shape
+        x_flat = x.view(B * L, C, H, W)
+        feat = self.conv(x_flat)
+        feat = self.pool(feat)
+        feat = feat.permute(0, 2, 3, 1)
+        params = self.head(feat)
+        params = params.view(B, L, 1, self.w_freq, self.emb_ch, self.rank, 4)
+        params = params.permute(0, 1, 4, 3, 5, 6).contiguous()
+        return torch.tanh(params[..., 0]), torch.tanh(params[..., 1]), torch.sigmoid(params[..., 2]), torch.sigmoid(params[..., 3])
 
 class StaticInitState(nn.Module):
     def __init__(self, static_ch, emb_ch, rank, S, W_freq):
@@ -966,14 +925,11 @@ class ConvLRULayer(nn.Module):
         super().__init__()
         self.args = args
         self.use_bias = True
-        self.r_min = 0.8
-        self.r_max = 0.99
         self.emb_ch = int(getattr(args, "emb_ch", 32))
         self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
         self.S = int(self.hidden_size[0])
         self.W = int(self.hidden_size[1])
         self.rank = int(getattr(args, "lru_rank", 32))
-        self.is_selective = bool(getattr(args, "use_selective", False))
         self.W_freq = self.W // 2 + 1
         dt_min = 0.001
         dt_max = 0.1
@@ -989,21 +945,19 @@ class ConvLRULayer(nn.Module):
         self.dispersion_mod = nn.Parameter(torch.zeros(2, self.emb_ch, self.rank) * 0.01)
         
         self.use_spectral_mixing = bool(getattr(args, "use_spectral_mixing", False))
-        self.use_anisotropic_diffusion = bool(getattr(args, "use_anisotropic_diffusion", False))
         self.use_advection = bool(getattr(args, "use_advection", False))
-        self.use_graph_interaction = bool(getattr(args, "use_graph_interaction", False))
-        self.use_adaptive_ssm = bool(getattr(args, "use_adaptive_ssm", False))
-        self.use_neural_operator = bool(getattr(args, "use_neural_operator", False))
+        self.use_spatial_ssm = bool(getattr(args, "use_spatial_ssm", True)) 
+        self.use_stochastic = bool(getattr(args, "use_stochastic", False))
         
+        self.stochastic_injector = StochasticInjector(self.emb_ch) if self.use_stochastic else None
         self.ctx_extractor = ContextExtractor(self.emb_ch)
         
-        in_dim = self.emb_ch * 3 
-        if self.use_anisotropic_diffusion:
-            in_dim += self.emb_ch * 2
-            
-        self.param_generator = DynamicSSMParameterGenerator(in_dim, self.emb_ch, self.rank)
+        if self.use_spatial_ssm:
+            self.param_generator = SpatialSSMParameterGenerator(self.emb_ch, self.emb_ch, self.rank, self.W_freq)
+        else:
+            self.param_generator = None 
+
         self.forcing_scale = nn.Parameter(torch.tensor(0.1))
-        
         self.freq_decay_curve = nn.Parameter(torch.zeros(1, 1, 1, self.W_freq, 1))
 
         self.latest_kl = 0.0
@@ -1021,16 +975,12 @@ class ConvLRULayer(nn.Module):
         self.proj_b = nn.Parameter(torch.zeros(C, dtype=torch.cfloat)) if self.use_bias else None
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = RMSNorm(self.emb_ch)
-        self.noise_level = nn.Parameter(torch.tensor(0.01))
-        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8, use_adaptive=self.use_neural_operator) if bool(getattr(args, "use_freq_prior", False)) else None
+        self.freq_prior = SpectralConv2d(self.emb_ch, self.emb_ch, 8, 8) if bool(getattr(args, "use_freq_prior", False)) else None
         self.sh_prior = DynamicSphericalHarmonicsPrior(self.emb_ch, self.S, self.W, Lmax=int(getattr(args, "sh_Lmax", 6)), rank=int(getattr(args, "sh_rank", 8)), gain_init=float(getattr(args, "sh_gain_init", 0.0))) if bool(getattr(args, "use_sh_prior", False)) else None
-        if bool(getattr(args, "use_gate", False)):
-            self.gate_conv = nn.Sequential(
-                nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
-                nn.Sigmoid(),
-            )
-        else:
-            self.gate_conv = None
+        self.gate_conv = nn.Sequential(
+            nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same"),
+            nn.Sigmoid(),
+        )
         self.pscan = pscan
         
         self.use_cross_var_attn = bool(getattr(args, "use_cross_var_attn", False))
@@ -1065,20 +1015,8 @@ class ConvLRULayer(nn.Module):
         if self.use_advection:
             self.advection = AdvectionBlock(self.emb_ch)
             
-        if self.use_graph_interaction:
-            self.graph_block = GraphInteraction(self.emb_ch)
-            
-        if self.use_adaptive_ssm:
-             self.b_proj = nn.Linear(self.emb_ch, self.rank)
-             self.c_proj = nn.Linear(self.emb_ch, self.rank)
-
-    def _apply_forcing(self, x: torch.Tensor, ctx_stats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        inp = ctx_stats
-        if self.use_anisotropic_diffusion:
-            grad_x = torch.mean(torch.abs(torch.diff(x, dim=-1, prepend=x[..., :1])), dim=(-2, -1))
-            grad_y = torch.mean(torch.abs(torch.diff(x, dim=-2, prepend=x[..., :1, :])), dim=(-2, -1))
-            inp = torch.cat([inp, grad_x, grad_y], dim=-1)
-        dnu, dth, gate_B, gate_C = self.param_generator(inp)
+    def _apply_forcing(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        dnu, dth, gate_B, gate_C = self.param_generator(x)
         dnu = self.forcing_scale * dnu
         dth = self.forcing_scale * dth
         return dnu, dth, gate_B, gate_C
@@ -1097,8 +1035,6 @@ class ConvLRULayer(nn.Module):
         x_perm = x.permute(0, 2, 1, 3, 4)
         if self.use_cross_var_attn:
             x_perm = self.cross_var_attn(x_perm)
-        if self.use_graph_interaction:
-            x_perm = x_perm + self.graph_block(x_perm)
         B, L, C, S, W = x_perm.shape
         if listT is None:
             dt = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
@@ -1112,7 +1048,12 @@ class ConvLRULayer(nn.Module):
         with torch.amp.autocast("cuda", enabled=False):
             x_in_fp32 = x_perm.float()
             dt_fp32 = dt.float()
-            ctx_stats = self.ctx_extractor(x_in_fp32) 
+            
+            if self.use_stochastic and self.stochastic_injector is not None:
+                x_in_fp32 = self.stochastic_injector(x_in_fp32)
+                self.latest_kl = self.stochastic_injector.latest_kl
+            else:
+                self.latest_kl = 0.0
             
             h = self._hybrid_forward_transform(x_in_fp32)
             h = h.contiguous()
@@ -1140,20 +1081,22 @@ class ConvLRULayer(nn.Module):
             disp_nu, disp_th = self.dispersion_mod.unbind(dim=0)
             nu_base = torch.exp(torch.log(nu_init).view(1, 1, C, 1, self.rank) + disp_nu.view(1, 1, C, 1, self.rank))
             th_base = torch.exp(theta_log + disp_th).view(1, 1, C, 1, self.rank)
-            dnu_force, dth_force, gate_B, gate_C = self._apply_forcing(x_in_fp32, ctx_stats)
-            nu_continuous = nu_base + dnu_force
-            th_continuous = th_base + dth_force
+            
+            gate_B = 1.0
+            gate_C = 1.0
+            if self.use_spatial_ssm and self.param_generator is not None:
+                dnu_force, dth_force, gate_B, gate_C = self._apply_forcing(x_in_fp32)
+                nu_continuous = nu_base + dnu_force
+                th_continuous = th_base + dth_force
+            else:
+                nu_continuous = nu_base
+                th_continuous = th_base
+
             nu_spatial_freq = nu_continuous + F.softplus(self.freq_decay_curve)
             nu_t = torch.clamp(nu_spatial_freq * dt_fp32, min=1e-6)
             th_t = th_continuous * dt_fp32
             lamb = torch.exp(torch.complex(-nu_t, th_t))
             x_in_lru = zq * gate_B
-            B_proj = None
-            C_proj = None
-            if self.use_adaptive_ssm:
-                 B_proj = self.b_proj(ctx_mean).view(B, L, 1, 1, self.rank)
-                 C_proj = self.c_proj(ctx_mean).view(B, L, 1, 1, self.rank)
-                 x_in_lru = x_in_lru * torch.sigmoid(B_proj)
             gamma_t = torch.sqrt(torch.clamp(-torch.expm1(-2.0 * nu_t.real), min=1e-12))
             x_in_lru = x_in_lru * gamma_t
             
@@ -1179,8 +1122,6 @@ class ConvLRULayer(nn.Module):
                 last_hidden_out = h_out[:, -1:]
             
             z_out = h_out * gate_C
-            if self.use_adaptive_ssm and C_proj is not None:
-                 z_out = z_out * torch.sigmoid(C_proj)
             def project_back(z: torch.Tensor, sc_u: torch.Tensor, sc_v: torch.Tensor) -> torch.Tensor:
                 z = z * sc_v
                 t1 = torch.einsum("blcwr,cwr->blcwr", z, V.conj())
@@ -1208,11 +1149,8 @@ class ConvLRULayer(nn.Module):
         x_local = self.local_conv(x)
         h_final = h_final + x_local
         h_final = self.norm(h_final)
-        if self.gate_conv is not None:
-            gate = self.gate_conv(h_final)
-            x_out = (1 - gate) * x + gate * h_final
-        else:
-            x_out = x + h_final
+        gate = self.gate_conv(h_final)
+        x_out = (1 - gate) * x + gate * h_final
         return x_out, last_hidden_out
 
 class FeedForward(nn.Module):
@@ -1220,9 +1158,9 @@ class FeedForward(nn.Module):
         super().__init__()
         self.args = args
         self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.ffn_hidden_ch = int(getattr(args, "ffn_hidden_ch", 32))
+        self.ffn_hidden_ch = self.emb_ch 
         self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
-        self.layers_num = int(getattr(args, "ffn_hidden_layers_num", 1))
+        self.layers_num = 1
         self.use_cbam = bool(getattr(args, "use_cbam", False))
         self.static_ch = int(getattr(args, "static_ch", 0))
         self.num_expert = int(getattr(args, "num_expert", -1))
@@ -1316,46 +1254,21 @@ class Decoder(nn.Module):
         self.head_mode = str(getattr(args, "head_mode", "gaussian")).lower()
         self.output_ch = int(getattr(args, "out_ch", 1))
         self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.dec_hidden_ch = int(getattr(args, "dec_hidden_ch", 0))
-        self.dec_hidden_layers_num = int(getattr(args, "dec_hidden_layers_num", 0))
+        self.dec_hidden_ch = self.emb_ch
+        self.dec_hidden_layers_num = 0
         self.static_ch = int(getattr(args, "static_ch", 0))
         self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
-        self.dec_strategy = str(getattr(args, "dec_strategy", "pxsf")).lower()
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
-        if self.dec_hidden_layers_num != 0 and self.dec_hidden_ch <= 0:
-            self.dec_hidden_ch = self.emb_ch
-        out_ch_after_up = self.dec_hidden_ch if self.dec_hidden_layers_num != 0 else self.emb_ch
-        if self.dec_strategy == "deconv":
-            self.upsp = nn.ConvTranspose3d(
-                in_channels=self.emb_ch, out_channels=out_ch_after_up, kernel_size=(1, self.rH, self.rW), stride=(1, self.rH, self.rW),
-            )
-            deconv3d_bilinear_init_(self.upsp.weight)
-            with torch.no_grad():
-                if self.upsp.bias is not None:
-                    self.upsp.bias.zero_()
-            self.pre_shuffle_conv = None
-        else:
-            self.pre_shuffle_conv = nn.Conv3d(
-                in_channels=self.emb_ch, out_channels=out_ch_after_up * self.rH * self.rW, kernel_size=(1, 3, 3), padding=(0, 1, 1),
-            )
-            icnr_conv3d_weight_(self.pre_shuffle_conv.weight, self.rH, self.rW)
-            with torch.no_grad():
-                if self.pre_shuffle_conv.bias is not None:
-                    self.pre_shuffle_conv.bias.zero_()
-            self.upsp = None
-        if self.dec_hidden_layers_num != 0:
-            cond_ch = self.emb_ch if self.static_ch > 0 else None
-            use_ada = (self.head_mode in ["diffusion", "flow"])
-            ada_cond_dim = out_ch_after_up if use_ada else None
-            self.c_hidden = nn.ModuleList(
-                [
-                    GatedConvBlock(out_ch_after_up, (1, 1), kernel_size=7, use_cbam=False, cond_channels=cond_ch, use_ada_norm=use_ada, ada_norm_cond_dim=ada_cond_dim)
-                    for _ in range(self.dec_hidden_layers_num)
-                ]
-            )
-        else:
-            self.c_hidden = None
+        out_ch_after_up = self.emb_ch
+        self.pre_shuffle_conv = nn.Conv3d(
+            in_channels=self.emb_ch, out_channels=out_ch_after_up * self.rH * self.rW, kernel_size=(1, 3, 3), padding=(0, 1, 1),
+        )
+        icnr_conv3d_weight_(self.pre_shuffle_conv.weight, self.rH, self.rW)
+        with torch.no_grad():
+            if self.pre_shuffle_conv.bias is not None:
+                self.pre_shuffle_conv.bias.zero_()
+        self.c_hidden = None
         if self.head_mode == "gaussian":
             self.c_out = nn.Conv3d(out_ch_after_up, self.output_ch * 2, kernel_size=(1, 1, 1), padding="same")
             self.time_embed = None
@@ -1377,24 +1290,16 @@ class Decoder(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, timestep: Optional[torch.Tensor] = None):
-        if self.dec_strategy == "deconv":
-            if self.upsp is None:
-                raise RuntimeError("Decoder misconfigured")
-            x = self.upsp(x)
-        else:
-            if self.pre_shuffle_conv is None:
-                raise RuntimeError("Decoder misconfigured")
-            x = self.pre_shuffle_conv(x)
-            x = pixel_shuffle_hw_3d(x, self.rH, self.rW)
+        if self.pre_shuffle_conv is None:
+            raise RuntimeError("Decoder misconfigured")
+        x = self.pre_shuffle_conv(x)
+        x = pixel_shuffle_hw_3d(x, self.rH, self.rW)
         x = self.activation(x)
         t_emb = None
         if self.head_mode in ["diffusion", "flow"] and timestep is not None:
             if self.time_embed is None:
                 raise RuntimeError("Head missing time_embed")
             t_emb = self.time_embed(timestep)
-        if self.c_hidden is not None:
-            for layer in self.c_hidden:
-                x = layer(x, cond=cond, time_emb=t_emb)
         x = self.c_out(x)
         if self.head_mode == "gaussian":
             mu, log_sigma = torch.chunk(x, 2, dim=1)
@@ -1464,7 +1369,6 @@ class ConvLRUModel(nn.Module):
                         self.downsamples.append(ShuffleDownsample(C))
                     else:
                         self.downsamples.append(nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)))
-                    
                     if curr_H % 2 != 0: curr_H += 1
                     if curr_W % 2 != 0: curr_W += 1
                     curr_H = max(1, curr_H // 2)
@@ -1557,8 +1461,7 @@ class Embedding(nn.Module):
         self.input_ch = int(getattr(args, "input_ch", 1))
         self.input_size = tuple(getattr(args, "input_size", (64, 64)))
         self.emb_ch = int(getattr(args, "emb_ch", 32))
-        self.emb_hidden_ch = int(getattr(args, "emb_hidden_ch", 32))
-        self.emb_hidden_layers_num = int(getattr(args, "emb_hidden_layers_num", 0))
+        self.emb_hidden_ch = self.emb_ch
         self.static_ch = int(getattr(args, "static_ch", 0))
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
@@ -1581,11 +1484,8 @@ class Embedding(nn.Module):
             )
         else:
             self.static_embed = None
-        if self.emb_hidden_layers_num > 0:
-            cond_ch = self.emb_ch if self.static_ch > 0 else None
-            self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch) for _ in range(self.emb_hidden_layers_num)])
-        else:
-            self.c_hidden = None
+        cond_ch = self.emb_ch if self.static_ch > 0 else None
+        self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch)])
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
         self.norm = RMSNorm(self.emb_ch)
@@ -1608,9 +1508,8 @@ class Embedding(nn.Module):
         cond = None
         if self.static_ch > 0 and self.static_embed is not None and static_feats is not None:
             cond = self.static_embed(static_feats)
-        if self.c_hidden is not None:
-            for layer in self.c_hidden:
-                x = layer(x, cond=cond)
+        for layer in self.c_hidden:
+            x = layer(x, cond=cond)
         x = self.c_out(x)
         x = self.norm(x)
         return x, cond

@@ -109,7 +109,7 @@ class Args:
         self.use_cbam = True
         self.ffn_hidden_ch = 128
         self.ffn_hidden_layers_num = 2
-        self.num_expert = 16
+        self.num_expert = 8
         self.activate_expert = 4
         self.use_gate = True
         self.lru_rank = 32
@@ -131,10 +131,10 @@ class Args:
         self.diffusion_steps = 1000
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 27
+        self.train_data_n_frames = 18
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = "e7_s570_l0.265707.pth"
+        self.ckpt = ""
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
@@ -161,14 +161,14 @@ class Args:
         self.wandb_group = "v3.0.0"
         self.wandb_mode = "online"
         self.use_checkpointing = True
-        self.train_mode = "alignment"
+        self.train_mode = "p_only"
         
         self.use_spectral_mixing = True
         self.use_anisotropic_diffusion = True
-        self.use_advection = True
-        self.use_graph_interaction = False
+        self.use_advection = False
+        self.use_graph_interaction = True
         self.use_adaptive_ssm = True
-        self.use_neural_operator = False
+        self.use_neural_operator = True
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
