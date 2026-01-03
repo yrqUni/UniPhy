@@ -965,7 +965,12 @@ class SpatialPatchMoE(nn.Module):
         
         for t in range(L):
             xt = x[:, :, t:t+1]
-            ct = cond[:, :, t:t+1] if cond is not None else None
+            ct = None
+            if cond is not None:
+                if cond.dim() == 5:
+                     ct = cond[:, :, t:t+1]
+                else:
+                     ct = cond.unsqueeze(2) 
             
             P = self.patch_size
             pad_h = (P - (H % P)) % P
