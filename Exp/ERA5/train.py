@@ -137,7 +137,7 @@ class Args:
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
         self.use_graph_interaction = False
-        self.ffn_ratio = 4.0
+        self.ffn_ratio = 1.0
         self.ConvType = "dcn"
         self.Arch = "bifpn"
         self.check_args()
