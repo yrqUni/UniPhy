@@ -1,4 +1,28 @@
-import math
+(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
+        N, C_mul, D, H, W = x.shape
+            C = C_mul // (rH * rW)
+                x = x.reshape(N, C, rH, rW, D, H, W)
+                    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
+                        x = x.reshape(N, C, D, H * rH, W * rW)
+                            return x
+
+                        def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
+                                N, C, D, H, W = x.shape
+                                    x = x.reshape(N, C, D, H // rH, rH, W // rW, rW)
+                                        x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
+                                            x = x.reshape(N, C * rH * rW, D, H // rH, W // rW)
+                                                return x
+
+                                            @triton.jit
+                                            def rms_norm_kernel(
+                                                        x_ptr, w_ptr, out_ptr,
+                                                            stride_row, stride_col,
+                                                                N_COLS, eps,
+                                                                    BLOCK_SIZE: tl.constexpr
+                                                                    ):
+                                                    row_idx = tl.program_id(0)
+                                                        col_offsets = tl.arange(0, BLOCK_SIZE)
+                                                            mask = col_import math
 from typing import Any, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
@@ -22,31 +46,7 @@ def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
         weight.copy_(base)
     return weight
 
-def pixel_shuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
-    N, C_mul, D, H, W = x.shape
-    C = C_mul // (rH * rW)
-    x = x.reshape(N, C, rH, rW, D, H, W)
-    x = x.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
-    x = x.reshape(N, C, D, H * rH, W * rW)
-    return x
-
-def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
-    N, C, D, H, W = x.shape
-    x = x.reshape(N, C, D, H // rH, rH, W // rW, rW)
-    x = x.permute(0, 1, 4, 6, 2, 3, 5).contiguous()
-    x = x.reshape(N, C * rH * rW, D, H // rH, W // rW)
-    return x
-
-@triton.jit
-def rms_norm_kernel(
-    x_ptr, w_ptr, out_ptr,
-    stride_row, stride_col,
-    N_COLS, eps,
-    BLOCK_SIZE: tl.constexpr
-):
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < N_COLS
+def pixel_shuffle_hw_3doffsets < N_COLS
     
     x_ptr_row = x_ptr + row_idx * stride_row
     x = tl.load(x_ptr_row + col_offsets * stride_col, mask=mask, other=0.0).to(tl.float32)
