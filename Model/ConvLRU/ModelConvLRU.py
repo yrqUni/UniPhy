@@ -38,76 +38,27 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     return x
 
 @triton.jit
-def fused_moe_router_kernel(
-    logits_ptr, indices_out_ptr, n_experts, k: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    logits_row_start = logits_ptr + pid * n_experts
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_experts
-    logits = tl.load(logits_row_start + offsets, mask=mask, other=-float("inf"))
-    logits_max = tl.max(logits, 0)
-    logits = logits - logits_max
-    numerator = tl.exp(logits)
-    denominator = tl.sum(numerator, 0)
-    probs = numerator / denominator
-    indices_row_start = indices_out_ptr + pid * k
-    for i in range(k):
-        current_max_idx = tl.argmax(probs, 0)
-        tl.store(indices_row_start + i, current_max_idx)
-        mask_max = offsets == current_max_idx
-        probs = tl.where(mask_max, 0.0, probs)
-
-@triton.jit
-def fused_gate_kernel(
-    in_ptr, out_ptr, C, Spatial, n_elements, BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    batch_idx = offsets // (C * Spatial)
-    rem = offsets % (C * Spatial)
-    c_idx = rem // Spatial
-    s_idx = rem % Spatial
-    in_idx_x = batch_idx * (2 * C * Spatial) + c_idx * Spatial + s_idx
-    in_idx_g = batch_idx * (2 * C * Spatial) + (c_idx + C) * Spatial + s_idx
-    x = tl.load(in_ptr + in_idx_x, mask=mask, other=0.0).to(tl.float32)
-    g = tl.load(in_ptr + in_idx_g, mask=mask, other=0.0).to(tl.float32)
-    sigmoid_x = 1.0 / (1.0 + tl.exp(-x))
-    out = (x * sigmoid_x) * g
-    tl.store(out_ptr + offsets, out, mask=mask)
-
-class FusedGatedSiLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        B, C2, D, H, W = x.shape
-        C = C2 // 2
-        out = torch.empty((B, C, D, H, W), device=x.device, dtype=x.dtype)
-        n_elements = B * C * D * H * W
-        Spatial = D * H * W
-        grid = (triton.cdiv(n_elements, 1024),)
-        fused_gate_kernel[grid](x, out, C, Spatial, n_elements, BLOCK_SIZE=1024)
-        return out
-
-@triton.jit
 def rms_norm_kernel(
-    x_ptr, w_ptr, out_ptr, stride_x_row, N_COLS, eps, BLOCK_SIZE: tl.constexpr,
+    x_ptr, w_ptr, out_ptr,
+    stride_row, stride_col,
+    N_COLS, eps,
+    BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < N_COLS
-    x_row_start = x_ptr + row_idx * stride_x_row
-    x = tl.load(x_row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    
+    x_ptr_row = x_ptr + row_idx * stride_row
+    x = tl.load(x_ptr_row + col_offsets * stride_col, mask=mask, other=0.0).to(tl.float32)
+    
     mean_sq = tl.sum(x * x, axis=0) / N_COLS
     rstd = tl.rsqrt(mean_sq + eps)
+    
     w = tl.load(w_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
     y = x * rstd * w
-    out_row_start = out_ptr + row_idx * stride_x_row
-    tl.store(out_row_start + col_offsets, y, mask=mask)
+    
+    out_ptr_row = out_ptr + row_idx * stride_row
+    tl.store(out_ptr_row + col_offsets * stride_col, y, mask=mask)
 
 class RMSNorm(nn.Module):
     def __init__(self, channels: int, eps: float = 1e-6):
@@ -119,28 +70,37 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.is_complex():
             x = x.real
-        orig_shape = x.shape
-        if x.dim() == 5:
-            x = x.permute(0, 2, 3, 4, 1).contiguous()
-        x_flat = x.reshape(-1, self.channels)
-        if not x_flat.is_contiguous():
-            x_flat = x_flat.contiguous()
+        
+        dim_to_norm = -1
+        if x.shape[-1] != self.channels:
+            if x.dim() == 5 and x.shape[1] == self.channels:
+                x = x.permute(0, 2, 3, 4, 1).contiguous()
+            elif x.dim() == 4 and x.shape[1] == self.channels:
+                x = x.permute(0, 2, 3, 1).contiguous()
+            else:
+                 return F.rms_norm(x, (self.channels,), self.weight, self.eps)
+
+        shape_orig = x.shape
+        x_flat = x.view(-1, self.channels)
         M, N = x_flat.shape
         out = torch.empty_like(x_flat)
-        grid = (M,)
+        
         BLOCK_SIZE = triton.next_power_of_2(N)
         BLOCK_SIZE = max(1, min(BLOCK_SIZE, 4096))
-        if N > 4096:
-            with torch.amp.autocast("cuda", enabled=False):
-                x_f = x_flat.float()
-                var = x_f.pow(2).mean(dim=-1, keepdim=True)
-                out_norm = x_f * torch.rsqrt(var + self.eps)
-                return (out_norm * self.weight.float()).to(x.dtype).view(*x.shape)
+        
+        if N > 4096: 
+             return F.rms_norm(x, (self.channels,), self.weight, self.eps)
+
+        grid = (M,)
         rms_norm_kernel[grid](
-            x_flat, self.weight, out, x_flat.stride(0), N, self.eps, BLOCK_SIZE=BLOCK_SIZE,
+            x_flat, self.weight, out,
+            x_flat.stride(0), x_flat.stride(1),
+            N, self.eps,
+            BLOCK_SIZE=BLOCK_SIZE
         )
-        out = out.view(*x.shape)
-        if len(orig_shape) == 5:
+        
+        out = out.view(*shape_orig)
+        if len(shape_orig) == 5: 
             out = out.permute(0, 4, 1, 2, 3).contiguous()
         return out
 
@@ -162,6 +122,86 @@ class AdaRMSNorm(nn.Module):
             shift = shift.view(x.size(0), x.size(1), 1, 1, 1)
             x = x * scale + shift
         return x
+
+@triton.jit
+def gated_silu_kernel(
+    x_ptr, out_ptr,
+    stride_row_in, stride_col_in,
+    stride_row_out, stride_col_out,
+    C_half,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < C_half
+    
+    base_in = x_ptr + row_idx * stride_row_in
+    val = tl.load(base_in + col_offsets * stride_col_in, mask=mask, other=0.0)
+    gate = tl.load(base_in + (col_offsets + C_half) * stride_col_in, mask=mask, other=0.0)
+    
+    sig_gate = 1.0 / (1.0 + tl.exp(-gate))
+    res = val * sig_gate
+    
+    base_out = out_ptr + row_idx * stride_row_out
+    tl.store(base_out + col_offsets * stride_col_out, res, mask=mask)
+
+class FusedGatedSiLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 5: 
+            B, C2, L, H, W = x.shape
+            x_reshaped = x.permute(0, 2, 3, 4, 1).contiguous().view(-1, C2)
+        elif x.dim() == 4:
+            B, C2, H, W = x.shape
+            x_reshaped = x.permute(0, 2, 3, 1).contiguous().view(-1, C2)
+        else:
+             chunk1, chunk2 = torch.chunk(x, 2, dim=1)
+             return chunk1 * F.sigmoid(chunk2)
+
+        N_rows, C2 = x_reshaped.shape
+        C = C2 // 2
+        out = torch.empty((N_rows, C), device=x.device, dtype=x.dtype)
+        
+        BLOCK_SIZE = triton.next_power_of_2(C)
+        grid = (N_rows,)
+        
+        gated_silu_kernel[grid](
+            x_reshaped, out,
+            x_reshaped.stride(0), x_reshaped.stride(1),
+            out.stride(0), out.stride(1),
+            C, BLOCK_SIZE=BLOCK_SIZE
+        )
+        
+        if x.dim() == 5:
+            B, _, L, H, W = x.shape
+            return out.view(B, L, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
+        elif x.dim() == 4:
+            B, _, H, W = x.shape
+            return out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        return out
+
+@triton.jit
+def fused_moe_router_kernel(
+    logits_ptr, indices_out_ptr, n_experts, k: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    logits_row_start = logits_ptr + pid * n_experts
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_experts
+    logits = tl.load(logits_row_start + offsets, mask=mask, other=-float("inf"))
+    logits_max = tl.max(logits, 0)
+    logits = logits - logits_max
+    numerator = tl.exp(logits)
+    denominator = tl.sum(numerator, 0)
+    probs = numerator / denominator
+    indices_row_start = indices_out_ptr + pid * k
+    for i in range(k):
+        current_max_idx = tl.argmax(probs, 0)
+        tl.store(indices_row_start + i, current_max_idx)
+        mask_max = offsets == current_max_idx
+        probs = tl.where(mask_max, 0.0, probs)
 
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
