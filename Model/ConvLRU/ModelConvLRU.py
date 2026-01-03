@@ -71,11 +71,7 @@ class RMSNorm(nn.Module):
         if x.is_complex():
             x = x.real
         
-        # 记录原始形状
-        shape_orig = x.shape
         permuted = False
-        
-        # 将通道维移到最后 (B, ..., C)
         if x.shape[-1] != self.channels:
             if x.dim() == 5 and x.shape[1] == self.channels:
                 x = x.permute(0, 2, 3, 4, 1).contiguous()
@@ -86,10 +82,8 @@ class RMSNorm(nn.Module):
             else:
                  return F.rms_norm(x, (self.channels,), self.weight, self.eps)
 
-        # 此时 x 的形状是 (..., C)，记录这个形状用于恢复
         shape_permuted = x.shape
-        
-        x_flat = x.view(-1, self.channels)
+        x_flat = x.reshape(-1, self.channels)
         M, N = x_flat.shape
         out = torch.empty_like(x_flat)
         
@@ -107,16 +101,12 @@ class RMSNorm(nn.Module):
             BLOCK_SIZE=BLOCK_SIZE
         )
         
-        # 恢复到 (..., C)
-        out = out.view(*shape_permuted)
+        out = out.reshape(*shape_permuted)
         
-        # 如果之前 permute 过，现在 permute 回去
         if permuted:
-            if len(shape_orig) == 5: 
-                # (B, L, H, W, C) -> (B, C, L, H, W)
+            if out.dim() == 5: 
                 out = out.permute(0, 4, 1, 2, 3).contiguous()
-            elif len(shape_orig) == 4:
-                # (B, H, W, C) -> (B, C, H, W)
+            elif out.dim() == 4:
                 out = out.permute(0, 3, 1, 2).contiguous()
                 
         return out
@@ -318,7 +308,7 @@ class FactorizedPeriodicConv3d(nn.Module):
         x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
         x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
         x_sp = self.spatial_conv(x_sp)
-        x_sp = x_sp.view(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+        x_sp = x_sp.reshape(B, D, C, H, W).permute(0, 2, 1, 3, 4)
         out = self.depth_conv(x_sp)
         return out
 
@@ -737,7 +727,7 @@ class StochasticInjector(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        x_flat = x.view(B * L, C, H, W)
+        x_flat = x.reshape(B * L, C, H, W)
         stats = self.conv(x_flat)
         mu, logvar = torch.chunk(stats, 2, dim=1)
         std = torch.exp(0.5 * logvar)
@@ -765,10 +755,10 @@ class SpatialSSMParameterGenerator(nn.Module):
 
     def forward(self, x):
         B, L, C, H, W = x.shape
-        x_flat = x.view(B * L, C, H, W)
+        x_flat = x.reshape(B * L, C, H, W)
         feat = self.conv(x_flat)
         feat = self.pool(feat)
-        feat = feat.permute(0, 2, 3, 1)
+        feat = feat.permute(0, 2, 3, 1).reshape(B, L, 1, self.w_freq, self.emb_ch)
         params = self.head(feat)
         params = params.view(B, L, 1, self.w_freq, self.emb_ch, self.rank, 4)
         params = params.permute(0, 1, 4, 3, 5, 6).contiguous()
