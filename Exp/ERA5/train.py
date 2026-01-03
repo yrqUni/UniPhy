@@ -109,12 +109,12 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
-        self.use_tf32 = True
+        self.use_tf32 = False
         self.use_compile = False
-        self.lr = 1e-4
+        self.lr = 1e-5
         self.weight_decay = 0.05
-        self.use_scheduler = True
-        self.init_lr_scheduler = True
+        self.use_scheduler = False
+        self.init_lr_scheduler = False
         self.loss = ["lat", "gdl", "spec"]
         self.T = 6
         self.use_amp = False
@@ -132,12 +132,12 @@ class Args:
         self.use_spectral_mixing = True
         self.use_advection = True
         self.use_spatial_ssm = True
-        self.use_stochastic = False
+        self.use_stochastic = True
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
         self.use_graph_interaction = False
-        self.ffn_ratio = 1.0
+        self.ffn_ratio = 4.0
         self.ConvType = "dcn"
         self.Arch = "bifpn"
         self.check_args()
