@@ -82,10 +82,10 @@ class Args:
         self.out_ch = 30
         self.static_ch = 6
         self.hidden_factor = (7, 12)
-        self.emb_ch = 48
-        self.convlru_num_blocks = 5
+        self.emb_ch = 96
+        self.convlru_num_blocks = 6
         self.use_cbam = True
-        self.num_expert = 8
+        self.num_expert = 16
         self.activate_expert = 4
         self.lru_rank = 32
         self.down_mode = "shuffle"
@@ -101,7 +101,7 @@ class Args:
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = ""
+        self.ckpt = "e7_s570_l0.265707.pth"
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
@@ -532,8 +532,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     amp_dtype = torch.bfloat16 if str(args.amp_dtype).lower() == "bf16" else torch.float16
     use_amp = bool(args.use_amp)
     
-    micro_steps = int(args.T) 
-    
     for ep in range(int(start_epoch), int(args.epochs)):
         train_sampler.set_epoch(ep)
         train_iter = tqdm(train_dataloader, desc=f"Epoch {ep + 1}/{args.epochs}") if rank == 0 else train_dataloader
@@ -543,13 +541,23 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             opt.zero_grad(set_to_none=True)
 
             B_full, L_full, C, H, W = data.shape
-            L_eff = L_full - 1
+            sample_k = int(args.sample_k)
             
-            x = data[:, :L_eff].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-            target = data[:, 1 : L_eff + 1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-            
-            listT_vals = [float(args.T)] * x.shape[1]
-            listT = torch.tensor(listT_vals, device=x.device, dtype=x.dtype).view(1, -1).repeat(x.size(0), 1)
+            if L_full > sample_k + 1:
+                indices = torch.randperm(L_full, device=data.device)[:sample_k+1]
+                indices, _ = torch.sort(indices)
+                data_slice = data.index_select(1, indices.cpu())
+                
+                dt_indices = indices[1:] - indices[:-1]
+                listT_vals = dt_indices.float() * float(args.T)
+                listT = listT_vals.unsqueeze(0).repeat(B_full, 1).to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True)
+            else:
+                data_slice = data
+                listT_vals = [float(args.T)] * (data.shape[1] - 1)
+                listT = torch.tensor(listT_vals, device=torch.device(f"cuda:{local_rank}"), dtype=torch.float32).view(1, -1).repeat(B_full, 1)
+                
+            x = data_slice[:, :-1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+            target = data_slice[:, 1:].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
 
             static_feats = None
             if static_gpu is not None:
@@ -577,7 +585,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     x_seed = x[:, -1:]
                     target_last = target[:, -1:]
                     
+                    current_last_dt = listT[0, -1].item()
                     dt_micro_val = 1.0
+                    micro_steps = int(current_last_dt)
+                    
                     listT_seed = torch.full((x.size(0), 1), dt_micro_val, device=x.device, dtype=x.dtype)
                     listT_future = torch.full((x.size(0), micro_steps - 1), dt_micro_val, device=x.device, dtype=x.dtype)
                     
@@ -697,7 +708,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, solver_tensor
+            del data, data_slice, x, preds, target, loss, listT, static_feats, timestep, loss_tensor, metric_l1, l1_tensor, solver_tensor
             if train_step % 50 == 0:
                 gc.collect()
 
