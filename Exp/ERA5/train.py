@@ -53,9 +53,9 @@ MODEL_ARG_KEYS = [
     "learnable_init_state",
     "use_wavelet_ssm",
     "use_cross_var_attn",
+    "use_graph_interaction",
     "ConvType",
     "Arch",
-    "loss",
 ]
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
@@ -108,12 +108,12 @@ class Args:
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
-        self.use_tf32 = False
+        self.use_tf32 = True
         self.use_compile = False
         self.lr = 1e-4
         self.weight_decay = 0.05
-        self.use_scheduler = False
-        self.init_lr_scheduler = False
+        self.use_scheduler = True
+        self.init_lr_scheduler = True
         self.loss = ["lat", "gdl", "spec"]
         self.T = 6
         self.use_amp = False
@@ -129,12 +129,13 @@ class Args:
         self.use_checkpointing = True
         self.train_mode = "alignment"
         self.use_spectral_mixing = True
-        self.use_advection = False
+        self.use_advection = True
         self.use_spatial_ssm = True
         self.use_stochastic = False
         self.learnable_init_state = True
         self.use_wavelet_ssm = True
         self.use_cross_var_attn = True
+        self.use_graph_interaction = True
         self.ConvType = "dcn"
         self.Arch = "bifpn"
         self.check_args()
@@ -601,7 +602,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
 
                 loss = torch.tensor(0.0, device=x.device)
-                
                 if "lat" in args.loss:
                     loss = loss + loss_main
                 
