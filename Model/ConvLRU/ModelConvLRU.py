@@ -184,8 +184,9 @@ def _get_base_grid(H: int, W: int, device: torch.device, dtype: torch.dtype) -> 
 
 
 class LieTransport(nn.Module):
-    def __init__(self):
+    def __init__(self, chunk_size: int = 32):
         super().__init__()
+        self.chunk_size = int(chunk_size)
 
     def forward(self, h_prev: torch.Tensor, flow: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         B, C, H, W, R = h_prev.shape
@@ -193,10 +194,9 @@ class LieTransport(nn.Module):
             flow = flow[:, 0]
         dt = dt.view(B, 1)
         base_grid = _get_base_grid(H, W, h_prev.device, h_prev.dtype)
-        chunk_size = 4
         h_warped_list: List[torch.Tensor] = []
-        for i in range(0, R, chunk_size):
-            r_end = min(i + chunk_size, R)
+        for i in range(0, R, self.chunk_size):
+            r_end = min(i + self.chunk_size, R)
             curr_R = r_end - i
             h_chunk = h_prev[..., i:r_end]
             h_flat = h_chunk.permute(0, 4, 1, 2, 3).reshape(B * curr_R, C, H, W)
@@ -248,16 +248,25 @@ class SpectralKoopmanSDE(nn.Module):
         self.use_noise = bool(use_noise)
         self.noise_scale = float(noise_scale)
 
-    def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+    def compute_params(self, x_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, L, C, H, W = x_seq.shape
+        x_flat = x_seq.reshape(B * L, C, H, W)
+        nu_rate, theta_rate, sigma = self.estimator(x_flat)
+        _, _, C_emb, W_freq, Rank = nu_rate.shape
+        nu_rate = nu_rate.view(B, L, 1, C_emb, W_freq, Rank)
+        theta_rate = theta_rate.view(B, L, 1, C_emb, W_freq, Rank)
+        sigma = sigma.view(B, L, 1, C_emb, W_freq, Rank)
+        return nu_rate, theta_rate, sigma
+
+    def forward_step(self, h_trans: torch.Tensor, dt: torch.Tensor, params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, C, H, W, R = h_trans.shape
         h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho")
-        x_flat = x_curr.squeeze(2)
-        nu_rate, theta_rate, sigma = self.estimator(x_flat)
+        nu_rate, theta_rate, sigma_val = params
         dt_ = dt.view(B, -1)
-        dt_expanded = dt_.view(B, dt_.shape[1], 1, 1, 1, 1)
+        dt_expanded = dt_.view(B, 1, 1, 1, 1, 1)
         nu = nu_rate.unsqueeze(4) * dt_expanded
         theta = theta_rate.unsqueeze(4) * dt_expanded
-        sigma = sigma.unsqueeze(4)
+        sigma = sigma_val.unsqueeze(4)
         decay = torch.exp(-nu)
         rotate = torch.exp(1j * theta)
         lambda_k = decay * rotate
@@ -272,6 +281,12 @@ class SpectralKoopmanSDE(nn.Module):
         h_evolved = h_freq * lambda_k + noise
         h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
         return h_out.permute(0, 2, 3, 4, 1)
+
+    def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        x_flat = x_curr.squeeze(2)
+        nu_rate, theta_rate, sigma = self.estimator(x_flat)
+        params = (nu_rate, theta_rate, sigma)
+        return self.forward_step(h_trans, dt, params)
 
 
 class StaticInitState(nn.Module):
@@ -334,7 +349,7 @@ class SimplifiedHKLFLayer(nn.Module):
         self.inj_k = float(getattr(args, "inj_k", 2.0))
         self.inj_k = max(self.inj_k, 0.0)
         self.hamiltonian = HamiltonianGenerator(self.emb_ch)
-        self.lie_transport = LieTransport()
+        self.lie_transport = LieTransport(chunk_size=32)
         self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq, use_noise=use_noise, noise_scale=noise_scale)
         self.proj_out = nn.Linear(self.rank, 1)
         if bool(getattr(args, "learnable_init_state", False)) and int(getattr(args, "static_ch", 0)) > 0:
@@ -371,12 +386,18 @@ class SimplifiedHKLFLayer(nn.Module):
         h_states: List[torch.Tensor] = []
         x_perm = x.permute(0, 2, 1, 3, 4)
         dt_ref = torch.tensor(self.dt_ref, device=x.device, dtype=x.dtype).clamp_min(1e-6)
+        flows_all = self.hamiltonian(x_perm)
+        koopman_params_all = self.koopman.compute_params(x_perm)
         for t in range(L):
             x_t = x[:, :, t : t + 1]
             dt_t = dt_seq[:, t : t + 1]
-            flow = self.hamiltonian(x_perm[:, t : t + 1])
-            h_trans = self.lie_transport(curr_h, flow.squeeze(1), dt_t)
-            h_next = self.koopman(h_trans, x_t, dt_t)
+            flow_t = flows_all[:, t]
+            nu_t = koopman_params_all[0][:, t]
+            theta_t = koopman_params_all[1][:, t]
+            sigma_t = koopman_params_all[2][:, t]
+            params_t = (nu_t, theta_t, sigma_t)
+            h_trans = self.lie_transport(curr_h, flow_t, dt_t)
+            h_next = self.koopman.forward_step(h_trans, dt_t, params_t)
             x_inject = x_t.squeeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, self.rank)
             dt_scaled = (dt_t / dt_ref).clamp_min(0.0)
             if self.inj_k > 0:
