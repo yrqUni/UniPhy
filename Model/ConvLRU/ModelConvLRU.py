@@ -7,6 +7,107 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def fused_koopman_kernel(
+        h_real_ptr, h_imag_ptr,
+        nu_ptr, theta_ptr,
+        dt_ptr,
+        out_real_ptr, out_imag_ptr,
+        B, R, C, H, W,
+        stride_h_b, stride_h_r, stride_h_c, stride_h_h, stride_h_w,
+        stride_p_b, stride_p_r, stride_p_c, stride_p_h, stride_p_w,
+        stride_dt_b,
+        BLOCK_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(0)
+        num_elements = B * R * C * H * W
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_elements
+
+        idx_w = offsets % W
+        tmp = offsets // W
+        idx_h = tmp % H
+        tmp = tmp // H
+        idx_c = tmp % C
+        tmp = tmp // C
+        idx_r = tmp % R
+        idx_b = tmp // R
+
+        dt_val = tl.load(dt_ptr + idx_b * stride_dt_b, mask=mask, other=0.0)
+        
+        p_offset = (idx_b * stride_p_b + idx_r * stride_p_r + idx_c * stride_p_c + idx_w * stride_p_w)
+        nu = tl.load(nu_ptr + p_offset, mask=mask, other=0.0)
+        theta = tl.load(theta_ptr + p_offset, mask=mask, other=0.0)
+        
+        h_offset = (idx_b * stride_h_b + idx_r * stride_h_r + idx_c * stride_h_c + idx_h * stride_h_h + idx_w * stride_h_w)
+        h_real = tl.load(h_real_ptr + h_offset, mask=mask, other=0.0)
+        h_imag = tl.load(h_imag_ptr + h_offset, mask=mask, other=0.0)
+
+        decay = tl.exp(-nu * dt_val)
+        angle = theta * dt_val
+        cos_a = tl.cos(angle)
+        sin_a = tl.sin(angle)
+        
+        rot_real = h_real * cos_a - h_imag * sin_a
+        rot_imag = h_real * sin_a + h_imag * cos_a
+        
+        res_real = rot_real * decay
+        res_imag = rot_imag * decay
+        
+        tl.store(out_real_ptr + h_offset, res_real, mask=mask)
+        tl.store(out_imag_ptr + h_offset, res_imag, mask=mask)
+
+    @triton.jit
+    def gen_warp_grid_kernel(
+        flow_ptr, dt_ptr, out_grid_ptr,
+        B, curr_R, H, W,
+        stride_f_b, stride_f_c, stride_f_h, stride_f_w,
+        stride_dt_b,
+        stride_o_n, stride_o_h, stride_o_w, stride_o_c,
+        BLOCK_SIZE: tl.constexpr
+    ):
+        pid = tl.program_id(0)
+        num_pixels = B * curr_R * H * W
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_pixels
+
+        idx_w = offsets % W
+        tmp = offsets // W
+        idx_h = tmp % H
+        idx_n = tmp // H 
+
+        idx_b = idx_n // curr_R
+        
+        dt_val = tl.load(dt_ptr + idx_b * stride_dt_b, mask=mask, other=0.0)
+
+        off_u = idx_b * stride_f_b + 0 * stride_f_c + idx_h * stride_f_h + idx_w * stride_f_w
+        flow_u = tl.load(flow_ptr + off_u, mask=mask, other=0.0)
+        
+        off_v = idx_b * stride_f_b + 1 * stride_f_c + idx_h * stride_f_h + idx_w * stride_f_w
+        flow_v = tl.load(flow_ptr + off_v, mask=mask, other=0.0)
+
+        w_norm = (idx_w.to(tl.float32) / (W - 1)) * 2.0 - 1.0
+        h_norm = (idx_h.to(tl.float32) / (H - 1)) * 2.0 - 1.0
+
+        grid_x = w_norm - flow_u * dt_val
+        grid_y = h_norm - flow_v * dt_val
+
+        off_out_x = idx_n * stride_o_n + idx_h * stride_o_h + idx_w * stride_o_w + 0 * stride_o_c
+        tl.store(out_grid_ptr + off_out_x, grid_x, mask=mask)
+        
+        off_out_y = idx_n * stride_o_n + idx_h * stride_o_h + idx_w * stride_o_w + 1 * stride_o_c
+        tl.store(out_grid_ptr + off_out_y, grid_y, mask=mask)
+
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 
 def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     out_ch, in_ch, kD, kH, kW = weight.shape
@@ -134,7 +235,7 @@ class CBAM2DPerStep(nn.Module):
 
 
 class HamiltonianGenerator(nn.Module):
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, height: int):
         super().__init__()
         ch = int(channels)
         mid = max(ch // 2, 1)
@@ -145,6 +246,11 @@ class HamiltonianGenerator(nn.Module):
         )
         self.register_buffer("sobel_x", torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
         self.register_buffer("sobel_y", torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
+        
+        self.height = int(height)
+        lat = torch.linspace(-math.pi / 2, math.pi / 2, self.height).view(1, 1, self.height, 1)
+        metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
+        self.register_buffer("metric_correction", metric_correction)
         nn.init.zeros_(self.conv[-1].weight)
         nn.init.zeros_(self.conv[-1].bias)
 
@@ -152,8 +258,13 @@ class HamiltonianGenerator(nn.Module):
         B, L, C, H, W = x.shape
         x_flat = x.reshape(B * L, C, H, W)
         H_field = self.conv(x_flat)
-        lat = torch.linspace(-math.pi / 2, math.pi / 2, H, device=x.device).view(1, 1, H, 1)
-        metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
+        
+        if H != self.height:
+             lat = torch.linspace(-math.pi / 2, math.pi / 2, H, device=x.device).view(1, 1, H, 1)
+             metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
+        else:
+             metric_correction = self.metric_correction
+
         H_padded = F.pad(H_field, (1, 1, 0, 0), mode="circular")
         H_padded = F.pad(H_padded, (0, 0, 1, 1), mode="replicate")
         grad_x = F.conv2d(H_padded, self.sobel_x.to(x.device))
@@ -193,19 +304,46 @@ class LieTransport(nn.Module):
         if flow.dim() == 5:
             flow = flow[:, 0]
         dt = dt.view(B, 1)
-        base_grid = _get_base_grid(H, W, h_prev.device, h_prev.dtype)
+        
         h_warped_list: List[torch.Tensor] = []
+        
+        use_triton_grid = HAS_TRITON and h_prev.device.type == "cuda"
+        
+        if not use_triton_grid:
+            base_grid = _get_base_grid(H, W, h_prev.device, h_prev.dtype)
+
         for i in range(0, R, self.chunk_size):
             r_end = min(i + self.chunk_size, R)
             curr_R = r_end - i
+            
             h_chunk = h_prev[..., i:r_end]
             h_flat = h_chunk.permute(0, 4, 1, 2, 3).reshape(B * curr_R, C, H, W)
-            flow_chunk = flow.unsqueeze(1).expand(-1, curr_R, -1, -1, -1).reshape(B * curr_R, 2, H, W)
-            dt_chunk = dt.expand(-1, curr_R).reshape(B * curr_R, 1, 1, 1)
-            flow_dt = flow_chunk * dt_chunk
-            sampling_grid = base_grid.expand(B * curr_R, -1, -1, -1) - flow_dt.permute(0, 2, 3, 1)
+            
+            if use_triton_grid:
+                sampling_grid = torch.empty((B * curr_R, H, W, 2), device=h_prev.device, dtype=h_prev.dtype)
+                
+                dt_contiguous = dt.view(B).contiguous()
+                flow_contiguous = flow.contiguous()
+                
+                grid = lambda META: (triton.cdiv(B * curr_R * H * W, META['BLOCK_SIZE']), )
+                
+                gen_warp_grid_kernel[grid](
+                    flow_contiguous, dt_contiguous, sampling_grid,
+                    B, curr_R, H, W,
+                    *flow_contiguous.stride(),
+                    dt_contiguous.stride(0),
+                    *sampling_grid.stride(),
+                    BLOCK_SIZE=256
+                )
+            else:
+                flow_chunk = flow.unsqueeze(1).expand(-1, curr_R, -1, -1, -1).reshape(B * curr_R, 2, H, W)
+                dt_chunk = dt.expand(-1, curr_R).reshape(B * curr_R, 1, 1, 1)
+                flow_dt = flow_chunk * dt_chunk
+                sampling_grid = base_grid.expand(B * curr_R, -1, -1, -1) - flow_dt.permute(0, 2, 3, 1)
+            
             h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode="bilinear", padding_mode="border", align_corners=False)
             h_warped_list.append(h_warped_flat.reshape(B, curr_R, C, H, W).permute(0, 2, 3, 4, 1))
+            
         return torch.cat(h_warped_list, dim=4)
 
 
@@ -260,32 +398,67 @@ class SpectralKoopmanSDE(nn.Module):
 
     def forward_step(self, h_trans: torch.Tensor, dt: torch.Tensor, params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, C, H, W, R = h_trans.shape
-        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho")
+        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho") 
+        W_freq = h_freq.shape[-1]
+        
         nu_rate, theta_rate, sigma_val = params
-        dt_ = dt.view(B, -1)
-        dt_expanded = dt_.view(B, 1, 1, 1, 1, 1)
-        nu = nu_rate.unsqueeze(4) * dt_expanded
-        theta = theta_rate.unsqueeze(4) * dt_expanded
-        sigma = sigma_val.unsqueeze(4)
-        decay = torch.exp(-nu)
-        rotate = torch.exp(1j * theta)
-        lambda_k = decay * rotate
-        lambda_k = lambda_k.squeeze(1).permute(0, 4, 1, 3, 2)
-        sigma_b = sigma.squeeze(1).permute(0, 4, 1, 3, 2)
-        if self.use_noise:
-            dt_sqrt = torch.sqrt(dt_.clamp_min(0.0)).view(B, 1, 1, 1, 1)
-            amp = sigma_b.mean(dim=-1, keepdim=True) * (self.noise_scale * dt_sqrt)
-            noise = torch.randn_like(h_freq) * amp
+
+        if HAS_TRITON and h_freq.device.type == "cuda":
+            nu_in = nu_rate.permute(0, 4, 2, 1, 3) 
+            theta_in = theta_rate.permute(0, 4, 2, 1, 3)
+            
+            nu_in = nu_in.expand(B, R, C, H, W_freq)
+            theta_in = theta_in.expand(B, R, C, H, W_freq)
+            
+            h_real = h_freq.real.contiguous()
+            h_imag = h_freq.imag.contiguous()
+            out_real = torch.empty_like(h_real)
+            out_imag = torch.empty_like(h_imag)
+            dt_in = dt.view(B).contiguous()
+            
+            grid = lambda META: (triton.cdiv(B * R * C * H * W_freq, META['BLOCK_SIZE']), )
+            
+            fused_koopman_kernel[grid](
+                h_real, h_imag,
+                nu_in, theta_in, dt_in,
+                out_real, out_imag,
+                B, R, C, H, W_freq,
+                *h_real.stride(),
+                *nu_in.stride(),
+                dt_in.stride(0),
+                BLOCK_SIZE=256
+            )
+            h_evolved = torch.complex(out_real, out_imag)
+            
+            if self.use_noise:
+                 sigma_in = sigma_val.permute(0, 4, 2, 1, 3).expand(B, R, C, H, W_freq)
+                 dt_sqrt = torch.sqrt(dt.view(B, 1, 1, 1, 1).clamp_min(0.0))
+                 amp = sigma_in * (self.noise_scale * dt_sqrt)
+                 noise = torch.randn_like(h_evolved) * amp
+                 h_evolved = h_evolved + noise
         else:
-            noise = torch.zeros_like(h_freq)
-        h_evolved = h_freq * lambda_k + noise
+            dt_ = dt.view(B, -1)
+            dt_expanded = dt_.view(B, 1, 1, 1, 1, 1)
+            nu = nu_rate.permute(0, 4, 2, 1, 3) * dt_expanded.view(B, 1, 1, 1, 1)
+            theta = theta_rate.permute(0, 4, 2, 1, 3) * dt_expanded.view(B, 1, 1, 1, 1)
+            decay = torch.exp(-nu)
+            rotate = torch.exp(1j * theta)
+            lambda_k = decay * rotate
+            h_evolved = h_freq * lambda_k
+            if self.use_noise:
+                sigma_b = sigma_val.permute(0, 4, 2, 1, 3)
+                dt_sqrt = torch.sqrt(dt_.clamp_min(0.0)).view(B, 1, 1, 1, 1)
+                amp = sigma_b * (self.noise_scale * dt_sqrt)
+                noise = torch.randn_like(h_freq) * amp
+                h_evolved = h_evolved + noise
+
         h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
         return h_out.permute(0, 2, 3, 4, 1)
 
     def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         x_flat = x_curr.squeeze(2)
         nu_rate, theta_rate, sigma = self.estimator(x_flat)
-        params = (nu_rate, theta_rate, sigma)
+        params = (nu_rate.unsqueeze(1), theta_rate.unsqueeze(1), sigma.unsqueeze(1))
         return self.forward_step(h_trans, dt, params)
 
 
@@ -348,7 +521,7 @@ class SimplifiedHKLFLayer(nn.Module):
             self.dt_ref = 1.0
         self.inj_k = float(getattr(args, "inj_k", 2.0))
         self.inj_k = max(self.inj_k, 0.0)
-        self.hamiltonian = HamiltonianGenerator(self.emb_ch)
+        self.hamiltonian = HamiltonianGenerator(self.emb_ch, height=H)
         self.lie_transport = LieTransport(chunk_size=32)
         self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq, use_noise=use_noise, noise_scale=noise_scale)
         self.proj_out = nn.Linear(self.rank, 1)
@@ -514,10 +687,12 @@ class BottleneckAttention(nn.Module):
         x_norm = self.norm(x_flat)
         qkv = self.qkv(x_norm).reshape(BN, N, 3, self.num_heads, Cc // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x_attn = (attn @ v).transpose(1, 2).reshape(BN, N, Cc)
+        
+        x_attn = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0, scale=self.scale
+        )
+        
+        x_attn = x_attn.transpose(1, 2).reshape(BN, N, Cc)
         x_attn = self.proj(x_attn)
         x_attn = self.proj_drop(x_attn)
         out = shortcut + x_attn
