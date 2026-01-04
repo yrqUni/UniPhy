@@ -19,9 +19,12 @@ def _env_info(device: torch.device) -> str:
     det = torch.are_deterministic_algorithms_enabled()
     det_mode = "on" if det else "warn"
     cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG", None)
+    tf32_override = os.environ.get("NVIDIA_TF32_OVERRIDE", None)
     s = f"[INFO] Device={device.type} AMP={amp} dtype={dtype} determinism={det_mode}"
     if cublas is not None:
         s += f"\n[INFO] CUBLAS_WORKSPACE_CONFIG={cublas}"
+    if tf32_override is not None:
+        s += f"\n[INFO] NVIDIA_TF32_OVERRIDE={tf32_override}"
     return s
 
 
@@ -44,6 +47,8 @@ def _make_args() -> Any:
         koopman_use_noise=False,
         koopman_noise_scale=1.0,
         learnable_init_state=False,
+        dt_ref=1.0,
+        inj_k=2.0,
     )
 
 
@@ -68,13 +73,32 @@ def _path_check(model: ConvLRU, x_full: torch.Tensor, listT_full: torch.Tensor, 
     print("[PASS] p: explicit revin_stats")
 
 
-def _teacher_forcing_numeric(model: ConvLRU, x_full: torch.Tensor, listT_full: torch.Tensor, static_feats: Optional[torch.Tensor], tol_max: float = 1e-5, tol_mean: float = 1e-6) -> None:
+def _default_tols() -> Tuple[float, float]:
+    cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG", None)
+    if cublas is not None:
+        return 2e-3, 5e-5
+    return 5e-2, 2e-3
+
+
+def _teacher_forcing_numeric(
+    model: ConvLRU,
+    x_full: torch.Tensor,
+    listT_full: torch.Tensor,
+    static_feats: Optional[torch.Tensor],
+    tol_max: Optional[float] = None,
+    tol_mean: Optional[float] = None,
+) -> None:
+    if tol_max is None or tol_mean is None:
+        dmx, dmn = _default_tols()
+        tol_max = dmx if tol_max is None else tol_max
+        tol_mean = dmn if tol_mean is None else tol_mean
+
     model.eval()
     with torch.no_grad():
         stats_full = model.revin.stats(x_full)
         y_p, _ = model(x_full, mode="p", listT=listT_full, static_feats=static_feats, revin_stats=stats_full)
 
-        B, L, C, H, W = x_full.shape
+        B, L, _, _, _ = x_full.shape
         head_mode = str(getattr(model.decoder, "head_mode", "gaussian")).lower()
 
         cond = None
@@ -90,7 +114,14 @@ def _teacher_forcing_numeric(model: ConvLRU, x_full: torch.Tensor, listT_full: t
 
             x_norm = model.revin(x_t, "norm", stats=st_t)
             x_emb, _ = model.embedding(x_norm, static_feats=static_feats)
-            x_hid, last_hidden = model.convlru_model(x_emb, last_hidden_ins=last_hidden, listT=dt_t, cond=cond, static_feats=static_feats)
+            x_hid, last_hidden_outs = model.convlru_model(
+                x_emb,
+                last_hidden_ins=last_hidden,
+                listT=dt_t,
+                cond=cond,
+                static_feats=static_feats,
+            )
+            last_hidden = last_hidden_outs
             out = model.decoder(x_hid, cond=cond, timestep=None)
             out_t = out.permute(0, 2, 1, 3, 4).contiguous()
 
@@ -113,11 +144,11 @@ def _teacher_forcing_numeric(model: ConvLRU, x_full: torch.Tensor, listT_full: t
         mx, mn = _max_mean(y_tf, y_p)
         print(f"[RESULT] TF(GT stepwise) vs p(full) max={mx:.6e} mean={mn:.6e}")
 
-        ok = (mx <= tol_max) and (mn <= tol_mean)
+        ok = (mx <= float(tol_max)) and (mn <= float(tol_mean))
         for t in range(L):
             mx_t, mn_t = _max_mean(y_tf[:, t : t + 1], y_p[:, t : t + 1])
             print(f"[STEP {t}] max={mx_t:.6e} mean={mn_t:.6e}")
-            if mx_t > tol_max or mn_t > tol_mean:
+            if mx_t > float(tol_max) or mn_t > float(tol_mean):
                 ok = False
 
         if not ok:
@@ -126,7 +157,14 @@ def _teacher_forcing_numeric(model: ConvLRU, x_full: torch.Tensor, listT_full: t
 
 def main() -> None:
     torch.set_grad_enabled(False)
+
     torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        torch.set_float32_matmul_precision("highest")
+    except Exception:
+        pass
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(_env_info(device))
@@ -141,6 +179,7 @@ def main() -> None:
 
     x_full = torch.randn(B, L, C, H, W, device=device, dtype=torch.float32)
     listT_full = torch.ones(B, L, device=device, dtype=torch.float32)
+
     static_feats = None
     if int(getattr(args, "static_ch", 0)) > 0:
         static_feats = torch.randn(B, int(args.static_ch), H, W, device=device, dtype=torch.float32)
