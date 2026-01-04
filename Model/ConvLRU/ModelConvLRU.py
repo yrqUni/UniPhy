@@ -98,7 +98,6 @@ try:
         grid_x_raw = w_norm - flow_u * dt_val
         grid_y = h_norm - flow_v * dt_val
 
-        # Periodic Boundary Condition for W (Longitude)
         grid_x_shifted = grid_x_raw + 1.0
         grid_x_mod = grid_x_shifted - 2.0 * tl.floor(grid_x_shifted * 0.5)
         grid_x = grid_x_mod - 1.0
@@ -192,6 +191,53 @@ class FactorizedPeriodicConv3d(nn.Module):
         return self.depth_conv(x_sp)
 
 
+class ChannelAttention2D(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(int(int(channels) // int(reduction)), 4)
+        self.mlp = nn.Sequential(
+            nn.Linear(int(channels), hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, int(channels), bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        BL, C, H, W = x.shape
+        avg_pool = torch.mean(x, dim=(2, 3), keepdim=False)
+        max_pool, _ = torch.max(x.reshape(BL, C, -1), dim=-1)
+        attn = torch.sigmoid(self.mlp(avg_pool) + self.mlp(max_pool)).view(BL, C, 1, 1)
+        return x * attn
+
+
+class SpatialAttention2D(nn.Module):
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        k = int(kernel_size)
+        pad = k // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=k, padding=pad, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        attn = torch.cat([avg_out, max_out], dim=1)
+        attn = torch.sigmoid(self.conv(attn))
+        return x * attn
+
+
+class CBAM2DPerStep(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16, spatial_kernel: int = 7):
+        super().__init__()
+        self.ca = ChannelAttention2D(int(channels), int(reduction))
+        self.sa = SpatialAttention2D(int(spatial_kernel))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, L, H, W = x.shape
+        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
+        x_flat = self.ca(x_flat)
+        x_flat = self.sa(x_flat)
+        return x_flat.view(B, L, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+
+
 class LatitudeAwareSE(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
@@ -204,23 +250,24 @@ class LatitudeAwareSE(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, H, W]
-        B, C, H, W = x.shape
-        # Pool longitude (W), keep latitude (H)
-        # y: [B, C, H]
-        y = x.mean(dim=-1)
-        
-        # Permute for Linear: [B, H, C]
-        y = y.permute(0, 2, 1)
-        
-        y = self.fc1(y)
-        y = self.act(y)
-        y = self.fc2(y)
-        y = self.sigmoid(y)
-        
-        # Restore: [B, H, C] -> [B, C, H] -> [B, C, H, 1]
-        y = y.permute(0, 2, 1).unsqueeze(-1)
-        
+        if x.dim() == 5:
+            B, C, L, H, W = x.shape
+            y = x.mean(dim=-1)
+            y = y.permute(0, 2, 3, 1)
+            y = self.fc1(y)
+            y = self.act(y)
+            y = self.fc2(y)
+            y = self.sigmoid(y)
+            y = y.permute(0, 3, 1, 2).unsqueeze(-1)
+        else:
+            B, C, H, W = x.shape
+            y = x.mean(dim=-1)
+            y = y.permute(0, 2, 1)
+            y = self.fc1(y)
+            y = self.act(y)
+            y = self.fc2(y)
+            y = self.sigmoid(y)
+            y = y.permute(0, 2, 1).unsqueeze(-1)
         return x * y
 
 
@@ -235,7 +282,6 @@ class GradientOperator(nn.Module):
         elif self.mode in ["learnable", "diffconv"]:
             self.conv_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
             self.conv_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
-            # Initialize close to Sobel/Central Diff
             nn.init.xavier_normal_(self.conv_x.weight)
             nn.init.xavier_normal_(self.conv_y.weight)
 
@@ -246,14 +292,12 @@ class GradientOperator(nn.Module):
             return grad_x, grad_y
         
         if self.mode == "diffconv":
-            # Constraint: weights sum to 0
             w_x = self.conv_x.weight - self.conv_x.weight.mean(dim=(2, 3), keepdim=True)
             w_y = self.conv_y.weight - self.conv_y.weight.mean(dim=(2, 3), keepdim=True)
             grad_x = F.conv2d(x, w_x)
             grad_y = F.conv2d(x, w_y)
             return grad_x, grad_y
             
-        # learnable
         return self.conv_x(x), self.conv_y(x)
 
 
@@ -574,7 +618,6 @@ class SimplifiedHKLFLayer(nn.Module):
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = SpatialGroupNorm(4, self.emb_ch)
         
-        # Latitude-Aware Gating
         self.gate = LatitudeAwareSE(self.emb_ch)
 
     def forward(
@@ -626,7 +669,6 @@ class SimplifiedHKLFLayer(nn.Module):
         out = self.post_ifft_proj(out)
         out = self.norm(out)
         
-        # Latitude-Aware Gating
         out_gated = self.gate(out)
         x_out = x + out_gated
         
@@ -1029,14 +1071,13 @@ class Decoder(nn.Module):
             if self.pre_shuffle_conv.bias is not None:
                 self.pre_shuffle_conv.bias.zero_()
         
-        self.final_out_ch = self.output_ch * 2 # Default Gaussian/Laplace
+        self.final_out_ch = self.output_ch * 2
         if self.dist_mode == "mdn":
             self.num_mixtures = 3
             self.final_out_ch = self.output_ch * 3 * self.num_mixtures
         
         self.c_out = nn.Conv3d(out_ch_after_up, self.final_out_ch, kernel_size=(1, 1, 1), padding="same")
         self.time_embed = None 
-        # Note: Diffusion head logic removed as dist_mode supersedes it for now
         self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, timestep: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1153,7 +1194,6 @@ class ConvLRU(nn.Module):
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
             
-            # Simple Gaussian handling for compatibility with existing training loop
             if str(self.decoder.dist_mode).lower() == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
@@ -1161,7 +1201,6 @@ class ConvLRU(nn.Module):
                     sigma = sigma * stats.stdev
                 return torch.cat([mu, sigma], dim=2), last_hidden_outs
             
-            # Pass through for other modes (Laplace, MDN) - assumes training loop handles them
             if out_tensor.size(2) == self.revin.num_features:
                 return self.revin(out_tensor, "denorm", stats=stats), last_hidden_outs
             return out_tensor, last_hidden_outs
@@ -1196,8 +1235,6 @@ class ConvLRU(nn.Module):
             out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
             x_step_mean = mu_denorm
         else:
-            # Fallback for inference with other modes: just take first channel chunk as mean approximation
-            # For real usage, would need specific sampling/decoding logic per distribution
             if x_step_dist.size(2) >= self.revin.num_features:
                  x_mean_approx = x_step_dist[:, :, :self.revin.num_features]
                  x_step_dist_denorm = self.revin(x_mean_approx, "denorm", stats=stats)
