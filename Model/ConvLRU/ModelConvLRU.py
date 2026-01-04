@@ -321,7 +321,6 @@ class LieTransport(nn.Module):
             
             if use_triton_grid:
                 sampling_grid = torch.empty((B * curr_R, H, W, 2), device=h_prev.device, dtype=h_prev.dtype)
-                
                 dt_contiguous = dt.view(B).contiguous()
                 flow_contiguous = flow.contiguous()
                 
@@ -597,8 +596,10 @@ class GatedConvBlock(nn.Module):
         self.norm = SpatialGroupNorm(4, int(channels))
         self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
-        self.pw_conv_in = nn.Conv3d(int(channels), int(channels) * 2, kernel_size=1)
-        self.pw_conv_out = nn.Conv3d(int(channels), int(channels), kernel_size=1)
+        
+        self.pw_conv_in = nn.Linear(int(channels), int(channels) * 2)
+        self.pw_conv_out = nn.Linear(int(channels), int(channels))
+        
         self.cbam = CBAM2DPerStep(int(channels), reduction=16) if self.use_cbam else None
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -614,12 +615,16 @@ class GatedConvBlock(nn.Module):
             affine = self.cond_proj(cond_rs)
             gamma, beta = torch.chunk(affine, 2, dim=1)
             x = x * (1 + gamma) + beta
+        
+        x = x.permute(0, 2, 3, 4, 1)
         x = self.pw_conv_in(x)
-        x1, x2 = torch.chunk(x, 2, dim=1)
+        x1, x2 = torch.chunk(x, 2, dim=4)
         x = x1 * torch.sigmoid(x2)
+        x = self.pw_conv_out(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        
         if self.cbam is not None:
             x = self.cbam(x)
-        x = self.pw_conv_out(x)
         return residual + x
 
 
@@ -633,18 +638,25 @@ class FeedForward(nn.Module):
         self.use_cbam = bool(getattr(args, "use_cbam", False))
         self.static_ch = int(getattr(args, "static_ch", 0))
         self.conv_type = str(getattr(args, "ConvType", "conv"))
-        self.c_in = nn.Conv3d(self.emb_ch, self.hidden_dim, kernel_size=(1, 1, 1), padding="same")
+        
+        self.c_in = nn.Linear(self.emb_ch, self.hidden_dim)
         cond_ch = self.emb_ch if self.static_ch > 0 else None
         self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, use_cbam=self.use_cbam, cond_channels=cond_ch, conv_type=self.conv_type)
-        self.c_out = nn.Conv3d(self.hidden_dim, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
+        self.c_out = nn.Linear(self.hidden_dim, self.emb_ch)
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
+        x = x.permute(0, 2, 3, 4, 1)
         x = self.c_in(x)
         x = self.act(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        
         x = self.block(x, cond=cond)
+        
+        x = x.permute(0, 2, 3, 4, 1)
         x = self.c_out(x)
+        x = x.permute(0, 4, 1, 2, 3)
         return residual + x
 
 
