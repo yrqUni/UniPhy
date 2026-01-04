@@ -280,8 +280,8 @@ class GradientOperator(nn.Module):
             self.register_buffer("kernel_x", torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
             self.register_buffer("kernel_y", torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
         elif self.mode in ["learnable", "diffconv"]:
-            self.conv_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
-            self.conv_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+            self.conv_x = nn.Conv2d(1, 1, 3, padding=0, bias=False)
+            self.conv_y = nn.Conv2d(1, 1, 3, padding=0, bias=False)
             nn.init.xavier_normal_(self.conv_x.weight)
             nn.init.xavier_normal_(self.conv_y.weight)
 
