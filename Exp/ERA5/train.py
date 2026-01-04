@@ -23,7 +23,7 @@ sys.path.append("/nfs/ConvLRU/Model/ConvLRU")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
-from ModelConvLRU import ConvLRU
+from ModelConvLRU import ConvLRU, RevINStats
 
 warnings.filterwarnings("ignore")
 
@@ -68,89 +68,67 @@ set_random_seed(1017, deterministic=False)
 
 class Args:
     def __init__(self) -> None:
-        # A100 High-Res Configuration
-        self.input_size = (721, 1440)  # Full ERA5 resolution
+        self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
         self.static_ch = 6
         self.hidden_factor = (7, 12)
-        
-        # Model Capacity (Increased for A100)
         self.emb_ch = 64
-        self.lru_rank = 64
         self.convlru_num_blocks = 6
-        self.ffn_ratio = 1.5  # Kept light to save memory for Spatial dims
-        
-        # Advanced Features
         self.use_cbam = True
+        self.lru_rank = 64
         self.down_mode = "shuffle"
         self.head_mode = "gaussian"
-        self.dist_mode = "gaussian"  # Options: gaussian, laplace, mdn
-        self.diff_mode = "learnable" # Options: sobel, learnable, diffconv
-        
-        # Diffusion (if enabled)
+        self.dist_mode = "gaussian"
+        self.diff_mode = "learnable"
         self.diffusion_steps = 1000
-        
-        # Data & Path
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ""
+        self.train_batch_size = 1
+        self.eval_batch_size = 1
+        self.epochs = 128
         self.log_path = "./convlru_base/logs"
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
-        
-        # Training Dynamics (A100 Optimized)
-        self.train_batch_size = 1      # Limit due to high resolution
-        self.eval_batch_size = 1
-        self.grad_accum_steps = 8      # Effective batch size = 1 * 8 = 8
-        self.epochs = 128
-        self.lr = 2e-4                 # Slightly higher for OneCycleLR
-        self.weight_decay = 0.05
-        self.grad_clip = 1.0
-        
-        # Optimization & System
         self.do_eval = True
-        self.use_tf32 = True           # Enable for A100
-        self.use_compile = True        # Enable PyTorch 2.0+ Compiler
-        self.use_amp = True
-        self.amp_dtype = "bf16"        # BFloat16 is best for A100
-        
-        # Scheduling
+        self.use_tf32 = True
+        self.use_compile = True
+        self.lr = 2e-4
+        self.weight_decay = 0.05
         self.use_scheduler = True
         self.init_lr_scheduler = False
-        
-        # Loss Config
         self.loss = ["lat", "gdl", "spec"]
         self.gdl_every = 1
         self.spec_every = 1
         self.T = 6
+        self.use_amp = True
+        self.amp_dtype = "bf16"
+        self.grad_clip = 1.0
         self.sample_k = 9
-        
-        # Logging
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
         self.wandb_run_name = "PhyConvLRU_A100_Optim"
         self.wandb_group = "v5.0.0_Triton"
         self.wandb_mode = "online"
-        self.log_every = 10
-        self.wandb_every = 10
-        
-        # Task Mode
-        self.train_mode = "p_only"     # 'p_only' or 'alignment'
+        self.train_mode = "p_only"
         self.learnable_init_state = True
+        self.ffn_ratio = 1.5
         self.ConvType = "dcn"
         self.Arch = "bifpn"
-        self.enable_no_sync = True     # Optimize DDP sync for gradient accumulation
-
+        self.grad_accum_steps = 8
+        self.enable_no_sync = True
+        self.log_every = 10
+        self.wandb_every = 10
         self.check_args()
 
     def check_args(self) -> None:
         if bool(self.use_compile):
-            print("[Info] Torch Compile Enabled (Mode: default). Expect warm-up overhead.")
+            print("[Info] Torch Compile Enabled.")
         if int(self.grad_accum_steps) < 1:
             raise ValueError("grad_accum_steps must be >= 1")
 
@@ -187,7 +165,7 @@ def setup_logging(args: Args) -> None:
 
 def keep_latest_ckpts(ckpt_dir: str) -> None:
     ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
-    if len(ckpt_files) <= 10:  # Keep fewer checkpoints to save disk space
+    if len(ckpt_files) <= 10:
         return
     ckpt_files.sort(key=os.path.getmtime, reverse=True)
     for file_path in ckpt_files[10:]:
@@ -509,16 +487,15 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         rank=dist.get_rank(),
         gpus=dist.get_world_size(),
     )
-    # Recommended num_workers for A100: at least 4-8
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
     train_dataloader = DataLoader(
         train_dataset,
         sampler=train_sampler,
         batch_size=args.train_batch_size,
-        num_workers=8,  # Increased for A100
+        num_workers=1,
         pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True,
+        prefetch_factor=1,
+        persistent_workers=False,
     )
     len_train_dataloader = len(train_dataloader)
 
@@ -660,6 +637,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             revin_stats=revin_stats
                         )
                         preds_recursive_last = preds_recursive_seq[:, -1:]
+                        
                         target_last_real = model.module.revin(target_last, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target_last, "denorm", stats=revin_stats)
                         
                         if preds_recursive_last.shape[2] == 2 * C_gt:
@@ -803,10 +781,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 eval_dataset,
                 sampler=eval_sampler,
                 batch_size=args.eval_batch_size,
-                num_workers=8, # Increased
+                num_workers=1,
                 pin_memory=True,
-                prefetch_factor=2,
-                persistent_workers=True,
+                prefetch_factor=1,
+                persistent_workers=False,
             )
             eval_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep + 1}/{args.epochs}") if rank == 0 else eval_dataloader
             with torch.no_grad():
