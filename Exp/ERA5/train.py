@@ -111,8 +111,8 @@ class Args:
         self.train_mode = "p_only"
         self.learnable_init_state = True
         self.ffn_ratio = 1.5
-        self.ConvType = "dcn"
-        self.Arch = "bifpn"
+        self.ConvType = "conv"
+        self.Arch = "unet"
         self.check_args()
 
     def check_args(self) -> None:
