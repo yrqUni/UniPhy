@@ -39,6 +39,8 @@ MODEL_ARG_KEYS = [
     "static_ch",
     "down_mode",
     "head_mode",
+    "dist_mode",
+    "diff_mode",
     "learnable_init_state",
     "ffn_ratio",
     "ConvType",
@@ -66,75 +68,91 @@ set_random_seed(1017, deterministic=False)
 
 class Args:
     def __init__(self) -> None:
-        self.input_size = (721, 1440)
+        # A100 High-Res Configuration
+        self.input_size = (721, 1440)  # Full ERA5 resolution
         self.input_ch = 30
         self.out_ch = 30
         self.static_ch = 6
         self.hidden_factor = (7, 12)
-        self.emb_ch = 96
+        
+        # Model Capacity (Increased for A100)
+        self.emb_ch = 64
+        self.lru_rank = 64
         self.convlru_num_blocks = 6
+        self.ffn_ratio = 1.5  # Kept light to save memory for Spatial dims
+        
+        # Advanced Features
         self.use_cbam = True
-        self.lru_rank = 32
         self.down_mode = "shuffle"
         self.head_mode = "gaussian"
+        self.dist_mode = "gaussian"  # Options: gaussian, laplace, mdn
+        self.diff_mode = "learnable" # Options: sobel, learnable, diffconv
+        
+        # Diffusion (if enabled)
         self.diffusion_steps = 1000
+        
+        # Data & Path
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ""
-        self.train_batch_size = 1
-        self.eval_batch_size = 1
-        self.epochs = 128
         self.log_path = "./convlru_base/logs"
         self.ckpt_dir = "./convlru_base/ckpt"
         self.ckpt_step = 0.25
-        self.do_eval = False
-        self.use_tf32 = False
-        self.use_compile = False
-        self.lr = 1e-5
+        
+        # Training Dynamics (A100 Optimized)
+        self.train_batch_size = 1      # Limit due to high resolution
+        self.eval_batch_size = 1
+        self.grad_accum_steps = 8      # Effective batch size = 1 * 8 = 8
+        self.epochs = 128
+        self.lr = 2e-4                 # Slightly higher for OneCycleLR
         self.weight_decay = 0.05
-        self.use_scheduler = False
+        self.grad_clip = 1.0
+        
+        # Optimization & System
+        self.do_eval = True
+        self.use_tf32 = True           # Enable for A100
+        self.use_compile = True        # Enable PyTorch 2.0+ Compiler
+        self.use_amp = True
+        self.amp_dtype = "bf16"        # BFloat16 is best for A100
+        
+        # Scheduling
+        self.use_scheduler = True
         self.init_lr_scheduler = False
+        
+        # Loss Config
         self.loss = ["lat", "gdl", "spec"]
         self.gdl_every = 1
         self.spec_every = 1
         self.T = 6
-        self.use_amp = False
-        self.amp_dtype = "bf16"
-        self.grad_clip = 1.0
         self.sample_k = 9
+        
+        # Logging
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
-        self.wandb_run_name = "PhyConvLRU_HKLF"
-        self.wandb_group = "v4.0.0"
+        self.wandb_run_name = "PhyConvLRU_A100_Optim"
+        self.wandb_group = "v5.0.0_Triton"
         self.wandb_mode = "online"
-        self.train_mode = "p_only"
+        self.log_every = 10
+        self.wandb_every = 10
+        
+        # Task Mode
+        self.train_mode = "p_only"     # 'p_only' or 'alignment'
         self.learnable_init_state = True
-        self.ffn_ratio = 1.5
         self.ConvType = "dcn"
         self.Arch = "bifpn"
-        self.grad_accum_steps = 1
-        self.enable_no_sync = True
-        self.log_every = 1
-        self.wandb_every = 1
+        self.enable_no_sync = True     # Optimize DDP sync for gradient accumulation
+
         self.check_args()
 
     def check_args(self) -> None:
         if bool(self.use_compile):
-            print("[Warning] Torch Compile is experimental.")
+            print("[Info] Torch Compile Enabled (Mode: default). Expect warm-up overhead.")
         if int(self.grad_accum_steps) < 1:
             raise ValueError("grad_accum_steps must be >= 1")
-        if int(self.gdl_every) < 1:
-            raise ValueError("gdl_every must be >= 1")
-        if int(self.spec_every) < 1:
-            raise ValueError("spec_every must be >= 1")
-        if int(self.log_every) < 1:
-            raise ValueError("log_every must be >= 1")
-        if int(self.wandb_every) < 1:
-            raise ValueError("wandb_every must be >= 1")
 
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
@@ -169,10 +187,10 @@ def setup_logging(args: Args) -> None:
 
 def keep_latest_ckpts(ckpt_dir: str) -> None:
     ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
-    if len(ckpt_files) <= 64:
+    if len(ckpt_files) <= 10:  # Keep fewer checkpoints to save disk space
         return
     ckpt_files.sort(key=os.path.getmtime, reverse=True)
-    for file_path in ckpt_files[64:]:
+    for file_path in ckpt_files[10:]:
         try:
             os.remove(file_path)
         except Exception:
@@ -324,10 +342,20 @@ def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> to
     return (nll * w).mean()
 
 
+def laplace_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    _, _, _, H, _ = preds.shape
+    C_gt = targets.size(2)
+    mu = preds[:, :, :C_gt]
+    b = preds[:, :, C_gt:]
+    w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
+    nll = torch.log(2 * b) + torch.abs(targets - mu) / b
+    return (nll * w).mean()
+
+
 def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     _, _, C_pred, H, _ = preds.shape
     C_gt = targets.shape[2]
-    if C_pred == 2 * C_gt:
+    if C_pred > C_gt:
         preds = preds[:, :, :C_gt]
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
@@ -355,7 +383,7 @@ _LRU_GATE_MEAN: Dict[Any, float] = {}
 def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
     for name, module in model_to_hook.named_modules():
-        if name.endswith("lru_layer.gate_conv"):
+        if name.endswith("lru_layer.gate.sigmoid"):
             if "convlru_blocks." in name:
                 try:
                     tag = int(name.split("convlru_blocks.")[1].split(".")[0])
@@ -481,15 +509,16 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         rank=dist.get_rank(),
         gpus=dist.get_world_size(),
     )
+    # Recommended num_workers for A100: at least 4-8
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
     train_dataloader = DataLoader(
         train_dataset,
         sampler=train_sampler,
         batch_size=args.train_batch_size,
-        num_workers=1,
+        num_workers=8,  # Increased for A100
         pin_memory=True,
-        prefetch_factor=1,
-        persistent_workers=False,
+        prefetch_factor=2,
+        persistent_workers=True,
     )
     len_train_dataloader = len(train_dataloader)
 
@@ -507,7 +536,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         scheduler = lr_scheduler.OneCycleLR(
             opt,
             max_lr=float(args.lr),
-            steps_per_epoch=len_train_dataloader,
+            steps_per_epoch=len_train_dataloader // int(args.grad_accum_steps),
             epochs=int(args.epochs),
         )
 
@@ -521,14 +550,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             map_location=f"cuda:{local_rank}",
             args=args,
             restore_model_args=False,
-        )
-
-    if bool(args.init_lr_scheduler) and bool(args.use_scheduler):
-        scheduler = lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=float(args.lr),
-            steps_per_epoch=len_train_dataloader,
-            epochs=int(args.epochs) - int(start_epoch),
         )
 
     if not bool(args.use_scheduler):
@@ -546,6 +567,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     use_no_sync = bool(args.enable_no_sync)
     train_mode = str(getattr(args, "train_mode", "p_only")).lower()
     enable_alignment = train_mode == "alignment"
+    dist_mode = str(getattr(args, "dist_mode", "gaussian")).lower()
 
     global_step = int(start_epoch) * len_train_dataloader
     opt.zero_grad(set_to_none=True)
@@ -595,17 +617,26 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with sync_ctx:
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
+                    revin_stats = model.module.revin.stats(x) if isinstance(model, DDP) else model.revin.stats(x)
+                    preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep, revin_stats=revin_stats)
                     if isinstance(preds, tuple):
                         preds = preds[0]
 
                     C_gt = target.shape[2]
-                    if preds.shape[2] == 2 * C_gt:
-                        loss_main = gaussian_nll_loss_weighted(preds, target)
+                    p_det = None
+                    loss_main = torch.tensor(0.0, device=x.device)
+
+                    if dist_mode == "gaussian":
+                        target_real = model.module.revin(target, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target, "denorm", stats=revin_stats)
+                        loss_main = gaussian_nll_loss_weighted(preds, target_real)
                         p_det = preds[:, :, :C_gt]
+                    elif dist_mode == "laplace":
+                        loss_main = laplace_nll_loss_weighted(preds, target)
+                        p_det_norm = preds[:, :, :C_gt]
+                        p_det = model.module.revin(p_det_norm, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(p_det_norm, "denorm", stats=revin_stats)
                     else:
                         loss_main = latitude_weighted_l1(preds, target)
-                        p_det = preds
+                        p_det = preds[:, :, :C_gt] if preds.shape[2] >= C_gt else preds
 
                     loss_solver = torch.tensor(0.0, device=x.device)
                     loss_consistency = torch.tensor(0.0, device=x.device)
@@ -626,14 +657,17 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             listT_future=listT_future,
                             static_feats=static_feats,
                             timestep=timestep,
+                            revin_stats=revin_stats
                         )
                         preds_recursive_last = preds_recursive_seq[:, -1:]
+                        target_last_real = model.module.revin(target_last, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target_last, "denorm", stats=revin_stats)
+                        
                         if preds_recursive_last.shape[2] == 2 * C_gt:
-                            loss_solver = F.l1_loss(preds_recursive_last[:, :, :C_gt], target_last)
                             p_rec_det = preds_recursive_last[:, :, :C_gt]
                         else:
-                            loss_solver = F.l1_loss(preds_recursive_last, target_last)
                             p_rec_det = preds_recursive_last
+                        
+                        loss_solver = F.l1_loss(p_rec_det, target_last_real)
                         p_direct_last = p_det[:, -1:].detach()
                         loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
 
@@ -641,14 +675,16 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     if "lat" in args.loss:
                         loss = loss + loss_main
 
+                    target_real_for_aux = model.module.revin(target, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target, "denorm", stats=revin_stats)
+
                     gdl_loss = torch.tensor(0.0, device=x.device)
                     if "gdl" in args.loss and should_compute("gdl", global_step + 1, args):
-                        gdl_loss = gradient_difference_loss(p_det, target)
+                        gdl_loss = gradient_difference_loss(p_det, target_real_for_aux)
                         loss = loss + 0.5 * gdl_loss
 
                     spec_loss = torch.tensor(0.0, device=x.device)
                     if "spec" in args.loss and should_compute("spec", global_step + 1, args):
-                        spec_loss = spectral_loss(p_det, target)
+                        spec_loss = spectral_loss(p_det, target_real_for_aux)
                         loss = loss + 0.1 * spec_loss
 
                     if enable_alignment:
@@ -687,7 +723,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             if do_log or do_wandb:
                 with torch.no_grad():
-                    metric_l1 = F.l1_loss(p_det, target)
+                    metric_l1 = F.l1_loss(p_det, target_real_for_aux)
                     loss_tensor = loss.detach()
                     l1_tensor = metric_l1.detach()
                     dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -716,7 +752,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     "train/epoch": ep + 1,
                     "train/step": int(global_step),
                     "train/loss": float(avg_loss) if avg_loss is not None else float(loss.detach().item()),
-                    "train/loss_l1": float(avg_l1) if avg_l1 is not None else float(F.l1_loss(p_det, target).detach().item()),
+                    "train/loss_l1": float(avg_l1) if avg_l1 is not None else float(F.l1_loss(p_det, target_real_for_aux).detach().item()),
                     "train/loss_solver": float(avg_solver) if avg_solver is not None else float(loss_solver.detach().item()),
                     "train/loss_consistency": float(loss_consistency.detach().item()) if enable_alignment else 0.0,
                     "train/loss_gdl": float(gdl_loss.detach().item()),
@@ -767,10 +803,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 eval_dataset,
                 sampler=eval_sampler,
                 batch_size=args.eval_batch_size,
-                num_workers=1,
+                num_workers=8, # Increased
                 pin_memory=True,
-                prefetch_factor=1,
-                persistent_workers=False,
+                prefetch_factor=2,
+                persistent_workers=True,
             )
             eval_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep + 1}/{args.epochs}") if rank == 0 else eval_dataloader
             with torch.no_grad():
@@ -793,6 +829,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     timestep = sample_timestep(args, cond_data.size(0), cond_data.device, cond_data.dtype)
 
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                        revin_stats = model.module.revin.stats(cond_data) if isinstance(model, DDP) else model.revin.stats(cond_data)
                         preds = model(
                             cond_data,
                             mode="i",
@@ -801,12 +838,16 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             listT_future=listT_future,
                             static_feats=static_feats,
                             timestep=timestep,
+                            revin_stats=revin_stats
                         )
+                        
+                        target_real = model.module.revin(target, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target, "denorm", stats=revin_stats)
+                        
                         if preds.shape[2] == 2 * target.shape[2]:
                             preds_cmp = preds[:, :, : target.shape[2]]
                         else:
                             preds_cmp = preds
-                        loss_eval = F.l1_loss(preds_cmp, target)
+                        loss_eval = F.l1_loss(preds_cmp, target_real)
 
                     tot_tensor = loss_eval.detach()
                     dist.all_reduce(tot_tensor, op=dist.ReduceOp.SUM)
