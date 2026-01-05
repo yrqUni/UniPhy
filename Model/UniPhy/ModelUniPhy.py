@@ -1322,7 +1322,7 @@ class UniPhy(nn.Module):
                 mu = x_step_dist[:, :, :out_ch, :, :]
                 scale = x_step_dist[:, :, out_ch:, :, :]
                 if mu.size(2) == self.revin.num_features:
-                    mu = self.revin(mu, "denorm", stats=stats)
+                    mu_denorm = self.revin(mu, "denorm", stats=stats)
                     scale_denorm = scale * stats.stdev
                 else:
                     mu_denorm = mu
