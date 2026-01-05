@@ -19,7 +19,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Adjust paths as per your environment
 sys.path.append("/nfs/ConvLRU/Model/ConvLRU")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
@@ -693,14 +692,14 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             global_step += 1
 
-            do_log = (rank == 0) and ((global_step % int(args.log_every)) == 0 or train_step == len_train_dataloader)
-            do_wandb = (rank == 0) and bool(getattr(args, "use_wandb", False)) and ((global_step % int(args.wandb_every)) == 0 or train_step == len_train_dataloader)
+            is_log_step = ((global_step % int(args.log_every)) == 0 or train_step == len_train_dataloader)
+            is_wandb_step = bool(getattr(args, "use_wandb", False)) and ((global_step % int(args.wandb_every)) == 0 or train_step == len_train_dataloader)
 
             avg_loss = None
             avg_l1 = None
             avg_solver = None
 
-            if do_log or do_wandb:
+            if is_log_step or is_wandb_step:
                 with torch.no_grad():
                     metric_l1 = F.l1_loss(p_det, target_real_for_aux)
                     loss_tensor = loss.detach()
@@ -716,36 +715,36 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     else:
                         avg_solver = 0.0
 
-            if do_log:
-                current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
-                gate_str = format_gate_means()
-                msg = f"Ep {ep + 1} - step {train_step}/{len_train_dataloader} - L: {avg_loss:.4f} - L1: {avg_l1:.4f} - Solv: {avg_solver:.4f} - LR: {current_lr:.2e} - {gate_str}"
-                if isinstance(train_iter, tqdm):
-                    train_iter.set_description(msg)
-                logging.info(msg)
-
-            if do_wandb:
-                current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
-                grad_norm, _, _ = get_grad_stats(model) if rank == 0 else (0.0, 0.0, 0)
-                log_dict: Dict[str, Any] = {
-                    "train/epoch": ep + 1,
-                    "train/step": int(global_step),
-                    "train/loss": float(avg_loss) if avg_loss is not None else float(loss.detach().item()),
-                    "train/loss_l1": float(avg_l1) if avg_l1 is not None else float(F.l1_loss(p_det, target_real_for_aux).detach().item()),
-                    "train/loss_solver": float(avg_solver) if avg_solver is not None else float(loss_solver.detach().item()),
-                    "train/loss_consistency": float(loss_consistency.detach().item()) if enable_alignment else 0.0,
-                    "train/loss_gdl": float(gdl_loss.detach().item()),
-                    "train/loss_spec": float(spec_loss.detach().item()),
-                    "train/lr": float(current_lr),
-                    "train/grad_norm": float(grad_norm),
-                    "train/train_mode": str(train_mode),
-                }
-                for k, v in _LRU_GATE_MEAN.items():
-                    g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
-                    log_dict[g_key] = float(v)
-                wandb.log(log_dict, step=int(global_step))
-
             if rank == 0:
+                if is_log_step:
+                    current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
+                    gate_str = format_gate_means()
+                    msg = f"Ep {ep + 1} - step {train_step}/{len_train_dataloader} - L: {avg_loss:.4f} - L1: {avg_l1:.4f} - Solv: {avg_solver:.4f} - LR: {current_lr:.2e} - {gate_str}"
+                    if isinstance(train_iter, tqdm):
+                        train_iter.set_description(msg)
+                    logging.info(msg)
+
+                if is_wandb_step:
+                    current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
+                    grad_norm, _, _ = get_grad_stats(model)
+                    log_dict: Dict[str, Any] = {
+                        "train/epoch": ep + 1,
+                        "train/step": int(global_step),
+                        "train/loss": float(avg_loss),
+                        "train/loss_l1": float(avg_l1),
+                        "train/loss_solver": float(avg_solver),
+                        "train/loss_consistency": float(loss_consistency.detach().item()) if enable_alignment else 0.0,
+                        "train/loss_gdl": float(gdl_loss.detach().item()),
+                        "train/loss_spec": float(spec_loss.detach().item()),
+                        "train/lr": float(current_lr),
+                        "train/grad_norm": float(grad_norm),
+                        "train/train_mode": str(train_mode),
+                    }
+                    for k, v in _LRU_GATE_MEAN.items():
+                        g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
+                        log_dict[g_key] = float(v)
+                    wandb.log(log_dict, step=int(global_step))
+
                 ckpt_every = max(1, int(len_train_dataloader * float(args.ckpt_step)))
                 if (train_step % ckpt_every == 0) or (train_step == len_train_dataloader):
                     loss_for_ckpt = float(avg_loss) if avg_loss is not None else float(loss.detach().item())
