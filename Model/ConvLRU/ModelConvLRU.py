@@ -164,6 +164,16 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     return x
 
 
+class SpatialGroupNorm(nn.GroupNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 5:
+            B, C, L, H, W = x.shape
+            y = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
+            y = super().forward(y)
+            return y.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+        return super().forward(x)
+
+
 class FactorizedPeriodicConv3d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7, conv_type: str = "conv"):
         super().__init__()
@@ -1154,9 +1164,12 @@ class ConvLRU(nn.Module):
             sigma = x_step_dist[:, :, out_ch:, :, :]
             if mu.size(2) == self.revin.num_features:
                 mu = self.revin(mu, "denorm", stats=stats)
-                sigma = sigma * stats.stdev
-            out_list.append(torch.cat([mu, sigma], dim=2))
-            x_step_mean = mu
+                sigma_denorm = sigma * stats.stdev
+            else:
+                mu_denorm = mu
+                sigma_denorm = sigma
+            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+            x_step_mean = mu_denorm
         else:
             if x_step_dist.size(2) >= self.revin.num_features:
                  x_mean_approx = x_step_dist[:, :, :self.revin.num_features]
