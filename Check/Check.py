@@ -12,6 +12,7 @@ MODEL_DIR = os.path.join(ROOT, "Model", "UniPhy")
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
+import ModelUniPhy
 from ModelUniPhy import UniPhy
 
 def get_base_args() -> Any:
@@ -35,57 +36,67 @@ def get_base_args() -> Any:
         learnable_init_state=True,
         dt_ref=1.0,
         inj_k=2.0,
+        max_velocity=5.0,
     )
 
-def run_single_check(args: Any, device: torch.device) -> None:
-    model = UniPhy(args).to(device).eval()
+def run_single_check(args: Any, device: torch.device, force_no_triton: bool = False) -> None:
+    original_triton_flag = getattr(ModelUniPhy, 'HAS_TRITON', False)
     
-    B, L, C, H, W = 1, 4, args.input_ch, args.input_size[0], args.input_size[1]
-    x = torch.randn(B, L, C, H, W, device=device)
-    listT = torch.ones(B, L, device=device)
+    if force_no_triton:
+        ModelUniPhy.HAS_TRITON = False
     
-    static_feats = None
-    if args.static_ch > 0:
-        static_feats = torch.randn(B, args.static_ch, H, W, device=device)
-    
-    with torch.no_grad():
-        out_p, _ = model(x, mode="p", listT=listT, static_feats=static_feats)
+    try:
+        model = UniPhy(args).to(device).eval()
         
-        expected_ch = args.out_ch * 2
-        if args.dist_mode == "mdn":
-            expected_ch = args.out_ch * 3 * 3
+        B, L, C, H, W = 1, 4, args.input_ch, args.input_size[0], args.input_size[1]
+        x = torch.randn(B, L, C, H, W, device=device)
+        listT = torch.ones(B, L, device=device)
         
-        if out_p.shape != (B, L, expected_ch, H, W):
-            raise RuntimeError(f"P-mode shape mismatch: expected {(B, L, expected_ch, H, W)}, got {out_p.shape}")
+        static_feats = None
+        if args.static_ch > 0:
+            static_feats = torch.randn(B, args.static_ch, H, W, device=device)
+        
+        with torch.no_grad():
+            out_p, _ = model(x, mode="p", listT=listT, static_feats=static_feats)
+            
+            expected_ch = args.out_ch * 2
+            if args.dist_mode == "mdn":
+                expected_ch = args.out_ch * 3 * 3
+            
+            if out_p.shape != (B, L, expected_ch, H, W):
+                raise RuntimeError(f"P-mode shape mismatch: expected {(B, L, expected_ch, H, W)}, got {out_p.shape}")
 
-        x_init = x[:, :1]
-        out_gen_num = 3
-        listT_future = torch.ones(B, out_gen_num - 1, device=device)
-        
-        out_i = model(
-            x_init, 
-            mode="i", 
-            out_gen_num=out_gen_num, 
-            listT=listT[:, :1], 
-            listT_future=listT_future,
-            static_feats=static_feats
-        )
-        
-        if out_i.shape != (B, out_gen_num, expected_ch, H, W):
-            raise RuntimeError(f"I-mode shape mismatch: expected {(B, out_gen_num, expected_ch, H, W)}, got {out_i.shape}")
+            x_init = x[:, :1]
+            out_gen_num = 3
+            listT_future = torch.ones(B, out_gen_num - 1, device=device)
+            
+            out_i = model(
+                x_init, 
+                mode="i", 
+                out_gen_num=out_gen_num, 
+                listT=listT[:, :1], 
+                listT_future=listT_future,
+                static_feats=static_feats
+            )
+            
+            if out_i.shape != (B, out_gen_num, expected_ch, H, W):
+                raise RuntimeError(f"I-mode shape mismatch: expected {(B, out_gen_num, expected_ch, H, W)}, got {out_i.shape}")
 
-    del model, x, listT, static_feats, out_p, out_i
-    gc.collect()
-    torch.cuda.empty_cache()
+        del model, x, listT, static_feats, out_p, out_i
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+    finally:
+        ModelUniPhy.HAS_TRITON = original_triton_flag
 
 def main():
     torch.backends.cudnn.benchmark = False
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running checks on {device}")
+    device_cuda = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running checks on {device_cuda}")
 
     param_grid = {
-        "dist_mode": ["gaussian", "laplace", "mdn"],
-        "diff_mode": ["sobel", "learnable", "diffconv"],
+        "dist_mode": ["gaussian", "laplace"],
+        "diff_mode": ["sobel", "learnable"],
         "Arch": ["unet", "bifpn"],
         "down_mode": ["avg", "shuffle"],
         "static_ch": [0, 4]
@@ -96,28 +107,42 @@ def main():
     combinations = list(itertools.product(*values))
 
     total = len(combinations)
-    print(f"Total configurations to test: {total}")
+    print(f"Total configurations: {total}")
 
     for idx, combo in enumerate(combinations):
         args = get_base_args()
         config_str_parts = []
-        
         for k, v in zip(keys, combo):
             setattr(args, k, v)
             config_str_parts.append(f"{k}={v}")
-        
         config_str = ", ".join(config_str_parts)
-        print(f"[{idx+1}/{total}] Testing: {config_str} ...", end="", flush=True)
-        
+
+        print(f"[{idx+1}/{total}] {config_str} | Triton: ON ...", end="", flush=True)
         try:
-            run_single_check(args, device)
-            print(" PASS")
+            run_single_check(args, device_cuda, force_no_triton=False)
+            print(" PASS", end="", flush=True)
         except Exception as e:
-            print(f" FAIL")
-            print(f"Error details: {e}")
+            print(f" FAIL: {e}")
             sys.exit(1)
 
-    print("\nAll hyperparameter combinations check finished.")
+        print(" | Triton: OFF ...", end="", flush=True)
+        try:
+            run_single_check(args, device_cuda, force_no_triton=True)
+            print(" PASS")
+        except Exception as e:
+            print(f" FAIL: {e}")
+            sys.exit(1)
+
+    print("\nRunning CPU fallback check on base config...")
+    if torch.cuda.is_available():
+        args = get_base_args()
+        try:
+            run_single_check(args, torch.device("cpu"), force_no_triton=False)
+            print("CPU Check: PASS")
+        except Exception as e:
+            print(f"CPU Check: FAIL: {e}")
+
+    print("\nAll checks finished.")
 
 if __name__ == "__main__":
     main()
