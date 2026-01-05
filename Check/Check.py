@@ -13,7 +13,7 @@ if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
 import ModelUniPhy
-from ModelUniPhy import UniPhy
+from ModelUniPhy import UniPhy, RevINStats
 
 def get_base_args() -> Any:
     return SimpleNamespace(
@@ -39,6 +39,62 @@ def get_base_args() -> Any:
         max_velocity=5.0,
     )
 
+def check_p_i_equivalence(model: torch.nn.Module, device: torch.device, args: Any) -> None:
+    B, L, H, W = 1, 4, args.input_size[0], args.input_size[1]
+    C = args.input_ch
+    
+    x_init = torch.randn(B, 1, C, H, W, device=device)
+    
+    static_feats = None
+    if args.static_ch > 0:
+        static_feats = torch.randn(B, args.static_ch, H, W, device=device)
+        
+    stats = model.revin.stats(x_init)
+    
+    listT_i = torch.ones(B, 1, device=device)
+    listT_future = torch.ones(B, L - 1, device=device)
+    
+    with torch.no_grad():
+        out_i = model(
+            x_init,
+            mode="i",
+            out_gen_num=L,
+            listT=listT_i,
+            listT_future=listT_future,
+            static_feats=static_feats,
+            revin_stats=stats 
+        )
+        
+        preds_i_mean = out_i[..., :args.out_ch, :, :] 
+        
+        p_input_list = [x_init]
+        for t in range(L - 1):
+            pred_t = preds_i_mean[:, t:t+1]
+            if pred_t.shape[2] != C:
+                if pred_t.shape[2] > C:
+                    pred_t = pred_t[:, :, :C]
+                else:
+                    diff = C - pred_t.shape[2]
+                    zeros = torch.zeros(B, 1, diff, H, W, device=device)
+                    pred_t = torch.cat([pred_t, zeros], dim=2)
+            p_input_list.append(pred_t)
+            
+        x_p = torch.cat(p_input_list, dim=1)
+        
+        listT_p = torch.ones(B, L, device=device)
+        
+        out_p, _ = model(
+            x_p,
+            mode="p",
+            listT=listT_p,
+            static_feats=static_feats,
+            revin_stats=stats 
+        )
+        
+        diff = (out_i - out_p).abs().max().item()
+        if diff > 1e-4:
+            raise RuntimeError(f"P/I Equivalence Check Failed! Max diff: {diff:.2e}")
+
 def run_single_check(args: Any, device: torch.device, force_no_triton: bool = False) -> None:
     original_triton_flag = getattr(ModelUniPhy, 'HAS_TRITON', False)
     
@@ -47,47 +103,13 @@ def run_single_check(args: Any, device: torch.device, force_no_triton: bool = Fa
     
     try:
         model = UniPhy(args).to(device).eval()
-        
-        B, L, C, H, W = 1, 4, args.input_ch, args.input_size[0], args.input_size[1]
-        x = torch.randn(B, L, C, H, W, device=device)
-        listT = torch.ones(B, L, device=device)
-        
-        static_feats = None
-        if args.static_ch > 0:
-            static_feats = torch.randn(B, args.static_ch, H, W, device=device)
-        
-        with torch.no_grad():
-            out_p, _ = model(x, mode="p", listT=listT, static_feats=static_feats)
-            
-            expected_ch = args.out_ch * 2
-            if args.dist_mode == "mdn":
-                expected_ch = args.out_ch * 3 * 3
-            
-            if out_p.shape != (B, L, expected_ch, H, W):
-                raise RuntimeError(f"P-mode shape mismatch: expected {(B, L, expected_ch, H, W)}, got {out_p.shape}")
-
-            x_init = x[:, :1]
-            out_gen_num = 3
-            listT_future = torch.ones(B, out_gen_num - 1, device=device)
-            
-            out_i = model(
-                x_init, 
-                mode="i", 
-                out_gen_num=out_gen_num, 
-                listT=listT[:, :1], 
-                listT_future=listT_future,
-                static_feats=static_feats
-            )
-            
-            if out_i.shape != (B, out_gen_num, expected_ch, H, W):
-                raise RuntimeError(f"I-mode shape mismatch: expected {(B, out_gen_num, expected_ch, H, W)}, got {out_i.shape}")
-
-        del model, x, listT, static_feats, out_p, out_i
-        gc.collect()
-        torch.cuda.empty_cache()
+        check_p_i_equivalence(model, device, args)
         
     finally:
         ModelUniPhy.HAS_TRITON = original_triton_flag
+    
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def main():
     torch.backends.cudnn.benchmark = False

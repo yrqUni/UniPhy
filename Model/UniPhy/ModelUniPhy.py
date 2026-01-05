@@ -676,11 +676,11 @@ class PhysicalRecurrentLayer(nn.Module):
         for t in range(L):
             x_t = x[:, :, t : t + 1]
             dt_t = dt_seq[:, t : t + 1]
-            flow_t = flows_all[:, t]
+            flow_t = flows_all[:, t].contiguous()
             
-            nu_t = koopman_params_all[0][:, t]
-            theta_t = koopman_params_all[1][:, t]
-            sigma_t = koopman_params_all[2][:, t]
+            nu_t = koopman_params_all[0][:, t].contiguous()
+            theta_t = koopman_params_all[1][:, t].contiguous()
+            sigma_t = koopman_params_all[2][:, t].contiguous()
             params_t = (nu_t, theta_t, sigma_t)
             
             h_trans = self.lie_transport(curr_h, flow_t, dt_t)
@@ -1322,7 +1322,7 @@ class UniPhy(nn.Module):
                 mu = x_step_dist[:, :, :out_ch, :, :]
                 scale = x_step_dist[:, :, out_ch:, :, :]
                 if mu.size(2) == self.revin.num_features:
-                    mu_denorm = self.revin(mu, "denorm", stats=stats)
+                    mu = self.revin(mu, "denorm", stats=stats)
                     scale_denorm = scale * stats.stdev
                 else:
                     mu_denorm = mu
