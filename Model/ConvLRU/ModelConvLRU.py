@@ -690,12 +690,10 @@ class SimplifiedHKLFLayer(nn.Module):
             h_stack[:, :, t] = curr_h
             
         out = self.proj_out(h_stack).squeeze(-1)
-        out = out.permute(0, 2, 1, 3, 4)
         out = self.post_ifft_proj(out)
         out = self.norm(out)
         out_gated = self.gate(out)
-        x_out = x.permute(0, 2, 1, 3, 4) + out_gated
-        x_out = x_out.permute(0, 2, 1, 3, 4)
+        x_out = x + out_gated
         
         return x_out, curr_h
 
