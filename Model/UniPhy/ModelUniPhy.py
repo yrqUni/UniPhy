@@ -410,13 +410,22 @@ class LieAdvection(nn.Module):
             dt_view = dt.view(B_G, 1, 1, 1)
             k1 = flows
             grid_mid = base_grid - 0.5 * k1.permute(0, 2, 3, 1) * dt_view
+            
+            grid_mid_x = grid_mid[..., 0]
+            grid_mid_y = grid_mid[..., 1]
+            grid_mid_x = torch.remainder(grid_mid_x + 1.0, 2.0) - 1.0
+            grid_mid = torch.stack([grid_mid_x, grid_mid_y], dim=-1)
+            
             k2 = F.grid_sample(flows, grid_mid, mode='bilinear', padding_mode='border', align_corners=False)
             grid = base_grid - k2.permute(0, 2, 3, 1) * dt_view
             
         else:
             raise NotImplementedError
             
-        return grid
+        grid_x = grid[..., 0]
+        grid_y = grid[..., 1]
+        grid_x = torch.remainder(grid_x + 1.0, 2.0) - 1.0
+        return torch.stack([grid_x, grid_y], dim=-1)
 
     def forward(self, h_prev: torch.Tensor, flows: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         B, C, H, W, R = h_prev.shape
