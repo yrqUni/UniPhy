@@ -548,7 +548,7 @@ class SpectralKoopmanSDE(nn.Module):
                 *h_real.stride(),
                 *nu_in.stride(),
                 dt_in.stride(0),
-                BLOCK_SIZE=256
+                *out_real.stride(),
             )
             h_evolved = torch.complex(out_real, out_imag)
             if self.use_noise:
@@ -725,7 +725,6 @@ class GatedConvBlock(nn.Module):
             fused_glu_kernel[grid](
                 x, x_out,
                 n_elements_out, C_out,
-                BLOCK_SIZE=1024
             )
             x = x_out
         else:
