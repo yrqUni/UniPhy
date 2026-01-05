@@ -555,7 +555,6 @@ class SpectralKoopmanSDE(nn.Module):
                 noise = torch.randn_like(h_freq_in) * amp
                 h_evolved = h_evolved + noise
 
-        # Correctly inverse FFT on spatial/frequency dimensions
         h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
         return h_out.permute(0, 2, 3, 4, 1)
 
@@ -587,31 +586,31 @@ class StaticInitState(nn.Module):
         return out.permute(0, 1, 3, 4, 2)
 
 class SimplifiedHKLFLayer(nn.Module):
-    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], rank: int = 64, use_noise: bool = False, noise_scale: float = 1.0, dt_ref: float = 1.0, inj_k: float = 2.0, diff_mode: str = "sobel", static_ch: int = 0, learnable_init_state: bool = False):
         super().__init__()
-        self.emb_ch = int(getattr(args, "emb_ch", 64))
-        H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
-        self.rank = int(getattr(args, "lru_rank", 64))
+        self.emb_ch = int(emb_ch)
+        H, W = int(input_shape[0]), int(input_shape[1])
+        self.rank = int(rank)
         self.W_freq = W // 2 + 1
-        use_noise = bool(getattr(args, "koopman_use_noise", False))
-        noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
-        self.dt_ref = float(getattr(args, "dt_ref", getattr(args, "T", 1.0)))
+        self.use_noise = bool(use_noise)
+        self.noise_scale = float(noise_scale)
+        self.dt_ref = float(dt_ref)
         if self.dt_ref <= 0:
             self.dt_ref = 1.0
-        self.inj_k = float(getattr(args, "inj_k", 2.0))
+        self.inj_k = float(inj_k)
         self.inj_k = max(self.inj_k, 0.0)
         
-        diff_mode = str(getattr(args, "diff_mode", "sobel"))
+        diff_mode = str(diff_mode)
         self.flow_groups = 4
         if self.rank % self.flow_groups != 0:
             self.flow_groups = 1
             
         self.hamiltonian = HamiltonianGenerator(self.emb_ch, height=H, groups=self.flow_groups, diff_mode=diff_mode)
         self.lie_transport = LieTransport(rank=self.rank, groups=self.flow_groups)
-        self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq, use_noise=use_noise, noise_scale=noise_scale)
+        self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq, use_noise=self.use_noise, noise_scale=self.noise_scale)
         self.proj_out = nn.Linear(self.rank, 1)
-        if bool(getattr(args, "learnable_init_state", False)) and int(getattr(args, "static_ch", 0)) > 0:
-            self.init_state = StaticInitState(int(args.static_ch), self.emb_ch, self.rank, H, W)
+        if bool(learnable_init_state) and int(static_ch) > 0:
+            self.init_state = StaticInitState(int(static_ch), self.emb_ch, self.rank, H, W)
         else:
             self.init_state = None
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
@@ -723,14 +722,14 @@ class GatedConvBlock(nn.Module):
         return residual + x
 
 class FeedForward(nn.Module):
-    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], ffn_ratio: float = 4.0, static_ch: int = 0, conv_type: str = "conv"):
         super().__init__()
-        self.emb_ch = int(getattr(args, "emb_ch", 64))
-        self.ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
+        self.emb_ch = int(emb_ch)
+        self.ffn_ratio = float(ffn_ratio)
         self.hidden_dim = int(self.emb_ch * self.ffn_ratio)
-        self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
-        self.static_ch = int(getattr(args, "static_ch", 0))
-        self.conv_type = str(getattr(args, "ConvType", "conv"))
+        self.hidden_size = (int(input_shape[0]), int(input_shape[1]))
+        self.static_ch = int(static_ch)
+        self.conv_type = str(conv_type)
         self.c_in = nn.Linear(self.emb_ch, self.hidden_dim)
         cond_ch = self.emb_ch if self.static_ch > 0 else None
         self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch, conv_type=self.conv_type)
@@ -750,10 +749,10 @@ class FeedForward(nn.Module):
         return residual + x
 
 class ConvLRUBlock(nn.Module):
-    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], lru_args: Dict[str, Any], ffn_args: Dict[str, Any]):
         super().__init__()
-        self.lru_layer = SimplifiedHKLFLayer(args, input_downsp_shape)
-        self.feed_forward = FeedForward(args, input_downsp_shape)
+        self.lru_layer = SimplifiedHKLFLayer(emb_ch, input_shape, **lru_args)
+        self.feed_forward = FeedForward(emb_ch, input_shape, **ffn_args)
 
     def forward(
         self,
@@ -841,22 +840,21 @@ class ShuffleDownsample(nn.Module):
         return self.proj(x)
 
 class ConvLRUModel(nn.Module):
-    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], num_layers: int, arch_mode: str, down_mode: str, lru_args: Dict[str, Any], ffn_args: Dict[str, Any]):
         super().__init__()
-        self.args = args
-        self.arch_mode = str(getattr(args, "Arch", "unet")).lower()
+        self.arch_mode = str(arch_mode).lower()
         self.use_unet = self.arch_mode != "no_unet"
-        layers = int(getattr(args, "convlru_num_blocks", 2))
-        self.down_mode = str(getattr(args, "down_mode", "avg")).lower()
+        layers = int(num_layers)
+        self.down_mode = str(down_mode).lower()
         self.down_blocks = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         self.csa_blocks = nn.ModuleList()
         self.downsamples = nn.ModuleList()
-        C = int(getattr(args, "emb_ch", 64))
-        H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
+        C = int(emb_ch)
+        H, W = int(input_shape[0]), int(input_shape[1])
         
         if not self.use_unet:
-            self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
+            self.convlru_blocks = nn.ModuleList([ConvLRUBlock(C, (H, W), lru_args, ffn_args) for _ in range(layers)])
             self.upsample = None
             self.fusion = None
             self.mid_attention = None
@@ -864,7 +862,7 @@ class ConvLRUModel(nn.Module):
             curr_H, curr_W = H, W
             encoder_res: List[Tuple[int, int]] = []
             for i in range(layers):
-                self.down_blocks.append(ConvLRUBlock(self.args, (C, curr_H, curr_W)))
+                self.down_blocks.append(ConvLRUBlock(C, (curr_H, curr_W), lru_args, ffn_args))
                 encoder_res.append((curr_H, curr_W))
                 if i < layers - 1:
                     if self.down_mode == "conv":
@@ -887,7 +885,7 @@ class ConvLRUModel(nn.Module):
             self.mid_attention = BottleneckAttention(C, num_heads=heads)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
-                self.up_blocks.append(ConvLRUBlock(self.args, (C, h_up, w_up)))
+                self.up_blocks.append(ConvLRUBlock(C, (h_up, w_up), lru_args, ffn_args))
                 if self.arch_mode == "bifpn":
                     self.csa_blocks.append(BiFPNFusion(C))
                 else:
@@ -963,15 +961,14 @@ class ConvLRUModel(nn.Module):
         return x, last_hidden_outs
 
 class Embedding(nn.Module):
-    def __init__(self, args: Any):
+    def __init__(self, input_ch: int, input_size: Tuple[int, int], emb_ch: int, static_ch: int = 0, hidden_factor: Tuple[int, int] = (2, 2)):
         super().__init__()
-        self.input_ch = int(getattr(args, "input_ch", 1))
-        self.input_size = tuple(getattr(args, "input_size", (64, 64)))
-        self.emb_ch = int(getattr(args, "emb_ch", 64))
+        self.input_ch = int(input_ch)
+        self.input_size = tuple(input_size)
+        self.emb_ch = int(emb_ch)
         self.emb_hidden_ch = self.emb_ch
-        self.static_ch = int(getattr(args, "static_ch", 0))
-        hf = getattr(args, "hidden_factor", (2, 2))
-        self.rH, self.rW = int(hf[0]), int(hf[1])
+        self.static_ch = int(static_ch)
+        self.rH, self.rW = int(hidden_factor[0]), int(hidden_factor[1])
         self.input_ch_total = self.input_ch + 4
         self.patch_embed = nn.Conv3d(
             self.input_ch_total,
@@ -985,7 +982,7 @@ class Embedding(nn.Module):
             out_dummy = self.patch_embed(dummy)
             _, _, _, H, W = out_dummy.shape
             self.input_downsp_shape = (self.emb_ch, int(H), int(W))
-        self.register_buffer("grid_embed", self._make_grid(args), persistent=False)
+        self.register_buffer("grid_embed", self._make_grid(self.input_size), persistent=False)
         self.hidden_size = (int(self.input_downsp_shape[1]), int(self.input_downsp_shape[2]))
         if self.static_ch > 0:
             self.static_embed = nn.Sequential(
@@ -1000,8 +997,8 @@ class Embedding(nn.Module):
         self.activation = nn.SiLU()
         self.norm = SpatialGroupNorm(4, self.emb_ch)
 
-    def _make_grid(self, args: Any) -> torch.Tensor:
-        H, W = tuple(getattr(args, "input_size", (64, 64)))
+    def _make_grid(self, input_size: Tuple[int, int]) -> torch.Tensor:
+        H, W = tuple(input_size)
         lat = torch.linspace(-math.pi / 2, math.pi / 2, int(H))
         lon = torch.linspace(0, 2 * math.pi, int(W))
         grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
@@ -1049,15 +1046,12 @@ class DiffusionHead(nn.Module):
         return self.mlp(emb.to(dtype=self.mlp[0].weight.dtype))
 
 class Decoder(nn.Module):
-    def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
+    def __init__(self, out_ch: int, emb_ch: int, dist_mode: str = "gaussian", hidden_factor: Tuple[int, int] = (2, 2)):
         super().__init__()
-        self.args = args
-        self.dist_mode = str(getattr(args, "dist_mode", "gaussian")).lower()
-        self.output_ch = int(getattr(args, "out_ch", 1))
-        self.emb_ch = int(getattr(args, "emb_ch", 64))
-        self.static_ch = int(getattr(args, "static_ch", 0))
-        hf = getattr(args, "hidden_factor", (2, 2))
-        self.rH, self.rW = int(hf[0]), int(hf[1])
+        self.dist_mode = str(dist_mode).lower()
+        self.output_ch = int(out_ch)
+        self.emb_ch = int(emb_ch)
+        self.rH, self.rW = int(hidden_factor[0]), int(hidden_factor[1])
         out_ch_after_up = self.emb_ch
         self.pre_shuffle_conv = nn.Conv3d(
             in_channels=self.emb_ch,
@@ -1154,10 +1148,61 @@ class ConvLRU(nn.Module):
     def __init__(self, args: Any):
         super().__init__()
         self.args = args
-        self.embedding = Embedding(self.args)
-        self.convlru_model = ConvLRUModel(self.args, self.embedding.input_downsp_shape)
-        self.decoder = Decoder(self.args, self.embedding.input_downsp_shape)
-        self.revin = RevIN(int(getattr(args, "input_ch", 1)), affine=True)
+        input_ch = int(getattr(args, "input_ch", 1))
+        input_size = tuple(getattr(args, "input_size", (64, 64)))
+        emb_ch = int(getattr(args, "emb_ch", 64))
+        static_ch = int(getattr(args, "static_ch", 0))
+        hidden_factor = getattr(args, "hidden_factor", (2, 2))
+        
+        self.embedding = Embedding(input_ch, input_size, emb_ch, static_ch, hidden_factor)
+        
+        convlru_num_blocks = int(getattr(args, "convlru_num_blocks", 2))
+        arch = getattr(args, "Arch", "unet")
+        down_mode = getattr(args, "down_mode", "avg")
+        
+        lru_rank = int(getattr(args, "lru_rank", 64))
+        koopman_use_noise = bool(getattr(args, "koopman_use_noise", False))
+        koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
+        dt_ref = float(getattr(args, "dt_ref", getattr(args, "T", 1.0)))
+        inj_k = float(getattr(args, "inj_k", 2.0))
+        diff_mode = str(getattr(args, "diff_mode", "sobel"))
+        learnable_init_state = bool(getattr(args, "learnable_init_state", False))
+        
+        lru_args = {
+            "rank": lru_rank,
+            "use_noise": koopman_use_noise,
+            "noise_scale": koopman_noise_scale,
+            "dt_ref": dt_ref,
+            "inj_k": inj_k,
+            "diff_mode": diff_mode,
+            "static_ch": static_ch,
+            "learnable_init_state": learnable_init_state
+        }
+        
+        ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
+        conv_type = str(getattr(args, "ConvType", "conv"))
+        ffn_args = {
+            "ffn_ratio": ffn_ratio,
+            "static_ch": static_ch,
+            "conv_type": conv_type
+        }
+        
+        self.convlru_model = ConvLRUModel(
+            emb_ch,
+            self.embedding.input_downsp_shape[1:],
+            convlru_num_blocks,
+            arch,
+            down_mode,
+            lru_args,
+            ffn_args
+        )
+        
+        out_ch = int(getattr(args, "out_ch", 1))
+        dist_mode = getattr(args, "dist_mode", "gaussian")
+        
+        self.decoder = Decoder(out_ch, emb_ch, dist_mode, hidden_factor)
+        self.revin = RevIN(input_ch, affine=True)
+        
         skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion", "dct_matrix", "grid_embed", "sobel"]
         with torch.no_grad():
             for n, p in self.named_parameters():
