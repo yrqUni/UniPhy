@@ -113,7 +113,7 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
-        self.wandb_run_name = "PhyConvLRU_A100_Optim"
+        self.wandb_run_name = ""
         self.wandb_group = "v5.0.0_Triton"
         self.wandb_mode = "online"
         self.train_mode = "p_only"
@@ -121,11 +121,10 @@ class Args:
         self.ffn_ratio = 1.5
         self.ConvType = "dcn"
         self.Arch = "bifpn"
-        # Disabled Gradient Accumulation as requested (set to 1)
         self.grad_accum_steps = 1
         self.enable_no_sync = True
-        self.log_every = 10
-        self.wandb_every = 10
+        self.log_every = 1
+        self.wandb_every = 1
         self.check_args()
 
     def check_args(self) -> None:
