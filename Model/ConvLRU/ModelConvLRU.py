@@ -578,12 +578,6 @@ class SpectralKoopmanSDE(nn.Module):
         h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
         return h_out.permute(0, 2, 3, 4, 1)
 
-    def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-        x_flat = x_curr.squeeze(2)
-        nu_rate, theta_rate, sigma = self.estimator(x_flat)
-        params = (nu_rate.unsqueeze(1), theta_rate.unsqueeze(1), sigma.unsqueeze(1))
-        return self.forward_step(h_trans, dt, params)
-
 class StaticInitState(nn.Module):
     def __init__(self, static_ch: int, emb_ch: int, rank: int, S: int, W_freq: int):
         super().__init__()
@@ -698,7 +692,7 @@ class SimplifiedHKLFLayer(nn.Module):
         return x_out, curr_h
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, conv_type: str = "conv"):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, cond_channels: Optional[int] = None, conv_type: str = "conv"):
         super().__init__()
         self.dw_conv = FactorizedPeriodicConv3d(int(channels), int(channels), kernel_size=int(kernel_size), conv_type=str(conv_type))
         self.norm = SpatialGroupNorm(4, int(channels))
@@ -754,7 +748,7 @@ class FeedForward(nn.Module):
         self.conv_type = str(conv_type)
         self.c_in = nn.Linear(self.emb_ch, self.hidden_dim)
         cond_ch = self.emb_ch if self.static_ch > 0 else None
-        self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch, conv_type=self.conv_type)
+        self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, cond_channels=cond_ch, conv_type=self.conv_type)
         self.c_out = nn.Linear(self.hidden_dim, self.emb_ch)
         self.act = nn.SiLU()
 
@@ -1014,7 +1008,7 @@ class Embedding(nn.Module):
         else:
             self.static_embed = None
         cond_ch = self.emb_ch if self.static_ch > 0 else None
-        self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch)])
+        self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, cond_channels=cond_ch)])
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
         self.norm = SpatialGroupNorm(4, self.emb_ch)
@@ -1045,28 +1039,6 @@ class Embedding(nn.Module):
         x = self.norm(x)
         return x, cond
 
-class DiffusionHead(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = int(dim)
-        if self.dim % 2 != 0:
-            raise ValueError(f"DiffusionHead dim must be even, got {self.dim}")
-        self.mlp = nn.Sequential(
-            nn.Linear(self.dim, self.dim * 4),
-            nn.SiLU(),
-            nn.Linear(self.dim * 4, self.dim),
-        )
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        device = t.device
-        half_dim = self.dim // 2
-        scale = math.log(10000.0) / max(1, (half_dim - 1))
-        t_float = t.float()
-        freqs = torch.exp(torch.arange(half_dim, device=device, dtype=t_float.dtype) * (-scale))
-        tt = t_float.view(-1, 1) * freqs.view(1, -1)
-        emb = torch.cat([tt.sin(), tt.cos()], dim=-1)
-        return self.mlp(emb.to(dtype=self.mlp[0].weight.dtype))
-
 class Decoder(nn.Module):
     def __init__(self, out_ch: int, emb_ch: int, dist_mode: str = "gaussian", hidden_factor: Tuple[int, int] = (2, 2)):
         super().__init__()
@@ -1092,10 +1064,9 @@ class Decoder(nn.Module):
             self.final_out_ch = self.output_ch * 3 * self.num_mixtures
         
         self.c_out = nn.Conv3d(out_ch_after_up, self.final_out_ch, kernel_size=(1, 1, 1), padding="same")
-        self.time_embed = None 
         self.activation = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None, timestep: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.pre_shuffle_conv(x)
         x = pixel_shuffle_hw_3d(x, self.rH, self.rW)
         x = self.activation(x)
@@ -1254,7 +1225,7 @@ class ConvLRU(nn.Module):
             x_norm = self.revin(x, "norm", stats=stats)
             x_emb, _ = self.embedding(x_norm, static_feats=static_feats)
             x_hid, last_hidden_outs = self.convlru_model(x_emb, listT=listT, cond=cond, static_feats=static_feats)
-            out = self.decoder(x_hid, cond=cond, timestep=timestep)
+            out = self.decoder(x_hid, cond=cond)
             out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
             if str(self.decoder.dist_mode).lower() == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
@@ -1277,7 +1248,7 @@ class ConvLRU(nn.Module):
         x_norm = self.revin(x, "norm", stats=stats)
         x_emb, _ = self.embedding(x_norm, static_feats=static_feats)
         x_hidden, last_hidden_outs = self.convlru_model(x_emb, listT=listT0, cond=cond, static_feats=static_feats)
-        x_dec0 = self.decoder(x_hidden, cond=cond, timestep=timestep)
+        x_dec0 = self.decoder(x_hidden, cond=cond)
         x_step_dist = x_dec0.permute(0, 2, 1, 3, 4).contiguous()
         x_step_dist = x_step_dist[:, -1:, :, :, :]
         
@@ -1287,7 +1258,7 @@ class ConvLRU(nn.Module):
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
             if mu.size(2) == self.revin.num_features:
-                mu_denorm = self.revin(mu, "denorm", stats=stats)
+                mu = self.revin(mu, "denorm", stats=stats)
                 scale_denorm = scale * stats.stdev
             else:
                 mu_denorm = mu
@@ -1323,7 +1294,7 @@ class ConvLRU(nn.Module):
             x_step_norm = self.revin(curr_x, "norm", stats=stats) if curr_x.size(2) == self.revin.num_features else curr_x
             x_in, _ = self.embedding(x_step_norm, static_feats=static_feats)
             x_hidden, last_hidden_outs = self.convlru_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond, static_feats=static_feats)
-            x_dec = self.decoder(x_hidden, cond=cond, timestep=timestep)
+            x_dec = self.decoder(x_hidden, cond=cond)
             x_step_dist = x_dec.permute(0, 2, 1, 3, 4).contiguous()
             x_step_dist = x_step_dist[:, -1:, :, :, :]
             
