@@ -3,7 +3,7 @@ import os
 import sys
 import gc
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -12,7 +12,6 @@ MODEL_DIR = os.path.join(ROOT, "Model", "UniPhy")
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
-import ModelUniPhy
 from ModelUniPhy import UniPhy
 
 
@@ -41,23 +40,30 @@ def get_base_args() -> Any:
     )
 
 
-def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> None:
+def _make_static_feats(args: Any, B: int, H: int, W: int, device: torch.device) -> Optional[torch.Tensor]:
+    if int(getattr(args, "static_ch", 0)) > 0:
+        return torch.randn(B, int(args.static_ch), H, W, device=device)
+    return None
+
+
+def _extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
+    return dist_out[:, :, :out_ch]
+
+
+def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> Tuple[float, str]:
     B, L = 1, 4
     H, W = args.input_size
-    C = args.input_ch
+    C = int(args.input_ch)
 
     model = UniPhy(args).to(device).eval()
 
     x_init = torch.randn(B, 1, C, H, W, device=device)
-
-    static_feats = None
-    if args.static_ch > 0:
-        static_feats = torch.randn(B, args.static_ch, H, W, device=device)
+    static_feats = _make_static_feats(args, B, H, W, device)
 
     stats = model.revin.stats(x_init)
 
-    listT_i = torch.ones(B, 1, device=device)
-    listT_future = torch.ones(B, L - 1, device=device)
+    listT_i = torch.ones(B, 1, device=device, dtype=x_init.dtype)
+    listT_future = torch.ones(B, L - 1, device=device, dtype=x_init.dtype)
 
     with torch.no_grad():
         out_i = model(
@@ -70,21 +76,21 @@ def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> None:
             revin_stats=stats,
         )
 
-        preds_i = out_i[..., :args.out_ch, :, :]
+        mu_i = _extract_mu(out_i, int(args.out_ch))
 
         p_inputs = [x_init]
         for t in range(L - 1):
-            pred_t = preds_i[:, t:t+1]
+            pred_t = mu_i[:, t : t + 1]
             if pred_t.shape[2] != C:
                 if pred_t.shape[2] > C:
                     pred_t = pred_t[:, :, :C]
                 else:
-                    pad = torch.zeros(B, 1, C - pred_t.shape[2], H, W, device=device)
+                    pad = torch.zeros(B, 1, C - pred_t.shape[2], H, W, device=device, dtype=pred_t.dtype)
                     pred_t = torch.cat([pred_t, pad], dim=2)
             p_inputs.append(pred_t)
 
         x_p = torch.cat(p_inputs, dim=1)
-        listT_p = torch.ones(B, L, device=device)
+        listT_p = torch.ones(B, L, device=device, dtype=x_init.dtype)
 
         out_p, _ = model(
             x_p,
@@ -97,15 +103,15 @@ def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> None:
         diff = (out_i - out_p).abs().max().item()
 
     cfg = ", ".join(f"{k}={getattr(args, k)}" for k in vars(args))
-    if diff <= tol:
-        print(f"[PASS] diff={diff:.3e} | {cfg}")
-    else:
-        print(f"[WARN] diff={diff:.3e} | {cfg}")
+    status = "PASS" if diff <= tol else "WARN"
+    msg = f"[{status}] diff={diff:.3e} | {cfg}"
 
     del model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+    return diff, msg
 
 
 def main():
@@ -136,7 +142,8 @@ def main():
             setattr(args, k, v)
 
         print(f"\n[{idx}/{len(combos)}] RUN")
-        check_once(args, device)
+        _, msg = check_once(args, device)
+        print(msg)
 
 
 if __name__ == "__main__":
