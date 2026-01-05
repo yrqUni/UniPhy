@@ -523,10 +523,10 @@ class SpectralKoopmanSDE(nn.Module):
 
     def forward_step(self, h_trans: torch.Tensor, dt: torch.Tensor, params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, C, H, W, R = h_trans.shape
-        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho").permute(0, 2, 3, 4, 1)
+        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho").permute(0, 2, 3, 4, 1).contiguous()
         W_freq = h_freq.shape[-2]
         h_freq = self.mixer(h_freq)
-        h_freq_in = h_freq.permute(0, 4, 1, 2, 3)
+        h_freq_in = h_freq.permute(0, 4, 1, 2, 3).contiguous()
         nu_rate, theta_rate, sigma_val = params
 
         if HAS_TRITON and h_freq_in.device.type == "cuda":
@@ -534,13 +534,11 @@ class SpectralKoopmanSDE(nn.Module):
             theta_in = theta_rate.permute(0, 4, 2, 1, 3)
             nu_in = nu_in.expand(B, R, C, H, W_freq)
             theta_in = theta_in.expand(B, R, C, H, W_freq)
-            
-            h_real = h_freq_in.real
-            h_imag = h_freq_in.imag
+            h_real = h_freq_in.real.contiguous()
+            h_imag = h_freq_in.imag.contiguous()
             out_real = torch.empty_like(h_real)
             out_imag = torch.empty_like(h_imag)
-            dt_in = dt.view(B)
-            
+            dt_in = dt.view(B).contiguous()
             grid = lambda META: (triton.cdiv(B * R * C * H * W_freq, META['BLOCK_SIZE']), )
             fused_koopman_kernel[grid](
                 h_real, h_imag,
@@ -550,7 +548,7 @@ class SpectralKoopmanSDE(nn.Module):
                 *h_real.stride(),
                 *nu_in.stride(),
                 dt_in.stride(0),
-                *out_real.stride(),
+                BLOCK_SIZE=256
             )
             h_evolved = torch.complex(out_real, out_imag)
             if self.use_noise:
@@ -727,6 +725,7 @@ class GatedConvBlock(nn.Module):
             fused_glu_kernel[grid](
                 x, x_out,
                 n_elements_out, C_out,
+                BLOCK_SIZE=1024
             )
             x = x_out
         else:
@@ -1258,7 +1257,7 @@ class ConvLRU(nn.Module):
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
             if mu.size(2) == self.revin.num_features:
-                mu = self.revin(mu, "denorm", stats=stats)
+                mu_denorm = self.revin(mu, "denorm", stats=stats)
                 scale_denorm = scale * stats.stdev
             else:
                 mu_denorm = mu
@@ -1305,6 +1304,9 @@ class ConvLRU(nn.Module):
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm", stats=stats)
                     scale_denorm = scale * stats.stdev
+                else:
+                    mu_denorm = mu
+                    scale_denorm = scale
                 out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2))
                 x_step_mean = mu_denorm
             else:
