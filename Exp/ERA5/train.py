@@ -23,7 +23,7 @@ sys.path.append("/nfs/ConvLRU/Model/UniPhy")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
-from ModelUniPhy import UniPhy, RevINStats
+from ModelUniPhy import UniPhy
 
 warnings.filterwarnings("ignore")
 
@@ -82,7 +82,6 @@ class Args:
         self.down_mode = "shuffle"
         self.dist_mode = "gaussian"
         self.diff_mode = "learnable"
-        self.diffusion_steps = 1000
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
@@ -101,7 +100,6 @@ class Args:
         self.lr = 1e-5
         self.weight_decay = 0.05
         self.use_scheduler = False
-        self.init_lr_scheduler = False
         self.loss = ["lat", "gdl", "spec"]
         self.gdl_every = 1
         self.spec_every = 1
@@ -367,8 +365,8 @@ _LRU_GATE_MEAN: Dict[Any, float] = {}
 def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
     for name, module in model_to_hook.named_modules():
-        if name.endswith("lru_layer.gate.sigmoid"):
-            tag = "unknown"
+        if name.endswith("gate.sigmoid"):
+            tag = name
             if "down_blocks" in name:
                 parts = name.split("down_blocks.")
                 if len(parts) > 1:
@@ -383,8 +381,6 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
                         tag = f"up_{int(parts[1].split('.')[0])}"
                     except Exception:
                         tag = name
-            else:
-                tag = name
 
             def _hook(mod: torch.nn.Module, inp: Tuple[Any, ...], out: torch.Tensor, tag_local: Any = tag) -> None:
                 with torch.no_grad():
@@ -436,20 +432,22 @@ def setup_wandb(rank: int, args: Args) -> None:
     wandb.init(**wandb_kwargs)
 
 
-def sample_timestep(args: Args, batch_size: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
-    if str(getattr(args, "head_mode", "gaussian")).lower() not in ["diffusion", "flow"]:
-        return None
-    steps = int(getattr(args, "diffusion_steps", 1000))
-    t = torch.randint(0, max(1, steps), (batch_size,), device=device)
-    return t.to(dtype=dtype)
-
-
 def should_compute(loss_name: str, global_step: int, args: Args) -> bool:
     if loss_name == "gdl":
         return (global_step % int(args.gdl_every)) == 0
     if loss_name == "spec":
         return (global_step % int(args.spec_every)) == 0
     return True
+
+
+def unwrap_preds(preds_out: Any) -> torch.Tensor:
+    if isinstance(preds_out, (tuple, list)):
+        return preds_out[0]
+    return preds_out
+
+
+def get_revin(ddp_model: torch.nn.Module) -> Any:
+    return ddp_model.module.revin if isinstance(ddp_model, DDP) else ddp_model.revin
 
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
@@ -565,6 +563,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     global_step = int(start_epoch) * len_train_dataloader
     opt.zero_grad(set_to_none=True)
 
+    revin_mod = get_revin(model)
+
     for ep in range(int(start_epoch), int(args.epochs)):
         train_sampler.set_epoch(ep)
         train_iter = tqdm(train_dataloader, desc=f"Epoch {ep + 1}/{args.epochs}") if rank == 0 else train_dataloader
@@ -596,8 +596,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             if static_gpu is not None:
                 static_feats = static_gpu.unsqueeze(0).expand(x.size(0), -1, -1, -1)
 
-            timestep = sample_timestep(args, x.size(0), x.device, x.dtype)
-
             accum_count += 1
             is_accum_boundary = (accum_count % grad_accum_steps) == 0
             is_last_batch = train_step == len_train_dataloader
@@ -610,79 +608,42 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with sync_ctx:
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    revin_stats = model.module.revin.stats(x) if isinstance(model, DDP) else model.revin.stats(x)
-                    preds = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep, revin_stats=revin_stats)
-                    if isinstance(preds, tuple):
-                        preds = preds[0]
+                    revin_stats = revin_mod.stats(x)
+
+                    preds_out = model(x, mode="p", listT=listT, static_feats=static_feats, revin_stats=revin_stats)
+                    preds = unwrap_preds(preds_out)
 
                     C_gt = target.shape[2]
-                    p_det = None
-                    loss_main = torch.tensor(0.0, device=x.device)
+                    target_real = revin_mod(target, "denorm", stats=revin_stats)
 
                     if dist_mode == "gaussian":
-                        target_real = model.module.revin(target, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target, "denorm", stats=revin_stats)
                         loss_main = gaussian_nll_loss_weighted(preds, target_real)
                         p_det = preds[:, :, :C_gt]
                     elif dist_mode == "laplace":
-                        loss_main = laplace_nll_loss_weighted(preds, target)
-                        p_det_norm = preds[:, :, :C_gt]
-                        p_det = model.module.revin(p_det_norm, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(p_det_norm, "denorm", stats=revin_stats)
+                        mu = preds[:, :, :C_gt]
+                        b = preds[:, :, C_gt:]
+                        mu_denorm = revin_mod(mu, "denorm", stats=revin_stats) if mu.shape[2] == revin_mod.num_features else mu
+                        b_denorm = b * revin_stats.stdev if b.shape[2] == revin_mod.num_features else b
+                        preds_denorm = torch.cat([mu_denorm, b_denorm], dim=2)
+                        loss_main = laplace_nll_loss_weighted(preds_denorm, target_real)
+                        p_det = mu_denorm
                     else:
-                        loss_main = latitude_weighted_l1(preds, target)
+                        loss_main = latitude_weighted_l1(preds, target_real)
                         p_det = preds[:, :, :C_gt] if preds.shape[2] >= C_gt else preds
-
-                    loss_solver = torch.tensor(0.0, device=x.device)
-                    loss_consistency = torch.tensor(0.0, device=x.device)
-
-                    if enable_alignment:
-                        x_seed = x[:, -1:]
-                        target_last = target[:, -1:]
-                        current_last_dt = float(listT[0, -1].item())
-                        dt_micro_val = 1.0
-                        micro_steps = int(max(1, round(current_last_dt)))
-                        listT_seed = torch.full((x.size(0), 1), dt_micro_val, device=x.device, dtype=x.dtype)
-                        listT_future = torch.full((x.size(0), max(0, micro_steps - 1)), dt_micro_val, device=x.device, dtype=x.dtype)
-                        preds_recursive_seq = model(
-                            x_seed,
-                            mode="i",
-                            out_gen_num=micro_steps,
-                            listT=listT_seed,
-                            listT_future=listT_future,
-                            static_feats=static_feats,
-                            timestep=timestep,
-                            revin_stats=revin_stats
-                        )
-                        preds_recursive_last = preds_recursive_seq[:, -1:]
-                        
-                        target_last_real = model.module.revin(target_last, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target_last, "denorm", stats=revin_stats)
-                        
-                        if preds_recursive_last.shape[2] == 2 * C_gt:
-                            p_rec_det = preds_recursive_last[:, :, :C_gt]
-                        else:
-                            p_rec_det = preds_recursive_last
-                        
-                        loss_solver = F.l1_loss(p_rec_det, target_last_real)
-                        p_direct_last = p_det[:, -1:].detach()
-                        loss_consistency = F.l1_loss(p_rec_det, p_direct_last)
 
                     loss = torch.tensor(0.0, device=x.device)
                     if "lat" in args.loss:
                         loss = loss + loss_main
 
-                    target_real_for_aux = model.module.revin(target, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target, "denorm", stats=revin_stats)
-
                     gdl_loss = torch.tensor(0.0, device=x.device)
                     if "gdl" in args.loss and should_compute("gdl", global_step + 1, args):
-                        gdl_loss = gradient_difference_loss(p_det, target_real_for_aux)
+                        gdl_loss = gradient_difference_loss(p_det, target_real)
                         loss = loss + 0.5 * gdl_loss
 
                     spec_loss = torch.tensor(0.0, device=x.device)
                     if "spec" in args.loss and should_compute("spec", global_step + 1, args):
-                        spec_loss = spectral_loss(p_det, target_real_for_aux)
+                        spec_loss = spectral_loss(p_det, target_real)
                         loss = loss + 0.1 * spec_loss
-
-                    if enable_alignment:
-                        loss = loss + 0.5 * loss_solver + 0.1 * loss_consistency
 
                     if isinstance(model, DDP):
                         dummy_loss = torch.tensor(0.0, device=loss.device)
@@ -694,7 +655,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 (loss / float(grad_accum_steps)).backward()
 
             if not will_step:
-                del data, data_slice, x, target, preds, listT, static_feats, timestep, loss, loss_main, gdl_loss, spec_loss, loss_solver, loss_consistency, p_det
+                del data, data_slice, x, target, preds_out, preds, listT, static_feats, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
                 continue
 
             if float(args.grad_clip) and float(args.grad_clip) > 0:
@@ -713,29 +674,22 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             avg_loss = None
             avg_l1 = None
-            avg_solver = None
 
             if is_log_step or is_wandb_step:
                 with torch.no_grad():
-                    metric_l1 = F.l1_loss(p_det, target_real_for_aux)
+                    metric_l1 = F.l1_loss(p_det, target_real)
                     loss_tensor = loss.detach()
                     l1_tensor = metric_l1.detach()
                     dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
                     dist.all_reduce(l1_tensor, op=dist.ReduceOp.SUM)
                     avg_loss = (loss_tensor / world_size).item()
                     avg_l1 = (l1_tensor / world_size).item()
-                    if enable_alignment:
-                        solver_tensor = loss_solver.detach()
-                        dist.all_reduce(solver_tensor, op=dist.ReduceOp.SUM)
-                        avg_solver = (solver_tensor / world_size).item()
-                    else:
-                        avg_solver = 0.0
 
             if rank == 0:
                 if is_log_step:
                     current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
                     gate_str = format_gate_means()
-                    msg = f"Ep {ep + 1} - step {train_step}/{len_train_dataloader} - L: {avg_loss:.4f} - L1: {avg_l1:.4f} - Solv: {avg_solver:.4f} - LR: {current_lr:.2e} - {gate_str}"
+                    msg = f"Ep {ep + 1} - step {train_step}/{len_train_dataloader} - L: {avg_loss:.4f} - L1: {avg_l1:.4f} - LR: {current_lr:.2e} - {gate_str}"
                     if isinstance(train_iter, tqdm):
                         train_iter.set_description(msg)
                     logging.info(msg)
@@ -748,8 +702,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/step": int(global_step),
                         "train/loss": float(avg_loss),
                         "train/loss_l1": float(avg_l1),
-                        "train/loss_solver": float(avg_solver),
-                        "train/loss_consistency": float(loss_consistency.detach().item()) if enable_alignment else 0.0,
                         "train/loss_gdl": float(gdl_loss.detach().item()),
                         "train/loss_spec": float(spec_loss.detach().item()),
                         "train/lr": float(current_lr),
@@ -774,7 +726,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, data_slice, x, target, preds, listT, static_feats, timestep, loss, loss_main, gdl_loss, spec_loss, loss_solver, loss_consistency, p_det
+            del data, data_slice, x, target, preds_out, preds, listT, static_feats, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
             if (train_step % 50) == 0:
                 gc.collect()
 
@@ -820,27 +772,26 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     if static_gpu is not None:
                         static_feats = static_gpu.unsqueeze(0).expand(cond_data.size(0), -1, -1, -1)
 
-                    timestep = sample_timestep(args, cond_data.size(0), cond_data.device, cond_data.dtype)
-
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        revin_stats = model.module.revin.stats(cond_data) if isinstance(model, DDP) else model.revin.stats(cond_data)
-                        preds = model(
+                        revin_stats = revin_mod.stats(cond_data)
+                        preds_out = model(
                             cond_data,
                             mode="i",
                             out_gen_num=out_gen_num,
                             listT=listT_cond,
                             listT_future=listT_future,
                             static_feats=static_feats,
-                            timestep=timestep,
-                            revin_stats=revin_stats
+                            revin_stats=revin_stats,
                         )
-                        
-                        target_real = model.module.revin(target, "denorm", stats=revin_stats) if isinstance(model, DDP) else model.revin(target, "denorm", stats=revin_stats)
-                        
-                        if preds.shape[2] == 2 * target.shape[2]:
+                        preds = unwrap_preds(preds_out)
+
+                        target_real = revin_mod(target, "denorm", stats=revin_stats)
+
+                        if preds.shape[2] >= 2 * target.shape[2]:
                             preds_cmp = preds[:, :, : target.shape[2]]
                         else:
-                            preds_cmp = preds
+                            preds_cmp = preds[:, :, : target.shape[2]] if preds.shape[2] >= target.shape[2] else preds
+
                         loss_eval = F.l1_loss(preds_cmp, target_real)
 
                     tot_tensor = loss_eval.detach()
@@ -855,7 +806,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         if bool(getattr(args, "use_wandb", False)):
                             wandb.log({"eval/l1_loss": avg_total, "eval/epoch": ep + 1}, step=int(global_step))
 
-                    del data, target, cond_data, preds, loss_eval, tot_tensor, listT_cond, listT_future, static_feats, timestep
+                    del data, target, cond_data, preds_out, preds, loss_eval, tot_tensor, listT_cond, listT_future, static_feats
                     if eval_step % 20 == 0:
                         gc.collect()
 
