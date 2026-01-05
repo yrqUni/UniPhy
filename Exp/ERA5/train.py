@@ -24,8 +24,6 @@ sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhy, RevINStats
-import ModelUniPhy
-ModelUniPhy.HAS_TRITON = False
 
 warnings.filterwarnings("ignore")
 
