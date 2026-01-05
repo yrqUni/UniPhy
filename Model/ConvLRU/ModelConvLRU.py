@@ -7,9 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-# ==========================================
-# 1. Triton Optimization Section
-# ==========================================
 try:
     import triton
     import triton.language as tl
@@ -138,10 +135,6 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-# ==========================================
-# 2. Utils & Base Classes
-# ==========================================
-
 def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     out_ch, in_ch, kD, kH, kW = weight.shape
     base_out = out_ch // (rH * rW)
@@ -203,10 +196,6 @@ class SpatialGroupNorm(nn.GroupNorm):
             y = super().forward(y)
             return y.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
         return super().forward(x)
-
-# ==========================================
-# 3. Convolutional Primitives
-# ==========================================
 
 class DeformConv2d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1, bias: bool = False):
@@ -286,10 +275,6 @@ class LatitudeAwareSE(nn.Module):
             y = self.sigmoid(y)
             y = y.permute(0, 2, 1).unsqueeze(-1)
         return x * y
-
-# ==========================================
-# 4. Physics Core Components
-# ==========================================
 
 class GradientOperator(nn.Module):
     def __init__(self, mode: str = "sobel"):
@@ -537,13 +522,9 @@ class SpectralKoopmanSDE(nn.Module):
                 noise = torch.randn_like(h_freq_in) * amp
                 h_evolved = h_evolved + noise
 
-        # IFFT on dimensions H and W_freq.
-        # h_evolved has shape [B, R, C, H, W_freq]
-        # irfft2 defaults dim=(-2, -1), which is correct for (H, W_freq) input
-        h_out_struct = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho") 
-        # h_out_struct is [B, R, C, H, W]
-        h_out = h_out_struct.permute(0, 2, 3, 4, 1) 
-        return h_out
+        h_evolved_perm = h_evolved.permute(0, 2, 3, 4, 1)
+        h_out = torch.fft.irfft2(h_evolved_perm, s=(H, W), norm="ortho")
+        return h_out.permute(0, 2, 3, 4, 1)
 
     def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         x_flat = x_curr.squeeze(2)
@@ -662,10 +643,6 @@ class SimplifiedHKLFLayer(nn.Module):
         x_out = x + out_gated
         return x_out, curr_h
 
-# ==========================================
-# 5. Neural Network Blocks
-# ==========================================
-
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, conv_type: str = "conv"):
         super().__init__()
@@ -678,8 +655,7 @@ class GatedConvBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
-        self.dw_conv(x) # Call for side-effects? No, bug in previous version.
-        x = self.dw_conv(x) # Corrected assignment
+        x = self.dw_conv(x)
         x = self.norm(x)
         if self.cond_proj is not None and cond is not None:
             cond_in = cond.unsqueeze(2) if cond.dim() == 4 else cond
@@ -833,7 +809,7 @@ class ShuffleDownsample(nn.Module):
         return self.proj(x)
 
 # ==========================================
-# 6. Main Model Structure
+# 7. Model Wrapper
 # ==========================================
 
 class ConvLRUModel(nn.Module):
@@ -1185,18 +1161,15 @@ class ConvLRU(nn.Module):
             x_hid, last_hidden_outs = self.convlru_model(x_emb, listT=listT, cond=cond, static_feats=static_feats)
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
-            
             if str(self.decoder.dist_mode).lower() == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm", stats=stats)
                     sigma = sigma * stats.stdev
                 return torch.cat([mu, sigma], dim=2), last_hidden_outs
-            
             if out_tensor.size(2) == self.revin.num_features:
                 return self.revin(out_tensor, "denorm", stats=stats), last_hidden_outs
             return out_tensor, last_hidden_outs
-            
         if out_gen_num is None or int(out_gen_num) <= 0:
             raise ValueError("out_gen_num must be positive for inference mode")
         B = x.size(0)
@@ -1267,7 +1240,7 @@ class ConvLRU(nn.Module):
                     mu = self.revin(mu, "denorm", stats=stats)
                     scale_denorm = scale * stats.stdev
                 out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2))
-                x_step_mean = mu
+                x_step_mean = mu_denorm
             else:
                 out_list.append(x_step_dist)
                 if x_step_dist.size(2) >= self.revin.num_features:
