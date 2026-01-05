@@ -387,26 +387,50 @@ class HamiltonianGenerator(nn.Module):
         return flows_stack
 
 class LieTransport(nn.Module):
-    def __init__(self, rank: int, groups: int = 1):
+    def __init__(self, rank: int, groups: int = 1, integration_mode: str = 'rk2'):
         super().__init__()
         self.rank = int(rank)
         self.groups = int(groups)
+        self.integration_mode = integration_mode.lower()
         if self.rank % self.groups != 0:
             raise ValueError(f"Rank {self.rank} must be divisible by groups {self.groups}")
         self.ranks_per_group = self.rank // self.groups
 
+    def _get_grid(self, flows: torch.Tensor, dt: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        B_G = flows.shape[0]
+        base_grid = _get_base_grid(H, W, flows.device, flows.dtype)
+        base_grid = base_grid.expand(B_G, -1, -1, -1)
+
+        if self.integration_mode == 'euler':
+            flow_dt = flows * dt.view(B_G, 1, 1, 1)
+            grid = base_grid - flow_dt.permute(0, 2, 3, 1)
+            
+        elif self.integration_mode == 'rk2':
+            dt_view = dt.view(B_G, 1, 1, 1)
+            k1 = flows
+            grid_mid = base_grid - 0.5 * k1.permute(0, 2, 3, 1) * dt_view
+            k2 = F.grid_sample(flows, grid_mid, mode='bilinear', padding_mode='border', align_corners=False)
+            grid = base_grid - k2.permute(0, 2, 3, 1) * dt_view
+            
+        else:
+            raise NotImplementedError
+            
+        return grid
+
     def forward(self, h_prev: torch.Tensor, flows: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         B, C, H, W, R = h_prev.shape
-        dt = dt.view(B, 1)
-        use_triton_grid = HAS_TRITON and h_prev.device.type == "cuda"
+        dt_scalar = dt.view(B, 1)
         
         h_reshaped = h_prev.view(B, C, H, W, self.groups, self.ranks_per_group)
         h_flat = h_reshaped.permute(0, 4, 1, 5, 2, 3).reshape(B * self.groups, C * self.ranks_per_group, H, W)
         flows_flat = flows.view(B * self.groups, 2, H, W)
+        dt_flat = dt_scalar.repeat_interleave(self.groups, dim=0)
+
+        use_triton_grid = (HAS_TRITON and h_prev.device.type == "cuda" and self.integration_mode == 'euler')
         
         if use_triton_grid:
             sampling_grid = torch.empty((B * self.groups, H, W, 2), device=h_prev.device, dtype=h_prev.dtype)
-            dt_view = dt.view(B)
+            dt_view = dt_scalar.view(B)
             grid = lambda META: (triton.cdiv(B * self.groups * H * W, META['BLOCK_SIZE']), )
             gen_warp_grid_kernel[grid](
                 flows_flat, dt_view, sampling_grid,
@@ -417,11 +441,7 @@ class LieTransport(nn.Module):
                 self.groups,
             )
         else:
-            base_grid = _get_base_grid(H, W, h_prev.device, h_prev.dtype)
-            flow_chunk = flows_flat
-            dt_chunk = dt.repeat_interleave(self.groups, dim=0).view(B * self.groups, 1, 1, 1)
-            flow_dt = flow_chunk * dt_chunk
-            sampling_grid = base_grid.expand(B * self.groups, -1, -1, -1) - flow_dt.permute(0, 2, 3, 1)
+            sampling_grid = self._get_grid(flows_flat, dt_flat, H, W)
             
         h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode="bilinear", padding_mode="border", align_corners=False)
         h_warped = h_warped_flat.view(B, self.groups, C, self.ranks_per_group, H, W).permute(0, 2, 4, 5, 1, 3).reshape(B, C, H, W, R)
@@ -606,7 +626,7 @@ class SimplifiedHKLFLayer(nn.Module):
             self.flow_groups = 1
             
         self.hamiltonian = HamiltonianGenerator(self.emb_ch, height=H, groups=self.flow_groups, diff_mode=diff_mode)
-        self.lie_transport = LieTransport(rank=self.rank, groups=self.flow_groups)
+        self.lie_transport = LieTransport(rank=self.rank, groups=self.flow_groups, integration_mode='rk2')
         self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq, use_noise=self.use_noise, noise_scale=self.noise_scale)
         self.proj_out = nn.Linear(self.rank, 1)
         if bool(learnable_init_state) and int(static_ch) > 0:
@@ -616,6 +636,7 @@ class SimplifiedHKLFLayer(nn.Module):
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = SpatialGroupNorm(4, self.emb_ch)
         self.gate = LatitudeAwareSE(self.emb_ch)
+        self.rec_norm = nn.LayerNorm(self.rank)
 
     def forward(
         self,
@@ -627,8 +648,8 @@ class SimplifiedHKLFLayer(nn.Module):
         B, C, L, H, W = x.shape
         if last_hidden_in is None:
             if self.init_state is not None and static_feats is not None:
-                h0 = self.init_state(static_feats).unsqueeze(1).repeat(1, L, 1, 1, 1, 1)
-                curr_h = h0[:, 0]
+                h0 = self.init_state(static_feats)
+                curr_h = h0
             else:
                 curr_h = torch.zeros(B, C, H, W, self.rank, device=x.device, dtype=x.dtype)
         else:
@@ -637,12 +658,13 @@ class SimplifiedHKLFLayer(nn.Module):
             dt_seq = torch.ones(B, L, device=x.device, dtype=x.dtype)
         else:
             dt_seq = _match_dt_seq(listT.to(x.device, x.dtype), L)
-        h_states: List[torch.Tensor] = []
-        x_perm = x.permute(0, 2, 1, 3, 4)
-        dt_ref = torch.tensor(self.dt_ref, device=x.device, dtype=x.dtype).clamp_min(1e-6)
         
+        x_perm = x.permute(0, 2, 1, 3, 4)
         flows_all = self.hamiltonian(x_perm)
         koopman_params_all = self.koopman.compute_params(x_perm)
+        dt_ref = torch.tensor(self.dt_ref, device=x.device, dtype=x.dtype).clamp_min(1e-6)
+        
+        h_stack = torch.empty((B, C, L, H, W, self.rank), device=x.device, dtype=x.dtype)
         
         for t in range(L):
             x_t = x[:, :, t : t + 1]
@@ -664,15 +686,17 @@ class SimplifiedHKLFLayer(nn.Module):
             else:
                 g = dt_scaled
             curr_h = h_next + g.view(B, 1, 1, 1, 1) * x_inject
-            h_states.append(curr_h)
+            curr_h = self.rec_norm(curr_h)
+            h_stack[:, :, t] = curr_h
             
-        h_stack = torch.stack(h_states, dim=2)
-        out = self.proj_out(h_stack.permute(0, 2, 3, 4, 1, 5)).squeeze(-1)
-        out = out.permute(0, 4, 1, 2, 3)
+        out = self.proj_out(h_stack).squeeze(-1)
+        out = out.permute(0, 2, 1, 3, 4)
         out = self.post_ifft_proj(out)
         out = self.norm(out)
         out_gated = self.gate(out)
-        x_out = x + out_gated
+        x_out = x.permute(0, 2, 1, 3, 4) + out_gated
+        x_out = x_out.permute(0, 2, 1, 3, 4)
+        
         return x_out, curr_h
 
 class GatedConvBlock(nn.Module):
