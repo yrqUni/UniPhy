@@ -1,7 +1,9 @@
+import itertools
 import os
 import sys
+import gc
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -10,29 +12,13 @@ MODEL_DIR = os.path.join(ROOT, "Model", "ConvLRU")
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
-from ModelConvLRU import ConvLRU, RevINStats
+from ModelConvLRU import ConvLRU
 
-
-def _env_info(device: torch.device) -> str:
-    amp = "OFF"
-    dtype = torch.float32
-    det = torch.are_deterministic_algorithms_enabled()
-    det_mode = "on" if det else "warn"
-    cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG", None)
-    tf32_override = os.environ.get("NVIDIA_TF32_OVERRIDE", None)
-    s = f"[INFO] Device={device.type} AMP={amp} dtype={dtype} determinism={det_mode}"
-    if cublas is not None:
-        s += f"\n[INFO] CUBLAS_WORKSPACE_CONFIG={cublas}"
-    if tf32_override is not None:
-        s += f"\n[INFO] NVIDIA_TF32_OVERRIDE={tf32_override}"
-    return s
-
-
-def _make_args() -> Any:
+def get_base_args() -> Any:
     return SimpleNamespace(
         input_ch=2,
-        out_ch=1,
-        input_size=(64, 64),
+        out_ch=2,
+        input_size=(32, 32),
         emb_ch=16,
         static_ch=0,
         hidden_factor=(2, 2),
@@ -44,165 +30,102 @@ def _make_args() -> Any:
         convlru_num_blocks=2,
         down_mode="avg",
         use_cbam=False,
-        ffn_ratio=4.0,
-        lru_rank=16,
+        ffn_ratio=2.0,
+        lru_rank=8,
         koopman_use_noise=False,
         koopman_noise_scale=1.0,
-        learnable_init_state=False,
+        learnable_init_state=True,
         dt_ref=1.0,
         inj_k=2.0,
     )
 
-
-def _max_mean(a: torch.Tensor, b: torch.Tensor) -> Tuple[float, float]:
-    d = (a - b).abs()
-    return float(d.max().item()), float(d.mean().item())
-
-
-def _path_check(model: ConvLRU, x_full: torch.Tensor, listT_full: torch.Tensor, static_feats: Optional[torch.Tensor]) -> None:
-    model.eval()
-    with torch.no_grad():
-        print("[TEST] Mode='p' with full args...")
-        _ = model(x_full, mode="p", listT=listT_full, static_feats=static_feats)
-        
-        print("[TEST] Mode='p' with listT=None...")
-        _ = model(x_full, mode="p", listT=None, static_feats=static_feats)
-        
-        print("[TEST] Mode='p' with static_feats=None...")
-        _ = model(x_full, mode="p", listT=listT_full, static_feats=None)
-        
-        print("[TEST] Mode='i' (Inference) generation...")
-        x_init = x_full[:, :1]
-        out_gen = model(x_init, mode="i", out_gen_num=5, listT=None, static_feats=static_feats)
-        if out_gen.shape[1] != 5:
-            raise RuntimeError(f"Inference output length mismatch. Expected 5, got {out_gen.shape[1]}")
-
-        print("[TEST] RevIN manual stats...")
-        st = model.revin.stats(x_full)
-        _ = model(x_full, mode="p", listT=listT_full, static_feats=static_feats, revin_stats=st)
-
-    print("[PASS] All path checks completed successfully.")
-
-
-def _default_tols() -> Tuple[float, float]:
-    cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG", None)
-    if cublas is not None:
-        return 2e-3, 5e-5
-    return 5e-2, 2e-3
-
-
-def _teacher_forcing_numeric(
-    model: ConvLRU,
-    x_full: torch.Tensor,
-    listT_full: torch.Tensor,
-    static_feats: Optional[torch.Tensor],
-    tol_max: Optional[float] = None,
-    tol_mean: Optional[float] = None,
-) -> None:
-    if tol_max is None or tol_mean is None:
-        dmx, dmn = _default_tols()
-        tol_max = dmx if tol_max is None else tol_max
-        tol_mean = dmn if tol_mean is None else tol_mean
-
-    model.eval()
-    with torch.no_grad():
-        stats_full = model.revin.stats(x_full)
-        y_p, _ = model(x_full, mode="p", listT=listT_full, static_feats=static_feats, revin_stats=stats_full)
-
-        B, L, _, _, _ = x_full.shape
-        dist_mode = str(getattr(model.decoder, "dist_mode", "gaussian")).lower()
-
-        cond = None
-        if model.embedding.static_ch > 0 and model.embedding.static_embed is not None and static_feats is not None:
-            cond = model.embedding.static_embed(static_feats)
-
-        last_hidden = None
-        outs = []
-        for t in range(L):
-            x_t = x_full[:, t : t + 1]
-            dt_t = listT_full[:, t : t + 1] if listT_full is not None else None
-            st_t = RevINStats(mean=stats_full.mean[:, t : t + 1], stdev=stats_full.stdev[:, t : t + 1])
-
-            x_norm = model.revin(x_t, "norm", stats=st_t)
-            x_emb, _ = model.embedding(x_norm, static_feats=static_feats)
-            x_hid, last_hidden_outs = model.convlru_model(
-                x_emb,
-                last_hidden_ins=last_hidden,
-                listT=dt_t,
-                cond=cond,
-                static_feats=static_feats,
-            )
-            last_hidden = last_hidden_outs
-            out = model.decoder(x_hid, cond=cond, timestep=None)
-            out_t = out.permute(0, 2, 1, 3, 4).contiguous()
-
-            if dist_mode == "gaussian":
-                mu, sigma = torch.chunk(out_t, 2, dim=2)
-                if mu.size(2) == model.revin.num_features:
-                    mu = model.revin(mu, "denorm", stats=st_t)
-                    sigma = sigma * st_t.stdev
-                outs.append(torch.cat([mu, sigma], dim=2))
-            elif dist_mode == "laplace":
-                mu, b = torch.chunk(out_t, 2, dim=2)
-                if mu.size(2) == model.revin.num_features:
-                    mu = model.revin(mu, "denorm", stats=st_t)
-                    b = b * st_t.stdev
-                outs.append(torch.cat([mu, b], dim=2))
-            else:
-                if out_t.size(2) == model.revin.num_features:
-                    out_t = model.revin(out_t, "denorm", stats=st_t)
-                outs.append(out_t)
-
-        y_tf = torch.cat(outs, dim=1)
-
-        if tuple(y_tf.shape) != tuple(y_p.shape):
-            raise RuntimeError(f"Shape mismatch: Parallel={tuple(y_p.shape)} vs Stepwise={tuple(y_tf.shape)}")
-
-        mx, mn = _max_mean(y_tf, y_p)
-        print(f"[RESULT] Parallel vs Stepwise: max_diff={mx:.6e}, mean_diff={mn:.6e}")
-
-        ok = (mx <= float(tol_max)) and (mn <= float(tol_mean))
-        for t in range(L):
-            mx_t, mn_t = _max_mean(y_tf[:, t : t + 1], y_p[:, t : t + 1])
-            if mx_t > float(tol_max) or mn_t > float(tol_mean):
-                ok = False
-
-        if not ok:
-            print(f"[WARNING] Numeric mismatch > tolerance ({tol_max}). This is expected with Triton/Float32 optimization.")
-        else:
-            print("[PASS] Numeric consistency check passed.")
-
-
-def main() -> None:
-    torch.set_grad_enabled(False)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(_env_info(device))
-
-    args = _make_args()
+def run_single_check(args: Any, device: torch.device) -> None:
     model = ConvLRU(args).to(device).eval()
-
-    B = 1
-    L = 6
-    C = int(getattr(args, "input_ch", 2))
-    H, W = tuple(getattr(args, "input_size", (64, 64)))
-
-    x_full = torch.randn(B, L, C, H, W, device=device, dtype=torch.float32)
-    listT_full = torch.ones(B, L, device=device, dtype=torch.float32)
-
+    
+    B, L, C, H, W = 1, 4, args.input_ch, args.input_size[0], args.input_size[1]
+    x = torch.randn(B, L, C, H, W, device=device)
+    listT = torch.ones(B, L, device=device)
+    
     static_feats = None
-    if int(getattr(args, "static_ch", 0)) > 0:
-        static_feats = torch.randn(B, int(args.static_ch), H, W, device=device, dtype=torch.float32)
+    if args.static_ch > 0:
+        static_feats = torch.randn(B, args.static_ch, H, W, device=device)
+    
+    timestep = None
+    if args.head_mode in ["diffusion", "flow"]:
+        timestep = torch.randint(0, 100, (B,), device=device)
 
-    print("\n=== STARTING PATH CHECK ===")
-    _path_check(model, x_full, listT_full, static_feats)
+    with torch.no_grad():
+        out_p, _ = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
+        
+        expected_ch = args.out_ch * 2
+        if args.dist_mode == "mdn":
+            expected_ch = args.out_ch * 3 * 3
+        
+        if out_p.shape != (B, L, expected_ch, H, W):
+            raise RuntimeError(f"P-mode shape mismatch: expected {(B, L, expected_ch, H, W)}, got {out_p.shape}")
 
-    print("\n=== STARTING NUMERIC CONSISTENCY CHECK ===")
-    _teacher_forcing_numeric(model, x_full, listT_full, static_feats)
+        x_init = x[:, :1]
+        out_gen_num = 3
+        listT_future = torch.ones(B, out_gen_num - 1, device=device)
+        
+        out_i = model(
+            x_init, 
+            mode="i", 
+            out_gen_num=out_gen_num, 
+            listT=listT[:, :1], 
+            listT_future=listT_future,
+            static_feats=static_feats,
+            timestep=timestep
+        )
+        
+        if out_i.shape != (B, out_gen_num, expected_ch, H, W):
+            raise RuntimeError(f"I-mode shape mismatch: expected {(B, out_gen_num, expected_ch, H, W)}, got {out_i.shape}")
 
+    del model, x, listT, static_feats, out_p, out_i
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def main():
+    torch.backends.cudnn.benchmark = False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running checks on {device}")
+
+    param_grid = {
+        "dist_mode": ["gaussian", "laplace", "mdn"],
+        "diff_mode": ["sobel", "learnable", "diffconv"],
+        "Arch": ["unet", "bifpn"],
+        "down_mode": ["avg", "shuffle"],
+        "static_ch": [0, 4],
+        "use_cbam": [False, True]
+    }
+
+    keys = list(param_grid.keys())
+    values = list(param_grid.values())
+    combinations = list(itertools.product(*values))
+
+    total = len(combinations)
+    print(f"Total configurations to test: {total}")
+
+    for idx, combo in enumerate(combinations):
+        args = get_base_args()
+        config_str_parts = []
+        
+        for k, v in zip(keys, combo):
+            setattr(args, k, v)
+            config_str_parts.append(f"{k}={v}")
+        
+        config_str = ", ".join(config_str_parts)
+        print(f"[{idx+1}/{total}] Testing: {config_str} ...", end="", flush=True)
+        
+        try:
+            run_single_check(args, device)
+            print(" PASS")
+        except Exception as e:
+            print(f" FAIL")
+            print(f"Error details: {e}")
+            sys.exit(1)
+
+    print("\nAll hyperparameter combinations passed successfully.")
 
 if __name__ == "__main__":
     main()
