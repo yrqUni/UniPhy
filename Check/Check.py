@@ -3,7 +3,7 @@ import os
 import sys
 import gc
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -24,12 +24,10 @@ def get_base_args() -> Any:
         hidden_factor=(2, 2),
         ConvType="conv",
         Arch="unet",
-        head_mode="gaussian",
         dist_mode="gaussian",
         diff_mode="sobel",
         convlru_num_blocks=2,
         down_mode="avg",
-        use_cbam=False,
         ffn_ratio=2.0,
         lru_rank=8,
         koopman_use_noise=False,
@@ -50,12 +48,8 @@ def run_single_check(args: Any, device: torch.device) -> None:
     if args.static_ch > 0:
         static_feats = torch.randn(B, args.static_ch, H, W, device=device)
     
-    timestep = None
-    if args.head_mode in ["diffusion", "flow"]:
-        timestep = torch.randint(0, 100, (B,), device=device)
-
     with torch.no_grad():
-        out_p, _ = model(x, mode="p", listT=listT, static_feats=static_feats, timestep=timestep)
+        out_p, _ = model(x, mode="p", listT=listT, static_feats=static_feats)
         
         expected_ch = args.out_ch * 2
         if args.dist_mode == "mdn":
@@ -74,8 +68,7 @@ def run_single_check(args: Any, device: torch.device) -> None:
             out_gen_num=out_gen_num, 
             listT=listT[:, :1], 
             listT_future=listT_future,
-            static_feats=static_feats,
-            timestep=timestep
+            static_feats=static_feats
         )
         
         if out_i.shape != (B, out_gen_num, expected_ch, H, W):
@@ -95,8 +88,7 @@ def main():
         "diff_mode": ["sobel", "learnable", "diffconv"],
         "Arch": ["unet", "bifpn"],
         "down_mode": ["avg", "shuffle"],
-        "static_ch": [0, 4],
-        "use_cbam": [False, True]
+        "static_ch": [0, 4]
     }
 
     keys = list(param_grid.keys())
@@ -125,7 +117,7 @@ def main():
             print(f"Error details: {e}")
             sys.exit(1)
 
-    print("\nAll hyperparameter combinations passed successfully.")
+    print("\nAll hyperparameter combinations check finished.")
 
 if __name__ == "__main__":
     main()
