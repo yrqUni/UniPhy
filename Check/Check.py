@@ -8,11 +8,11 @@ from typing import Any
 import torch
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-MODEL_DIR = os.path.join(ROOT, "Model", "ConvLRU")
+MODEL_DIR = os.path.join(ROOT, "Model", "UniPhy")
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
-from ModelConvLRU import ConvLRU
+from ModelUniPhy import UniPhy
 
 def get_base_args() -> Any:
     return SimpleNamespace(
@@ -38,7 +38,7 @@ def get_base_args() -> Any:
     )
 
 def run_single_check(args: Any, device: torch.device) -> None:
-    model = ConvLRU(args).to(device).eval()
+    model = UniPhy(args).to(device).eval()
     
     B, L, C, H, W = 1, 4, args.input_ch, args.input_size[0], args.input_size[1]
     x = torch.randn(B, L, C, H, W, device=device)

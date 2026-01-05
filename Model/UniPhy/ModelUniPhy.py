@@ -330,10 +330,11 @@ class GradientOperator(nn.Module):
         return self.conv_x(x), self.conv_y(x)
 
 class FlowFieldGenerator(nn.Module):
-    def __init__(self, channels: int, height: int, groups: int = 1, diff_mode: str = "sobel"):
+    def __init__(self, channels: int, height: int, groups: int = 1, diff_mode: str = "sobel", max_velocity: float = 5.0):
         super().__init__()
         ch = int(channels)
         self.groups = int(groups)
+        self.max_velocity = float(max_velocity)
         mid = max(ch // 2, 1)
         self.conv = nn.Sequential(
             nn.Conv2d(ch, mid, 3, padding=1),
@@ -381,7 +382,7 @@ class FlowFieldGenerator(nn.Module):
         v = grad_y_phi + grad_x_psi * metric_correction
         
         flows_flat = torch.cat([u, v], dim=1)
-        flows_flat = torch.tanh(flows_flat)
+        flows_flat = self.max_velocity * torch.tanh(flows_flat)
         
         flows_stack = flows_flat.view(BL, G, 2, H, W).reshape(B, L, G, 2, H, W)
         return flows_stack
@@ -484,6 +485,11 @@ class DynamicsParameterEstimator(nn.Module):
         self.global_fc = nn.Linear(ch, ch)
         self.pool = nn.AdaptiveAvgPool2d((1, self.w_freq))
         self.head = nn.Linear(ch, self.emb_ch * self.rank * 3)
+        nn.init.zeros_(self.head.weight)
+        with torch.no_grad():
+            self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 0].fill_(1.0)
+            self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 1].fill_(0.0)
+            self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 2].fill_(-5.0)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, C, H, W = x.shape
@@ -598,7 +604,7 @@ class LearnableStateMap(nn.Module):
         return out.permute(0, 1, 3, 4, 2)
 
 class PhysicalRecurrentLayer(nn.Module):
-    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], rank: int = 64, use_noise: bool = False, noise_scale: float = 1.0, dt_ref: float = 1.0, inj_k: float = 2.0, diff_mode: str = "sobel", static_ch: int = 0, learnable_init_state: bool = False):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], rank: int = 64, use_noise: bool = False, noise_scale: float = 1.0, dt_ref: float = 1.0, inj_k: float = 2.0, diff_mode: str = "sobel", static_ch: int = 0, learnable_init_state: bool = False, max_velocity: float = 5.0):
         super().__init__()
         self.emb_ch = int(emb_ch)
         H, W = int(input_shape[0]), int(input_shape[1])
@@ -617,7 +623,7 @@ class PhysicalRecurrentLayer(nn.Module):
         if self.rank % self.flow_groups != 0:
             self.flow_groups = 1
             
-        self.hamiltonian = FlowFieldGenerator(self.emb_ch, height=H, groups=self.flow_groups, diff_mode=diff_mode)
+        self.hamiltonian = FlowFieldGenerator(self.emb_ch, height=H, groups=self.flow_groups, diff_mode=diff_mode, max_velocity=max_velocity)
         self.lie_transport = LieAdvection(rank=self.rank, groups=self.flow_groups, integration_mode='rk2')
         self.koopman = SpectralDynamics(self.emb_ch, self.rank, self.W_freq, use_noise=self.use_noise, noise_scale=self.noise_scale)
         self.proj_out = nn.Linear(self.rank, 1)
@@ -1158,6 +1164,7 @@ class UniPhy(nn.Module):
         inj_k = float(getattr(args, "inj_k", 2.0))
         diff_mode = str(getattr(args, "diff_mode", "sobel"))
         learnable_init_state = bool(getattr(args, "learnable_init_state", False))
+        max_velocity = float(getattr(args, "max_velocity", 5.0))
         
         lru_args = {
             "rank": rank,
@@ -1167,7 +1174,8 @@ class UniPhy(nn.Module):
             "inj_k": inj_k,
             "diff_mode": diff_mode,
             "static_ch": static_ch,
-            "learnable_init_state": learnable_init_state
+            "learnable_init_state": learnable_init_state,
+            "max_velocity": max_velocity
         }
         
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
