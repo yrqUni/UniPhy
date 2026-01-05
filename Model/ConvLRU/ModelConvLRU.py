@@ -521,51 +521,6 @@ class SpectralKoopmanSDE(nn.Module):
         return self.forward_step(h_trans, dt, params)
 
 
-class StaticInitState(nn.Module):
-    def __init__(self, static_ch: int, emb_ch: int, rank: int, S: int, W_freq: int):
-        super().__init__()
-        self.static_ch = int(static_ch)
-        self.emb_ch = int(emb_ch)
-        self.rank = int(rank)
-        self.S = int(S)
-        self.W_freq = int(W_freq)
-        self.mapper = nn.Sequential(
-            nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d((self.S, self.W_freq)),
-            nn.Conv2d(self.emb_ch, self.emb_ch * self.rank, kernel_size=1),
-        )
-
-    def forward(self, static_feats: torch.Tensor) -> torch.Tensor:
-        B = static_feats.size(0)
-        out = self.mapper(static_feats)
-        out = out.view(B, self.emb_ch, self.rank, self.S, self.W_freq)
-        return out.permute(0, 1, 3, 4, 2)
-
-
-class SpatialGroupNorm(nn.GroupNorm):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 5:
-            B, C, L, H, W = x.shape
-            y = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
-            y = super().forward(y)
-            return y.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
-        return super().forward(x)
-
-
-def _match_dt_seq(dt_seq: torch.Tensor, L: int) -> torch.Tensor:
-    if dt_seq.dim() != 2:
-        raise ValueError(f"listT must be 2D [B,L], got {tuple(dt_seq.shape)}")
-    if dt_seq.size(1) == L:
-        return dt_seq
-    if dt_seq.size(1) == 1:
-        return dt_seq.repeat(1, L)
-    if dt_seq.size(1) > L:
-        return dt_seq[:, :L]
-    pad = dt_seq[:, -1:].repeat(1, L - dt_seq.size(1))
-    return torch.cat([dt_seq, pad], dim=1)
-
-
 class SimplifiedHKLFLayer(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -587,7 +542,7 @@ class SimplifiedHKLFLayer(nn.Module):
             self.flow_groups = 1
             
         self.hamiltonian = HamiltonianGenerator(self.emb_ch, height=H, groups=self.flow_groups, diff_mode=diff_mode)
-        self.lie_transport = LieTransport(rank=self.rank, groups=self.flow_groups, chunk_size=32)
+        self.lie_transport = LieTransport(rank=self.rank, groups=self.flow_groups)
         self.koopman = SpectralKoopmanSDE(self.emb_ch, self.rank, self.W_freq, use_noise=use_noise, noise_scale=noise_scale)
         self.proj_out = nn.Linear(self.rank, 1)
         if bool(getattr(args, "learnable_init_state", False)) and int(getattr(args, "static_ch", 0)) > 0:
@@ -1198,13 +1153,10 @@ class ConvLRU(nn.Module):
             mu = x_step_dist[:, :, :out_ch, :, :]
             sigma = x_step_dist[:, :, out_ch:, :, :]
             if mu.size(2) == self.revin.num_features:
-                mu_denorm = self.revin(mu, "denorm", stats=stats)
-                sigma_denorm = sigma * stats.stdev
-            else:
-                mu_denorm = mu
-                sigma_denorm = sigma
-            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
-            x_step_mean = mu_denorm
+                mu = self.revin(mu, "denorm", stats=stats)
+                sigma = sigma * stats.stdev
+            out_list.append(torch.cat([mu, sigma], dim=2))
+            x_step_mean = mu
         else:
             if x_step_dist.size(2) >= self.revin.num_features:
                  x_mean_approx = x_step_dist[:, :, :self.revin.num_features]
