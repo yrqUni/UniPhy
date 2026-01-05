@@ -778,9 +778,9 @@ class FeedForwardNetwork(nn.Module):
         return residual + x
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], lru_args: Dict[str, Any], ffn_args: Dict[str, Any]):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], prl_args: Dict[str, Any], ffn_args: Dict[str, Any]):
         super().__init__()
-        self.lru_layer = PhysicalRecurrentLayer(emb_ch, input_shape, **lru_args)
+        self.prl_layer = PhysicalRecurrentLayer(emb_ch, input_shape, **prl_args)
         self.feed_forward = FeedForwardNetwork(emb_ch, input_shape, **ffn_args)
 
     def forward(
@@ -791,7 +791,7 @@ class UniPhyBlock(nn.Module):
         cond: Optional[torch.Tensor] = None,
         static_feats: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_mid, h_out = self.lru_layer(x, last_hidden_in, listT=listT, static_feats=static_feats)
+        x_mid, h_out = self.prl_layer(x, last_hidden_in, listT=listT, static_feats=static_feats)
         x_out = self.feed_forward(x_mid, cond=cond)
         return x_out, h_out
 
@@ -869,7 +869,7 @@ class ShuffleDownsample(nn.Module):
         return self.proj(x)
 
 class UniPhyBackbone(nn.Module):
-    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], num_layers: int, arch_mode: str, down_mode: str, lru_args: Dict[str, Any], ffn_args: Dict[str, Any]):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], num_layers: int, arch_mode: str, down_mode: str, prl_args: Dict[str, Any], ffn_args: Dict[str, Any]):
         super().__init__()
         self.arch_mode = str(arch_mode).lower()
         self.use_unet = self.arch_mode != "no_unet"
@@ -883,7 +883,7 @@ class UniPhyBackbone(nn.Module):
         H, W = int(input_shape[0]), int(input_shape[1])
         
         if not self.use_unet:
-            self.uniphy_blocks = nn.ModuleList([UniPhyBlock(C, (H, W), lru_args, ffn_args) for _ in range(layers)])
+            self.uniphy_blocks = nn.ModuleList([UniPhyBlock(C, (H, W), prl_args, ffn_args) for _ in range(layers)])
             self.upsample = None
             self.fusion = None
             self.mid_attention = None
@@ -891,7 +891,7 @@ class UniPhyBackbone(nn.Module):
             curr_H, curr_W = H, W
             encoder_res: List[Tuple[int, int]] = []
             for i in range(layers):
-                self.down_blocks.append(UniPhyBlock(C, (curr_H, curr_W), lru_args, ffn_args))
+                self.down_blocks.append(UniPhyBlock(C, (curr_H, curr_W), prl_args, ffn_args))
                 encoder_res.append((curr_H, curr_W))
                 if i < layers - 1:
                     if self.down_mode == "conv":
@@ -914,7 +914,7 @@ class UniPhyBackbone(nn.Module):
             self.mid_attention = BottleneckAttention(C, num_heads=heads)
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
-                self.up_blocks.append(UniPhyBlock(C, (h_up, w_up), lru_args, ffn_args))
+                self.up_blocks.append(UniPhyBlock(C, (h_up, w_up), prl_args, ffn_args))
                 if self.arch_mode == "bifpn":
                     self.csa_blocks.append(BiFPNFusion(C))
                 else:
@@ -1162,11 +1162,11 @@ class UniPhy(nn.Module):
         
         self.embedding = FeatureEmbedding(input_ch, input_size, emb_ch, static_ch, hidden_factor)
         
-        num_blocks = int(getattr(args, "convlru_num_blocks", 2))
+        num_blocks = int(getattr(args, "convprl_num_blocks", 2))
         arch = getattr(args, "Arch", "unet")
         down_mode = getattr(args, "down_mode", "avg")
         
-        rank = int(getattr(args, "lru_rank", 64))
+        rank = int(getattr(args, "prl_rank", 64))
         koopman_use_noise = bool(getattr(args, "koopman_use_noise", False))
         koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
         dt_ref = float(getattr(args, "dt_ref", getattr(args, "T", 1.0)))
@@ -1175,7 +1175,7 @@ class UniPhy(nn.Module):
         learnable_init_state = bool(getattr(args, "learnable_init_state", False))
         max_velocity = float(getattr(args, "max_velocity", 5.0))
         
-        lru_args = {
+        prl_args = {
             "rank": rank,
             "use_noise": koopman_use_noise,
             "noise_scale": koopman_noise_scale,
@@ -1201,7 +1201,7 @@ class UniPhy(nn.Module):
             num_blocks,
             arch,
             down_mode,
-            lru_args,
+            prl_args,
             ffn_args
         )
         

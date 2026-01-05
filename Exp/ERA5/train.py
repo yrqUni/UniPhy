@@ -24,6 +24,8 @@ sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhy, RevINStats
+import ModelUniPhy
+ModelUniPhy.HAS_TRITON = False
 
 warnings.filterwarnings("ignore")
 
@@ -113,8 +115,8 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
-        self.wandb_run_name = "UniPhy_A100_Optim"
-        self.wandb_group = "v6.0.0_UniPhy"
+        self.wandb_run_name = ""
+        self.wandb_group = ""
         self.wandb_mode = "online"
         self.train_mode = "p_only"
         self.learnable_init_state = True
@@ -125,7 +127,7 @@ class Args:
         self.enable_no_sync = True
         self.log_every = 1
         self.wandb_every = 1
-        self.koopman_use_noise = False
+        self.koopman_use_noise = True
         self.koopman_noise_scale = 1.0
         self.dt_ref = 1.0
         self.inj_k = 2.0
