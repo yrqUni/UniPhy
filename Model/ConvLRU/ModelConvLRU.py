@@ -523,10 +523,10 @@ class SpectralKoopmanSDE(nn.Module):
 
     def forward_step(self, h_trans: torch.Tensor, dt: torch.Tensor, params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
         B, C, H, W, R = h_trans.shape
-        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho").permute(0, 2, 3, 4, 1).contiguous()
+        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho").permute(0, 2, 3, 4, 1)
         W_freq = h_freq.shape[-2]
         h_freq = self.mixer(h_freq)
-        h_freq_in = h_freq.permute(0, 4, 1, 2, 3).contiguous()
+        h_freq_in = h_freq.permute(0, 4, 1, 2, 3)
         nu_rate, theta_rate, sigma_val = params
 
         if HAS_TRITON and h_freq_in.device.type == "cuda":
@@ -534,11 +534,11 @@ class SpectralKoopmanSDE(nn.Module):
             theta_in = theta_rate.permute(0, 4, 2, 1, 3)
             nu_in = nu_in.expand(B, R, C, H, W_freq)
             theta_in = theta_in.expand(B, R, C, H, W_freq)
-            h_real = h_freq_in.real.contiguous()
-            h_imag = h_freq_in.imag.contiguous()
+            h_real = h_freq_in.real
+            h_imag = h_freq_in.imag
             out_real = torch.empty_like(h_real)
             out_imag = torch.empty_like(h_imag)
-            dt_in = dt.view(B).contiguous()
+            dt_in = dt.view(B)
             grid = lambda META: (triton.cdiv(B * R * C * H * W_freq, META['BLOCK_SIZE']), )
             fused_koopman_kernel[grid](
                 h_real, h_imag,
@@ -682,7 +682,7 @@ class SimplifiedHKLFLayer(nn.Module):
             h_stack[:, :, t] = curr_h
             
         out = self.proj_out(h_stack).squeeze(-1)
-        out = self.post_ifft_proj(out)
+        out = self.post_ifft_proj(out.permute(0, 1, 4, 2, 3)).permute(0, 1, 3, 4, 2)
         out = self.norm(out)
         out_gated = self.gate(out)
         x_out = x + out_gated
@@ -1305,7 +1305,7 @@ class ConvLRU(nn.Module):
                 mu = x_step_dist[:, :, :out_ch, :, :]
                 scale = x_step_dist[:, :, out_ch:, :, :]
                 if mu.size(2) == self.revin.num_features:
-                    mu_denorm = self.revin(mu, "denorm", stats=stats)
+                    mu = self.revin(mu, "denorm", stats=stats)
                     scale_denorm = scale * stats.stdev
                 else:
                     mu_denorm = mu
