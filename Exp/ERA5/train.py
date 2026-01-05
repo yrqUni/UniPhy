@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# Adjust paths as per your environment
 sys.path.append("/nfs/ConvLRU/Model/ConvLRU")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
@@ -120,7 +121,8 @@ class Args:
         self.ffn_ratio = 1.5
         self.ConvType = "dcn"
         self.Arch = "bifpn"
-        self.grad_accum_steps = 8
+        # Disabled Gradient Accumulation as requested (set to 1)
+        self.grad_accum_steps = 1
         self.enable_no_sync = True
         self.log_every = 10
         self.wandb_every = 10
