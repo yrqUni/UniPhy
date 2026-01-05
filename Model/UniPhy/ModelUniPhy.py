@@ -9,6 +9,8 @@ import torchvision
 import triton
 import triton.language as tl
 
+from pscan import pscan
+
 
 @triton.autotune(
     configs=[
@@ -17,79 +19,83 @@ import triton.language as tl
         triton.Config({"BLOCK_SIZE": 512, "num_warps": 8}, num_stages=4),
         triton.Config({"BLOCK_SIZE": 1024, "num_warps": 8}, num_stages=4),
     ],
-    key=["B", "R", "C", "H", "W"],
+    key=["B", "L", "R", "C", "H", "Wf"],
 )
 @triton.jit
-def koopman_kernel(
-    h_real_ptr,
-    h_imag_ptr,
+def koopman_A_kernel(
     nu_ptr,
     theta_ptr,
     dt_ptr,
     out_real_ptr,
     out_imag_ptr,
     B,
+    L,
     R,
     C,
     H,
-    W,
-    stride_h_b,
-    stride_h_r,
-    stride_h_c,
-    stride_h_h,
-    stride_h_w,
-    stride_p_b,
-    stride_p_r,
-    stride_p_c,
-    stride_p_h,
-    stride_p_w,
+    Wf,
+    stride_nu_b,
+    stride_nu_l,
+    stride_nu_r,
+    stride_nu_c,
+    stride_nu_wf,
     stride_dt_b,
+    stride_dt_l,
     stride_o_b,
+    stride_o_l,
     stride_o_r,
     stride_o_c,
     stride_o_h,
-    stride_o_w,
+    stride_o_wf,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    num_elements = B * R * C * H * W
+    n = B * L * R * C * H * Wf
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < num_elements
+    offs = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n
 
-    idx_w = offsets % W
-    tmp = offsets // W
+    idx_wf = offs % Wf
+    tmp = offs // Wf
     idx_h = tmp % H
     tmp = tmp // H
     idx_c = tmp % C
     tmp = tmp // C
     idx_r = tmp % R
-    idx_b = tmp // R
+    tmp = tmp // R
+    idx_l = tmp % L
+    idx_b = tmp // L
 
-    dt_val = tl.load(dt_ptr + idx_b * stride_dt_b, mask=mask, other=0.0)
+    dt = tl.load(dt_ptr + idx_b * stride_dt_b + idx_l * stride_dt_l, mask=mask, other=0.0)
 
-    p_offset = idx_b * stride_p_b + idx_r * stride_p_r + idx_c * stride_p_c + idx_w * stride_p_w
-    nu = tl.load(nu_ptr + p_offset, mask=mask, other=0.0)
-    theta = tl.load(theta_ptr + p_offset, mask=mask, other=0.0)
+    nu_off = (
+        idx_b * stride_nu_b
+        + idx_l * stride_nu_l
+        + idx_r * stride_nu_r
+        + idx_c * stride_nu_c
+        + idx_wf * stride_nu_wf
+    )
+    nu = tl.load(nu_ptr + nu_off, mask=mask, other=0.0)
+    th = tl.load(theta_ptr + nu_off, mask=mask, other=0.0)
 
-    h_offset = idx_b * stride_h_b + idx_r * stride_h_r + idx_c * stride_h_c + idx_h * stride_h_h + idx_w * stride_h_w
-    h_real = tl.load(h_real_ptr + h_offset, mask=mask, other=0.0)
-    h_imag = tl.load(h_imag_ptr + h_offset, mask=mask, other=0.0)
+    decay = tl.exp(-nu * dt)
+    ang = th * dt
+    c = tl.cos(ang)
+    s = tl.sin(ang)
 
-    decay = tl.exp(-nu * dt_val)
-    angle = theta * dt_val
-    cos_a = tl.cos(angle)
-    sin_a = tl.sin(angle)
+    out_r = decay * c
+    out_i = decay * s
 
-    rot_real = h_real * cos_a - h_imag * sin_a
-    rot_imag = h_real * sin_a + h_imag * cos_a
-
-    res_real = rot_real * decay
-    res_imag = rot_imag * decay
-
-    out_offset = idx_b * stride_o_b + idx_r * stride_o_r + idx_c * stride_o_c + idx_h * stride_o_h + idx_w * stride_o_w
-    tl.store(out_real_ptr + out_offset, res_real, mask=mask)
-    tl.store(out_imag_ptr + out_offset, res_imag, mask=mask)
+    o_off = (
+        idx_b * stride_o_b
+        + idx_l * stride_o_l
+        + idx_r * stride_o_r
+        + idx_c * stride_o_c
+        + idx_h * stride_o_h
+        + idx_wf * stride_o_wf
+    )
+    tl.store(out_real_ptr + o_off, out_r, mask=mask)
+    tl.store(out_imag_ptr + o_off, out_i, mask=mask)
 
 
 @triton.autotune(
@@ -270,145 +276,10 @@ class LatitudeGating(nn.Module):
         return x * y
 
 
-class GradientOperator(nn.Module):
-    def __init__(self, mode: str = "sobel"):
-        super().__init__()
-        self.mode = str(mode).lower()
-        if self.mode == "sobel":
-            self.register_buffer("kernel_x", torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
-            self.register_buffer("kernel_y", torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
-        elif self.mode in ["learnable", "diffconv"]:
-            self.conv_x = nn.Conv2d(1, 1, 3, padding=0, bias=False)
-            self.conv_y = nn.Conv2d(1, 1, 3, padding=0, bias=False)
-            nn.init.xavier_normal_(self.conv_x.weight)
-            nn.init.xavier_normal_(self.conv_y.weight)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.mode == "sobel":
-            grad_x = F.conv2d(x, self.kernel_x.to(x.device, x.dtype))
-            grad_y = F.conv2d(x, self.kernel_y.to(x.device, x.dtype))
-            return grad_x, grad_y
-        if self.mode == "diffconv":
-            w_x = self.conv_x.weight - self.conv_x.weight.mean(dim=(2, 3), keepdim=True)
-            w_y = self.conv_y.weight - self.conv_y.weight.mean(dim=(2, 3), keepdim=True)
-            grad_x = F.conv2d(x, w_x)
-            grad_y = F.conv2d(x, w_y)
-            return grad_x, grad_y
-        return self.conv_x(x), self.conv_y(x)
-
-
-class FlowFieldGenerator(nn.Module):
-    def __init__(self, channels: int, height: int, groups: int = 1, diff_mode: str = "sobel", max_velocity: float = 5.0):
-        super().__init__()
-        ch = int(channels)
-        self.groups = int(groups)
-        self.max_velocity = float(max_velocity)
-        mid = max(ch // 2, 1)
-        self.conv = nn.Sequential(
-            nn.Conv2d(ch, mid, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(mid, 2 * self.groups, 3, padding=1),
-        )
-        self.grad_op = GradientOperator(mode=diff_mode)
-        self.height = int(height)
-        lat = torch.linspace(-math.pi / 2, math.pi / 2, self.height).view(1, 1, self.height, 1)
-        metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
-        self.register_buffer("metric_correction", metric_correction)
-        nn.init.zeros_(self.conv[-1].weight)
-        nn.init.zeros_(self.conv[-1].bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, C, H, W = x.shape
-        x_flat = x.reshape(B * L, C, H, W)
-        field = self.conv(x_flat)
-
-        if H != self.height:
-            lat = torch.linspace(-math.pi / 2, math.pi / 2, H, device=x.device).view(1, 1, H, 1)
-            metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
-        else:
-            metric_correction = self.metric_correction
-
-        BL = B * L
-        G = self.groups
-        field_folded = field.view(BL, G, 2, H, W).reshape(BL * G, 2, H, W)
-
-        phi = field_folded[:, 0:1]
-        psi = field_folded[:, 1:2]
-
-        pad_h = (1, 1, 0, 0)
-        pad_w = (0, 0, 1, 1)
-
-        phi_pad = F.pad(phi, pad_h, mode="circular")
-        phi_pad = F.pad(phi_pad, pad_w, mode="replicate")
-        psi_pad = F.pad(psi, pad_h, mode="circular")
-        psi_pad = F.pad(psi_pad, pad_w, mode="replicate")
-
-        grad_x_phi, grad_y_phi = self.grad_op(phi_pad)
-        grad_x_psi, grad_y_psi = self.grad_op(psi_pad)
-
-        u = grad_x_phi * metric_correction - grad_y_psi
-        v = grad_y_phi + grad_x_psi * metric_correction
-
-        flows_flat = torch.cat([u, v], dim=1)
-        flows_flat = self.max_velocity * torch.tanh(flows_flat)
-        flows_stack = flows_flat.view(BL, G, 2, H, W).reshape(B, L, G, 2, H, W)
-        return flows_stack
-
-
-class LieAdvection(nn.Module):
-    def __init__(self, rank: int, groups: int = 1, integration_mode: str = "rk2"):
-        super().__init__()
-        self.rank = int(rank)
-        self.groups = int(groups)
-        self.integration_mode = str(integration_mode).lower()
-        if self.rank % self.groups != 0:
-            raise ValueError(f"Rank {self.rank} must be divisible by groups {self.groups}")
-        self.ranks_per_group = self.rank // self.groups
-
-    def _get_grid(self, flows: torch.Tensor, dt: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        B_G = flows.shape[0]
-        base_grid = _get_base_grid(H, W, flows.device, flows.dtype)
-        base_grid = base_grid.expand(B_G, -1, -1, -1)
-
-        if self.integration_mode == "rk2":
-            dt_view = dt.view(B_G, 1, 1, 1)
-            k1 = flows
-            grid_mid = base_grid - 0.5 * k1.permute(0, 2, 3, 1) * dt_view
-            grid_mid_x = grid_mid[..., 0]
-            grid_mid_y = grid_mid[..., 1]
-            grid_mid_x = torch.remainder(grid_mid_x + 1.0, 2.0) - 1.0
-            grid_mid = torch.stack([grid_mid_x, grid_mid_y], dim=-1)
-            k2 = F.grid_sample(flows, grid_mid, mode="bilinear", padding_mode="border", align_corners=False)
-            grid = base_grid - k2.permute(0, 2, 3, 1) * dt_view
-        else:
-            flow_dt = flows * dt.view(B_G, 1, 1, 1)
-            grid = base_grid - flow_dt.permute(0, 2, 3, 1)
-
-        grid_x = grid[..., 0]
-        grid_y = grid[..., 1]
-        grid_x = torch.remainder(grid_x + 1.0, 2.0) - 1.0
-        return torch.stack([grid_x, grid_y], dim=-1)
-
-    def forward(self, h_prev: torch.Tensor, flows: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-        B, C, H, W, R = h_prev.shape
-        dt_scalar = dt.view(B, 1)
-
-        h_reshaped = h_prev.view(B, C, H, W, self.groups, self.ranks_per_group)
-        h_flat = h_reshaped.permute(0, 4, 1, 5, 2, 3).reshape(B * self.groups, C * self.ranks_per_group, H, W)
-        flows_flat = flows.view(B * self.groups, 2, H, W)
-        dt_flat = dt_scalar.repeat_interleave(self.groups, dim=0)
-
-        sampling_grid = self._get_grid(flows_flat, dt_flat, H, W)
-        h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode="bilinear", padding_mode="border", align_corners=False)
-        h_warped = h_warped_flat.view(B, self.groups, C, self.ranks_per_group, H, W).permute(0, 2, 4, 5, 1, 3).reshape(B, C, H, W, R)
-        return h_warped
-
-
 class SpectralMixer(nn.Module):
-    def __init__(self, rank: int, w_freq: int):
+    def __init__(self, rank: int):
         super().__init__()
         self.rank = int(rank)
-        self.w_freq = int(w_freq)
         self.mix_linear = nn.Linear(self.rank * 2, self.rank * 2)
         nn.init.zeros_(self.mix_linear.weight)
         nn.init.zeros_(self.mix_linear.bias)
@@ -497,70 +368,53 @@ class DynamicsParameterEstimator(nn.Module):
 
 
 class SpectralDynamics(nn.Module):
-    def __init__(self, channels: int, rank: int, w_freq: int, use_noise: bool = False, noise_scale: float = 1.0):
+    def __init__(self, channels: int, rank: int, w_freq: int):
         super().__init__()
-        self.estimator = DynamicsParameterEstimator(int(channels), int(channels), int(rank), int(w_freq))
         self.channels = int(channels)
         self.rank = int(rank)
-        self.use_noise = bool(use_noise)
-        self.noise_scale = float(noise_scale)
-        self.mixer = SpectralMixer(rank, w_freq)
+        self.w_freq = int(w_freq)
+        self.estimator = DynamicsParameterEstimator(self.channels, self.channels, self.rank, self.w_freq)
+        self.mixer = SpectralMixer(self.rank)
 
     def compute_params(self, x_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, L, C, H, W = x_seq.shape
         x_flat = x_seq.reshape(B * L, C, H, W)
         nu_rate, theta_rate, sigma = self.estimator(x_flat)
-        _, _, C_emb, W_freq, Rank = nu_rate.shape
-        nu_rate = nu_rate.view(B, L, 1, C_emb, W_freq, Rank)
-        theta_rate = theta_rate.view(B, L, 1, C_emb, W_freq, Rank)
-        sigma = sigma.view(B, L, 1, C_emb, W_freq, Rank)
+        _, _, C_emb, Wf, R = nu_rate.shape
+        nu_rate = nu_rate.view(B, L, 1, C_emb, Wf, R)
+        theta_rate = theta_rate.view(B, L, 1, C_emb, Wf, R)
+        sigma = sigma.view(B, L, 1, C_emb, Wf, R)
         return nu_rate, theta_rate, sigma
 
-    def forward_step(self, h_trans: torch.Tensor, dt: torch.Tensor, params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        B, C, H, W, R = h_trans.shape
-        h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho").permute(0, 2, 3, 4, 1).contiguous()
-        W_freq = h_freq.shape[-2]
-        h_freq = self.mixer(h_freq)
-        h_freq_in = h_freq.permute(0, 4, 1, 2, 3).contiguous()
-        nu_rate, theta_rate, sigma_val = params
+    def build_A_koop(self, nu_rate: torch.Tensor, theta_rate: torch.Tensor, dt_seq: torch.Tensor, H: int) -> torch.Tensor:
+        B, L = dt_seq.shape
+        _, _, _, C, Wf, R = nu_rate.shape
 
-        nu_in = nu_rate.permute(0, 4, 2, 1, 3).expand(B, R, C, H, W_freq)
-        theta_in = theta_rate.permute(0, 4, 2, 1, 3).expand(B, R, C, H, W_freq)
-        h_real = h_freq_in.real.contiguous()
-        h_imag = h_freq_in.imag.contiguous()
-        out_real = torch.empty_like(h_real)
-        out_imag = torch.empty_like(h_imag)
-        dt_in = dt.view(B).contiguous()
-        grid = lambda META: (triton.cdiv(B * R * C * H * W_freq, META["BLOCK_SIZE"]),)
-        koopman_kernel[grid](
-            h_real,
-            h_imag,
-            nu_in,
-            theta_in,
-            dt_in,
+        nu = nu_rate.squeeze(2).permute(0, 1, 5, 3, 4).contiguous()
+        th = theta_rate.squeeze(2).permute(0, 1, 5, 3, 4).contiguous()
+        dt = dt_seq.contiguous()
+
+        out_real = torch.empty((B, L, R, C, H, Wf), device=dt.device, dtype=dt.dtype)
+        out_imag = torch.empty_like(out_real)
+
+        grid = lambda META: (triton.cdiv(B * L * R * C * H * Wf, META["BLOCK_SIZE"]),)
+        koopman_A_kernel[grid](
+            nu,
+            th,
+            dt,
             out_real,
             out_imag,
             B,
+            L,
             R,
             C,
             H,
-            W_freq,
-            *h_real.stride(),
-            *nu_in.stride(),
-            dt_in.stride(0),
+            Wf,
+            *nu.stride(),
+            *dt.stride(),
             *out_real.stride(),
         )
-        h_evolved = torch.complex(out_real, out_imag)
-
-        if self.use_noise:
-            sigma_in = sigma_val.permute(0, 4, 2, 1, 3).expand(B, R, C, H, W_freq)
-            dt_sqrt = torch.sqrt(dt.view(B, 1, 1, 1, 1).clamp_min(0.0))
-            amp = sigma_in * (self.noise_scale * dt_sqrt)
-            noise = torch.randn_like(h_evolved) * amp
-            h_evolved = h_evolved + noise
-
-        h_out = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho")
-        return h_out.permute(0, 2, 3, 4, 1)
+        return torch.complex(out_real, out_imag)
 
 
 class LearnableStateMap(nn.Module):
@@ -585,87 +439,63 @@ class LearnableStateMap(nn.Module):
         return out.permute(0, 1, 3, 4, 2)
 
 
-def _prl_forward_impl(
-    lie_transport: LieAdvection,
-    koopman: SpectralDynamics,
-    rec_norm: nn.LayerNorm,
-    proj_out: nn.Linear,
-    post_ifft_proj: nn.Conv3d,
-    norm: SpatialGroupNorm,
-    gate: LatitudeGating,
-    x: torch.Tensor,
-    curr_h: torch.Tensor,
-    dt_seq: torch.Tensor,
-    flows_all: torch.Tensor,
-    koopman_params_all: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    dt_ref: torch.Tensor,
-    inj_k: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, C, L, H, W = x.shape
-    h_stack = torch.empty((B, C, L, H, W, curr_h.shape[-1]), device=x.device, dtype=x.dtype)
-    for t in range(L):
-        x_t = x[:, :, t : t + 1]
-        dt_t = dt_seq[:, t : t + 1]
-        flow_t = flows_all[:, t]
-        nu_t = koopman_params_all[0][:, t]
-        theta_t = koopman_params_all[1][:, t]
-        sigma_t = koopman_params_all[2][:, t]
-        h_trans = lie_transport(curr_h, flow_t, dt_t)
-        h_next = koopman.forward_step(h_trans, dt_t, (nu_t, theta_t, sigma_t))
-        x_inject = x_t.squeeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, curr_h.shape[-1])
-        dt_scaled = (dt_t / dt_ref).clamp_min(0.0)
-        g = 1.0 - torch.exp(-dt_scaled * inj_k)
-        curr_h = h_next + g.view(B, 1, 1, 1, 1) * x_inject
-        curr_h = rec_norm(curr_h)
-        h_stack[:, :, t] = curr_h
-    out = proj_out(h_stack).squeeze(-1)
-    out = post_ifft_proj(out.permute(0, 1, 4, 2, 3)).permute(0, 1, 3, 4, 2)
-    out = norm(out)
-    out_gated = gate(out)
-    x_out = x + out_gated
-    return x_out, curr_h
-
-
-class PhysicalRecurrentLayer(nn.Module):
+class ParallelPhysicalRecurrentLayer(nn.Module):
     def __init__(
         self,
         emb_ch: int,
         input_shape: Tuple[int, int],
         rank: int = 64,
-        use_noise: bool = False,
-        noise_scale: float = 1.0,
         dt_ref: float = 1.0,
         inj_k: float = 2.0,
-        diff_mode: str = "sobel",
         static_ch: int = 0,
         learnable_init_state: bool = False,
-        max_velocity: float = 5.0,
     ):
         super().__init__()
         self.emb_ch = int(emb_ch)
         H, W = int(input_shape[0]), int(input_shape[1])
         self.rank = int(rank)
-        self.W_freq = W // 2 + 1
-        self.use_noise = bool(use_noise)
-        self.noise_scale = float(noise_scale)
+        self.H = H
+        self.W = W
+        self.Wf = W // 2 + 1
         self.dt_ref = float(dt_ref) if float(dt_ref) > 0 else 1.0
         self.inj_k = max(float(inj_k), 0.0)
 
-        diff_mode = str(diff_mode)
-        self.flow_groups = 4
-        if self.rank % self.flow_groups != 0:
-            self.flow_groups = 1
-
-        self.hamiltonian = FlowFieldGenerator(self.emb_ch, height=H, groups=self.flow_groups, diff_mode=diff_mode, max_velocity=max_velocity)
-        self.lie_transport = LieAdvection(rank=self.rank, groups=self.flow_groups, integration_mode="rk2")
-        self.koopman = SpectralDynamics(self.emb_ch, self.rank, self.W_freq, use_noise=self.use_noise, noise_scale=self.noise_scale)
+        self.koopman = SpectralDynamics(self.emb_ch, self.rank, self.Wf)
         self.proj_out = nn.Linear(self.rank, 1)
-        self.init_state = LearnableStateMap(int(static_ch), self.emb_ch, self.rank, H, W) if bool(learnable_init_state) and int(static_ch) > 0 else None
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = SpatialGroupNorm(4, self.emb_ch)
         self.gate = LatitudeGating(self.emb_ch)
-        self.rec_norm = nn.LayerNorm(self.rank)
-        self._compiled = torch.compile(_prl_forward_impl, fullgraph=True)
+
+        self.init_state = LearnableStateMap(int(static_ch), self.emb_ch, self.rank, H, self.Wf) if bool(learnable_init_state) and int(static_ch) > 0 else None
+        self.rank_scale = nn.Parameter(torch.ones(self.rank))
+
+    def _build_injection_freq(self, x: torch.Tensor, dt_seq: torch.Tensor) -> torch.Tensor:
+        B, C, L, H, W = x.shape
+        dt_ref = torch.tensor(self.dt_ref, device=x.device, dtype=x.dtype).clamp_min(1e-6)
+        inj_k = torch.tensor(self.inj_k, device=x.device, dtype=x.dtype)
+
+        dt_scaled = (dt_seq / dt_ref).clamp_min(0.0)
+        g = 1.0 - torch.exp(-dt_scaled * inj_k)
+        g = g.view(B, L, 1, 1, 1, 1)
+
+        x_bl = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W).float()
+        xf = torch.fft.rfft2(x_bl, norm="ortho")
+        xf = xf.reshape(B, L, C, H, self.Wf).to(torch.complex64)
+
+        rs = self.rank_scale.to(x.device, x.dtype).view(1, 1, self.rank, 1, 1, 1)
+        xf = xf.unsqueeze(2).expand(B, L, self.rank, C, H, self.Wf)
+        xinj = xf * rs.to(torch.complex64)
+
+        return xinj * g.to(torch.complex64)
+
+    def _init_state_freq(self, B: int, device: torch.device, dtype: torch.dtype, static_feats: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.init_state is None or static_feats is None:
+            return torch.zeros((B, self.rank, self.emb_ch, self.H, self.Wf), device=device, dtype=torch.complex64)
+
+        h0 = self.init_state(static_feats)
+        h0 = h0.permute(0, 4, 1, 2, 3).contiguous()
+        h0f = torch.fft.rfft2(h0.float(), norm="ortho")
+        return h0f.to(torch.complex64)
 
     def forward(
         self,
@@ -675,39 +505,45 @@ class PhysicalRecurrentLayer(nn.Module):
         static_feats: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, L, H, W = x.shape
-        if last_hidden_in is None:
-            if self.init_state is not None and static_feats is not None:
-                curr_h = self.init_state(static_feats)
-            else:
-                curr_h = torch.zeros(B, C, H, W, self.rank, device=x.device, dtype=x.dtype)
-        else:
-            curr_h = last_hidden_in
+        if (H, W) != (self.H, self.W):
+            raise ValueError(f"input spatial {(H, W)} must match layer {(self.H, self.W)}")
 
         dt_seq = torch.ones(B, L, device=x.device, dtype=x.dtype) if listT is None else _match_dt_seq(listT.to(x.device, x.dtype), L)
 
-        x_perm = x.permute(0, 2, 1, 3, 4)
-        flows_all = self.hamiltonian(x_perm)
-        koopman_params_all = self.koopman.compute_params(x_perm)
+        x_perm = x.permute(0, 2, 1, 3, 4).contiguous()
+        nu_rate, theta_rate, _ = self.koopman.compute_params(x_perm)
+        A_koop = self.koopman.build_A_koop(nu_rate, theta_rate, dt_seq, H)
+        X_inj = self._build_injection_freq(x, dt_seq)
 
-        dt_ref = torch.tensor(self.dt_ref, device=x.device, dtype=x.dtype).clamp_min(1e-6)
-        inj_k = torch.tensor(self.inj_k, device=x.device, dtype=x.dtype)
+        A_flat = A_koop.permute(0, 1, 2, 3, 4, 5).reshape(B, L, -1).contiguous()
+        X_flat = X_inj.permute(0, 1, 2, 3, 4, 5).reshape(B, L, -1).contiguous()
 
-        return self._compiled(
-            self.lie_transport,
-            self.koopman,
-            self.rec_norm,
-            self.proj_out,
-            self.post_ifft_proj,
-            self.norm,
-            self.gate,
-            x,
-            curr_h,
-            dt_seq,
-            flows_all,
-            koopman_params_all,
-            dt_ref,
-            inj_k,
-        )
+        if last_hidden_in is None:
+            H0 = self._init_state_freq(B, x.device, x.dtype, static_feats)
+        else:
+            if last_hidden_in.dtype.is_complex:
+                H0 = last_hidden_in
+            else:
+                h0 = last_hidden_in.permute(0, 4, 1, 2, 3).contiguous()
+                H0 = torch.fft.rfft2(h0.float(), norm="ortho").to(torch.complex64)
+
+        H0_flat = H0.reshape(B, -1).contiguous()
+        X_flat[:, 0] = X_flat[:, 0] + A_flat[:, 0] * H0_flat
+
+        Y_flat = pscan(A_flat, X_flat)
+        Y = Y_flat.view(B, L, self.rank, C, H, self.Wf)
+
+        h_space = torch.fft.irfft2(Y, s=(H, W), norm="ortho").to(x.dtype)
+        h_stack = h_space.permute(0, 3, 1, 4, 5, 2).contiguous()
+        h_last = h_stack[:, :, -1].contiguous()
+
+        out = self.proj_out(h_stack).squeeze(-1)
+        out = self.post_ifft_proj(out.permute(0, 1, 4, 2, 3)).permute(0, 1, 3, 4, 2)
+        out = self.norm(out)
+        out = self.gate(out)
+        x_out = x + out
+
+        return x_out, h_last
 
 
 class GatedConvBlock(nn.Module):
@@ -780,7 +616,7 @@ class FeedForwardNetwork(nn.Module):
 class UniPhyBlock(nn.Module):
     def __init__(self, emb_ch: int, input_shape: Tuple[int, int], prl_args: Dict[str, Any], ffn_args: Dict[str, Any]):
         super().__init__()
-        self.prl_layer = PhysicalRecurrentLayer(emb_ch, input_shape, **prl_args)
+        self.prl_layer = ParallelPhysicalRecurrentLayer(emb_ch, input_shape, **prl_args)
         self.feed_forward = FeedForwardNetwork(emb_ch, input_shape, **ffn_args)
 
     def forward(
@@ -801,7 +637,7 @@ class BottleneckAttention(nn.Module):
         super().__init__()
         self.num_heads = int(num_heads)
         head_dim = int(dim) // int(num_heads)
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
         self.qkv = nn.Linear(int(dim), int(dim) * 3, bias=bool(qkv_bias))
         self.attn_drop = nn.Dropout(float(attn_drop))
         self.proj = nn.Linear(int(dim), int(dim))
@@ -1172,24 +1008,16 @@ class UniPhy(nn.Module):
         down_mode = getattr(args, "down_mode", "avg")
 
         rank = int(getattr(args, "lru_rank", getattr(args, "prl_rank", 64)))
-        koopman_use_noise = bool(getattr(args, "koopman_use_noise", False))
-        koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
         dt_ref = float(getattr(args, "dt_ref", getattr(args, "T", 1.0)))
         inj_k = float(getattr(args, "inj_k", 2.0))
-        diff_mode = str(getattr(args, "diff_mode", "sobel"))
         learnable_init_state = bool(getattr(args, "learnable_init_state", False))
-        max_velocity = float(getattr(args, "max_velocity", 5.0))
 
         prl_args = {
             "rank": rank,
-            "use_noise": koopman_use_noise,
-            "noise_scale": koopman_noise_scale,
             "dt_ref": dt_ref,
             "inj_k": inj_k,
-            "diff_mode": diff_mode,
             "static_ch": static_ch,
             "learnable_init_state": learnable_init_state,
-            "max_velocity": max_velocity,
         }
 
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))

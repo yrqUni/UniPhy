@@ -2,9 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def complex_mul(ar, ai, br, bi):
     return ar * br - ai * bi, ar * bi + ai * br
+
 
 @triton.jit
 def scan_combine(ar, ai, xr, xi, br, bi, yr, yi):
@@ -14,13 +16,17 @@ def scan_combine(ar, ai, xr, xi, br, bi, yr, yi):
     new_xi = bx_i + yi
     return new_ar, new_ai, new_xr, new_xi
 
+
 @triton.jit
 def pscan_kernel(
-    A_ptr, X_ptr, Y_ptr,
-    stride_batch, stride_time,
-    L: tl.constexpr,
+    A_ptr,
+    X_ptr,
+    Y_ptr,
+    stride_batch: tl.constexpr,
+    stride_time: tl.constexpr,
+    L,
     BLOCK_SIZE: tl.constexpr,
-    REVERSE: tl.constexpr
+    REVERSE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     A_base = A_ptr + pid * stride_batch
@@ -30,27 +36,22 @@ def pscan_kernel(
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < L
 
-    if REVERSE:
-        read_offs = L - 1 - offs
-    else:
-        read_offs = offs
+    read_offs = tl.where(REVERSE, (L - 1 - offs), offs)
 
-    a_r = tl.load(A_base + read_offs * stride_time, mask=mask, other=1.0)
+    a_r = tl.load(A_base + read_offs * stride_time + 0, mask=mask, other=1.0)
     a_i = tl.load(A_base + read_offs * stride_time + 1, mask=mask, other=0.0)
-    x_r = tl.load(X_base + read_offs * stride_time, mask=mask, other=0.0)
+    x_r = tl.load(X_base + read_offs * stride_time + 0, mask=mask, other=0.0)
     x_i = tl.load(X_base + read_offs * stride_time + 1, mask=mask, other=0.0)
 
-    acc_ar, acc_ai, acc_xr, acc_xi = tl.associative_scan(
-        (a_r, a_i, x_r, x_i),
-        axis=0,
-        combine_fn=scan_combine
-    )
+    acc_ar, acc_ai, acc_xr, acc_xi = tl.associative_scan((a_r, a_i, x_r, x_i), axis=0, combine_fn=scan_combine)
 
-    tl.store(Y_base + read_offs * stride_time, acc_xr, mask=mask)
+    tl.store(Y_base + read_offs * stride_time + 0, acc_xr, mask=mask)
     tl.store(Y_base + read_offs * stride_time + 1, acc_xi, mask=mask)
 
-def next_power_of_2(n):
+
+def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
+
 
 class PScanTriton(torch.autograd.Function):
     @staticmethod
@@ -62,12 +63,11 @@ class PScanTriton(torch.autograd.Function):
             A = A.unsqueeze(-1)
         if A.shape != X.shape:
             A, X = torch.broadcast_tensors(A, X)
-        
-        A = A.clone()
-        X = X.clone()
 
-        input_shape = X.shape
-        L = input_shape[1]
+        A = A.contiguous()
+        X = X.contiguous()
+
+        L = X.shape[1]
 
         A_in = A.transpose(1, -1).contiguous()
         X_in = X.transpose(1, -1).contiguous()
@@ -77,23 +77,31 @@ class PScanTriton(torch.autograd.Function):
 
         num_sequences = A_flat.shape[0]
 
-        A_real = torch.view_as_real(A_flat)
-        X_real = torch.view_as_real(X_flat)
+        A_real = torch.view_as_real(A_flat).contiguous()
+        X_real = torch.view_as_real(X_flat).contiguous()
         Y_real = torch.empty_like(X_real)
 
         BLOCK_SIZE = next_power_of_2(L)
-        BLOCK_SIZE = max(BLOCK_SIZE, 16)
+        if BLOCK_SIZE < 16:
+            BLOCK_SIZE = 16
         if BLOCK_SIZE > 131072:
-             raise ValueError(f"Sequence length L={L} exceeds Triton block limits.")
+            raise ValueError(f"Sequence length L={L} exceeds Triton block limits.")
 
         grid = (num_sequences,)
+
         stride_batch = A_real.stride(0)
         stride_time = A_real.stride(1)
 
         pscan_kernel[grid](
-            A_real, X_real, Y_real,
-            stride_batch, stride_time,
-            L, BLOCK_SIZE, REVERSE=False
+            A_real,
+            X_real,
+            Y_real,
+            stride_batch=stride_batch,
+            stride_time=stride_time,
+            L=L,
+            BLOCK_SIZE=BLOCK_SIZE,
+            REVERSE=False,
+            num_warps=4 if BLOCK_SIZE <= 256 else 8,
         )
 
         Y = torch.view_as_complex(Y_real)
@@ -107,41 +115,50 @@ class PScanTriton(torch.autograd.Function):
     def backward(ctx, grad_output):
         A, Y = ctx.saved_tensors
         A_conj = A.conj()
-        
+
         zero_padding = torch.zeros_like(A_conj[:, 0:1])
         A_prep = torch.cat([A_conj[:, 1:], zero_padding], dim=1)
-        
+
         L = A.shape[1]
-        
+
         A_in = A_prep.transpose(1, -1).contiguous()
         X_in = grad_output.transpose(1, -1).contiguous()
-        
+
         A_flat = A_in.view(-1, L)
         X_flat = X_in.view(-1, L)
-        
+
         num_sequences = A_flat.shape[0]
-        
-        A_real = torch.view_as_real(A_flat)
-        X_real = torch.view_as_real(X_flat)
+
+        A_real = torch.view_as_real(A_flat).contiguous()
+        X_real = torch.view_as_real(X_flat).contiguous()
         Y_real = torch.empty_like(X_real)
-        
+
         BLOCK_SIZE = next_power_of_2(L)
-        BLOCK_SIZE = max(BLOCK_SIZE, 16)
-        
+        if BLOCK_SIZE < 16:
+            BLOCK_SIZE = 16
+        if BLOCK_SIZE > 131072:
+            raise ValueError(f"Sequence length L={L} exceeds Triton block limits.")
+
         grid = (num_sequences,)
+
         stride_batch = A_real.stride(0)
         stride_time = A_real.stride(1)
-        
+
         pscan_kernel[grid](
-            A_real, X_real, Y_real,
-            stride_batch, stride_time,
-            L, BLOCK_SIZE, REVERSE=True
+            A_real,
+            X_real,
+            Y_real,
+            stride_batch=stride_batch,
+            stride_time=stride_time,
+            L=L,
+            BLOCK_SIZE=BLOCK_SIZE,
+            REVERSE=True,
+            num_warps=4 if BLOCK_SIZE <= 256 else 8,
         )
-        
+
         dX_rev = torch.view_as_complex(Y_real)
         dX_rev = dX_rev.view(*A_in.shape).transpose(1, -1)
-        
-        dX = dX_rev 
+        dX = dX_rev
 
         slices_start = [slice(None)] * A.ndim
         slices_start[1] = slice(0, 1)
@@ -149,24 +166,20 @@ class PScanTriton(torch.autograd.Function):
         slices_end = [slice(None)] * A.ndim
         slices_end[1] = slice(None, -1)
 
-        Y_prev = torch.cat([
-            torch.zeros_like(Y[tuple(slices_start)]),
-            Y[tuple(slices_end)]
-        ], dim=1)
-
+        Y_prev = torch.cat([torch.zeros_like(Y[tuple(slices_start)]), Y[tuple(slices_end)]], dim=1)
         dA = dX * Y_prev.conj()
 
         shape_A_orig = ctx.shape_A_orig
-        
+
         if dA.ndim > len(shape_A_orig):
             if dA.ndim == len(shape_A_orig) + 1:
                 dA = dA.sum(dim=-1)
             else:
-                 while dA.ndim > len(shape_A_orig):
+                while dA.ndim > len(shape_A_orig):
                     dA = dA.sum(dim=0)
-        
+
         if dA.ndim == len(shape_A_orig):
-             for i, dim in enumerate(shape_A_orig):
+            for i, dim in enumerate(shape_A_orig):
                 if dim == 1 and dA.shape[i] > 1:
                     dA = dA.sum(dim=i, keepdim=True)
 
@@ -179,6 +192,7 @@ class PScanTriton(torch.autograd.Function):
                     dX = dX.sum(dim=i, keepdim=True)
 
         return dA, dX
+
 
 pscan = PScanTriton.apply
 
