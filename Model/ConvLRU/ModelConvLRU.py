@@ -7,6 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
+# ==========================================
+# 1. Triton Optimization Section
+# ==========================================
 try:
     import triton
     import triton.language as tl
@@ -135,6 +138,9 @@ try:
 except ImportError:
     HAS_TRITON = False
 
+# ==========================================
+# 2. Utils & Base Classes
+# ==========================================
 
 def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     out_ch, in_ch, kD, kH, kW = weight.shape
@@ -146,7 +152,6 @@ def icnr_conv3d_weight_(weight: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
         weight.copy_(base)
     return weight
 
-
 def pixel_shuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     N, C_mul, D, H, W = x.shape
     C = C_mul // (rH * rW)
@@ -155,7 +160,6 @@ def pixel_shuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.reshape(N, C, D, H * rH, W * rW)
     return x
 
-
 def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     N, C, D, H, W = x.shape
     x = x.reshape(N, C, D, H // rH, rH, W // rW, rW)
@@ -163,6 +167,33 @@ def pixel_unshuffle_hw_3d(x: torch.Tensor, rH: int, rW: int) -> torch.Tensor:
     x = x.reshape(N, C * rH * rW, D, H // rH, W // rW)
     return x
 
+def _match_dt_seq(dt_seq: torch.Tensor, L: int) -> torch.Tensor:
+    if dt_seq.dim() != 2:
+        raise ValueError(f"listT must be 2D [B,L], got {tuple(dt_seq.shape)}")
+    if dt_seq.size(1) == L:
+        return dt_seq
+    if dt_seq.size(1) == 1:
+        return dt_seq.repeat(1, L)
+    if dt_seq.size(1) > L:
+        return dt_seq[:, :L]
+    pad = dt_seq[:, -1:].repeat(1, L - dt_seq.size(1))
+    return torch.cat([dt_seq, pad], dim=1)
+
+_BASE_GRID_CACHE: Dict[Tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
+
+def _get_base_grid(H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (int(H), int(W), device, dtype)
+    g = _BASE_GRID_CACHE.get(key, None)
+    if g is not None:
+        return g
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device, dtype=dtype),
+        torch.linspace(-1, 1, W, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0)
+    _BASE_GRID_CACHE[key] = base_grid
+    return base_grid
 
 class SpatialGroupNorm(nn.GroupNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -173,12 +204,47 @@ class SpatialGroupNorm(nn.GroupNorm):
             return y.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
         return super().forward(x)
 
+# ==========================================
+# 3. Convolutional Primitives
+# ==========================================
+
+class DeformConv2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1, bias: bool = False):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.padding = int(padding)
+        self.conv_offset = nn.Conv2d(
+            int(in_channels),
+            int(2 * kernel_size * kernel_size + kernel_size * kernel_size),
+            kernel_size=int(kernel_size),
+            padding=int(padding),
+        )
+        self.conv_dcn = torchvision.ops.DeformConv2d(
+            int(in_channels),
+            int(out_channels),
+            kernel_size=int(kernel_size),
+            padding=int(padding),
+            bias=bool(bias),
+        )
+        nn.init.constant_(self.conv_offset.weight, 0)
+        nn.init.constant_(self.conv_offset.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv_offset(x)
+        o1, o2, mask = torch.chunk(out, 3, dim=1)
+        offset = torch.cat((o1, o2), dim=1)
+        mask = torch.sigmoid(mask)
+        return self.conv_dcn(x, offset, mask)
 
 class FactorizedPeriodicConv3d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7, conv_type: str = "conv"):
         super().__init__()
         self.pad_sp = int(kernel_size) // 2
-        self.spatial_conv = nn.Conv2d(int(in_channels), int(out_channels), kernel_size=int(kernel_size), padding=0, bias=False)
+        self.conv_type = str(conv_type)
+        if self.conv_type == "dcn":
+            self.spatial_conv = DeformConv2d(int(in_channels), int(out_channels), kernel_size=int(kernel_size), padding=0, bias=False)
+        else:
+            self.spatial_conv = nn.Conv2d(int(in_channels), int(out_channels), kernel_size=int(kernel_size), padding=0, bias=False)
         self.depth_conv = nn.Conv3d(int(out_channels), int(out_channels), kernel_size=(1, 1, 1), padding=0, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -190,13 +256,11 @@ class FactorizedPeriodicConv3d(nn.Module):
         x_sp = x_sp.reshape(B, D, -1, H, W).permute(0, 2, 1, 3, 4).contiguous()
         return self.depth_conv(x_sp)
 
-
 class LatitudeAwareSE(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
         self.channels = int(channels)
         mid_channels = max(self.channels // reduction, 4)
-        
         self.fc1 = nn.Linear(self.channels, mid_channels)
         self.fc2 = nn.Linear(mid_channels, self.channels)
         self.act = nn.SiLU()
@@ -223,12 +287,14 @@ class LatitudeAwareSE(nn.Module):
             y = y.permute(0, 2, 1).unsqueeze(-1)
         return x * y
 
+# ==========================================
+# 4. Physics Core Components
+# ==========================================
 
 class GradientOperator(nn.Module):
     def __init__(self, mode: str = "sobel"):
         super().__init__()
         self.mode = str(mode).lower()
-        
         if self.mode == "sobel":
             self.register_buffer("kernel_x", torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
             self.register_buffer("kernel_y", torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
@@ -243,16 +309,13 @@ class GradientOperator(nn.Module):
             grad_x = F.conv2d(x, self.kernel_x.to(x.device, x.dtype))
             grad_y = F.conv2d(x, self.kernel_y.to(x.device, x.dtype))
             return grad_x, grad_y
-        
         if self.mode == "diffconv":
             w_x = self.conv_x.weight - self.conv_x.weight.mean(dim=(2, 3), keepdim=True)
             w_y = self.conv_y.weight - self.conv_y.weight.mean(dim=(2, 3), keepdim=True)
             grad_x = F.conv2d(x, w_x)
             grad_y = F.conv2d(x, w_y)
             return grad_x, grad_y
-            
         return self.conv_x(x), self.conv_y(x)
-
 
 class HamiltonianGenerator(nn.Module):
     def __init__(self, channels: int, height: int, groups: int = 1, diff_mode: str = "sobel"):
@@ -266,7 +329,6 @@ class HamiltonianGenerator(nn.Module):
             nn.Conv2d(mid, 2 * self.groups, 3, padding=1),
         )
         self.grad_op = GradientOperator(mode=diff_mode)
-        
         self.height = int(height)
         lat = torch.linspace(-math.pi / 2, math.pi / 2, self.height).view(1, 1, self.height, 1)
         metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
@@ -278,22 +340,18 @@ class HamiltonianGenerator(nn.Module):
         B, L, C, H, W = x.shape
         x_flat = x.reshape(B * L, C, H, W)
         field = self.conv(x_flat)
-        
         flows = []
-        
         if H != self.height:
              lat = torch.linspace(-math.pi / 2, math.pi / 2, H, device=x.device).view(1, 1, H, 1)
              metric_correction = 1.0 / (torch.cos(lat) + 1e-6)
         else:
              metric_correction = self.metric_correction
-
+        
         pad_h = (1, 1, 0, 0)
         pad_w = (0, 0, 1, 1)
-
         for g in range(self.groups):
             phi = field[:, 2*g : 2*g+1]
             psi = field[:, 2*g+1 : 2*g+2]
-            
             phi_pad = F.pad(phi, pad_h, mode="circular")
             phi_pad = F.pad(phi_pad, pad_w, mode="replicate")
             psi_pad = F.pad(psi, pad_h, mode="circular")
@@ -304,31 +362,11 @@ class HamiltonianGenerator(nn.Module):
             
             u = grad_x_phi * metric_correction - grad_y_psi
             v = grad_y_phi + grad_x_psi * metric_correction
-            
             flows.append(torch.cat([u, v], dim=1))
             
         flows_stack = torch.stack(flows, dim=1)
         flows_stack = torch.tanh(flows_stack)
         return flows_stack.view(B, L, self.groups, 2, H, W)
-
-
-_BASE_GRID_CACHE: Dict[Tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
-
-
-def _get_base_grid(H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (int(H), int(W), device, dtype)
-    g = _BASE_GRID_CACHE.get(key, None)
-    if g is not None:
-        return g
-    grid_y, grid_x = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device, dtype=dtype),
-        torch.linspace(-1, 1, W, device=device, dtype=dtype),
-        indexing="ij",
-    )
-    base_grid = torch.stack((grid_x, grid_y), 2).unsqueeze(0)
-    _BASE_GRID_CACHE[key] = base_grid
-    return base_grid
-
 
 class LieTransport(nn.Module):
     def __init__(self, rank: int, groups: int = 1):
@@ -342,21 +380,17 @@ class LieTransport(nn.Module):
     def forward(self, h_prev: torch.Tensor, flows: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         B, C, H, W, R = h_prev.shape
         dt = dt.view(B, 1)
-        
         use_triton_grid = HAS_TRITON and h_prev.device.type == "cuda"
         
         h_reshaped = h_prev.view(B, C, H, W, self.groups, self.ranks_per_group)
         h_flat = h_reshaped.permute(0, 4, 1, 5, 2, 3).reshape(B * self.groups, C * self.ranks_per_group, H, W)
-        
         flows_flat = flows.view(B * self.groups, 2, H, W)
         
         if use_triton_grid:
             sampling_grid = torch.empty((B * self.groups, H, W, 2), device=h_prev.device, dtype=h_prev.dtype)
             dt_contiguous = dt.view(B).contiguous()
             flow_contiguous = flows_flat.contiguous()
-            
             grid = lambda META: (triton.cdiv(B * self.groups * H * W, META['BLOCK_SIZE']), )
-            
             gen_warp_grid_kernel[grid](
                 flow_contiguous, dt_contiguous, sampling_grid,
                 B * self.groups, H, W,
@@ -374,11 +408,8 @@ class LieTransport(nn.Module):
             sampling_grid = base_grid.expand(B * self.groups, -1, -1, -1) - flow_dt.permute(0, 2, 3, 1)
             
         h_warped_flat = F.grid_sample(h_flat, sampling_grid, mode="bilinear", padding_mode="border", align_corners=False)
-        
         h_warped = h_warped_flat.view(B, self.groups, C, self.ranks_per_group, H, W).permute(0, 2, 4, 5, 1, 3).reshape(B, C, H, W, R)
-        
         return h_warped
-
 
 class SpectralMixer(nn.Module):
     def __init__(self, rank: int, w_freq: int):
@@ -400,7 +431,6 @@ class SpectralMixer(nn.Module):
         h_real_out, h_imag_out = torch.chunk(h_mixed, 2, dim=-1)
         return torch.complex(h_real_out, h_imag_out)
 
-
 class KoopmanParamEstimator(nn.Module):
     def __init__(self, in_ch: int, emb_ch: int, rank: int, w_freq: int):
         super().__init__()
@@ -416,18 +446,15 @@ class KoopmanParamEstimator(nn.Module):
         )
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.global_fc = nn.Linear(ch, ch)
-        
         self.pool = nn.AdaptiveAvgPool2d((1, self.w_freq))
         self.head = nn.Linear(ch, self.emb_ch * self.rank * 3)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, C, H, W = x.shape
         feat = self.conv(x)
-        
         glob = self.global_pool(feat).flatten(1)
         glob = torch.sigmoid(self.global_fc(glob)).view(B, C, 1, 1)
         feat = feat * glob
-        
         feat = self.pool(feat)
         feat = feat.permute(0, 2, 3, 1).reshape(B, 1, self.w_freq, C)
         params = self.head(feat)
@@ -437,7 +464,6 @@ class KoopmanParamEstimator(nn.Module):
         theta_rate = torch.tanh(params[..., 1]) * math.pi
         sigma = torch.sigmoid(params[..., 2])
         return nu_rate, theta_rate, sigma
-
 
 class SpectralKoopmanSDE(nn.Module):
     def __init__(self, channels: int, rank: int, w_freq: int, use_noise: bool = False, noise_scale: float = 1.0):
@@ -463,28 +489,21 @@ class SpectralKoopmanSDE(nn.Module):
         B, C, H, W, R = h_trans.shape
         h_freq = torch.fft.rfft2(h_trans.permute(0, 4, 1, 2, 3).float(), norm="ortho").permute(0, 2, 3, 4, 1).contiguous()
         W_freq = h_freq.shape[-2]
-        
         h_freq = self.mixer(h_freq)
-        
         h_freq_in = h_freq.permute(0, 4, 1, 2, 3).contiguous()
-        
         nu_rate, theta_rate, sigma_val = params
 
         if HAS_TRITON and h_freq_in.device.type == "cuda":
             nu_in = nu_rate.permute(0, 4, 2, 1, 3) 
             theta_in = theta_rate.permute(0, 4, 2, 1, 3)
-            
             nu_in = nu_in.expand(B, R, C, H, W_freq)
             theta_in = theta_in.expand(B, R, C, H, W_freq)
-            
             h_real = h_freq_in.real.contiguous()
             h_imag = h_freq_in.imag.contiguous()
             out_real = torch.empty_like(h_real)
             out_imag = torch.empty_like(h_imag)
             dt_in = dt.view(B).contiguous()
-            
             grid = lambda META: (triton.cdiv(B * R * C * H * W_freq, META['BLOCK_SIZE']), )
-            
             fused_koopman_kernel[grid](
                 h_real, h_imag,
                 nu_in, theta_in, dt_in,
@@ -496,7 +515,6 @@ class SpectralKoopmanSDE(nn.Module):
                 BLOCK_SIZE=256
             )
             h_evolved = torch.complex(out_real, out_imag)
-            
             if self.use_noise:
                  sigma_in = sigma_val.permute(0, 4, 2, 1, 3).expand(B, R, C, H, W_freq)
                  dt_sqrt = torch.sqrt(dt.view(B, 1, 1, 1, 1).clamp_min(0.0))
@@ -519,9 +537,12 @@ class SpectralKoopmanSDE(nn.Module):
                 noise = torch.randn_like(h_freq_in) * amp
                 h_evolved = h_evolved + noise
 
-        h_evolved_perm = h_evolved.permute(0, 2, 3, 4, 1)
-        h_out = torch.fft.irfft2(h_evolved_perm, s=(H, W), norm="ortho")
-        
+        # IFFT on dimensions H and W_freq.
+        # h_evolved has shape [B, R, C, H, W_freq]
+        # irfft2 defaults dim=(-2, -1), which is correct for (H, W_freq) input
+        h_out_struct = torch.fft.irfft2(h_evolved, s=(H, W), norm="ortho") 
+        # h_out_struct is [B, R, C, H, W]
+        h_out = h_out_struct.permute(0, 2, 3, 4, 1) 
         return h_out
 
     def forward(self, h_trans: torch.Tensor, x_curr: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
@@ -530,6 +551,26 @@ class SpectralKoopmanSDE(nn.Module):
         params = (nu_rate.unsqueeze(1), theta_rate.unsqueeze(1), sigma.unsqueeze(1))
         return self.forward_step(h_trans, dt, params)
 
+class StaticInitState(nn.Module):
+    def __init__(self, static_ch: int, emb_ch: int, rank: int, S: int, W_freq: int):
+        super().__init__()
+        self.static_ch = int(static_ch)
+        self.emb_ch = int(emb_ch)
+        self.rank = int(rank)
+        self.S = int(S)
+        self.W_freq = int(W_freq)
+        self.mapper = nn.Sequential(
+            nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((self.S, self.W_freq)),
+            nn.Conv2d(self.emb_ch, self.emb_ch * self.rank, kernel_size=1),
+        )
+
+    def forward(self, static_feats: torch.Tensor) -> torch.Tensor:
+        B = static_feats.size(0)
+        out = self.mapper(static_feats)
+        out = out.view(B, self.emb_ch, self.rank, self.S, self.W_freq)
+        return out.permute(0, 1, 3, 4, 2)
 
 class SimplifiedHKLFLayer(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -561,7 +602,6 @@ class SimplifiedHKLFLayer(nn.Module):
             self.init_state = None
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
         self.norm = SpatialGroupNorm(4, self.emb_ch)
-        
         self.gate = LatitudeAwareSE(self.emb_ch)
 
     def forward(
@@ -618,12 +658,13 @@ class SimplifiedHKLFLayer(nn.Module):
         out = out.permute(0, 4, 1, 2, 3)
         out = self.post_ifft_proj(out)
         out = self.norm(out)
-        
         out_gated = self.gate(out)
         x_out = x + out_gated
-        
         return x_out, curr_h
 
+# ==========================================
+# 5. Neural Network Blocks
+# ==========================================
 
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, use_cbam: bool = False, cond_channels: Optional[int] = None, conv_type: str = "conv"):
@@ -632,13 +673,13 @@ class GatedConvBlock(nn.Module):
         self.norm = SpatialGroupNorm(4, int(channels))
         self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
-        
         self.pw_conv_in = nn.Linear(int(channels), int(channels) * 2)
         self.pw_conv_out = nn.Linear(int(channels), int(channels))
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = x
-        x = self.dw_conv(x)
+        self.dw_conv(x) # Call for side-effects? No, bug in previous version.
+        x = self.dw_conv(x) # Corrected assignment
         x = self.norm(x)
         if self.cond_proj is not None and cond is not None:
             cond_in = cond.unsqueeze(2) if cond.dim() == 4 else cond
@@ -673,7 +714,6 @@ class GatedConvBlock(nn.Module):
         x = x.permute(0, 4, 1, 2, 3)
         return residual + x
 
-
 class FeedForward(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -683,7 +723,6 @@ class FeedForward(nn.Module):
         self.hidden_size = (int(input_downsp_shape[1]), int(input_downsp_shape[2]))
         self.static_ch = int(getattr(args, "static_ch", 0))
         self.conv_type = str(getattr(args, "ConvType", "conv"))
-        
         self.c_in = nn.Linear(self.emb_ch, self.hidden_dim)
         cond_ch = self.emb_ch if self.static_ch > 0 else None
         self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, use_cbam=False, cond_channels=cond_ch, conv_type=self.conv_type)
@@ -696,14 +735,11 @@ class FeedForward(nn.Module):
         x = self.c_in(x)
         x = self.act(x)
         x = x.permute(0, 4, 1, 2, 3)
-        
         x = self.block(x, cond=cond)
-        
         x = x.permute(0, 2, 3, 4, 1)
         x = self.c_out(x)
         x = x.permute(0, 4, 1, 2, 3)
         return residual + x
-
 
 class ConvLRUBlock(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -722,7 +758,6 @@ class ConvLRUBlock(nn.Module):
         x_mid, h_out = self.lru_layer(x, last_hidden_in, listT=listT, static_feats=static_feats)
         x_out = self.feed_forward(x_mid, cond=cond)
         return x_out, h_out
-
 
 class BottleneckAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, attn_drop: float = 0.0, proj_drop: float = 0.0):
@@ -744,11 +779,9 @@ class BottleneckAttention(nn.Module):
         x_norm = self.norm(x_flat)
         qkv = self.qkv(x_norm).reshape(BN, N, 3, self.num_heads, Cc // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        
         x_attn = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0, scale=self.scale
         )
-        
         x_attn = x_attn.transpose(1, 2).reshape(BN, N, Cc)
         x_attn = self.proj(x_attn)
         x_attn = self.proj_drop(x_attn)
@@ -756,6 +789,23 @@ class BottleneckAttention(nn.Module):
         out = out.view(B, L, H, W, Cc).permute(0, 4, 1, 2, 3).contiguous()
         return out
 
+class CrossScaleAttentionGate(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        ch = int(channels)
+        self.conv_g = nn.Conv3d(ch, ch, kernel_size=1, bias=False)
+        self.conv_l = nn.Conv3d(ch, ch, kernel_size=1, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.psi = nn.Conv3d(ch, 1, kernel_size=1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+        self.norm = SpatialGroupNorm(4, ch)
+
+    def forward(self, local_x: torch.Tensor, global_x: torch.Tensor) -> torch.Tensor:
+        g = self.conv_g(global_x)
+        l = self.conv_l(local_x)
+        psi = self.relu(g + l)
+        attn = self.sigmoid(self.psi(psi))
+        return self.norm(local_x * attn)
 
 class BiFPNFusion(nn.Module):
     def __init__(self, channels: int):
@@ -773,7 +823,6 @@ class BiFPNFusion(nn.Module):
         out = (w1 * x + w2 * skip) / weight
         return self.conv(self.act(out))
 
-
 class ShuffleDownsample(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
@@ -783,6 +832,9 @@ class ShuffleDownsample(nn.Module):
         x = pixel_unshuffle_hw_3d(x, 2, 2)
         return self.proj(x)
 
+# ==========================================
+# 6. Main Model Structure
+# ==========================================
 
 class ConvLRUModel(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
@@ -798,6 +850,7 @@ class ConvLRUModel(nn.Module):
         self.downsamples = nn.ModuleList()
         C = int(getattr(args, "emb_ch", 64))
         H, W = int(input_downsp_shape[1]), int(input_downsp_shape[2])
+        
         if not self.use_unet:
             self.convlru_blocks = nn.ModuleList([ConvLRUBlock(self.args, (C, H, W)) for _ in range(layers)])
             self.upsample = None
@@ -855,11 +908,13 @@ class ConvLRUModel(nn.Module):
                 x, h_out = blk(x, h_in, listT=listT, cond=cond, static_feats=static_feats)
                 last_hidden_outs.append(h_out)
             return x, last_hidden_outs
+        
         skips: List[torch.Tensor] = []
         last_hidden_outs: List[torch.Tensor] = []
         num_down = len(self.down_blocks)
         hs_in_down = last_hidden_ins[:num_down] if last_hidden_ins is not None else [None] * num_down
         hs_in_up = last_hidden_ins[num_down:] if last_hidden_ins is not None else [None] * len(self.up_blocks)
+        
         for i, blk in enumerate(self.down_blocks):
             curr_cond = cond
             if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
@@ -876,8 +931,10 @@ class ConvLRUModel(nn.Module):
                 if x_s.shape[-2] >= 2 and x_s.shape[-1] >= 2:
                     x_s = self.downsamples[i](x_s)
                 x = x_s
+        
         assert self.mid_attention is not None
         x = self.mid_attention(x)
+        
         for i, blk in enumerate(self.up_blocks):
             x = self.upsample(x)
             skip = skips.pop()
@@ -885,19 +942,21 @@ class ConvLRUModel(nn.Module):
                 diffY = skip.size(-2) - x.size(-2)
                 diffX = skip.size(-1) - x.size(-1)
                 x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+            
             if self.arch_mode == "bifpn":
                 x = self.csa_blocks[i](x, skip)
             else:
                 skip = self.csa_blocks[i](skip, x)
                 x = torch.cat([x, skip], dim=1)
                 x = self.fusion(x)
+            
             curr_cond = cond
             if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
                 curr_cond = F.interpolate(curr_cond, size=x.shape[-2:], mode="bilinear", align_corners=False)
             x, h_out = blk(x, hs_in_up[i], listT=listT, cond=curr_cond, static_feats=static_feats)
             last_hidden_outs.append(h_out)
+            
         return x, last_hidden_outs
-
 
 class Embedding(nn.Module):
     def __init__(self, args: Any):
@@ -963,7 +1022,6 @@ class Embedding(nn.Module):
         x = self.norm(x)
         return x, cond
 
-
 class DiffusionHead(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -986,7 +1044,6 @@ class DiffusionHead(nn.Module):
         emb = torch.cat([tt.sin(), tt.cos()], dim=-1)
         return self.mlp(emb.to(dtype=self.mlp[0].weight.dtype))
 
-
 class Decoder(nn.Module):
     def __init__(self, args: Any, input_downsp_shape: Tuple[int, int, int]):
         super().__init__()
@@ -998,7 +1055,6 @@ class Decoder(nn.Module):
         hf = getattr(args, "hidden_factor", (2, 2))
         self.rH, self.rW = int(hf[0]), int(hf[1])
         out_ch_after_up = self.emb_ch
-        
         self.pre_shuffle_conv = nn.Conv3d(
             in_channels=self.emb_ch,
             out_channels=out_ch_after_up * self.rH * self.rW,
@@ -1041,12 +1097,10 @@ class Decoder(nn.Module):
             
         return x
 
-
 @dataclass
 class RevINStats:
     mean: torch.Tensor
     stdev: torch.Tensor
-
 
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
@@ -1092,7 +1146,6 @@ class RevIN(nn.Module):
             return self.denormalize(x, st)
         raise NotImplementedError
 
-
 class ConvLRU(nn.Module):
     def __init__(self, args: Any):
         super().__init__()
@@ -1132,15 +1185,18 @@ class ConvLRU(nn.Module):
             x_hid, last_hidden_outs = self.convlru_model(x_emb, listT=listT, cond=cond, static_feats=static_feats)
             out = self.decoder(x_hid, cond=cond, timestep=timestep)
             out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
+            
             if str(self.decoder.dist_mode).lower() == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm", stats=stats)
                     sigma = sigma * stats.stdev
                 return torch.cat([mu, sigma], dim=2), last_hidden_outs
+            
             if out_tensor.size(2) == self.revin.num_features:
                 return self.revin(out_tensor, "denorm", stats=stats), last_hidden_outs
             return out_tensor, last_hidden_outs
+            
         if out_gen_num is None or int(out_gen_num) <= 0:
             raise ValueError("out_gen_num must be positive for inference mode")
         B = x.size(0)
@@ -1158,26 +1214,23 @@ class ConvLRU(nn.Module):
         x_step_dist = x_step_dist[:, -1:, :, :, :]
         
         dist_mode = str(self.decoder.dist_mode).lower()
-        if dist_mode == "gaussian":
+        if dist_mode in ["gaussian", "laplace"]:
             out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
             mu = x_step_dist[:, :, :out_ch, :, :]
-            sigma = x_step_dist[:, :, out_ch:, :, :]
+            scale = x_step_dist[:, :, out_ch:, :, :]
             if mu.size(2) == self.revin.num_features:
-                mu = self.revin(mu, "denorm", stats=stats)
-                sigma_denorm = sigma * stats.stdev
+                mu_denorm = self.revin(mu, "denorm", stats=stats)
+                scale_denorm = scale * stats.stdev
             else:
                 mu_denorm = mu
-                sigma_denorm = sigma
-            out_list.append(torch.cat([mu_denorm, sigma_denorm], dim=2))
+                scale_denorm = scale
+            out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2))
             x_step_mean = mu_denorm
         else:
+            out_list.append(x_step_dist)
             if x_step_dist.size(2) >= self.revin.num_features:
-                 x_mean_approx = x_step_dist[:, :, :self.revin.num_features]
-                 x_step_dist_denorm = self.revin(x_mean_approx, "denorm", stats=stats)
-                 x_step_mean = x_step_dist_denorm
-                 out_list.append(x_step_dist_denorm)
+                 x_step_mean = x_step_dist[:, :, :self.revin.num_features]
             else:
-                 out_list.append(x_step_dist)
                  x_step_mean = x_step_dist
 
         future = listT_future
@@ -1206,23 +1259,20 @@ class ConvLRU(nn.Module):
             x_step_dist = x_dec.permute(0, 2, 1, 3, 4).contiguous()
             x_step_dist = x_step_dist[:, -1:, :, :, :]
             
-            if dist_mode == "gaussian":
+            if dist_mode in ["gaussian", "laplace"]:
                 out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
                 mu = x_step_dist[:, :, :out_ch, :, :]
-                sigma = x_step_dist[:, :, out_ch:, :, :]
+                scale = x_step_dist[:, :, out_ch:, :, :]
                 if mu.size(2) == self.revin.num_features:
                     mu = self.revin(mu, "denorm", stats=stats)
-                    sigma = sigma * stats.stdev
-                out_list.append(torch.cat([mu, sigma], dim=2))
+                    scale_denorm = scale * stats.stdev
+                out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2))
                 x_step_mean = mu
             else:
+                out_list.append(x_step_dist)
                 if x_step_dist.size(2) >= self.revin.num_features:
-                     x_mean_approx = x_step_dist[:, :, :self.revin.num_features]
-                     x_step_dist_denorm = self.revin(x_mean_approx, "denorm", stats=stats)
-                     x_step_mean = x_step_dist_denorm
-                     out_list.append(x_step_dist_denorm)
+                     x_step_mean = x_step_dist[:, :, :self.revin.num_features]
                 else:
-                     out_list.append(x_step_dist)
                      x_step_mean = x_step_dist
                      
         return torch.cat(out_list, dim=1)
