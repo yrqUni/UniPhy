@@ -19,11 +19,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.append("/nfs/ConvLRU/Model/ConvLRU")
+sys.path.append("/nfs/ConvLRU/Model/UniPhy")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
-from ModelConvLRU import ConvLRU, RevINStats
+from ModelUniPhy import UniPhy, RevINStats
 
 warnings.filterwarnings("ignore")
 
@@ -34,17 +34,20 @@ MODEL_ARG_KEYS = [
     "hidden_factor",
     "emb_ch",
     "convlru_num_blocks",
-    "use_cbam",
     "lru_rank",
     "static_ch",
     "down_mode",
-    "head_mode",
     "dist_mode",
     "diff_mode",
     "learnable_init_state",
     "ffn_ratio",
     "ConvType",
     "Arch",
+    "koopman_use_noise",
+    "koopman_noise_scale",
+    "dt_ref",
+    "inj_k",
+    "max_velocity",
 ]
 
 
@@ -75,10 +78,8 @@ class Args:
         self.hidden_factor = (7, 12)
         self.emb_ch = 64
         self.convlru_num_blocks = 6
-        self.use_cbam = True
         self.lru_rank = 64
         self.down_mode = "shuffle"
-        self.head_mode = "gaussian"
         self.dist_mode = "gaussian"
         self.diff_mode = "learnable"
         self.diffusion_steps = 1000
@@ -91,8 +92,8 @@ class Args:
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
-        self.log_path = "./convlru_base/logs"
-        self.ckpt_dir = "./convlru_base/ckpt"
+        self.log_path = "./uniphy_base/logs"
+        self.ckpt_dir = "./uniphy_base/ckpt"
         self.ckpt_step = 0.25
         self.do_eval = False
         self.use_tf32 = False
@@ -112,8 +113,8 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
-        self.wandb_run_name = ""
-        self.wandb_group = "v5.0.0_Triton"
+        self.wandb_run_name = "UniPhy_A100_Optim"
+        self.wandb_group = "v6.0.0_UniPhy"
         self.wandb_mode = "online"
         self.train_mode = "p_only"
         self.learnable_init_state = True
@@ -124,6 +125,11 @@ class Args:
         self.enable_no_sync = True
         self.log_every = 1
         self.wandb_every = 1
+        self.koopman_use_noise = False
+        self.koopman_noise_scale = 1.0
+        self.dt_ref = 1.0
+        self.inj_k = 2.0
+        self.max_velocity = 5.0
         self.check_args()
 
     def check_args(self) -> None:
@@ -362,11 +368,21 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
     for name, module in model_to_hook.named_modules():
         if name.endswith("lru_layer.gate.sigmoid"):
-            if "convlru_blocks." in name:
-                try:
-                    tag = int(name.split("convlru_blocks.")[1].split(".")[0])
-                except Exception:
-                    tag = name
+            tag = "unknown"
+            if "down_blocks" in name:
+                parts = name.split("down_blocks.")
+                if len(parts) > 1:
+                    try:
+                        tag = f"down_{int(parts[1].split('.')[0])}"
+                    except Exception:
+                        tag = name
+            elif "up_blocks" in name:
+                parts = name.split("up_blocks.")
+                if len(parts) > 1:
+                    try:
+                        tag = f"up_{int(parts[1].split('.')[0])}"
+                    except Exception:
+                        tag = name
             else:
                 tag = name
 
@@ -380,8 +396,8 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
 def format_gate_means() -> str:
     if not _LRU_GATE_MEAN:
         return "g=NA"
-    keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: (0, k) if isinstance(k, int) else (1, str(k)))
-    return " ".join([f"g[b{k}]={_LRU_GATE_MEAN[k]:.4f}" if isinstance(k, int) else f"g[{k}]={_LRU_GATE_MEAN[k]:.4f}" for k in keys])
+    keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: str(k))
+    return " ".join([f"g[{k}]={_LRU_GATE_MEAN[k]:.4f}" for k in keys])
 
 
 def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
@@ -468,7 +484,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 logging.info("[Args] applying model args from ckpt before building model.")
             apply_model_args(args, ckpt_model_args, verbose=True)
 
-    model = ConvLRU(args).cuda(local_rank)
+    model = UniPhy(args).cuda(local_rank)
     if bool(args.use_compile):
         model = torch.compile(model, mode="default")
 
@@ -741,7 +757,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/train_mode": str(train_mode),
                     }
                     for k, v in _LRU_GATE_MEAN.items():
-                        g_key = f"train/gate_b{k}" if isinstance(k, int) else f"train/gate_{k}"
+                        g_key = f"train/gate_{k}"
                         log_dict[g_key] = float(v)
                     wandb.log(log_dict, step=int(global_step))
 
