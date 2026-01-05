@@ -388,15 +388,16 @@ class SpectralDynamics(nn.Module):
 
     def build_A_koop(self, nu_rate: torch.Tensor, theta_rate: torch.Tensor, dt_seq: torch.Tensor, H: int) -> torch.Tensor:
         B, L = dt_seq.shape
-        _, _, _, C, Wf, R = nu_rate.shape
-
-        nu = nu_rate.squeeze(2).permute(0, 1, 5, 3, 4).contiguous()
-        th = theta_rate.squeeze(2).permute(0, 1, 5, 3, 4).contiguous()
+        nu = nu_rate.squeeze(2).permute(0, 1, 4, 2, 3).contiguous()
+        th = theta_rate.squeeze(2).permute(0, 1, 4, 2, 3).contiguous()
+        B2, L2, R, C, Wf = nu.shape
+        if B2 != B or L2 != L:
+            raise ValueError(f"nu shape {nu.shape} incompatible with dt {dt_seq.shape}")
         dt = dt_seq.contiguous()
-
+    
         out_real = torch.empty((B, L, R, C, H, Wf), device=dt.device, dtype=dt.dtype)
         out_imag = torch.empty_like(out_real)
-
+    
         grid = lambda META: (triton.cdiv(B * L * R * C * H * Wf, META["BLOCK_SIZE"]),)
         koopman_A_kernel[grid](
             nu,
@@ -415,7 +416,7 @@ class SpectralDynamics(nn.Module):
             *out_real.stride(),
         )
         return torch.complex(out_real, out_imag)
-
+    
 
 class LearnableStateMap(nn.Module):
     def __init__(self, static_ch: int, emb_ch: int, rank: int, S: int, W_freq: int):
@@ -488,15 +489,26 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
 
         return xinj * g.to(torch.complex64)
 
-    def _init_state_freq(self, B: int, device: torch.device, dtype: torch.dtype, static_feats: Optional[torch.Tensor]) -> torch.Tensor:
+    def _init_state_freq(
+        self,
+        B: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        static_feats: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         if self.init_state is None or static_feats is None:
-            return torch.zeros((B, self.rank, self.emb_ch, self.H, self.Wf), device=device, dtype=torch.complex64)
-
+            return torch.zeros(
+                (B, self.rank, self.emb_ch, self.H, self.Wf),
+                device=device,
+                dtype=torch.complex64,
+            )
+    
         h0 = self.init_state(static_feats)
         h0 = h0.permute(0, 4, 1, 2, 3).contiguous()
-        h0f = torch.fft.rfft2(h0.float(), norm="ortho")
-        return h0f.to(torch.complex64)
-
+        h0 = h0.to(torch.float32)
+    
+        return torch.complex(h0, torch.zeros_like(h0))
+    
     def forward(
         self,
         x: torch.Tensor,

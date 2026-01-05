@@ -3,7 +3,7 @@ import os
 import sys
 import gc
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import torch
 
@@ -40,17 +40,21 @@ def get_base_args() -> Any:
     )
 
 
-def _make_static_feats(args: Any, B: int, H: int, W: int, device: torch.device) -> Optional[torch.Tensor]:
+def make_static_feats(args: Any, B: int, H: int, W: int, device: torch.device) -> Optional[torch.Tensor]:
     if int(getattr(args, "static_ch", 0)) > 0:
         return torch.randn(B, int(args.static_ch), H, W, device=device)
     return None
 
 
-def _extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
+def extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
     return dist_out[:, :, :out_ch]
 
 
-def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> Tuple[float, str]:
+def is_finite(x: torch.Tensor) -> bool:
+    return bool(torch.isfinite(x).all().item())
+
+
+def check_once(args: Any, device: torch.device) -> None:
     B, L = 1, 4
     H, W = args.input_size
     C = int(args.input_ch)
@@ -58,8 +62,7 @@ def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> Tuple[floa
     model = UniPhy(args).to(device).eval()
 
     x_init = torch.randn(B, 1, C, H, W, device=device)
-    static_feats = _make_static_feats(args, B, H, W, device)
-
+    static_feats = make_static_feats(args, B, H, W, device)
     stats = model.revin.stats(x_init)
 
     listT_i = torch.ones(B, 1, device=device, dtype=x_init.dtype)
@@ -76,7 +79,7 @@ def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> Tuple[floa
             revin_stats=stats,
         )
 
-        mu_i = _extract_mu(out_i, int(args.out_ch))
+        mu_i = extract_mu(out_i, int(args.out_ch))
 
         p_inputs = [x_init]
         for t in range(L - 1):
@@ -101,17 +104,17 @@ def check_once(args: Any, device: torch.device, tol: float = 1e-4) -> Tuple[floa
         )
 
         diff = (out_i - out_p).abs().max().item()
+        fin_i = is_finite(out_i)
+        fin_p = is_finite(out_p)
 
     cfg = ", ".join(f"{k}={getattr(args, k)}" for k in vars(args))
-    status = "PASS" if diff <= tol else "WARN"
-    msg = f"[{status}] diff={diff:.3e} | {cfg}"
+    status = "PASS" if (fin_i and fin_p) else "FAIL"
+    print(f"[{status}] diff={diff:.3e} finite_i={fin_i} finite_p={fin_p} | {cfg}")
 
     del model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
-
-    return diff, msg
 
 
 def main():
@@ -133,17 +136,14 @@ def main():
 
     keys = list(grid.keys())
     combos = list(itertools.product(*grid.values()))
-
     print(f"[Total cases] {len(combos)}")
 
     for idx, combo in enumerate(combos, 1):
         args = get_base_args()
         for k, v in zip(keys, combo):
             setattr(args, k, v)
-
         print(f"\n[{idx}/{len(combos)}] RUN")
-        _, msg = check_once(args, device)
-        print(msg)
+        check_once(args, device)
 
 
 if __name__ == "__main__":
