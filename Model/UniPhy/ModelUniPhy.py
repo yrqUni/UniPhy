@@ -431,10 +431,10 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             self.koopman = SpectralDynamics(self.emb_ch, self.rank, self.Wf)
             self.proj_out = nn.Linear(self.rank, 1)
             self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-            self.rank_scale = nn.Parameter(torch.ones(self.rank))
+            self.rank_scale = nn.Parameter(torch.ones(self.rank) * 0.001)
         elif self.dynamics_mode == "advection":
             self.estimator = TransportParameterEstimator(self.emb_ch, self.emb_ch)
-            self.flow_scale = nn.Parameter(torch.tensor(1.0))
+            self.flow_scale = nn.Parameter(torch.tensor(0.01))
         else:
             raise ValueError(f"Unknown dynamics_mode: {self.dynamics_mode}")
 

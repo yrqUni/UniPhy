@@ -656,6 +656,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                                 dummy_loss = dummy_loss + p.view(-1)[0].abs() * 0.0
                         loss = loss + dummy_loss
 
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"[Warning] NaN/Inf loss detected at step {global_step}. Skipping step.")
+                    if rank == 0:
+                        logging.warning(f"NaN/Inf loss detected at step {global_step}")
+                    opt.zero_grad(set_to_none=True)
+                    continue
+
                 (loss / float(grad_accum_steps)).backward()
 
             if not will_step:
