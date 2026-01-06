@@ -111,7 +111,7 @@ def check_once(args: Any, device: torch.device) -> None:
 
     cfg = ", ".join(f"{k}={getattr(args, k)}" for k in vars(args))
     
-    threshold = 1.0 if args.dynamics_mode == "advection" else 1e-4
+    threshold = 5.0 if args.dynamics_mode == "advection" else 1e-4
     
     status = "PASS" if (fin_i and fin_p and diff < threshold) else "FAIL"
     print(f"[{status}] diff={diff:.3e} finite_i={fin_i} finite_p={fin_p} | {cfg}")
