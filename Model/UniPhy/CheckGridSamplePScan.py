@@ -16,7 +16,7 @@ def ref_flow_scan(grids, images):
         grid_t = grids[:, t]
         img_t = images[:, t]
         
-        # Consistent with PScan: Accumulate = Prev (+) Curr
+        # 使用相同的 flow_composition 函数，确保逻辑（含 Mask 处理）一致
         curr_grid_acc, curr_img_acc = flow_composition(
             curr_grid_acc, 
             curr_img_acc, 
@@ -34,9 +34,9 @@ def check_consistency(device="cuda"):
     # Parameters
     B, L, C, H, W = 2, 8, 4, 32, 32
     
-    # Inputs: Ensure grids are strictly within [-1, 1]
-    # Small displacements are safer for stability tests
-    grids = (torch.rand(B, L, H, W, 2, device=device) * 2 - 1) * 0.8
+    # Inputs:
+    # 使用稍微大一点的随机范围，测试出界处理能力
+    grids = (torch.rand(B, L, H, W, 2, device=device) * 2.4 - 1.2) # range [-1.2, 1.2]
     images = torch.randn(B, L, C, H, W, device=device)
     
     # 1. Forward Check
@@ -45,9 +45,10 @@ def check_consistency(device="cuda"):
         out_pscan = pscan_flow(grids, images)
 
     abs_diff = (out_ref - out_pscan).abs()
-    print(f"Forward Max Diff: {abs_diff.max().item():.2e}")
+    max_diff = abs_diff.max().item()
+    print(f"Forward Max Diff: {max_diff:.2e}")
     
-    if abs_diff.max().item() < 1e-4:
+    if max_diff < 1e-4:
         print(">> Forward Pass: PASSED")
     else:
         print(">> Forward Pass: FAILED")
@@ -70,6 +71,7 @@ def check_consistency(device="cuda"):
     print(f"Backward Grid Grad Diff: {grad_grid_diff:.2e}")
     print(f"Backward Image Grad Diff: {grad_img_diff:.2e}")
 
+    # 适当放宽梯度阈值，因为 Mask 操作在临界点可能导致微小数值差异放大
     if grad_grid_diff < 1e-3 and grad_img_diff < 1e-3:
         print(">> Backward Pass: PASSED")
     else:
@@ -80,4 +82,3 @@ if __name__ == "__main__":
         check_consistency("cuda")
     else:
         check_consistency("cpu")
-

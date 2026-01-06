@@ -9,7 +9,7 @@ import torchvision
 import triton
 import triton.language as tl
 
-from pscan import pscan
+from PScan import pscan
 
 
 @triton.autotune(

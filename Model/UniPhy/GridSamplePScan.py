@@ -6,15 +6,17 @@ import torch.nn.functional as F
 def flow_composition(grid_prev, img_prev, grid_curr, img_curr):
     """
     Compose (grid_prev, img_prev) with (grid_curr, img_curr).
+    Ensures that out-of-bound coordinates remain out-of-bound.
     """
-    # Grid Composition: grid_new(x) = grid_prev(grid_curr(x))
-    # grid_prev represents the coordinate map.
-    # We must permute it to (N, C, H, W) for grid_sample.
+    # 1. 计算 grid_curr 的有效性 Mask
+    # 如果 grid_curr 的任意一个分量超出 [-1, 1]，则认为该采样点无效
+    # (N, H, W, 1)
+    mask = (grid_curr.abs() <= 1).all(dim=-1, keepdim=True).to(grid_curr.dtype)
+
+    # 2. Grid Composition: grid_new(x) = grid_prev(grid_curr(x))
     grid_prev_perm = grid_prev.permute(0, 3, 1, 2)
     
-    # Use align_corners=True for precision.
-    # padding_mode='border' ensures that if grid_curr points outside, 
-    # we use the edge coordinates of grid_prev, preserving continuity.
+    # 使用 border padding 保证界内插值的连续性
     grid_composed = F.grid_sample(
         grid_prev_perm, 
         grid_curr, 
@@ -24,7 +26,14 @@ def flow_composition(grid_prev, img_prev, grid_curr, img_curr):
     )
     grid_composed = grid_composed.permute(0, 2, 3, 1)
 
-    # Image Advection: img_new(x) = img_prev(grid_curr(x)) + img_curr(x)
+    # 关键修复：利用 mask 强制处理出界点
+    # 如果 grid_curr 出界，则 grid_composed 强制设为 -2.0 (一个足够远的值)
+    # 这样在下一轮递归中，它依然是出界的
+    out_of_bound_val = -2.0 * torch.ones_like(grid_composed)
+    grid_composed = mask * grid_composed + (1 - mask) * out_of_bound_val
+
+    # 3. Image Advection: img_new(x) = img_prev(grid_curr(x)) + img_curr(x)
+    # Image 部分使用 zeros padding 即可，出界自动变黑
     img_warped = F.grid_sample(
         img_prev, 
         grid_curr, 
@@ -43,7 +52,7 @@ class GridSamplePScan(nn.Module):
 
     def forward(self, grids, images):
         """
-        grids: (B, L, H, W, 2) values in [-1, 1]
+        grids: (B, L, H, W, 2) values ideally in [-1, 1], but can handle outliers
         images: (B, L, C, H, W)
         """
         curr_grids = grids.clone()
@@ -54,15 +63,12 @@ class GridSamplePScan(nn.Module):
 
         step = 1
         while step < L:
-            # Indices for the "left" operand (previous accumulated)
             prev_grids_part = curr_grids[:, :-step].contiguous()
             prev_images_part = curr_images[:, :-step].contiguous()
             
-            # Indices for the "right" operand (current to be updated)
             curr_grids_part = curr_grids[:, step:].contiguous()
             curr_images_part = curr_images[:, step:].contiguous()
 
-            # Flatten batch and time for grid_sample
             B_part, L_part = prev_grids_part.shape[:2]
             N_part = B_part * L_part
             
@@ -78,12 +84,9 @@ class GridSamplePScan(nn.Module):
                 flat_curr_images
             )
 
-            # Reshape back to (B, L_part, ...)
             next_grids_part = next_grids_flat.view(B_part, L_part, H, W, 2)
             next_images_part = next_images_flat.view(B_part, L_part, C, H, W)
 
-            # Update the tensor. Note: we cannot update in-place safely due to autograd,
-            # so we concatenate the unchanged prefix with the updated suffix.
             prefix_grids = curr_grids[:, :step]
             prefix_images = curr_images[:, :step]
             
