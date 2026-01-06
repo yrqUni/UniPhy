@@ -38,7 +38,6 @@ MODEL_ARG_KEYS = [
     "static_ch",
     "down_mode",
     "dist_mode",
-    "diff_mode",
     "learnable_init_state",
     "ffn_ratio",
     "ConvType",
@@ -47,7 +46,10 @@ MODEL_ARG_KEYS = [
     "koopman_noise_scale",
     "dt_ref",
     "inj_k",
-    "max_velocity",
+    "dynamics_mode",
+    "interpolation_mode",
+    "spectral_modes_h",
+    "spectral_modes_w",
 ]
 
 
@@ -81,7 +83,6 @@ class Args:
         self.lru_rank = 64
         self.down_mode = "shuffle"
         self.dist_mode = "gaussian"
-        self.diff_mode = "learnable"
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
@@ -127,7 +128,10 @@ class Args:
         self.koopman_noise_scale = 1.0
         self.dt_ref = 1.0
         self.inj_k = 2.0
-        self.max_velocity = 5.0
+        self.dynamics_mode = "advection"
+        self.interpolation_mode = "bilinear"
+        self.spectral_modes_h = 12
+        self.spectral_modes_w = 12
         self.check_args()
 
     def check_args(self) -> None:
@@ -557,7 +561,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     grad_accum_steps = int(args.grad_accum_steps)
     use_no_sync = bool(args.enable_no_sync)
     train_mode = str(getattr(args, "train_mode", "p_only")).lower()
-    enable_alignment = train_mode == "alignment"
     dist_mode = str(getattr(args, "dist_mode", "gaussian")).lower()
 
     global_step = int(start_epoch) * len_train_dataloader
