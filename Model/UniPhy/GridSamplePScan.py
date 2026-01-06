@@ -26,7 +26,7 @@ def warp_flow(flow_prev, flow_curr, mode='bilinear'):
         flow_prev, 
         sample_grid_wrapped,
         mode=mode,
-        padding_mode='border', 
+        padding_mode='zeros', 
         align_corners=False
     )
 
