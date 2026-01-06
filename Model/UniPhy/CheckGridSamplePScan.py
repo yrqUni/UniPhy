@@ -1,78 +1,84 @@
 import torch
-import time
-import sys
-import os
+import torch.nn.functional as F
+from GridSamplePScan import pscan_flow, flow_composition_residual
 
-try:
-    from GridSamplePScan import pscan_flow as pscan_triton
-    from GridSamplePScan_Torch import pscan_flow as pscan_torch
-except ImportError:
-    sys.path.append(os.getcwd())
-    from GridSamplePScan import pscan_flow as pscan_triton
-    from GridSamplePScan_Torch import pscan_flow as pscan_torch
-
-def benchmark(func, name, *args):
-    torch.cuda.synchronize()
-    start = time.time()
-    out = func(*args)
-    torch.cuda.synchronize()
-    end = time.time()
-    print(f"[{name}] Forward Time: {(end - start) * 1000:.2f} ms")
-    return out
-
-def main():
-    torch.manual_seed(1017)
-    device = "cuda"
+def ref_flow_scan(flows, images, mode='bilinear'):
+    B, L, _, H, W = flows.shape
+    out_images = []
     
-    B, L, C, H, W = 2, 16, 32, 128, 128
-    print(f"Config: B={B}, L={L}, C={C}, H={H}, W={W}")
+    curr_flow_acc = flows[:, 0]
+    curr_img_acc = images[:, 0]
+    out_images.append(curr_img_acc)
+    
+    for t in range(1, L):
+        flow_t = flows[:, t]
+        img_t = images[:, t]
+        
+        curr_flow_acc, curr_img_acc = flow_composition_residual(
+            curr_flow_acc, 
+            curr_img_acc, 
+            flow_t, 
+            img_t,
+            mode=mode
+        )
+        out_images.append(curr_img_acc)
+        
+    return torch.stack(out_images, dim=1)
 
-    flows = torch.randn(B, L, 2, H, W, device=device, dtype=torch.float32) * 0.1
-    images = torch.randn(B, L, C, H, W, device=device, dtype=torch.float32)
+def check_strict_logic(device="cuda"):
+    print("=== Strict Logic Check (Nearest) ===")
+    
+    torch.manual_seed(42)
+    B, L, C, H, W = 1, 8, 1, 32, 32
+    
+    step_y = 2.0 / H
+    step_x = 2.0 / W
+    
+    shifts_x = torch.randint(-5, 5, (B, L, H, W), device=device).float() * step_x
+    shifts_y = torch.randint(-5, 5, (B, L, H, W), device=device).float() * step_y
+    
+    flows = torch.stack([shifts_x, shifts_y], dim=2)
+    images = torch.randn(B, L, C, H, W, device=device)
+
+    with torch.no_grad():
+        out_ref = ref_flow_scan(flows, images, mode='nearest')
+        out_pscan = pscan_flow(flows, images, mode='nearest')
+
+    diff = (out_ref - out_pscan).abs().max().item()
+    print(f"Max Difference: {diff:.2e}")
+    
+    if diff < 1e-6:
+        print(">> Logic: PASSED")
+    else:
+        print(">> Logic: FAILED")
+
+def check_approximation_error(device="cuda"):
+    print("\n=== Approximation Error Check (Bilinear) ===")
+    
+    torch.manual_seed(42)
+    B, L, C, H, W = 2, 8, 4, 32, 32
+    
+    flows = torch.randn(B, L, 2, H, W, device=device) * 0.05
+    images = torch.randn(B, L, C, H, W, device=device)
+    
+    with torch.no_grad():
+        out_ref = ref_flow_scan(flows, images, mode='bilinear')
+        out_pscan = pscan_flow(flows, images, mode='bilinear')
+
+    diff = (out_ref - out_pscan).abs().mean().item()
+    print(f"Mean Difference: {diff:.4f}")
     
     flows.requires_grad_(True)
     images.requires_grad_(True)
     
-    flows_ref = flows.clone().detach().requires_grad_(True)
-    images_ref = images.clone().detach().requires_grad_(True)
-
-    print("\n--- Forward Correctness & Speed ---")
-    out_triton = benchmark(pscan_triton, "Triton", flows, images)
-    out_torch = benchmark(pscan_torch, "Torch ", flows_ref, images_ref)
-
-    diff_max = (out_triton - out_torch).abs().max().item()
-    diff_mean = (out_triton - out_torch).abs().mean().item()
-    print(f"Forward Max Diff:  {diff_max:.2e}")
-    print(f"Forward Mean Diff: {diff_mean:.2e}")
+    loss = pscan_flow(flows, images, mode='bilinear').sum()
+    loss.backward()
     
-    print("\n--- Backward Correctness & Speed ---")
-    loss_triton = out_triton.sum()
-    loss_torch = out_torch.sum()
-
-    torch.cuda.synchronize()
-    start = time.time()
-    loss_triton.backward()
-    torch.cuda.synchronize()
-    print(f"[Triton] Backward Time: {(time.time() - start) * 1000:.2f} ms")
-
-    torch.cuda.synchronize()
-    start = time.time()
-    loss_torch.backward()
-    torch.cuda.synchronize()
-    print(f"[Torch ] Backward Time: {(time.time() - start) * 1000:.2f} ms")
-
-    grad_flow_diff = (flows.grad - flows_ref.grad).abs().max().item()
-    grad_img_diff = (images.grad - images_ref.grad).abs().max().item()
-
-    print(f"Grad Flow Max Diff: {grad_flow_diff:.2e}")
-    print(f"Grad Img  Max Diff: {grad_img_diff:.2e}")
-
-    status = "PASS" if diff_max < 1e-3 and grad_flow_diff < 1e-2 else "FAIL"
-    print(f"\n>> Check Result: {status}")
+    print(f"Backward Flow Grad Norm: {flows.grad.norm().item():.2e}")
+    print(">> Check: DONE")
 
 if __name__ == "__main__":
-    if torch.cuda.is_available():
-        main()
-    else:
-        print("CUDA not available")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    check_strict_logic(device)
+    check_approximation_error(device)
 

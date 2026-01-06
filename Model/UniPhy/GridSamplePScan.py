@@ -1,68 +1,79 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
 
-@torch.jit.script
-def gen_grid_fused(B: int, H: int, W: int, flow: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    step_y = 2.0 / float(H)
-    step_x = 2.0 / float(W)
-    
-    start_y = -1.0 + step_y * 0.5
-    start_x = -1.0 + step_x * 0.5
-    
-    grid_y = torch.arange(H, device=device, dtype=dtype) * step_y + start_y
-    grid_x = torch.arange(W, device=device, dtype=dtype) * step_x + start_x
-    
-    flow_perm = flow.permute(0, 2, 3, 1)
-    
-    final_x = grid_x.view(1, 1, -1) + flow_perm[..., 0]
-    final_y = grid_y.view(1, -1, 1) + flow_perm[..., 1]
-    
-    final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
-    
-    return torch.stack([final_x, final_y], dim=-1)
-
-def warp_flow(flow_prev: torch.Tensor, flow_curr: torch.Tensor, mode: str = 'bilinear') -> torch.Tensor:
+def warp_flow(flow_prev, flow_curr, mode='bilinear'):
     B, _, H, W = flow_prev.shape
-    grid = gen_grid_fused(B, H, W, flow_curr, flow_curr.device, flow_curr.dtype)
+    device = flow_prev.device
+    dtype = flow_prev.dtype
+
+    step_y = 2.0 / H
+    step_x = 2.0 / W
+    gy = torch.linspace(-1 + step_y/2, 1 - step_y/2, H, device=device, dtype=dtype)
+    gx = torch.linspace(-1 + step_x/2, 1 - step_x/2, W, device=device, dtype=dtype)
+
+    grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
+    base_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
     
+    flow_curr_perm = flow_curr.permute(0, 2, 3, 1)
+    sample_grid = base_grid + flow_curr_perm
+
+    sample_grid_w = sample_grid[..., 0]
+    sample_grid_w_wrapped = torch.remainder(sample_grid_w + 1, 2) - 1
+    sample_grid_wrapped = torch.stack([sample_grid_w_wrapped, sample_grid[..., 1]], dim=-1)
+
     sampled_prev = F.grid_sample(
         flow_prev, 
-        grid,
+        sample_grid_wrapped,
         mode=mode,
         padding_mode='zeros', 
         align_corners=False
     )
-    return flow_curr + sampled_prev
 
-def warp_image(img_prev: torch.Tensor, flow_curr: torch.Tensor, mode: str = 'bilinear') -> torch.Tensor:
+    flow_new = flow_curr + sampled_prev
+    return flow_new
+
+def warp_image(img_prev, flow_curr, mode='bilinear'):
     B, _, H, W = img_prev.shape
-    grid = gen_grid_fused(B, H, W, flow_curr, flow_curr.device, flow_curr.dtype)
+    device = img_prev.device
+    dtype = img_prev.dtype
     
-    return F.grid_sample(
+    step_y = 2.0 / H
+    step_x = 2.0 / W
+    gy = torch.linspace(-1 + step_y/2, 1 - step_y/2, H, device=device, dtype=dtype)
+    gx = torch.linspace(-1 + step_x/2, 1 - step_x/2, W, device=device, dtype=dtype)
+        
+    grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
+    base_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+    
+    flow_curr_perm = flow_curr.permute(0, 2, 3, 1)
+    sample_grid = base_grid + flow_curr_perm
+    
+    sample_grid_w = sample_grid[..., 0]
+    sample_grid_w_wrapped = torch.remainder(sample_grid_w + 1, 2) - 1
+    sample_grid_wrapped = torch.stack([sample_grid_w_wrapped, sample_grid[..., 1]], dim=-1)
+    
+    img_warped = F.grid_sample(
         img_prev,
-        grid,
+        sample_grid_wrapped,
         mode=mode,
         padding_mode='zeros',
         align_corners=False
     )
+    return img_warped
 
-def flow_composition_residual(flow_prev: torch.Tensor, img_prev: torch.Tensor, flow_curr: torch.Tensor, img_curr: torch.Tensor, mode: str = 'bilinear') -> Tuple[torch.Tensor, torch.Tensor]:
-    B, _, H, W = flow_prev.shape
-    grid = gen_grid_fused(B, H, W, flow_curr, flow_curr.device, flow_curr.dtype)
-    
-    flow_sampled = F.grid_sample(flow_prev, grid, mode=mode, padding_mode='zeros', align_corners=False)
-    img_sampled = F.grid_sample(img_prev, grid, mode=mode, padding_mode='zeros', align_corners=False)
-    
-    return flow_curr + flow_sampled, img_curr + img_sampled
+def flow_composition_residual(flow_prev, img_prev, flow_curr, img_curr, mode='bilinear'):
+    flow_combined = warp_flow(flow_prev, flow_curr, mode=mode)
+    img_warped = warp_image(img_prev, flow_curr, mode=mode)
+    img_combined = img_warped + img_curr
+    return flow_combined, img_combined
 
 class GridSamplePScan(nn.Module):
-    def __init__(self, mode: str = 'bilinear'):
+    def __init__(self, mode='bilinear'):
         super().__init__()
         self.mode = mode
 
-    def forward(self, flows: torch.Tensor, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, flows, images):
         curr_flows = flows.clone()
         curr_images = images.clone()
         
@@ -106,7 +117,7 @@ class GridSamplePScan(nn.Module):
 
         return curr_images
 
-def pscan_flow(flows: torch.Tensor, images: torch.Tensor, mode: str = 'bilinear') -> torch.Tensor:
+def pscan_flow(flows, images, mode='bilinear'):
     if flows.size(-1) == 2:
         flows = flows.permute(0, 1, 4, 2, 3)
     scanner = GridSamplePScan(mode=mode)
