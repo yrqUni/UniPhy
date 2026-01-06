@@ -184,6 +184,12 @@ def _get_base_grid(H: int, W: int, device: torch.device, dtype: torch.dtype) -> 
     return base_grid
 
 
+def get_safe_groups(channels: int, target: int = 4) -> int:
+    if channels % target == 0:
+        return target
+    return 1
+
+
 class SpatialGroupNorm(nn.GroupNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 5:
@@ -347,7 +353,7 @@ class DynamicsParameterEstimator(nn.Module):
         nn.init.zeros_(self.head.weight)
         with torch.no_grad():
             self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 0].fill_(1.0)
-            self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 1].fill_(0.0)
+            nn.init.uniform_(self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 1], -0.01, 0.01)
             self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 2].fill_(-5.0)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -394,10 +400,10 @@ class SpectralDynamics(nn.Module):
         if B2 != B or L2 != L:
             raise ValueError(f"nu shape {nu.shape} incompatible with dt {dt_seq.shape}")
         dt = dt_seq.contiguous()
-    
+
         out_real = torch.empty((B, L, R, C, H, Wf), device=dt.device, dtype=dt.dtype)
         out_imag = torch.empty_like(out_real)
-    
+
         grid = lambda META: (triton.cdiv(B * L * R * C * H * Wf, META["BLOCK_SIZE"]),)
         koopman_A_kernel[grid](
             nu,
@@ -416,7 +422,7 @@ class SpectralDynamics(nn.Module):
             *out_real.stride(),
         )
         return torch.complex(out_real, out_imag)
-    
+
 
 class LearnableStateMap(nn.Module):
     def __init__(self, static_ch: int, emb_ch: int, rank: int, S: int, W_freq: int):
@@ -450,6 +456,8 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         inj_k: float = 2.0,
         static_ch: int = 0,
         learnable_init_state: bool = False,
+        use_noise: bool = False,
+        noise_scale: float = 0.1,
     ):
         super().__init__()
         self.emb_ch = int(emb_ch)
@@ -460,11 +468,13 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         self.Wf = W // 2 + 1
         self.dt_ref = float(dt_ref) if float(dt_ref) > 0 else 1.0
         self.inj_k = max(float(inj_k), 0.0)
+        self.use_noise = bool(use_noise)
+        self.noise_scale = float(noise_scale)
 
         self.koopman = SpectralDynamics(self.emb_ch, self.rank, self.Wf)
         self.proj_out = nn.Linear(self.rank, 1)
         self.post_ifft_proj = nn.Conv3d(self.emb_ch, self.emb_ch, kernel_size=(1, 1, 1), padding="same")
-        self.norm = SpatialGroupNorm(4, self.emb_ch)
+        self.norm = SpatialGroupNorm(get_safe_groups(self.emb_ch), self.emb_ch)
         self.gate = LatitudeGating(self.emb_ch)
 
         self.init_state = LearnableStateMap(int(static_ch), self.emb_ch, self.rank, H, self.Wf) if bool(learnable_init_state) and int(static_ch) > 0 else None
@@ -502,13 +512,13 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
                 device=device,
                 dtype=torch.complex64,
             )
-    
+
         h0 = self.init_state(static_feats)
         h0 = h0.permute(0, 4, 1, 2, 3).contiguous()
         h0 = h0.to(torch.float32)
-    
+
         return torch.complex(h0, torch.zeros_like(h0))
-    
+
     def forward(
         self,
         x: torch.Tensor,
@@ -523,9 +533,20 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         dt_seq = torch.ones(B, L, device=x.device, dtype=x.dtype) if listT is None else _match_dt_seq(listT.to(x.device, x.dtype), L)
 
         x_perm = x.permute(0, 2, 1, 3, 4).contiguous()
-        nu_rate, theta_rate, _ = self.koopman.compute_params(x_perm)
+        nu_rate, theta_rate, sigma = self.koopman.compute_params(x_perm)
         A_koop = self.koopman.build_A_koop(nu_rate, theta_rate, dt_seq, H)
         X_inj = self._build_injection_freq(x, dt_seq)
+
+        if self.use_noise and self.training:
+             sig = sigma.squeeze(2).permute(0, 1, 4, 2, 3)
+             sig = sig.unsqueeze(-2)
+             dt_sqrt = torch.sqrt(dt_seq.view(B, L, 1, 1, 1, 1).clamp_min(1e-6))
+             
+             noise_real = torch.randn_like(X_inj.real)
+             noise_imag = torch.randn_like(X_inj.imag)
+             noise = torch.complex(noise_real, noise_imag)
+             
+             X_inj = X_inj + sig * self.noise_scale * dt_sqrt * noise
 
         A_flat = A_koop.permute(0, 1, 2, 3, 4, 5).reshape(B, L, -1).contiguous()
         X_flat = X_inj.permute(0, 1, 2, 3, 4, 5).reshape(B, L, -1).contiguous()
@@ -562,7 +583,7 @@ class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, cond_channels: Optional[int] = None, conv_type: str = "conv"):
         super().__init__()
         self.dw_conv = PeriodicConv3d(int(channels), int(channels), kernel_size=int(kernel_size), conv_type=str(conv_type))
-        self.norm = SpatialGroupNorm(4, int(channels))
+        self.norm = SpatialGroupNorm(get_safe_groups(int(channels)), int(channels))
         self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
         self.cond_proj = nn.Conv3d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
         self.pw_conv_in = nn.Linear(int(channels), int(channels) * 2)
@@ -682,7 +703,7 @@ class CrossScaleGate(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.psi = nn.Conv3d(ch, 1, kernel_size=1, bias=True)
         self.sigmoid = nn.Sigmoid()
-        self.norm = SpatialGroupNorm(4, ch)
+        self.norm = SpatialGroupNorm(get_safe_groups(ch), ch)
 
     def forward(self, local_x: torch.Tensor, global_x: torch.Tensor) -> torch.Tensor:
         g = self.conv_g(global_x)
@@ -873,7 +894,7 @@ class FeatureEmbedding(nn.Module):
         self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, cond_channels=cond_ch)])
         self.c_out = nn.Conv3d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
-        self.norm = SpatialGroupNorm(4, self.emb_ch)
+        self.norm = SpatialGroupNorm(get_safe_groups(self.emb_ch), self.emb_ch)
 
     def _make_grid(self, input_size: Tuple[int, int]) -> torch.Tensor:
         H, W = tuple(input_size)
@@ -1023,6 +1044,9 @@ class UniPhy(nn.Module):
         dt_ref = float(getattr(args, "dt_ref", getattr(args, "T", 1.0)))
         inj_k = float(getattr(args, "inj_k", 2.0))
         learnable_init_state = bool(getattr(args, "learnable_init_state", False))
+        
+        koopman_use_noise = bool(getattr(args, "koopman_use_noise", False))
+        koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
 
         prl_args = {
             "rank": rank,
@@ -1030,6 +1054,8 @@ class UniPhy(nn.Module):
             "inj_k": inj_k,
             "static_ch": static_ch,
             "learnable_init_state": learnable_init_state,
+            "use_noise": koopman_use_noise,
+            "noise_scale": koopman_noise_scale,
         }
 
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
@@ -1105,8 +1131,6 @@ class UniPhy(nn.Module):
         listT0 = torch.ones(B, x.size(1), device=x.device, dtype=x.dtype) if listT is None else listT
 
         stats = revin_stats if revin_stats is not None else self.revin.stats(x)
-        if stats.mean.dim() == 5 and stats.mean.size(1) > 1:
-            stats = RevINStats(mean=stats.mean[:, -1:], stdev=stats.stdev[:, -1:])
 
         out_list: List[torch.Tensor] = []
         x_norm = self.revin(x, "norm", stats=stats)
@@ -1139,17 +1163,13 @@ class UniPhy(nn.Module):
             curr_x = x_step_mean
             if curr_x.shape[1] != 1:
                 curr_x = curr_x[:, -1:, :, :, :]
-            if curr_x.size(2) != self.embedding.input_ch:
-                B_in, L_in, C_out, H_in, W_in = curr_x.shape
-                C_target = self.embedding.input_ch
-                if C_out > C_target:
-                    curr_x = curr_x[:, :, :C_target, :, :]
-                else:
-                    diff = C_target - C_out
-                    zeros = torch.zeros(B_in, L_in, diff, H_in, W_in, device=curr_x.device, dtype=curr_x.dtype)
-                    curr_x = torch.cat([curr_x, zeros], dim=2)
+            
+            if curr_x.size(2) == self.revin.num_features:
+                current_step_stats = self.revin.stats(curr_x)
+                x_step_norm = self.revin(curr_x, "norm", stats=current_step_stats)
+            else:
+                x_step_norm = curr_x
 
-            x_step_norm = self.revin(curr_x, "norm", stats=stats) if curr_x.size(2) == self.revin.num_features else curr_x
             x_in, _ = self.embedding(x_step_norm, static_feats=static_feats)
             x_hidden, last_hidden_outs = self.uniphy_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond, static_feats=static_feats)
             x_dec = self.decoder(x_hidden, cond=cond)
@@ -1161,8 +1181,8 @@ class UniPhy(nn.Module):
                 mu = x_step_dist[:, :, :out_ch, :, :]
                 scale = x_step_dist[:, :, out_ch:, :, :]
                 if mu.size(2) == self.revin.num_features:
-                    mu_denorm = self.revin(mu, "denorm", stats=stats)
-                    scale_denorm = scale * stats.stdev
+                    mu_denorm = self.revin(mu, "denorm", stats=current_step_stats)
+                    scale_denorm = scale * current_step_stats.stdev
                 else:
                     mu_denorm = mu
                     scale_denorm = scale
