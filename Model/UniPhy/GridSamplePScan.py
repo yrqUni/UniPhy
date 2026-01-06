@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def warp_flow(flow_prev, flow_curr):
+def warp_flow(flow_prev, flow_curr, mode='bilinear'):
     B, _, H, W = flow_prev.shape
     device = flow_prev.device
     dtype = flow_prev.dtype
@@ -25,7 +25,7 @@ def warp_flow(flow_prev, flow_curr):
     sampled_prev = F.grid_sample(
         flow_prev, 
         sample_grid_wrapped,
-        mode='bilinear',
+        mode=mode,
         padding_mode='border', 
         align_corners=False
     )
@@ -33,7 +33,7 @@ def warp_flow(flow_prev, flow_curr):
     flow_new = flow_curr + sampled_prev
     return flow_new
 
-def warp_image(img_prev, flow_curr):
+def warp_image(img_prev, flow_curr, mode='bilinear'):
     B, _, H, W = img_prev.shape
     device = img_prev.device
     dtype = img_prev.dtype
@@ -56,21 +56,22 @@ def warp_image(img_prev, flow_curr):
     img_warped = F.grid_sample(
         img_prev,
         sample_grid_wrapped,
-        mode='bilinear',
+        mode=mode,
         padding_mode='zeros',
         align_corners=False
     )
     return img_warped
 
-def flow_composition_residual(flow_prev, img_prev, flow_curr, img_curr):
-    flow_combined = warp_flow(flow_prev, flow_curr)
-    img_warped = warp_image(img_prev, flow_curr)
+def flow_composition_residual(flow_prev, img_prev, flow_curr, img_curr, mode='bilinear'):
+    flow_combined = warp_flow(flow_prev, flow_curr, mode=mode)
+    img_warped = warp_image(img_prev, flow_curr, mode=mode)
     img_combined = img_warped + img_curr
     return flow_combined, img_combined
 
 class GridSamplePScan(nn.Module):
-    def __init__(self):
+    def __init__(self, mode='bilinear'):
         super().__init__()
+        self.mode = mode
 
     def forward(self, flows, images):
         curr_flows = flows.clone()
@@ -99,7 +100,8 @@ class GridSamplePScan(nn.Module):
                 flat_prev_flows, 
                 flat_prev_images, 
                 flat_curr_flows, 
-                flat_curr_images
+                flat_curr_images,
+                mode=self.mode
             )
 
             next_flows_part = next_flows_flat.view(B_part, L_part, 2, H, W)
@@ -115,9 +117,9 @@ class GridSamplePScan(nn.Module):
 
         return curr_images
 
-def pscan_flow(flows, images):
+def pscan_flow(flows, images, mode='bilinear'):
     if flows.size(-1) == 2:
         flows = flows.permute(0, 1, 4, 2, 3)
-    scanner = GridSamplePScan()
+    scanner = GridSamplePScan(mode=mode)
     return scanner(flows, images)
 

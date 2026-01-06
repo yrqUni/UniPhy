@@ -38,6 +38,7 @@ def get_base_args() -> Any:
         dynamics_mode="advection",
         spectral_modes_h=12,
         spectral_modes_w=12,
+        interpolation_mode="bilinear",
     )
 
 

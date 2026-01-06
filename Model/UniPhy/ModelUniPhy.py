@@ -409,6 +409,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         use_noise: bool = False,
         noise_scale: float = 0.1,
         dynamics_mode: str = "spectral",
+        interpolation_mode: str = "bilinear",
         **kwargs
     ):
         super().__init__()
@@ -421,6 +422,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         self.use_noise = bool(use_noise)
         self.noise_scale = float(noise_scale)
         self.dynamics_mode = str(dynamics_mode).lower()
+        self.interpolation_mode = str(interpolation_mode).lower()
 
         self.norm = SpatialGroupNorm(get_safe_groups(self.emb_ch), self.emb_ch)
         self.gate = LatitudeGating(self.emb_ch)
@@ -553,14 +555,14 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             forcing_step = forcing[:, 0]
             h_prev = last_hidden_in
             
-            h_warped = warp_image(h_prev, flow_step)
+            h_warped = warp_image(h_prev, flow_step, mode=self.interpolation_mode)
             h_new = h_warped + forcing_step
             
             out = self.norm(h_new.unsqueeze(2)).squeeze(2)
             out = self.gate(out)
             return x + out.unsqueeze(2), h_new
 
-        h_seq = pscan_flow(flow, forcing)
+        h_seq = pscan_flow(flow, forcing, mode=self.interpolation_mode)
         
         h_seq_perm = h_seq.permute(0, 2, 1, 3, 4)
         out = self.norm(h_seq_perm)
@@ -1055,12 +1057,12 @@ class UniPhy(nn.Module):
 
         self.embedding = FeatureEmbedding(input_ch, input_size, emb_ch, static_ch, hidden_factor)
 
-        num_blocks = int(getattr(args, "convlru_num_blocks", getattr(args, "convprl_num_blocks", 2)))
+        num_blocks = int(getattr(args, "convlru_num_blocks", 2))
         arch = getattr(args, "Arch", "unet")
         down_mode = getattr(args, "down_mode", "avg")
 
-        rank = int(getattr(args, "lru_rank", getattr(args, "prl_rank", 64)))
-        dt_ref = float(getattr(args, "dt_ref", getattr(args, "T", 1.0)))
+        rank = int(getattr(args, "lru_rank", 64))
+        dt_ref = float(getattr(args, "dt_ref", 1.0))
         inj_k = float(getattr(args, "inj_k", 2.0))
         learnable_init_state = bool(getattr(args, "learnable_init_state", False))
         
@@ -1068,6 +1070,7 @@ class UniPhy(nn.Module):
         koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
         
         dynamics_mode = getattr(args, "dynamics_mode", "spectral")
+        interpolation_mode = getattr(args, "interpolation_mode", "bilinear")
 
         prl_args = {
             "rank": rank,
@@ -1078,6 +1081,7 @@ class UniPhy(nn.Module):
             "use_noise": koopman_use_noise,
             "noise_scale": koopman_noise_scale,
             "dynamics_mode": dynamics_mode,
+            "interpolation_mode": interpolation_mode,
         }
 
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
