@@ -81,8 +81,8 @@ class Args:
         self.emb_ch = 64
         self.convlru_num_blocks = 6
         self.lru_rank = 64
-        self.down_mode = "shuffle"
-        self.dist_mode = "gaussian"
+        self.down_mode = "shuffle"  # Options: avg, shuffle, conv
+        self.dist_mode = "gaussian"  # Options: gaussian, laplace
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
@@ -108,7 +108,7 @@ class Args:
         self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
-        self.sample_k = 8
+        self.sample_k = 9
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
@@ -118,8 +118,8 @@ class Args:
         self.train_mode = "p_only"
         self.learnable_init_state = True
         self.ffn_ratio = 1.5
-        self.ConvType = "dcn"
-        self.Arch = "bifpn"
+        self.ConvType = "dcn"  # Options: conv, dcn
+        self.Arch = "unet"  # Options: unet, no_unet
         self.grad_accum_steps = 1
         self.enable_no_sync = True
         self.log_every = 1
@@ -128,8 +128,9 @@ class Args:
         self.koopman_noise_scale = 1.0
         self.dt_ref = 1.0
         self.inj_k = 2.0
-        self.dynamics_mode = "advection"
-        self.interpolation_mode = "bilinear"
+        self.max_velocity = 5.0
+        self.dynamics_mode = "advection"  # Options: advection, spectral
+        self.interpolation_mode = "bilinear"  # Options: bilinear, nearest
         self.spectral_modes_h = 12
         self.spectral_modes_w = 12
         self.check_args()
