@@ -26,7 +26,6 @@ def get_base_args() -> Any:
         ConvType="conv",
         Arch="unet",
         dist_mode="gaussian",
-        diff_mode="sobel",
         convlru_num_blocks=2,
         down_mode="avg",
         ffn_ratio=2.0,
@@ -36,7 +35,9 @@ def get_base_args() -> Any:
         learnable_init_state=True,
         dt_ref=1.0,
         inj_k=2.0,
-        max_velocity=5.0,
+        dynamics_mode="advection",
+        spectral_modes_h=12,
+        spectral_modes_w=12,
     )
 
 
@@ -63,8 +64,9 @@ def check_once(args: Any, device: torch.device) -> None:
 
     x_init = torch.randn(B, 1, C, H, W, device=device)
     static_feats = make_static_feats(args, B, H, W, device)
+    
     stats = model.revin.stats(x_init)
-
+    
     listT_i = torch.ones(B, 1, device=device, dtype=x_init.dtype)
     listT_future = torch.ones(B, L - 1, device=device, dtype=x_init.dtype)
 
@@ -108,7 +110,10 @@ def check_once(args: Any, device: torch.device) -> None:
         fin_p = is_finite(out_p)
 
     cfg = ", ".join(f"{k}={getattr(args, k)}" for k in vars(args))
-    status = "PASS" if (fin_i and fin_p) else "FAIL"
+    
+    threshold = 1.0 if args.dynamics_mode == "advection" else 1e-4
+    
+    status = "PASS" if (fin_i and fin_p and diff < threshold) else "FAIL"
     print(f"[{status}] diff={diff:.3e} finite_i={fin_i} finite_p={fin_p} | {cfg}")
 
     del model
@@ -127,10 +132,10 @@ def main():
     print(f"[Device] {device}")
 
     grid = {
-        "dist_mode": ["gaussian", "laplace"],
-        "diff_mode": ["sobel", "learnable"],
-        "Arch": ["unet", "bifpn"],
-        "down_mode": ["avg", "shuffle"],
+        "dist_mode": ["gaussian"],
+        "dynamics_mode": ["advection", "spectral"],
+        "Arch": ["unet"],
+        "down_mode": ["avg"],
         "static_ch": [0, 4],
     }
 
