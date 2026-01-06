@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from GridSamplePScan_Torch import pscan_flow, flow_composition_residual
+from GridSamplePScan import pscan_flow, flow_composition_residual
 
 def ref_flow_scan(flows, images, mode='bilinear'):
     B, L, _, H, W = flows.shape
