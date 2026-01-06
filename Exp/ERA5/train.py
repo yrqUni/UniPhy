@@ -137,7 +137,13 @@ class Args:
 
     def check_args(self) -> None:
         if bool(self.use_compile):
-            print("[Info] Torch Compile Enabled.")
+            print("[Warning] Torch Compile is currently disabled/unstable. Forcing use_compile=False.")
+            self.use_compile = False
+        
+        if bool(self.use_amp):
+            print("[Warning] AMP is currently disabled/unstable. Forcing use_amp=False.")
+            self.use_amp = False
+
         if int(self.grad_accum_steps) < 1:
             raise ValueError("grad_accum_steps must be >= 1")
 
@@ -834,11 +840,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
 if __name__ == "__main__":
     args = Args()
-    if bool(args.use_amp):
-        print("[Warning] AMP is disabled by policy. Forcing use_amp=False.")
-        logging.warning("AMP is disabled by policy. Forcing use_amp=False.")
-        args.use_amp = False
-
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
