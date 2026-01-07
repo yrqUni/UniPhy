@@ -1,72 +1,69 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from functools import lru_cache
+
+@lru_cache(maxsize=4)
+def get_base_grid(B, H, W, device, dtype):
+    step_y = 2.0 / H
+    step_x = 2.0 / W
+    
+    start_y = -1.0 + step_y * 0.5
+    start_x = -1.0 + step_x * 0.5
+    
+    grid_y = torch.linspace(start_y, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
+    grid_x = torch.linspace(start_x, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
+    
+    grid_y = grid_y.view(1, H, 1)
+    grid_x = grid_x.view(1, 1, W)
+    
+    return grid_y, grid_x
+
+def warp_common(flow, B, H, W):
+    base_grid_y, base_grid_x = get_base_grid(B, H, W, flow.device, flow.dtype)
+    
+    flow_perm = flow.permute(0, 2, 3, 1)
+    
+    final_x = base_grid_x + flow_perm[..., 0]
+    final_y = base_grid_y + flow_perm[..., 1]
+    
+    final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
+    
+    return torch.stack([final_x, final_y], dim=-1)
 
 def warp_flow(flow_prev, flow_curr, mode='bilinear'):
     B, _, H, W = flow_prev.shape
-    device = flow_prev.device
-    dtype = flow_prev.dtype
-
-    step_y = 2.0 / H
-    step_x = 2.0 / W
-    gy = torch.linspace(-1 + step_y/2, 1 - step_y/2, H, device=device, dtype=dtype)
-    gx = torch.linspace(-1 + step_x/2, 1 - step_x/2, W, device=device, dtype=dtype)
-
-    grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
-    base_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+    grid = warp_common(flow_curr, B, H, W)
     
-    flow_curr_perm = flow_curr.permute(0, 2, 3, 1)
-    sample_grid = base_grid + flow_curr_perm
-
-    sample_grid_w = sample_grid[..., 0]
-    sample_grid_w_wrapped = torch.remainder(sample_grid_w + 1, 2) - 1
-    sample_grid_wrapped = torch.stack([sample_grid_w_wrapped, sample_grid[..., 1]], dim=-1)
-
     sampled_prev = F.grid_sample(
         flow_prev, 
-        sample_grid_wrapped,
+        grid,
         mode=mode,
         padding_mode='zeros', 
         align_corners=False
     )
-
-    flow_new = flow_curr + sampled_prev
-    return flow_new
+    return flow_curr + sampled_prev
 
 def warp_image(img_prev, flow_curr, mode='bilinear'):
     B, _, H, W = img_prev.shape
-    device = img_prev.device
-    dtype = img_prev.dtype
+    grid = warp_common(flow_curr, B, H, W)
     
-    step_y = 2.0 / H
-    step_x = 2.0 / W
-    gy = torch.linspace(-1 + step_y/2, 1 - step_y/2, H, device=device, dtype=dtype)
-    gx = torch.linspace(-1 + step_x/2, 1 - step_x/2, W, device=device, dtype=dtype)
-        
-    grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
-    base_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
-    
-    flow_curr_perm = flow_curr.permute(0, 2, 3, 1)
-    sample_grid = base_grid + flow_curr_perm
-    
-    sample_grid_w = sample_grid[..., 0]
-    sample_grid_w_wrapped = torch.remainder(sample_grid_w + 1, 2) - 1
-    sample_grid_wrapped = torch.stack([sample_grid_w_wrapped, sample_grid[..., 1]], dim=-1)
-    
-    img_warped = F.grid_sample(
+    return F.grid_sample(
         img_prev,
-        sample_grid_wrapped,
+        grid,
         mode=mode,
         padding_mode='zeros',
         align_corners=False
     )
-    return img_warped
 
 def flow_composition_residual(flow_prev, img_prev, flow_curr, img_curr, mode='bilinear'):
-    flow_combined = warp_flow(flow_prev, flow_curr, mode=mode)
-    img_warped = warp_image(img_prev, flow_curr, mode=mode)
-    img_combined = img_warped + img_curr
-    return flow_combined, img_combined
+    B, _, H, W = flow_prev.shape
+    grid = warp_common(flow_curr, B, H, W)
+    
+    flow_sampled = F.grid_sample(flow_prev, grid, mode=mode, padding_mode='zeros', align_corners=False)
+    img_sampled = F.grid_sample(img_prev, grid, mode=mode, padding_mode='zeros', align_corners=False)
+    
+    return flow_curr + flow_sampled, img_curr + img_sampled
 
 class GridSamplePScan(nn.Module):
     def __init__(self, mode='bilinear'):
