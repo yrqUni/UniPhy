@@ -88,7 +88,7 @@ class Args:
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
-        self.ckpt = ""
+        self.ckpt = "e3_s855_l-3.459431.pth"
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.epochs = 128
@@ -112,7 +112,7 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "ConvLRU"
-        self.wandb_run_name = ""
+        self.wandb_run_name = "e3_s855_l-3.459431.pth"
         self.wandb_group = ""
         self.wandb_mode = "online"
         self.train_mode = "p_only"
