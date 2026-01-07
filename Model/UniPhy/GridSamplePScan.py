@@ -9,43 +9,56 @@ class GridSamplePScan(nn.Module):
             raise ValueError(f"mode must be 'bilinear' or 'nearest', got {mode}")
         self.mode = mode
 
-    def get_base_grid(self, B, H, W, device, dtype):
-        step_y = 2.0 / H
-        step_x = 2.0 / W
-        
-        start_y = -1.0 + step_y * 0.5
-        start_x = -1.0 + step_x * 0.5
-        
-        grid_y = torch.linspace(start_y, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
-        grid_x = torch.linspace(start_x, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
-        
-        return grid_y.view(1, H, 1), grid_x.view(1, 1, W)
-
     def forward(self, flows, images):
         B, L, _, H, W = flows.shape
         _, _, C, _, _ = images.shape
         device = flows.device
         dtype = flows.dtype
 
-        cum_flows = torch.cumsum(flows, dim=1)
-        
-        rel_flows = cum_flows.unsqueeze(2) - cum_flows.unsqueeze(1) 
-        
-        flat_rel_flows = rel_flows.view(B * L * L, 2, H, W)
-        
-        base_grid_y, base_grid_x = self.get_base_grid(B * L * L, H, W, device, dtype)
-        
-        flow_perm = flat_rel_flows.permute(0, 2, 3, 1)
-        
-        grid_x = base_grid_x + flow_perm[..., 0]
-        grid_y = base_grid_y + flow_perm[..., 1]
-        
-        grid_x = torch.remainder(grid_x + 1.0, 2.0) - 1.0
-        
-        final_grid = torch.stack([grid_x, grid_y], dim=-1)
+        # 1. Precompute Cumulative Flow (B, L, 2, H, W)
+        # Use FP32 for accumulation precision, then cast back
+        cum_flows = torch.cumsum(flows.float(), dim=1).to(dtype)
 
-        flat_images = images.view(B, 1, L, C, H, W).expand(-1, L, -1, -1, -1, -1).reshape(B * L * L, C, H, W)
+        # 2. Generate Causal Indices (k <= t)
+        # N_pairs = L * (L + 1) / 2. This reduces memory/compute by ~50% vs L*L
+        # k_idx: source time index, t_idx: target time index
+        k_idx, t_idx = torch.triu_indices(L, L, offset=0, device=device)
+        N_pairs = k_idx.numel()
 
+        # 3. Prepare Batch Offsets
+        # We need to process all batches for these pairs.
+        # Total effective batch size: B * N_pairs
+        batch_idx = torch.arange(B, device=device)[:, None].expand(B, N_pairs).reshape(-1)
+        k_idx_flat = k_idx[None, :].expand(B, N_pairs).reshape(-1)
+        t_idx_flat = t_idx[None, :].expand(B, N_pairs).reshape(-1)
+        
+        # 4. Gather Flows and Compute Relative Flow
+        # flow_{k->t} = cum_flows[t] - cum_flows[k]
+        # We gather (B * N_pairs, 2, H, W) directly
+        flows_t = cum_flows[batch_idx, t_idx_flat]
+        flows_k = cum_flows[batch_idx, k_idx_flat]
+        flat_rel_flows = flows_t - flows_k
+
+        # 5. Generate Grid on the fly
+        # Grid generation is cheap compared to memory bandwidth of storing it
+        step_y = 2.0 / H
+        step_x = 2.0 / W
+        grid_y = torch.linspace(-1.0 + step_y * 0.5, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
+        grid_x = torch.linspace(-1.0 + step_x * 0.5, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
+        # (N, H, W, 2)
+        base_grid = torch.stack(torch.meshgrid(grid_x, grid_y, indexing='xy'), dim=-1).unsqueeze(0)
+        
+        # Apply Flow to Grid
+        final_grid = base_grid + flat_rel_flows.permute(0, 2, 3, 1)
+        # Wrap Longitude (X-axis)
+        final_grid[..., 0] = torch.remainder(final_grid[..., 0] + 1.0, 2.0) - 1.0
+
+        # 6. Gather Source Images
+        # Extract images at time k: (B * N_pairs, C, H, W)
+        flat_images = images[batch_idx, k_idx_flat]
+
+        # 7. Grid Sample (The Heavy Lifter)
+        # Only computing valid causal pairs
         warped_flat = F.grid_sample(
             flat_images, 
             final_grid, 
@@ -53,14 +66,22 @@ class GridSamplePScan(nn.Module):
             padding_mode='zeros', 
             align_corners=False
         )
+
+        # 8. Scatter Accumulate Results
+        # Accumulate warped_flat into h_state based on target time index t
+        # Output: (B, L, C, H, W)
+        h_state = torch.zeros(B, L, C, H, W, device=device, dtype=dtype)
         
-        warped_matrix = warped_flat.view(B, L, L, C, H, W)
+        # We need to reshape warped_flat to map back to (B, N_pairs, ...) for index_add
+        # But index_add_ only works on a specific dimension. 
+        # Easier strategy: Reshape h_state to (B*L, C, H, W) and index_add_ using flat indices
         
-        causal_mask = torch.tril(torch.ones(L, L, device=device, dtype=dtype)).view(1, L, L, 1, 1, 1)
+        target_flat_indices = batch_idx * L + t_idx_flat # Map (b, t) to global index
         
-        h_state = (warped_matrix * causal_mask).sum(dim=2)
+        h_state_flat = h_state.view(B * L, C, H, W)
+        h_state_flat.index_add_(0, target_flat_indices, warped_flat)
         
-        return h_state
+        return h_state_flat.view(B, L, C, H, W)
 
 def pscan_flow(flows, images, mode='bilinear'):
     if flows.size(-1) == 2:
