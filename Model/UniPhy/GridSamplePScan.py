@@ -12,12 +12,12 @@ def get_base_grid(B, H, W, device, dtype):
     return grid_y.view(1, H, 1), grid_x.view(1, 1, W)
 
 def warp_common(flow, B, H, W):
-    base_grid_y, base_grid_x = get_base_grid(B, H, W, flow.device, flow.dtype)
-    flow_perm = flow.permute(0, 2, 3, 1)
+    base_grid_y, base_grid_x = get_base_grid(B, H, W, flow.device, flow.float().dtype)
+    flow_perm = flow.permute(0, 2, 3, 1).float()
     final_x = base_grid_x + flow_perm[..., 0]
     final_y = base_grid_y + flow_perm[..., 1]
     final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
-    return torch.stack([final_x, final_y], dim=-1)
+    return torch.stack([final_x, final_y], dim=-1).to(flow.dtype)
 
 class GridSamplePScan(nn.Module):
     def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32):
@@ -26,6 +26,9 @@ class GridSamplePScan(nn.Module):
         self.use_decay = use_decay
         self.use_residual = use_residual and (channels is not None)
         self.chunk_size = chunk_size
+        self.cached_H = 0
+        self.cached_W = 0
+        self.register_buffer('base_grid_cache', None, persistent=False)
 
         if self.use_decay:
             self.decay_log = nn.Parameter(torch.tensor(-2.0))
@@ -39,11 +42,15 @@ class GridSamplePScan(nn.Module):
             nn.init.zeros_(self.res_conv[-1].weight)
             nn.init.zeros_(self.res_conv[-1].bias)
 
-    def get_base_grid_tensor(self, B, H, W, device, dtype):
-        step_y, step_x = 2.0 / H, 2.0 / W
-        grid_y = torch.linspace(-1.0 + step_y * 0.5, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
-        grid_x = torch.linspace(-1.0 + step_x * 0.5, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
-        return torch.stack(torch.meshgrid(grid_x, grid_y, indexing='xy'), dim=-1).view(1, 1, 1, H, W, 2)
+    def get_cached_grid(self, H, W, device, dtype):
+        if self.cached_H != H or self.cached_W != W or self.base_grid_cache is None:
+            self.cached_H, self.cached_W = H, W
+            step_y, step_x = 2.0 / H, 2.0 / W
+            grid_y = torch.linspace(-1.0 + step_y * 0.5, 1.0 - step_y * 0.5, H, device=device, dtype=torch.float32)
+            grid_x = torch.linspace(-1.0 + step_x * 0.5, 1.0 - step_x * 0.5, W, device=device, dtype=torch.float32)
+            self.base_grid_cache = torch.stack(torch.meshgrid(grid_x, grid_y, indexing='xy'), dim=-1).view(1, 1, 1, H, W, 2)
+        
+        return self.base_grid_cache.to(device)
 
     def forward(self, flows, images):
         B, L, C, H, W = images.shape
@@ -52,8 +59,8 @@ class GridSamplePScan(nn.Module):
         B_f, L_f, _, H_f, W_f = flows.shape
         is_low_res_flow = (H_f != H) or (W_f != W)
 
-        cum_flows = torch.cumsum(flows.float(), dim=1).to(dtype)
-        base_grid_flow = self.get_base_grid_tensor(B, H_f, W_f, device, dtype)
+        cum_flows = torch.cumsum(flows.float(), dim=1)
+        base_grid_flow = self.get_cached_grid(H_f, W_f, device, dtype)
         
         out_fused = torch.zeros(B, L, C, H, W, device=device, dtype=dtype)
         decay_factor = torch.exp(self.decay_log) if self.use_decay else None
@@ -65,8 +72,7 @@ class GridSamplePScan(nn.Module):
             
             flow_t = cum_flows[:, t_start:t_end].unsqueeze(2)
             flow_k = cum_flows[:, :k_end].unsqueeze(1)
-            
-            rel_flow = flow_t - flow_k 
+            rel_flow = flow_t - flow_k
 
             if self.use_residual:
                 img_t = images[:, t_start:t_end].unsqueeze(2).expand(-1, -1, k_end, -1, -1, -1)
@@ -79,7 +85,7 @@ class GridSamplePScan(nn.Module):
                     feat_diff_flat = F.interpolate(feat_diff_flat, size=(H_f, W_f), mode='bilinear', align_corners=False)
                 
                 res_flow = self.res_conv(feat_diff_flat).view(B, curr_chunk_len, k_end, 2, H_f, W_f)
-                rel_flow = rel_flow + res_flow
+                rel_flow = rel_flow + res_flow.float()
 
             grid = base_grid_flow + rel_flow.permute(0, 1, 2, 4, 5, 3)
             grid[..., 0] = torch.remainder(grid[..., 0] + 1.0, 2.0) - 1.0
@@ -89,10 +95,13 @@ class GridSamplePScan(nn.Module):
                 grid = F.interpolate(grid, size=(H, W), mode='bilinear', align_corners=False)
                 grid = grid.permute(0, 2, 3, 1).view(B, curr_chunk_len, k_end, H, W, 2)
 
-            img_k_input = images[:, :k_end].unsqueeze(1).expand(-1, curr_chunk_len, -1, -1, -1, -1)
+            grid = grid.to(dtype).contiguous()
             
+            img_k_input = images[:, :k_end].unsqueeze(1).expand(-1, curr_chunk_len, -1, -1, -1, -1)
+            img_k_input = img_k_input.reshape(-1, C, H, W).contiguous()
+
             sampled = F.grid_sample(
-                img_k_input.reshape(-1, C, H, W),
+                img_k_input,
                 grid.reshape(-1, H, W, 2),
                 mode=self.mode,
                 padding_mode='zeros',
@@ -101,14 +110,13 @@ class GridSamplePScan(nn.Module):
 
             t_idx = torch.arange(t_start, t_end, device=device)
             k_idx = torch.arange(k_end, device=device)
-            mask = (k_idx.unsqueeze(0) <= t_idx.unsqueeze(1))
-            mask = mask.view(1, curr_chunk_len, k_end, 1, 1, 1)
+            mask = (k_idx.unsqueeze(0) <= t_idx.unsqueeze(1)).view(1, curr_chunk_len, k_end, 1, 1, 1)
             
             sampled = sampled * mask
 
             if self.use_decay:
                 dist = t_idx.unsqueeze(1) - k_idx.unsqueeze(0)
-                weights = torch.exp(-decay_factor * dist).view(1, curr_chunk_len, k_end, 1, 1, 1)
+                weights = torch.exp(-decay_factor * dist).view(1, curr_chunk_len, k_end, 1, 1, 1).to(dtype)
                 sampled = sampled * weights
 
             out_fused[:, t_start:t_end] = sampled.sum(dim=2)
