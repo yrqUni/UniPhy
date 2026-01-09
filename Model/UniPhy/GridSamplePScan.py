@@ -20,12 +20,14 @@ def warp_common(flow, B, H, W):
     return torch.stack([final_x, final_y], dim=-1).to(flow.dtype)
 
 class GridSamplePScan(nn.Module):
-    def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32):
+    def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32, window_size=None):
         super().__init__()
         self.mode = mode
         self.use_decay = use_decay
         self.use_residual = use_residual and (channels is not None)
         self.chunk_size = chunk_size
+        self.window_size = window_size
+        
         self.cached_H = 0
         self.cached_W = 0
         self.register_buffer('base_grid_cache', None, persistent=False)
@@ -67,59 +69,78 @@ class GridSamplePScan(nn.Module):
 
         for t_start in range(0, L, self.chunk_size):
             t_end = min(t_start + self.chunk_size, L)
-            curr_chunk_len = t_end - t_start
-            k_end = t_end
+            curr_t_len = t_end - t_start
             
-            flow_t = cum_flows[:, t_start:t_end].unsqueeze(2)
-            flow_k = cum_flows[:, :k_end].unsqueeze(1)
-            rel_flow = flow_t - flow_k
+            acc_chunk = torch.zeros(B, curr_t_len, C, H, W, device=device, dtype=dtype)
+            
+            min_k = 0
+            if self.window_size is not None:
+                min_k = max(0, t_start - self.window_size)
+            
+            for k_start in range(min_k, t_end, self.chunk_size):
+                k_end = min(k_start + self.chunk_size, t_end)
+                curr_k_len = k_end - k_start
 
-            if self.use_residual:
-                img_t = images[:, t_start:t_end].unsqueeze(2).expand(-1, -1, k_end, -1, -1, -1)
-                img_k = images[:, :k_end].unsqueeze(1).expand(-1, curr_chunk_len, -1, -1, -1, -1)
-                
-                feat_diff = torch.cat([img_t, img_k], dim=3)
-                feat_diff_flat = feat_diff.reshape(-1, 2 * C, H, W)
+                if self.window_size is not None:
+                    if t_start - (k_end - 1) > self.window_size:
+                        continue
+
+                flow_t = cum_flows[:, t_start:t_end].unsqueeze(2)
+                flow_k = cum_flows[:, k_start:k_end].unsqueeze(1)
+                rel_flow = flow_t - flow_k
+
+                if self.use_residual:
+                    img_t = images[:, t_start:t_end].unsqueeze(2).expand(-1, -1, curr_k_len, -1, -1, -1)
+                    img_k_slice = images[:, k_start:k_end].unsqueeze(1).expand(-1, curr_t_len, -1, -1, -1, -1)
+                    
+                    feat_diff = torch.cat([img_t, img_k_slice], dim=3)
+                    feat_diff_flat = feat_diff.reshape(-1, 2 * C, H, W)
+
+                    if is_low_res_flow:
+                        feat_diff_flat = F.interpolate(feat_diff_flat, size=(H_f, W_f), mode='bilinear', align_corners=False)
+                    
+                    res_flow = self.res_conv(feat_diff_flat).view(B, curr_t_len, curr_k_len, 2, H_f, W_f)
+                    rel_flow = rel_flow + res_flow.float()
+
+                grid = base_grid_flow + rel_flow.permute(0, 1, 2, 4, 5, 3)
+                grid[..., 0] = torch.remainder(grid[..., 0] + 1.0, 2.0) - 1.0
 
                 if is_low_res_flow:
-                    feat_diff_flat = F.interpolate(feat_diff_flat, size=(H_f, W_f), mode='bilinear', align_corners=False)
+                    grid = grid.reshape(-1, H_f, W_f, 2).permute(0, 3, 1, 2)
+                    grid = F.interpolate(grid, size=(H, W), mode='bilinear', align_corners=False)
+                    grid = grid.permute(0, 2, 3, 1).view(B, curr_t_len, curr_k_len, H, W, 2)
                 
-                res_flow = self.res_conv(feat_diff_flat).view(B, curr_chunk_len, k_end, 2, H_f, W_f)
-                rel_flow = rel_flow + res_flow.float()
+                grid = grid.to(dtype).contiguous()
+                
+                img_k_input = images[:, k_start:k_end].unsqueeze(1).expand(-1, curr_t_len, -1, -1, -1, -1)
+                img_k_input = img_k_input.reshape(-1, C, H, W).contiguous()
 
-            grid = base_grid_flow + rel_flow.permute(0, 1, 2, 4, 5, 3)
-            grid[..., 0] = torch.remainder(grid[..., 0] + 1.0, 2.0) - 1.0
+                sampled = F.grid_sample(
+                    img_k_input,
+                    grid.reshape(-1, H, W, 2),
+                    mode=self.mode,
+                    padding_mode='zeros',
+                    align_corners=False
+                ).view(B, curr_t_len, curr_k_len, C, H, W)
 
-            if is_low_res_flow:
-                grid = grid.reshape(-1, H_f, W_f, 2).permute(0, 3, 1, 2)
-                grid = F.interpolate(grid, size=(H, W), mode='bilinear', align_corners=False)
-                grid = grid.permute(0, 2, 3, 1).view(B, curr_chunk_len, k_end, H, W, 2)
+                t_idx = torch.arange(t_start, t_end, device=device).view(curr_t_len, 1)
+                k_idx = torch.arange(k_start, k_end, device=device).view(1, curr_k_len)
+                
+                mask = (k_idx <= t_idx)
+                
+                if self.window_size is not None:
+                    mask = mask & ((t_idx - k_idx) <= self.window_size)
+                
+                sampled = sampled * mask.view(1, curr_t_len, curr_k_len, 1, 1, 1)
 
-            grid = grid.to(dtype).contiguous()
-            
-            img_k_input = images[:, :k_end].unsqueeze(1).expand(-1, curr_chunk_len, -1, -1, -1, -1)
-            img_k_input = img_k_input.reshape(-1, C, H, W).contiguous()
+                if self.use_decay:
+                    dist = (t_idx - k_idx).to(dtype)
+                    weights = torch.exp(-decay_factor * dist).view(1, curr_t_len, curr_k_len, 1, 1, 1)
+                    sampled = sampled * weights
 
-            sampled = F.grid_sample(
-                img_k_input,
-                grid.reshape(-1, H, W, 2),
-                mode=self.mode,
-                padding_mode='zeros',
-                align_corners=False
-            ).view(B, curr_chunk_len, k_end, C, H, W)
+                acc_chunk += sampled.sum(dim=2)
 
-            t_idx = torch.arange(t_start, t_end, device=device)
-            k_idx = torch.arange(k_end, device=device)
-            mask = (k_idx.unsqueeze(0) <= t_idx.unsqueeze(1)).view(1, curr_chunk_len, k_end, 1, 1, 1)
-            
-            sampled = sampled * mask
-
-            if self.use_decay:
-                dist = t_idx.unsqueeze(1) - k_idx.unsqueeze(0)
-                weights = torch.exp(-decay_factor * dist).view(1, curr_chunk_len, k_end, 1, 1, 1).to(dtype)
-                sampled = sampled * weights
-
-            out_fused[:, t_start:t_end] = sampled.sum(dim=2)
+            out_fused[:, t_start:t_end] = acc_chunk
 
         return out_fused
 
@@ -128,5 +149,5 @@ def pscan_flow(flows, images, mode='bilinear'):
         flows = flows.permute(0, 1, 4, 2, 3)
     
     C = images.shape[2]
-    return GridSamplePScan(mode=mode, channels=C, use_decay=True, use_residual=True).to(images.device)(flows, images)
+    return GridSamplePScan(mode=mode, channels=C, use_decay=True, use_residual=True, chunk_size=32).to(images.device)(flows, images)
 
