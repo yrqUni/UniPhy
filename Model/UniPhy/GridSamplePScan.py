@@ -36,12 +36,14 @@ def fused_pscan_forward_kernel_2d(
     mask_w = (off_w < W)
     mask_hw = mask_h[:, None] & mask_w[None, :]
 
+    # 预计算归一化网格 (-1, 1)
     base_y = (off_h[:, None].to(tl.float32) * (2.0 / H)) - 1.0 + (1.0 / H)
     base_x = (off_w[None, :].to(tl.float32) * (2.0 / W)) - 1.0 + (1.0 / W)
 
     acc = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
     
     t_abs = t_start_offset + t_idx
+    # 避免 continue 的逻辑
     k_end = t_idx + 1 if (k_start_offset == t_start_offset) else K_chunk
     k_end = tl.minimum(k_end, K_chunk)
 
@@ -52,60 +54,67 @@ def fused_pscan_forward_kernel_2d(
         k_abs = k_start_offset + k
         curr_k_mask = tl.load(mask_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
         
-        if curr_k_mask == 0.0:
-            continue
+        if curr_k_mask != 0.0:
+            flow_k_ptr = cum_flow_ptr + b_idx * stride_flow_b + k_abs * stride_flow_l
+            
+            # 使用广播计算 flow offset
+            off_flow_x = off_w[None, :] * stride_flow_w + off_h[:, None] * stride_flow_h
+            
+            fx_t = tl.load(flow_t_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            fy_t = tl.load(flow_t_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            
+            fx_k = tl.load(flow_k_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            fy_k = tl.load(flow_k_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
 
-        flow_k_ptr = cum_flow_ptr + b_idx * stride_flow_b + k_abs * stride_flow_l
-        
-        off_flow_x = off_w[None, :] * stride_flow_w + off_h[:, None] * stride_flow_h
-        
-        fx_t = tl.load(flow_t_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
-        fy_t = tl.load(flow_t_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
-        
-        fx_k = tl.load(flow_k_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
-        fy_k = tl.load(flow_k_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            res_x = 0.0
+            res_y = 0.0
+            if use_res_flow:
+                res_base = (b_idx * stride_res_b + t_idx * stride_res_t + k * stride_res_k)
+                res_x = tl.load(res_flow_ptr + res_base + 0 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
+                res_y = tl.load(res_flow_ptr + res_base + 1 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
 
-        res_x = 0.0
-        res_y = 0.0
-        if use_res_flow:
-            res_base = (b_idx * stride_res_b + t_idx * stride_res_t + k * stride_res_k)
-            res_x = tl.load(res_flow_ptr + res_base + 0 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
-            res_y = tl.load(res_flow_ptr + res_base + 1 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
+            gx = base_x + (fx_t - fx_k) + res_x
+            gy = base_y + (fy_t - fy_k) + res_y
 
-        gx = base_x + (fx_t - fx_k) + res_x
-        gy = base_y + (fy_t - fy_k) + res_y
+            # === FIX 1: 实现 grid[..., 0] 的 remainder wrap 逻辑 ===
+            # PyTorch logic: torch.remainder(grid[..., 0] + 1.0, 2.0) - 1.0
+            # Triton logic: 手动实现 floor remainder
+            val_x = gx + 1.0
+            val_x = val_x - 2.0 * tl.floor(val_x * 0.5)
+            gx = val_x - 1.0
+            # ====================================================
 
-        ix = (gx + 1.0) * (W * 0.5) - 0.5
-        iy = (gy + 1.0) * (H * 0.5) - 0.5
+            ix = (gx + 1.0) * (W * 0.5) - 0.5
+            iy = (gy + 1.0) * (H * 0.5) - 0.5
 
-        x0 = tl.floor(ix).to(tl.int32)
-        y0 = tl.floor(iy).to(tl.int32)
-        x1 = x0 + 1
-        y1 = y0 + 1
+            x0 = tl.floor(ix).to(tl.int32)
+            y0 = tl.floor(iy).to(tl.int32)
+            x1 = x0 + 1
+            y1 = y0 + 1
 
-        wa = (x1 - ix) * (y1 - iy)
-        wb = (x1 - ix) * (iy - y0)
-        wc = (ix - x0) * (y1 - iy)
-        wd = (ix - x0) * (iy - y0)
+            wa = (x1 - ix) * (y1 - iy)
+            wb = (x1 - ix) * (iy - y0)
+            wc = (ix - x0) * (y1 - iy)
+            wd = (ix - x0) * (iy - y0)
 
-        img_k_ptr = img_base_ptr + k_abs * stride_img_l
+            img_k_ptr = img_base_ptr + k_abs * stride_img_l
 
-        c_x0 = (x0 >= 0) & (x0 < W)
-        c_x1 = (x1 >= 0) & (x1 < W)
-        c_y0 = (y0 >= 0) & (y0 < H)
-        c_y1 = (y1 >= 0) & (y1 < H)
+            c_x0 = (x0 >= 0) & (x0 < W)
+            c_x1 = (x1 >= 0) & (x1 < W)
+            c_y0 = (y0 >= 0) & (y0 < H)
+            c_y1 = (y1 >= 0) & (y1 < H)
 
-        val_a = tl.load(img_k_ptr + y0 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y0 & mask_hw, other=0.0)
-        val_b = tl.load(img_k_ptr + y1 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y1 & mask_hw, other=0.0)
-        val_c = tl.load(img_k_ptr + y0 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y0 & mask_hw, other=0.0)
-        val_d = tl.load(img_k_ptr + y1 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y1 & mask_hw, other=0.0)
+            val_a = tl.load(img_k_ptr + y0 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y0 & mask_hw, other=0.0)
+            val_b = tl.load(img_k_ptr + y1 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y1 & mask_hw, other=0.0)
+            val_c = tl.load(img_k_ptr + y0 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y0 & mask_hw, other=0.0)
+            val_d = tl.load(img_k_ptr + y1 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y1 & mask_hw, other=0.0)
 
-        weight = curr_k_mask
-        if use_decay:
-            dist = tl.load(decay_dist_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
-            weight = weight * tl.exp(-decay_val * dist)
+            weight = curr_k_mask
+            if use_decay:
+                dist = tl.load(decay_dist_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
+                weight = weight * tl.exp(-decay_val * dist)
 
-        acc += (val_a * wa + val_b * wb + val_c * wc + val_d * wd) * weight
+            acc += (val_a * wa + val_b * wb + val_c * wc + val_d * wd) * weight
 
     out_offset = (b_idx * stride_out_b + t_idx * stride_out_t + c_idx * stride_out_c + 
                   off_h[:, None] * stride_out_h + off_w[None, :] * stride_out_w)
@@ -157,93 +166,125 @@ def fused_pscan_backward_kernel_2d(
     flow_t_ptr = cum_flow_ptr + b_idx * stride_flow_b + t_abs * stride_flow_l
     img_base_ptr = img_ptr + b_idx * stride_img_b + c_idx * stride_img_c
     grad_img_base_ptr = grad_img_ptr + b_idx * stride_img_b + c_idx * stride_img_c
+    
+    # === FIX 2: 准备 Flow 梯度的指针 ===
+    if grad_flow_ptr is not None:
+        grad_flow_t_ptr = grad_flow_ptr + b_idx * stride_flow_b + t_abs * stride_flow_l
 
     for k in range(k_end):
         k_abs = k_start_offset + k
         curr_k_mask = tl.load(mask_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
         
-        if curr_k_mask == 0.0:
-            continue
+        if curr_k_mask != 0.0:
+            flow_k_ptr = cum_flow_ptr + b_idx * stride_flow_b + k_abs * stride_flow_l
+            
+            off_flow_x = off_w[None, :] * stride_flP1+r4632=1B5B32347E\P0+r2531\P0+r2638\P1+r6B62=7F\P0+r6B49\P1+r6B44=1B5B337E\ow_w + off_h[:, None] * stride_flow_h
+            
+            fx_t = tl.load(flow_t_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            fy_t = tl.load(flow_t_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            fx_k = tl.load(flow_k_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            fy_k = tl.load(flow_k_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
 
-        flow_k_ptr = cum_flow_ptr + b_idx * stride_flow_b + k_abs * stride_flow_l
-        
-        off_flow_x = off_w[None, :] * stride_flow_w + off_h[:, None] * stride_flow_h
-        
-        fx_t = tl.load(flow_t_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
-        fy_t = tl.load(flow_t_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
-        fx_k = tl.load(flow_k_ptr + 0 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
-        fy_k = tl.load(flow_k_ptr + 1 * stride_flow_c + off_flow_x, mask=mask_hw, other=0.0)
+            res_x = 0.0
+            res_y = 0.0
+            if use_res_flow:
+                res_base = (b_idx * stride_res_b + t_idx * stride_res_t + k * stride_res_k)
+                res_x = tl.load(res_flow_ptr + res_base + 0 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
+                res_y = tl.load(res_flow_ptr + res_base + 1 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
 
-        res_x = 0.0
-        res_y = 0.0
-        if use_res_flow:
-            res_base = (b_idx * stride_res_b + t_idx * stride_res_t + k * stride_res_k)
-            res_x = tl.load(res_flow_ptr + res_base + 0 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
-            res_y = tl.load(res_flow_ptr + res_base + 1 * stride_res_c + off_flow_x, mask=mask_hw, other=0.0)
+            gx = base_x + (fx_t - fx_k) + res_x
+            gy = base_y + (fy_t - fy_k) + res_y
 
-        gx = base_x + (fx_t - fx_k) + res_x
-        gy = base_y + (fy_t - fy_k) + res_y
+            # === FIX 1: Backward 也要保持同样的坐标变换逻辑 ===
+            val_x = gx + 1.0
+            val_x = val_x - 2.0 * tl.floor(val_x * 0.5)
+            gx = val_x - 1.0
+            # ===============================================
 
-        ix = (gx + 1.0) * (W * 0.5) - 0.5
-        iy = (gy + 1.0) * (H * 0.5) - 0.5
+            ix = (gx + 1.0) * (W * 0.5) - 0.5
+            iy = (gy + 1.0) * (H * 0.5) - 0.5
 
-        x0 = tl.floor(ix).to(tl.int32)
-        y0 = tl.floor(iy).to(tl.int32)
-        x1 = x0 + 1
-        y1 = y0 + 1
+            x0 = tl.floor(ix).to(tl.int32)
+            y0 = tl.floor(iy).to(tl.int32)
+            x1 = x0 + 1
+            y1 = y0 + 1
 
-        wa = (x1 - ix) * (y1 - iy)
-        wb = (x1 - ix) * (iy - y0)
-        wc = (ix - x0) * (y1 - iy)
-        wd = (ix - x0) * (iy - y0)
+            wa = (x1 - ix) * (y1 - iy)
+            wb = (x1 - ix) * (iy - y0)
+            wc = (ix - x0) * (y1 - iy)
+            wd = (ix - x0) * (iy - y0)
 
-        img_k_ptr = img_base_ptr + k_abs * stride_img_l
-        
-        c_x0 = (x0 >= 0) & (x0 < W)
-        c_x1 = (x1 >= 0) & (x1 < W)
-        c_y0 = (y0 >= 0) & (y0 < H)
-        c_y1 = (y1 >= 0) & (y1 < H)
+            img_k_ptr = img_base_ptr + k_abs * stride_img_l
+            
+            c_x0 = (x0 >= 0) & (x0 < W)
+            c_x1 = (x1 >= 0) & (x1 < W)
+            c_y0 = (y0 >= 0) & (y0 < H)
+            c_y1 = (y1 >= 0) & (y1 < H)
 
-        val_a = tl.load(img_k_ptr + y0 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y0 & mask_hw, other=0.0)
-        val_b = tl.load(img_k_ptr + y1 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y1 & mask_hw, other=0.0)
-        val_c = tl.load(img_k_ptr + y0 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y0 & mask_hw, other=0.0)
-        val_d = tl.load(img_k_ptr + y1 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y1 & mask_hw, other=0.0)
+            val_a = tl.load(img_k_ptr + y0 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y0 & mask_hw, other=0.0)
+            val_b = tl.load(img_k_ptr + y1 * stride_img_h + x0 * stride_img_w, mask=mask_valid & c_x0 & c_y1 & mask_hw, other=0.0)
+            val_c = tl.load(img_k_ptr + y0 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y0 & mask_hw, other=0.0)
+            val_d = tl.load(img_k_ptr + y1 * stride_img_h + x1 * stride_img_w, mask=mask_valid & c_x1 & c_y1 & mask_hw, other=0.0)
 
-        weight = curr_k_mask
-        if use_decay:
-            dist = tl.load(decay_dist_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
-            weight = weight * tl.exp(-decay_val * dist)
+            weight = curr_k_mask
+            if use_decay:
+                dist = tl.load(decay_dist_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
+                weight = weight * tl.exp(-decay_val * dist)
 
-        grad_curr = grad_out_val * weight
-        
-        is_significant = tl.abs(grad_curr) > 1e-8
-        mask_ops = mask_valid & mask_hw & is_significant
+            grad_curr = grad_out_val * weight
+            
+            # 使用更小的阈值或者直接全算，为了正确性
+            is_significant = tl.abs(grad_curr) > 1e-10
+            mask_ops = mask_valid & mask_hw & is_significant
 
-        dwa_dx = -(y1 - iy)
-        dwa_dy = -(x1 - ix)
-        dwb_dx = -(iy - y0)
-        dwb_dy = (x1 - ix)
-        dwc_dx = (y1 - iy)
-        dwc_dy = -(ix - x0)
-        dwd_dx = (iy - y0)
-        dwd_dy = (ix - x0)
+            # 1. Image Gradients (Existing)
+            dwa_dx = -(y1 - iy)
+            dwa_dy = -(x1 - ix)
+            dwb_dx = -(iy - y0)
+            dwb_dy = (x1 - ix)
+            dwc_dx = (y1 - iy)
+            dwc_dy = -(ix - x0)
+            dwd_dx = (iy - y0)
+            dwd_dy = (ix - x0)
 
-        dval_dx = val_a * dwa_dx + val_b * dwb_dx + val_c * dwc_dx + val_d * dwd_dx
-        dval_dy = val_a * dwa_dy + val_b * dwb_dy + val_c * dwc_dy + val_d * dwd_dy
+            dval_dx = val_a * dwa_dx + val_b * dwb_dx + val_c * dwc_dx + val_d * dwd_dx
+            dval_dy = val_a * dwa_dy + val_b * dwb_dy + val_c * dwc_dy + val_d * dwd_dy
+            
+            # === FIX 3: 计算 Grid 的梯度 ===
+            grad_gx = grad_curr * dval_dx * (W * 0.5)
+            grad_gy = grad_curr * dval_dy * (H * 0.5)
+            
+            grad_a = grad_curr * wa
+            grad_b = grad_curr * wb
+            grad_c = grad_curr * wc
+            grad_d = grad_curr * wd
 
-        grad_gx = grad_curr * dval_dx * (W * 0.5)
-        grad_gy = grad_curr * dval_dy * (H * 0.5)
-
-        grad_a = grad_curr * wa
-        grad_b = grad_curr * wb
-        grad_c = grad_curr * wc
-        grad_d = grad_curr * wd
-
-        grad_img_k_ptr = grad_img_base_ptr + k_abs * stride_img_l
-        tl.atomic_add(grad_img_k_ptr + y0 * stride_img_h + x0 * stride_img_w, grad_a, mask=mask_ops & c_x0 & c_y0)
-        tl.atomic_add(grad_img_k_ptr + y1 * stride_img_h + x0 * stride_img_w, grad_b, mask=mask_ops & c_x0 & c_y1)
-        tl.atomic_add(grad_img_k_ptr + y0 * stride_img_h + x1 * stride_img_w, grad_c, mask=mask_ops & c_x1 & c_y0)
-        tl.atomic_add(grad_img_k_ptr + y1 * stride_img_h + x1 * stride_img_w, grad_d, mask=mask_ops & c_x1 & c_y1)
+            grad_img_k_ptr = grad_img_base_ptr + k_abs * stride_img_l
+            tl.atomic_add(grad_img_k_ptr + y0 * stride_img_h + x0 * stride_img_w, grad_a, mask=mask_ops & c_x0 & c_y0)
+            tl.atomic_add(grad_img_k_ptr + y1 * stride_img_h + x0 * stride_img_w, grad_b, mask=mask_ops & c_x0 & c_y1)
+            tl.atomic_add(grad_img_k_ptr + y0 * stride_img_h + x1 * stride_img_w, grad_c, mask=mask_ops & c_x1 & c_y0)
+            tl.atomic_add(grad_img_k_ptr + y1 * stride_img_h + x1 * stride_img_w, grad_d, mask=mask_ops & c_x1 & c_y1)
+            
+            # === FIX 3: 累加 Flow 的梯度 ===
+            # grad_flow_t += grad_g (因为 gx = ... + flow_t ...)
+            # grad_flow_k -= grad_g (因为 gx = ... - flow_k ...)
+            # grad_res    += grad_g (因为 gx = ... + res_flow ...)
+            
+            if grad_flow_ptr is not None:
+                grad_flow_k_ptr = grad_flow_ptr + b_idx * stride_flow_b + k_abs * stride_flow_l
+                
+                # Flow T (正向)
+                tl.atomic_add(grad_flow_t_ptr + 0 * stride_flow_c + off_flow_x, grad_gx, mask=mask_ops)
+                tl.atomic_add(grad_flow_t_ptr + 1 * stride_flow_c + off_flow_x, grad_gy, mask=mask_ops)
+                
+                # Flow K (负向)
+                tl.atomic_add(grad_flow_k_ptr + 0 * stride_flow_c + off_flow_x, -grad_gx, mask=mask_ops)
+                tl.atomic_add(grad_flow_k_ptr + 1 * stride_flow_c + off_flow_x, -grad_gy, mask=mask_ops)
+            
+            if grad_res_ptr is not None and use_res_flow:
+                res_base_grad = (b_idx * stride_res_b + t_idx * stride_res_t + k * stride_res_k)
+                tl.atomic_add(grad_res_ptr + res_base_grad + 0 * stride_res_c + off_flow_x, grad_gx, mask=mask_ops)
+                tl.atomic_add(grad_res_ptr + res_base_grad + 1 * stride_res_c + off_flow_x, grad_gy, mask=mask_ops)
 
 class TritonPScanFunction(Function):
     @staticmethod
@@ -274,7 +315,7 @@ class TritonPScanFunction(Function):
             out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
             k_start_offset, t_start_offset,
             decay_val if decay_val is not None else 0.0,
-            decay_val is not None, use_res_flow,
+            decay_val is not None, use_P1+r6B68=1B4F48\P1+r4037=1B4F46\P1+r6B50=1B5B357E\P1+r6B4E=1B5B367E\res_flow,
             BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W
         )
         
@@ -291,8 +332,11 @@ class TritonPScanFunction(Function):
         T_chunk, K_chunk = mask.shape[1], mask.shape[2]
         
         grad_images = torch.zeros_like(images) if images.requires_grad else None
+        grad_cum_flows = torch.zeros_like(cum_flows) if cum_flows.requires_grad else None
+        grad_res_flows = torch.zeros_like(res_flows) if (res_flows is not None and res_flows.requires_grad) else None
         
-        if grad_images is None:
+        # 如果所有输入都不需要梯度，直接返回
+        if grad_images is None and grad_cum_flows is None and grad_res_flows is None:
             return None, None, None, None, None, None, None, None
 
         BLOCK_H = 16
@@ -302,10 +346,13 @@ class TritonPScanFunction(Function):
         grad_output = grad_output.contiguous()
         use_res_flow = res_flows is not None
         r_stride = res_flows.stride() if use_res_flow else (0,0,0,0,0,0)
+        
+        grad_res_stride = grad_res_flows.stride() if grad_res_flows is not None else (0,0,0,0,0,0)
+        grad_flow_stride = grad_cum_flows.stride() if grad_cum_flows is not None else (0,0,0,0,0) # 5D tensor
 
         fused_pscan_backward_kernel_2d[grid_dim](
             grad_output, images, cum_flows, res_flows, mask, decay_dist,
-            grad_images, None, None,
+            grad_images, grad_cum_flows, grad_res_flows,
             B, C, L, H, W, T_chunk, K_chunk,
             images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
             cum_flows.stride(0), cum_flows.stride(1), cum_flows.stride(2), cum_flows.stride(3), cum_flows.stride(4),
@@ -317,7 +364,8 @@ class TritonPScanFunction(Function):
             BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W
         )
         
-        return grad_images, None, None, None, None, None, None, None
+        # === FIX 4: 正确返回 Flow 和 Res 的梯度 ===
+        return grad_images, grad_cum_flows, grad_res_flows, None, None, None, None, None
 
 class GridSamplePScan(nn.Module):
     def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32, window_size=None):
