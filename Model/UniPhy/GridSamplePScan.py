@@ -19,30 +19,29 @@ class GridSamplePScan(nn.Module):
         dtype = flows.dtype
 
         cum_flows = torch.cumsum(flows.float(), dim=1).to(dtype)
-        base_grid = self.get_base_grid(B, H, W, device, dtype)
+        base_grid = self.get_base_grid(B, H, W, device, dtype).squeeze(1)
 
-        flow_t = cum_flows.unsqueeze(2)
-        flow_k = cum_flows.unsqueeze(1)
-        
-        rel_flow = flow_t - flow_k
-        
-        grid = base_grid + rel_flow.permute(0, 1, 2, 4, 5, 3)
-        grid[..., 0] = torch.remainder(grid[..., 0] + 1.0, 2.0) - 1.0
-        
-        img_expanded = images.unsqueeze(1).expand(-1, L, -1, -1, -1, -1)
-        
-        warped_dense = F.grid_sample(
-            img_expanded.reshape(-1, C, H, W),
-            grid.reshape(-1, H, W, 2),
-            mode=self.mode, 
-            padding_mode='zeros', 
-            align_corners=False
-        ).view(B, L, L, C, H, W)
-        
-        mask = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
-        warped_dense = warped_dense.masked_fill(~mask.view(1, L, L, 1, 1, 1), 0)
-        
-        return warped_dense.sum(dim=2)
+        out_images = []
+        for t in range(L):
+            flow_t = cum_flows[:, t:t+1]
+            flow_k = cum_flows[:, :t+1]
+            rel_flow = flow_t - flow_k
+
+            grid = base_grid + rel_flow.permute(0, 1, 3, 4, 2)
+            grid[..., 0] = torch.remainder(grid[..., 0] + 1.0, 2.0) - 1.0
+
+            img_k = images[:, :t+1]
+
+            warped = F.grid_sample(
+                img_k.reshape(-1, C, H, W),
+                grid.reshape(-1, H, W, 2),
+                mode=self.mode,
+                padding_mode='zeros',
+                align_corners=False
+            )
+            out_images.append(warped.view(B, t+1, C, H, W).sum(dim=1))
+
+        return torch.stack(out_images, dim=1)
 
 def pscan_flow(flows, images, mode='bilinear'):
     if flows.size(-1) == 2:
