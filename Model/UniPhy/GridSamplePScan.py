@@ -6,7 +6,7 @@ import triton.language as tl
 from torch.autograd import Function
 
 @triton.jit
-def fused_pscan_kernel(
+def fused_pscan_forward_kernel(
     img_ptr, grid_ptr, out_ptr, mask_ptr, decay_dist_ptr,
     B, C, L, H, W, T_chunk, K_chunk,
     stride_img_b, stride_img_l, stride_img_c, stride_img_h, stride_img_w,
@@ -17,7 +17,6 @@ def fused_pscan_kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
     w_idx = offs % W
@@ -36,11 +35,8 @@ def fused_pscan_kernel(
     for k in range(K_chunk):
         curr_k_mask = tl.load(mask_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
         
-        grid_offset = (b_idx * stride_grid_b + 
-                       t_idx * stride_grid_t + 
-                       k * stride_grid_k + 
-                       h_idx * stride_grid_h + 
-                       w_idx * stride_grid_w)
+        grid_offset = (b_idx * stride_grid_b + t_idx * stride_grid_t + k * stride_grid_k + 
+                       h_idx * stride_grid_h + w_idx * stride_grid_w)
         
         gx = tl.load(grid_ptr + grid_offset + 0 * stride_grid_d, mask=mask_valid, other=0.0)
         gy = tl.load(grid_ptr + grid_offset + 1 * stride_grid_d, mask=mask_valid, other=0.0)
@@ -59,26 +55,19 @@ def fused_pscan_kernel(
         wd = (ix - x0) * (iy - y0)
         
         cur_l = k_start_offset + k
-        img_base = (b_idx * stride_img_b + 
-                    cur_l * stride_img_l + 
-                    c_idx * stride_img_c)
+        img_base = (b_idx * stride_img_b + cur_l * stride_img_l + c_idx * stride_img_c)
         
         check_x0 = (x0 >= 0) & (x0 < W)
         check_x1 = (x1 >= 0) & (x1 < W)
         check_y0 = (y0 >= 0) & (y0 < H)
         check_y1 = (y1 >= 0) & (y1 < H)
         
-        val_a = tl.load(img_ptr + img_base + y0 * stride_img_h + x0 * stride_img_w, 
-                        mask=mask_valid & check_x0 & check_y0, other=0.0)
-        val_b = tl.load(img_ptr + img_base + y1 * stride_img_h + x0 * stride_img_w, 
-                        mask=mask_valid & check_x0 & check_y1, other=0.0)
-        val_c = tl.load(img_ptr + img_base + y0 * stride_img_h + x1 * stride_img_w, 
-                        mask=mask_valid & check_x1 & check_y0, other=0.0)
-        val_d = tl.load(img_ptr + img_base + y1 * stride_img_h + x1 * stride_img_w, 
-                        mask=mask_valid & check_x1 & check_y1, other=0.0)
+        val_a = tl.load(img_ptr + img_base + y0 * stride_img_h + x0 * stride_img_w, mask=mask_valid & check_x0 & check_y0, other=0.0)
+        val_b = tl.load(img_ptr + img_base + y1 * stride_img_h + x0 * stride_img_w, mask=mask_valid & check_x0 & check_y1, other=0.0)
+        val_c = tl.load(img_ptr + img_base + y0 * stride_img_h + x1 * stride_img_w, mask=mask_valid & check_x1 & check_y0, other=0.0)
+        val_d = tl.load(img_ptr + img_base + y1 * stride_img_h + x1 * stride_img_w, mask=mask_valid & check_x1 & check_y1, other=0.0)
         
         interpolated = val_a * wa + val_b * wb + val_c * wc + val_d * wd
-        
         weighted = interpolated * curr_k_mask
         
         if use_decay:
@@ -88,14 +77,109 @@ def fused_pscan_kernel(
             
         acc += weighted
 
-    out_offset = (b_idx * stride_out_b + 
-                  t_idx * stride_out_t + 
-                  c_idx * stride_out_c + 
-                  h_idx * stride_out_h + 
-                  w_idx * stride_out_w)
-                  
+    out_offset = (b_idx * stride_out_b + t_idx * stride_out_t + c_idx * stride_out_c + 
+                  h_idx * stride_out_h + w_idx * stride_out_w)
     tl.store(out_ptr + out_offset, acc, mask=mask_valid)
 
+@triton.jit
+def fused_pscan_backward_kernel(
+    grad_out_ptr, img_ptr, grid_ptr, mask_ptr, decay_dist_ptr,
+    grad_img_ptr, grad_grid_ptr,
+    B, C, L, H, W, T_chunk, K_chunk,
+    stride_img_b, stride_img_l, stride_img_c, stride_img_h, stride_img_w,
+    stride_grid_b, stride_grid_t, stride_grid_k, stride_grid_h, stride_grid_w, stride_grid_d,
+    stride_out_b, stride_out_t, stride_out_c, stride_out_h, stride_out_w,
+    k_start_offset,
+    decay_val, use_decay: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    w_idx = offs % W
+    tmp = offs // W
+    h_idx = tmp % H
+    tmp = tmp // H
+    t_idx = tmp % T_chunk
+    tmp = tmp // T_chunk
+    c_idx = tmp % C
+    b_idx = tmp // C
+    
+    mask_valid = b_idx < B
+    
+    grad_out_offset = (b_idx * stride_out_b + t_idx * stride_out_t + c_idx * stride_out_c + 
+                       h_idx * stride_out_h + w_idx * stride_out_w)
+    grad_out_val = tl.load(grad_out_ptr + grad_out_offset, mask=mask_valid, other=0.0)
+    
+    for k in range(K_chunk):
+        curr_k_mask = tl.load(mask_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
+        
+        grid_offset = (b_idx * stride_grid_b + t_idx * stride_grid_t + k * stride_grid_k + 
+                       h_idx * stride_grid_h + w_idx * stride_grid_w)
+        
+        gx = tl.load(grid_ptr + grid_offset + 0 * stride_grid_d, mask=mask_valid, other=0.0)
+        gy = tl.load(grid_ptr + grid_offset + 1 * stride_grid_d, mask=mask_valid, other=0.0)
+        
+        ix = (gx + 1.0) * (W * 0.5) - 0.5
+        iy = (gy + 1.0) * (H * 0.5) - 0.5
+        
+        x0 = tl.floor(ix).to(tl.int32)
+        x1 = x0 + 1
+        y0 = tl.floor(iy).to(tl.int32)
+        y1 = y0 + 1
+        
+        wa = (x1 - ix) * (y1 - iy)
+        wb = (x1 - ix) * (iy - y0)
+        wc = (ix - x0) * (y1 - iy)
+        wd = (ix - x0) * (iy - y0)
+        
+        cur_l = k_start_offset + k
+        img_base = (b_idx * stride_img_b + cur_l * stride_img_l + c_idx * stride_img_c)
+        
+        check_x0 = (x0 >= 0) & (x0 < W)
+        check_x1 = (x1 >= 0) & (x1 < W)
+        check_y0 = (y0 >= 0) & (y0 < H)
+        check_y1 = (y1 >= 0) & (y1 < H)
+        
+        val_a = tl.load(img_ptr + img_base + y0 * stride_img_h + x0 * stride_img_w, mask=mask_valid & check_x0 & check_y0, other=0.0)
+        val_b = tl.load(img_ptr + img_base + y1 * stride_img_h + x0 * stride_img_w, mask=mask_valid & check_x0 & check_y1, other=0.0)
+        val_c = tl.load(img_ptr + img_base + y0 * stride_img_h + x1 * stride_img_w, mask=mask_valid & check_x1 & check_y0, other=0.0)
+        val_d = tl.load(img_ptr + img_base + y1 * stride_img_h + x1 * stride_img_w, mask=mask_valid & check_x1 & check_y1, other=0.0)
+        
+        weight = curr_k_mask
+        if use_decay:
+            dist = tl.load(decay_dist_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
+            weight = weight * tl.exp(-decay_val * dist)
+        
+        grad_curr = grad_out_val * weight
+        
+        dwa_dx = -(y1 - iy)
+        dwa_dy = -(x1 - ix)
+        dwb_dx = -(iy - y0)
+        dwb_dy = (x1 - ix)
+        dwc_dx = (y1 - iy)
+        dwc_dy = -(ix - x0)
+        dwd_dx = (iy - y0)
+        dwd_dy = (ix - x0)
+        
+        dval_dx = val_a * dwa_dx + val_b * dwb_dx + val_c * dwc_dx + val_d * dwd_dx
+        dval_dy = val_a * dwa_dy + val_b * dwb_dy + val_c * dwc_dy + val_d * dwd_dy
+        
+        grad_gx = grad_curr * dval_dx * (W * 0.5)
+        grad_gy = grad_curr * dval_dy * (H * 0.5)
+        
+        tl.store(grad_grid_ptr + grid_offset + 0 * stride_grid_d, grad_gx, mask=mask_valid)
+        tl.store(grad_grid_ptr + grid_offset + 1 * stride_grid_d, grad_gy, mask=mask_valid)
+        
+        grad_a = grad_curr * wa
+        grad_b = grad_curr * wb
+        grad_c = grad_curr * wc
+        grad_d = grad_curr * wd
+        
+        tl.atomic_add(grad_img_ptr + img_base + y0 * stride_img_h + x0 * stride_img_w, grad_a, mask=mask_valid & check_x0 & check_y0)
+        tl.atomic_add(grad_img_ptr + img_base + y1 * stride_img_h + x0 * stride_img_w, grad_b, mask=mask_valid & check_x0 & check_y1)
+        tl.atomic_add(grad_img_ptr + img_base + y0 * stride_img_h + x1 * stride_img_w, grad_c, mask=mask_valid & check_x1 & check_y0)
+        tl.atomic_add(grad_img_ptr + img_base + y1 * stride_img_h + x1 * stride_img_w, grad_d, mask=mask_valid & check_x1 & check_y1)
 
 class TritonPScanFunction(Function):
     @staticmethod
@@ -113,7 +197,7 @@ class TritonPScanFunction(Function):
         BLOCK_SIZE = 256
         grid_dim = (triton.cdiv(n_elements, BLOCK_SIZE),)
         
-        fused_pscan_kernel[grid_dim](
+        fused_pscan_forward_kernel[grid_dim](
             images, grid, out, mask, decay_dist,
             B, C, L, H, W, T_chunk, K_chunk,
             images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
@@ -142,49 +226,33 @@ class TritonPScanFunction(Function):
         if grad_images is None and grad_grid is None:
             return None, None, None, None, None, None
 
-        with torch.enable_grad():
-            for k in range(K_chunk):
-                img_idx = k_start_offset + k
-                if img_idx >= L: continue
-                
-                curr_img = images[:, img_idx].detach()
-                curr_img.requires_grad_(True)
-                
-                curr_grid = grid[:, :, k].detach()
-                curr_grid.requires_grad_(True)
-                
-                img_expanded = curr_img.unsqueeze(1).expand(-1, T_chunk, -1, -1, -1)
-                img_reshaped = img_expanded.reshape(B * T_chunk, C, H, W)
-                
-                grid_reshaped = curr_grid.reshape(B * T_chunk, H, W, 2)
-                
-                sampled = F.grid_sample(
-                    img_reshaped, 
-                    grid_reshaped, 
-                    mode='bilinear', 
-                    padding_mode='zeros', 
-                    align_corners=False
-                )
-                sampled = sampled.view(B, T_chunk, C, H, W)
-                
-                curr_mask = mask[:, k].view(1, T_chunk, 1, 1, 1)
-                weighted = sampled * curr_mask
-                
-                if decay_val is not None:
-                    curr_dist = decay_dist[:, k].view(1, T_chunk, 1, 1, 1)
-                    w_d = torch.exp(-decay_val * curr_dist)
-                    weighted = weighted * w_d
-                
-                weighted.backward(grad_output, retain_graph=False)
-                
-                if grad_images is not None:
-                    grad_images[:, img_idx] += curr_img.grad
-                
-                if grad_grid is not None:
-                    grad_grid[:, :, k] += curr_grid.grad
-        
-        return grad_images, grad_grid, None, None, None, None
+        if grad_images is None:
+             grad_images = torch.empty((1,), device=images.device) 
+        if grad_grid is None:
+             grad_grid = torch.empty((1,), device=images.device)
 
+        n_elements = B * C * T_chunk * H * W
+        BLOCK_SIZE = 256
+        grid_dim = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        
+        grad_output = grad_output.contiguous()
+        
+        fused_pscan_backward_kernel[grid_dim](
+            grad_output, images, grid, mask, decay_dist,
+            grad_images, grad_grid,
+            B, C, L, H, W, T_chunk, K_chunk,
+            images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
+            grid.stride(0), grid.stride(1), grid.stride(2), grid.stride(3), grid.stride(4), grid.stride(5),
+            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3), grad_output.stride(4),
+            k_start_offset,
+            decay_val if decay_val is not None else 0.0,
+            decay_val is not None,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        
+        return (grad_images if images.requires_grad else None, 
+                grad_grid if grid.requires_grad else None, 
+                None, None, None, None)
 
 class GridSamplePScan(nn.Module):
     def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32, window_size=None):
