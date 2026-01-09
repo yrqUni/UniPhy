@@ -73,6 +73,14 @@ class GridSamplePScan(nn.Module):
             
             acc_chunk = torch.zeros(B, curr_t_len, C, H, W, device=device, dtype=dtype)
             
+            flow_t = cum_flows[:, t_start:t_end].unsqueeze(2)
+            
+            img_t_slice = None
+            if self.use_residual:
+                img_t_slice = images[:, t_start:t_end].unsqueeze(2)
+
+            t_idx = torch.arange(t_start, t_end, device=device).view(curr_t_len, 1)
+
             min_k = 0
             if self.window_size is not None:
                 min_k = max(0, t_start - self.window_size)
@@ -85,15 +93,14 @@ class GridSamplePScan(nn.Module):
                     if t_start - (k_end - 1) > self.window_size:
                         continue
 
-                flow_t = cum_flows[:, t_start:t_end].unsqueeze(2)
                 flow_k = cum_flows[:, k_start:k_end].unsqueeze(1)
                 rel_flow = flow_t - flow_k
 
                 if self.use_residual:
-                    img_t = images[:, t_start:t_end].unsqueeze(2).expand(-1, -1, curr_k_len, -1, -1, -1)
-                    img_k_slice = images[:, k_start:k_end].unsqueeze(1).expand(-1, curr_t_len, -1, -1, -1, -1)
+                    img_t = img_t_slice.expand(-1, -1, curr_k_len, -1, -1, -1)
+                    img_k = images[:, k_start:k_end].unsqueeze(1).expand(-1, curr_t_len, -1, -1, -1, -1)
                     
-                    feat_diff = torch.cat([img_t, img_k_slice], dim=3)
+                    feat_diff = torch.cat([img_t, img_k], dim=3)
                     feat_diff_flat = feat_diff.reshape(-1, 2 * C, H, W)
 
                     if is_low_res_flow:
@@ -123,7 +130,6 @@ class GridSamplePScan(nn.Module):
                     align_corners=False
                 ).view(B, curr_t_len, curr_k_len, C, H, W)
 
-                t_idx = torch.arange(t_start, t_end, device=device).view(curr_t_len, 1)
                 k_idx = torch.arange(k_start, k_end, device=device).view(1, curr_k_len)
                 
                 mask = (k_idx <= t_idx)
