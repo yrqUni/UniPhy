@@ -1,23 +1,123 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-def get_base_grid(B, H, W, device, dtype):
-    step_y = 2.0 / H
-    step_x = 2.0 / W
-    start_y = -1.0 + step_y * 0.5
-    start_x = -1.0 + step_x * 0.5
-    grid_y = torch.linspace(start_y, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
-    grid_x = torch.linspace(start_x, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
-    return grid_y.view(1, H, 1), grid_x.view(1, 1, W)
+@triton.jit
+def fused_pscan_kernel(
+    img_ptr, grid_ptr, out_ptr, mask_ptr, decay_dist_ptr,
+    B, C, L, H, W, T_chunk, K_chunk,
+    stride_img_b, stride_img_l, stride_img_c, stride_img_h, stride_img_w,
+    stride_grid_b, stride_grid_t, stride_grid_k, stride_grid_h, stride_grid_w, stride_grid_d,
+    stride_out_b, stride_out_t, stride_out_c, stride_out_h, stride_out_w,
+    k_start_offset,
+    decay_val, use_decay: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    num_spatial = H * W
+    
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    w_idx = offs % W
+    tmp = offs // W
+    h_idx = tmp % H
+    tmp = tmp // H
+    t_idx = tmp % T_chunk
+    tmp = tmp // T_chunk
+    c_idx = tmp % C
+    b_idx = tmp // C
+    
+    mask_valid = b_idx < B
+    
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
+    for k in range(K_chunk):
+        curr_k_mask = tl.load(mask_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
+        
+        grid_offset = (b_idx * stride_grid_b + 
+                       t_idx * stride_grid_t + 
+                       k * stride_grid_k + 
+                       h_idx * stride_grid_h + 
+                       w_idx * stride_grid_w)
+        
+        gx = tl.load(grid_ptr + grid_offset + 0 * stride_grid_d, mask=mask_valid, other=0.0)
+        gy = tl.load(grid_ptr + grid_offset + 1 * stride_grid_d, mask=mask_valid, other=0.0)
+        
+        ix = (gx + 1.0) * (W * 0.5) - 0.5
+        iy = (gy + 1.0) * (H * 0.5) - 0.5
+        
+        x0 = tl.floor(ix).to(tl.int32)
+        x1 = x0 + 1
+        y0 = tl.floor(iy).to(tl.int32)
+        y1 = y0 + 1
+        
+        wa = (x1 - ix) * (y1 - iy)
+        wb = (x1 - ix) * (iy - y0)
+        wc = (ix - x0) * (y1 - iy)
+        wd = (ix - x0) * (iy - y0)
+        
+        cur_l = k_start_offset + k
+        img_base = (b_idx * stride_img_b + 
+                    cur_l * stride_img_l + 
+                    c_idx * stride_img_c)
+        
+        check_x0 = (x0 >= 0) & (x0 < W)
+        check_x1 = (x1 >= 0) & (x1 < W)
+        check_y0 = (y0 >= 0) & (y0 < H)
+        check_y1 = (y1 >= 0) & (y1 < H)
+        
+        val_a = tl.load(img_ptr + img_base + y0 * stride_img_h + x0 * stride_img_w, 
+                        mask=mask_valid & check_x0 & check_y0, other=0.0)
+        val_b = tl.load(img_ptr + img_base + y1 * stride_img_h + x0 * stride_img_w, 
+                        mask=mask_valid & check_x0 & check_y1, other=0.0)
+        val_c = tl.load(img_ptr + img_base + y0 * stride_img_h + x1 * stride_img_w, 
+                        mask=mask_valid & check_x1 & check_y0, other=0.0)
+        val_d = tl.load(img_ptr + img_base + y1 * stride_img_h + x1 * stride_img_w, 
+                        mask=mask_valid & check_x1 & check_y1, other=0.0)
+        
+        interpolated = val_a * wa + val_b * wb + val_c * wc + val_d * wd
+        
+        weighted = interpolated * curr_k_mask
+        
+        if use_decay:
+            dist = tl.load(decay_dist_ptr + t_idx * K_chunk + k, mask=mask_valid, other=0.0)
+            w_d = tl.exp(-decay_val * dist)
+            weighted = weighted * w_d
+            
+        acc += weighted
 
-def warp_common(flow, B, H, W):
-    base_grid_y, base_grid_x = get_base_grid(B, H, W, flow.device, flow.float().dtype)
-    flow_perm = flow.permute(0, 2, 3, 1).float()
-    final_x = base_grid_x + flow_perm[..., 0]
-    final_y = base_grid_y + flow_perm[..., 1]
-    final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
-    return torch.stack([final_x, final_y], dim=-1).to(flow.dtype)
+    out_offset = (b_idx * stride_out_b + 
+                  t_idx * stride_out_t + 
+                  c_idx * stride_out_c + 
+                  h_idx * stride_out_h + 
+                  w_idx * stride_out_w)
+                  
+    tl.store(out_ptr + out_offset, acc, mask=mask_valid)
+
+def run_fused_pscan(images, grid, mask, decay_dist, decay_val, k_start):
+    B, L, C, H, W = images.shape
+    _, T_chunk, K_chunk, _, _, _ = grid.shape
+    
+    out = torch.empty((B, T_chunk, C, H, W), device=images.device, dtype=torch.float32)
+    
+    n_elements = B * C * T_chunk * H * W
+    BLOCK_SIZE = 256
+    grid_dim = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    fused_pscan_kernel[grid_dim](
+        images, grid, out, mask, decay_dist,
+        B, C, L, H, W, T_chunk, K_chunk,
+        images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
+        grid.stride(0), grid.stride(1), grid.stride(2), grid.stride(3), grid.stride(4), grid.stride(5),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+        k_start,
+        decay_val if decay_val is not None else 0.0,
+        decay_val is not None,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    return out.to(images.dtype)
 
 class GridSamplePScan(nn.Module):
     def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32, window_size=None):
@@ -65,13 +165,11 @@ class GridSamplePScan(nn.Module):
         base_grid_flow = self.get_cached_grid(H_f, W_f, device, dtype)
         
         out_fused = torch.zeros(B, L, C, H, W, device=device, dtype=dtype)
-        decay_factor = torch.exp(self.decay_log) if self.use_decay else None
+        decay_val = torch.exp(self.decay_log).item() if self.use_decay else None
 
         for t_start in range(0, L, self.chunk_size):
             t_end = min(t_start + self.chunk_size, L)
             curr_t_len = t_end - t_start
-            
-            acc_chunk = torch.zeros(B, curr_t_len, C, H, W, device=device, dtype=dtype)
             
             flow_t = cum_flows[:, t_start:t_end].unsqueeze(2)
             
@@ -117,36 +215,19 @@ class GridSamplePScan(nn.Module):
                     grid = F.interpolate(grid, size=(H, W), mode='bilinear', align_corners=False)
                     grid = grid.permute(0, 2, 3, 1).view(B, curr_t_len, curr_k_len, H, W, 2)
                 
-                grid = grid.to(dtype).contiguous()
+                grid = grid.contiguous()
                 
-                img_k_input = images[:, k_start:k_end].unsqueeze(1).expand(-1, curr_t_len, -1, -1, -1, -1)
-                img_k_input = img_k_input.reshape(-1, C, H, W).contiguous()
-
-                sampled = F.grid_sample(
-                    img_k_input,
-                    grid.reshape(-1, H, W, 2),
-                    mode=self.mode,
-                    padding_mode='zeros',
-                    align_corners=False
-                ).view(B, curr_t_len, curr_k_len, C, H, W)
-
                 k_idx = torch.arange(k_start, k_end, device=device).view(1, curr_k_len)
-                
                 mask = (k_idx <= t_idx)
                 
                 if self.window_size is not None:
                     mask = mask & ((t_idx - k_idx) <= self.window_size)
                 
-                sampled = sampled * mask.view(1, curr_t_len, curr_k_len, 1, 1, 1)
+                mask = mask.float().contiguous()
+                dist = (t_idx - k_idx).float().contiguous()
 
-                if self.use_decay:
-                    dist = (t_idx - k_idx).to(dtype)
-                    weights = torch.exp(-decay_factor * dist).view(1, curr_t_len, curr_k_len, 1, 1, 1)
-                    sampled = sampled * weights
-
-                acc_chunk += sampled.sum(dim=2)
-
-            out_fused[:, t_start:t_end] = acc_chunk
+                acc_chunk = run_fused_pscan(images, grid, mask, dist, decay_val, k_start)
+                out_fused[:, t_start:t_end] += acc_chunk
 
         return out_fused
 
