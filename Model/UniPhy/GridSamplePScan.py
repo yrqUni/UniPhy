@@ -3,68 +3,64 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class GridSamplePScan(nn.Module):
-    def __init__(self, mode='bilinear', chunk_size=1024):
+    def __init__(self, mode='bilinear', block_size=16):
         super().__init__()
-        if mode not in ['bilinear', 'nearest']:
-            raise ValueError(f"mode must be 'bilinear' or 'nearest', got {mode}")
         self.mode = mode
-        self.chunk_size = chunk_size
+        self.block_size = block_size
+
+    def get_base_grid(self, H, W, device, dtype):
+        step_y, step_x = 2.0 / H, 2.0 / W
+        grid_y = torch.linspace(-1.0 + step_y * 0.5, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
+        grid_x = torch.linspace(-1.0 + step_x * 0.5, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
+        return torch.stack(torch.meshgrid(grid_x, grid_y, indexing='xy'), dim=-1).view(1, 1, 1, H, W, 2)
 
     def forward(self, flows, images):
         B, L, C, H, W = images.shape
         device = flows.device
         dtype = flows.dtype
 
-        cum_flows = torch.cumsum(flows.float(), dim=1).to(dtype)
+        cum_flows = torch.cumsum(flows.float(), dim=1).to(dtype).permute(0, 1, 3, 4, 2)
+        flow_blocks = cum_flows.split(self.block_size, dim=1)
+        img_blocks = images.split(self.block_size, dim=1)
+        
+        base_grid = self.get_base_grid(H, W, device, dtype)
+        h_blocks = []
 
-        k_idx, t_idx = torch.triu_indices(L, L, offset=0, device=device)
-        N_pairs = k_idx.numel()
-
-        step_y = 2.0 / H
-        step_x = 2.0 / W
-        grid_y = torch.linspace(-1.0 + step_y * 0.5, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
-        grid_x = torch.linspace(-1.0 + step_x * 0.5, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
-        base_grid = torch.stack(torch.meshgrid(grid_x, grid_y, indexing='xy'), dim=-1).unsqueeze(0)
-
-        h_state = torch.zeros(B, L, C, H, W, device=device, dtype=dtype)
-        h_state_flat = h_state.view(B * L, C, H, W)
-
-        for start in range(0, N_pairs, self.chunk_size):
-            end = min(start + self.chunk_size, N_pairs)
-            current_pairs = end - start
+        for t_idx, flow_t in enumerate(flow_blocks):
+            T_len = flow_t.shape[1]
+            flow_t = flow_t.unsqueeze(2)
             
-            k_chunk = k_idx[start:end]
-            t_chunk = t_idx[start:end]
+            acc = 0
 
-            batch_idx = torch.arange(B, device=device)[:, None].expand(B, current_pairs).reshape(-1)
-            k_flat = k_chunk[None, :].expand(B, current_pairs).reshape(-1)
-            t_flat = t_chunk[None, :].expand(B, current_pairs).reshape(-1)
+            for k_idx, (flow_k, img_k) in enumerate(zip(flow_blocks[:t_idx+1], img_blocks[:t_idx+1])):
+                K_len = flow_k.shape[1]
+                flow_k = flow_k.unsqueeze(1)
 
-            sub_flows_t = cum_flows[batch_idx, t_flat]
-            sub_flows_k = cum_flows[batch_idx, k_flat]
-            sub_rel_flows = sub_flows_t - sub_flows_k
+                grid = base_grid + (flow_t - flow_k)
+                grid[..., 0] = torch.remainder(grid[..., 0] + 1.0, 2.0) - 1.0
 
-            sub_grid = base_grid + sub_rel_flows.permute(0, 2, 3, 1)
-            sub_grid[..., 0] = torch.remainder(sub_grid[..., 0] + 1.0, 2.0) - 1.0
+                img_expanded = img_k.unsqueeze(1).expand(-1, T_len, -1, -1, -1, -1)
+                
+                warped = F.grid_sample(
+                    img_expanded.reshape(-1, C, H, W),
+                    grid.reshape(-1, H, W, 2),
+                    mode=self.mode, 
+                    padding_mode='zeros', 
+                    align_corners=False
+                ).view(B, T_len, K_len, C, H, W)
 
-            sub_images = images[batch_idx, k_flat]
+                if t_idx == k_idx:
+                    mask = torch.tril(torch.ones(T_len, K_len, device=device, dtype=torch.bool))
+                    warped = warped.masked_fill(~mask.view(1, T_len, K_len, 1, 1, 1), 0)
 
-            warped_chunk = F.grid_sample(
-                sub_images, 
-                sub_grid, 
-                mode=self.mode, 
-                padding_mode='zeros', 
-                align_corners=False
-            )
+                acc = acc + warped.sum(dim=2)
+            
+            h_blocks.append(acc)
 
-            target_flat_indices = batch_idx * L + t_flat
-            h_state_flat.index_add_(0, target_flat_indices, warped_chunk)
+        return torch.cat(h_blocks, dim=1)
 
-        return h_state_flat.view(B, L, C, H, W)
-
-def pscan_flow(flows, images, mode='bilinear', chunk_size=4096):
+def pscan_flow(flows, images, mode='bilinear'):
     if flows.size(-1) == 2:
         flows = flows.permute(0, 1, 4, 2, 3)
-    scanner = GridSamplePScan(mode=mode, chunk_size=chunk_size)
-    return scanner(flows, images)
+    return GridSamplePScan(mode=mode)(flows, images)
 
