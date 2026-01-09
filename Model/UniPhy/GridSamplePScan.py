@@ -2,6 +2,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def get_base_grid(B, H, W, device, dtype):
+    step_y = 2.0 / H
+    step_x = 2.0 / W
+    start_y = -1.0 + step_y * 0.5
+    start_x = -1.0 + step_x * 0.5
+    grid_y = torch.linspace(start_y, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
+    grid_x = torch.linspace(start_x, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
+    return grid_y.view(1, H, 1), grid_x.view(1, 1, W)
+
+def warp_common(flow, B, H, W):
+    base_grid_y, base_grid_x = get_base_grid(B, H, W, flow.device, flow.dtype)
+    flow_perm = flow.permute(0, 2, 3, 1)
+    final_x = base_grid_x + flow_perm[..., 0]
+    final_y = base_grid_y + flow_perm[..., 1]
+    final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
+    return torch.stack([final_x, final_y], dim=-1)
+
 class GridSamplePScan(nn.Module):
     def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32):
         super().__init__()
@@ -22,7 +39,7 @@ class GridSamplePScan(nn.Module):
             nn.init.zeros_(self.res_conv[-1].weight)
             nn.init.zeros_(self.res_conv[-1].bias)
 
-    def get_base_grid(self, B, H, W, device, dtype):
+    def get_base_grid_tensor(self, B, H, W, device, dtype):
         step_y, step_x = 2.0 / H, 2.0 / W
         grid_y = torch.linspace(-1.0 + step_y * 0.5, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
         grid_x = torch.linspace(-1.0 + step_x * 0.5, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
@@ -36,7 +53,7 @@ class GridSamplePScan(nn.Module):
         is_low_res_flow = (H_f != H) or (W_f != W)
 
         cum_flows = torch.cumsum(flows.float(), dim=1).to(dtype)
-        base_grid_flow = self.get_base_grid(B, H_f, W_f, device, dtype)
+        base_grid_flow = self.get_base_grid_tensor(B, H_f, W_f, device, dtype)
         
         out_fused = torch.zeros(B, L, C, H, W, device=device, dtype=dtype)
         decay_factor = torch.exp(self.decay_log) if self.use_decay else None
