@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch.autograd import Function
 
 @triton.jit
 def fused_pscan_kernel(
@@ -16,7 +17,6 @@ def fused_pscan_kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    num_spatial = H * W
     
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
@@ -96,28 +96,95 @@ def fused_pscan_kernel(
                   
     tl.store(out_ptr + out_offset, acc, mask=mask_valid)
 
-def run_fused_pscan(images, grid, mask, decay_dist, decay_val, k_start):
-    B, L, C, H, W = images.shape
-    _, T_chunk, K_chunk, _, _, _ = grid.shape
-    
-    out = torch.empty((B, T_chunk, C, H, W), device=images.device, dtype=torch.float32)
-    
-    n_elements = B * C * T_chunk * H * W
-    BLOCK_SIZE = 256
-    grid_dim = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    
-    fused_pscan_kernel[grid_dim](
-        images, grid, out, mask, decay_dist,
-        B, C, L, H, W, T_chunk, K_chunk,
-        images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
-        grid.stride(0), grid.stride(1), grid.stride(2), grid.stride(3), grid.stride(4), grid.stride(5),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
-        k_start,
-        decay_val if decay_val is not None else 0.0,
-        decay_val is not None,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    return out.to(images.dtype)
+
+class TritonPScanFunction(Function):
+    @staticmethod
+    def forward(ctx, images, grid, mask, decay_dist, decay_val, k_start_offset):
+        ctx.save_for_backward(images, grid, mask, decay_dist)
+        ctx.decay_val = decay_val
+        ctx.k_start_offset = k_start_offset
+        
+        B, L, C, H, W = images.shape
+        _, T_chunk, K_chunk, _, _, _ = grid.shape
+        
+        out = torch.empty((B, T_chunk, C, H, W), device=images.device, dtype=torch.float32)
+        
+        n_elements = B * C * T_chunk * H * W
+        BLOCK_SIZE = 256
+        grid_dim = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        
+        fused_pscan_kernel[grid_dim](
+            images, grid, out, mask, decay_dist,
+            B, C, L, H, W, T_chunk, K_chunk,
+            images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
+            grid.stride(0), grid.stride(1), grid.stride(2), grid.stride(3), grid.stride(4), grid.stride(5),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
+            k_start_offset,
+            decay_val if decay_val is not None else 0.0,
+            decay_val is not None,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        
+        return out.to(images.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        images, grid, mask, decay_dist = ctx.saved_tensors
+        decay_val = ctx.decay_val
+        k_start_offset = ctx.k_start_offset
+        
+        B, L, C, H, W = images.shape
+        _, T_chunk, K_chunk, _, _, _ = grid.shape
+        
+        grad_images = torch.zeros_like(images) if images.requires_grad else None
+        grad_grid = torch.zeros_like(grid) if grid.requires_grad else None
+        
+        if grad_images is None and grad_grid is None:
+            return None, None, None, None, None, None
+
+        with torch.enable_grad():
+            for k in range(K_chunk):
+                img_idx = k_start_offset + k
+                if img_idx >= L: continue
+                
+                curr_img = images[:, img_idx].detach()
+                curr_img.requires_grad_(True)
+                
+                curr_grid = grid[:, :, k].detach()
+                curr_grid.requires_grad_(True)
+                
+                img_expanded = curr_img.unsqueeze(1).expand(-1, T_chunk, -1, -1, -1)
+                img_reshaped = img_expanded.reshape(B * T_chunk, C, H, W)
+                
+                grid_reshaped = curr_grid.reshape(B * T_chunk, H, W, 2)
+                
+                sampled = F.grid_sample(
+                    img_reshaped, 
+                    grid_reshaped, 
+                    mode='bilinear', 
+                    padding_mode='zeros', 
+                    align_corners=False
+                )
+                sampled = sampled.view(B, T_chunk, C, H, W)
+                
+                curr_mask = mask[:, k].view(1, T_chunk, 1, 1, 1)
+                weighted = sampled * curr_mask
+                
+                if decay_val is not None:
+                    curr_dist = decay_dist[:, k].view(1, T_chunk, 1, 1, 1)
+                    w_d = torch.exp(-decay_val * curr_dist)
+                    weighted = weighted * w_d
+                
+                weighted.backward(grad_output, retain_graph=False)
+                
+                if grad_images is not None:
+                    grad_images[:, img_idx] += curr_img.grad
+                
+                if grad_grid is not None:
+                    grad_grid[:, :, k] += curr_grid.grad
+        
+        return grad_images, grad_grid, None, None, None, None
+
 
 class GridSamplePScan(nn.Module):
     def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32, window_size=None):
@@ -226,7 +293,7 @@ class GridSamplePScan(nn.Module):
                 mask = mask.float().contiguous()
                 dist = (t_idx - k_idx).float().contiguous()
 
-                acc_chunk = run_fused_pscan(images, grid, mask, dist, decay_val, k_start)
+                acc_chunk = TritonPScanFunction.apply(images, grid, mask, dist, decay_val, k_start)
                 out_fused[:, t_start:t_end] += acc_chunk
 
         return out_fused
