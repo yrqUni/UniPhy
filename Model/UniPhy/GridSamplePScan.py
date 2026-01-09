@@ -5,6 +5,23 @@ import triton
 import triton.language as tl
 from torch.autograd import Function
 
+def get_base_grid(B, H, W, device, dtype):
+    step_y = 2.0 / H
+    step_x = 2.0 / W
+    start_y = -1.0 + step_y * 0.5
+    start_x = -1.0 + step_x * 0.5
+    grid_y = torch.linspace(start_y, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
+    grid_x = torch.linspace(start_x, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
+    return grid_y.view(1, H, 1), grid_x.view(1, 1, W)
+
+def warp_common(flow, B, H, W):
+    base_grid_y, base_grid_x = get_base_grid(B, H, W, flow.device, flow.dtype)
+    flow_perm = flow.permute(0, 2, 3, 1)
+    final_x = base_grid_x + flow_perm[..., 0]
+    final_y = base_grid_y + flow_perm[..., 1]
+    final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
+    return torch.stack([final_x, final_y], dim=-1)
+
 @triton.jit
 def fused_pscan_forward_kernel_2d(
     img_ptr, cum_flow_ptr, res_flow_ptr, out_ptr, mask_ptr, decay_dist_ptr,
