@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from PScan import pscan
-from GridSamplePScan import pscan_flow, warp_image
+from GridSamplePScan import GridSamplePScan, warp_common
 
 @triton.autotune(
     configs=[
@@ -101,6 +101,11 @@ def get_safe_groups(channels: int, target: int = 4) -> int:
     if channels % target == 0:
         return target
     return 1
+
+def warp_image_step(x: torch.Tensor, flow: torch.Tensor, mode: str = 'bilinear') -> torch.Tensor:
+    B, C, H, W = x.shape
+    grid = warp_common(flow, B, H, W)
+    return F.grid_sample(x, grid, mode=mode, padding_mode='zeros', align_corners=False)
 
 class SpatialGroupNorm(nn.GroupNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -435,6 +440,18 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         elif self.dynamics_mode == "advection":
             self.estimator = TransportParameterEstimator(self.emb_ch, self.emb_ch)
             self.flow_scale = nn.Parameter(torch.tensor(0.01))
+            
+            pscan_use_decay = kwargs.get("pscan_use_decay", True)
+            pscan_use_residual = kwargs.get("pscan_use_residual", True)
+            pscan_chunk_size = kwargs.get("pscan_chunk_size", 32)
+            
+            self.advection_pscan = GridSamplePScan(
+                mode=self.interpolation_mode,
+                channels=self.emb_ch,
+                use_decay=pscan_use_decay,
+                use_residual=pscan_use_residual,
+                chunk_size=pscan_chunk_size
+            )
         else:
             raise ValueError(f"Unknown dynamics_mode: {self.dynamics_mode}")
 
@@ -555,14 +572,14 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             forcing_step = forcing[:, 0]
             h_prev = last_hidden_in
             
-            h_warped = warp_image(h_prev, flow_step, mode=self.interpolation_mode)
+            h_warped = warp_image_step(h_prev, flow_step, mode=self.interpolation_mode)
             h_new = h_warped + forcing_step
             
             out = self.norm(h_new.unsqueeze(2)).squeeze(2)
             out = self.gate(out)
             return x + out.unsqueeze(2), h_new
 
-        h_seq = pscan_flow(flow, forcing, mode=self.interpolation_mode)
+        h_seq = self.advection_pscan(flow, forcing)
         
         h_seq_perm = h_seq.permute(0, 2, 1, 3, 4)
         out = self.norm(h_seq_perm)
@@ -1063,6 +1080,10 @@ class UniPhy(nn.Module):
         
         dynamics_mode = getattr(args, "dynamics_mode", "spectral")
         interpolation_mode = getattr(args, "interpolation_mode", "bilinear")
+        
+        pscan_use_decay = bool(getattr(args, "pscan_use_decay", True))
+        pscan_use_residual = bool(getattr(args, "pscan_use_residual", True))
+        pscan_chunk_size = int(getattr(args, "pscan_chunk_size", 32))
 
         prl_args = {
             "rank": rank,
@@ -1074,6 +1095,9 @@ class UniPhy(nn.Module):
             "noise_scale": koopman_noise_scale,
             "dynamics_mode": dynamics_mode,
             "interpolation_mode": interpolation_mode,
+            "pscan_use_decay": pscan_use_decay,
+            "pscan_use_residual": pscan_use_residual,
+            "pscan_chunk_size": pscan_chunk_size,
         }
 
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
