@@ -558,10 +558,14 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
                 H0 = torch.fft.rfft2(h0.float(), norm="ortho").to(torch.complex64)
 
         H0_flat = H0.permute(0, 1, 2, 3, 4).reshape(B, -1).contiguous()
-        X_flat[:, 0] = X_flat[:, 0] + A_flat[:, 0] * H0_flat
 
-        Y_flat = pscan(A_flat, X_flat)
-        Y = Y_flat.view(B, L, self.rank, C, H, self.Wf)
+        Y_forced = pscan(A_flat, X_flat)
+        
+        A_cum = torch.cumprod(A_flat, dim=1)
+        H_natural = A_cum * H0_flat.unsqueeze(1)
+        
+        Y_total = Y_forced + H_natural
+        Y = Y_total.view(B, L, self.rank, C, H, self.Wf)
 
         h_space = torch.fft.irfft2(Y, s=(H, W), norm="ortho").to(x.dtype)
         h_stack = h_space.permute(0, 3, 1, 4, 5, 2).contiguous()
