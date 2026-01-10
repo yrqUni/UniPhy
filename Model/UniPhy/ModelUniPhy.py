@@ -559,6 +559,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
 
         H0_flat = H0.permute(0, 1, 2, 3, 4).reshape(B, -1).contiguous()
 
+        # [Decoupled Logic for Spectral]
         Y_forced = pscan(A_flat, X_flat)
         A_cum = torch.cumprod(A_flat, dim=1)
         H_natural = A_cum * H0_flat.unsqueeze(1)
@@ -602,14 +603,17 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
 
         if self.init_state is not None and static_feats is not None and last_hidden_in is None:
             h0 = self.init_state(static_feats) 
-            forcing[:, 0] = forcing[:, 0] + h0
+        elif last_hidden_in is not None:
+            h0 = last_hidden_in
+        else:
+            h0 = torch.zeros(B, self.emb_ch, H, W, device=x.device, dtype=x.dtype)
 
         if last_hidden_in is not None:
+            # Iterative Mode
             flow_step = flow[:, 0] 
             forcing_step = forcing[:, 0]
-            h_prev = last_hidden_in
             
-            h_warped = warp_image_step(h_prev, flow_step, mode=self.interpolation_mode, padding_mode="border")
+            h_warped = warp_image_step(h0, flow_step, mode=self.interpolation_mode, padding_mode="border")
             h_new = h_warped + forcing_step
             
             out = h_new.unsqueeze(2)
@@ -617,7 +621,23 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             out = self.gate(out)
             return x + out, h_new
 
-        h_seq = self.advection_pscan(flow, forcing)
+        # Parallel Mode [Decoupled Logic for Advection]
+        h_forced = self.advection_pscan(flow, forcing)
+        
+        # Calculate Natural Response: H_natural = warp(H0, cumsum(Flow))
+        flow_cum = torch.cumsum(flow, dim=1)
+        # Warp H0 by cumulative flow at each step t
+        # We process each step t to avoid writing a custom kernel for now, or use a loop for H_natural
+        # Since this is "Natural Response", it depends only on H0.
+        # Efficient way:
+        h_natural_list = []
+        for t in range(L):
+            flow_t = flow_cum[:, t]
+            h_nat_t = warp_image_step(h0, flow_t, mode=self.interpolation_mode, padding_mode="border")
+            h_natural_list.append(h_nat_t)
+        h_natural = torch.stack(h_natural_list, dim=1)
+        
+        h_seq = h_forced + h_natural
         
         h_seq_perm = h_seq.permute(0, 2, 1, 3, 4)
         out = self.norm(h_seq_perm)
