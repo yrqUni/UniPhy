@@ -213,7 +213,6 @@ class EfficientSpatialGating(nn.Module):
         g = self.global_pool(x_flat).view(B * L, C, 1)
         g_gate = self.global_mlp(g).view(B, L, C, 1, 1).permute(0, 2, 1, 3, 4)
         
-        # Pool over width (dim 3) to keep height info for gating
         lat = x_flat.mean(dim=3).view(B * L, C, H)
         lat_gate = self.lat_mlp(lat).view(B, L, C, H, 1).permute(0, 2, 1, 3, 4)
         
