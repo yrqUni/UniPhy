@@ -511,8 +511,6 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
                 h0 = last_hidden_in.permute(0, 4, 1, 2, 3).contiguous()
                 H0 = torch.fft.rfft2(h0.float(), norm="ortho").to(torch.complex64)
 
-        H0_flat = H0.permute(0, 1, 2, 3, 4).reshape(B, -1).contiguous()
-
         A_cum = torch.cumprod(A_koop, dim=1)
         H_natural = A_cum * H0.unsqueeze(1)
 
@@ -880,7 +878,7 @@ class UniPhyBackbone(nn.Module):
         return x, last_hidden_outs
 
 class FeatureEmbedding(nn.Module):
-    def __init__(self, input_ch: int, input_size: Tuple[int, int], emb_ch: int, hidden_factor: Tuple[int, int] = (2, 2), **kwargs):
+    def __init__(self, input_ch: int, input_size: Tuple[int, int], emb_ch: int, hidden_factor: Tuple[int, int] = (2, 2)):
         super().__init__()
         self.input_ch = int(input_ch)
         self.input_size = tuple(input_size)
