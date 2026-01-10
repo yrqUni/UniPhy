@@ -372,23 +372,28 @@ _LRU_GATE_MEAN: Dict[Any, float] = {}
 def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
     for name, module in model_to_hook.named_modules():
-        if name.endswith("gate.sigmoid"):
-            tag = name
+        if isinstance(module, torch.nn.Sigmoid) and "gate" in name:
+            tag = "unknown"
             if "down_blocks" in name:
-                parts = name.split("down_blocks.")
-                if len(parts) > 1:
-                    try:
-                        tag = f"down_{int(parts[1].split('.')[0])}"
-                    except Exception:
-                        tag = name
+                parts = name.split(".")
+                try:
+                    idx = parts[parts.index("down_blocks") + 1]
+                    tag = f"d{idx}"
+                except Exception:
+                    pass
             elif "up_blocks" in name:
-                parts = name.split("up_blocks.")
-                if len(parts) > 1:
-                    try:
-                        tag = f"up_{int(parts[1].split('.')[0])}"
-                    except Exception:
-                        tag = name
-
+                parts = name.split(".")
+                try:
+                    idx = parts[parts.index("up_blocks") + 1]
+                    tag = f"u{idx}"
+                except Exception:
+                    pass
+            
+            if "global" in name:
+                tag += "_g"
+            elif "lat" in name:
+                tag += "_l"
+            
             def _hook(mod: torch.nn.Module, inp: Tuple[Any, ...], out: torch.Tensor, tag_local: Any = tag) -> None:
                 with torch.no_grad():
                     _LRU_GATE_MEAN[tag_local] = float(out.mean().detach())
