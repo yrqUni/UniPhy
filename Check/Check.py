@@ -3,7 +3,7 @@ import os
 import sys
 import gc
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -24,7 +24,6 @@ def get_base_args() -> Any:
         out_ch=2,
         input_size=(32, 32),
         emb_ch=16,
-        static_ch=0, 
         hidden_factor=(2, 2),
         ConvType="conv",
         Arch="unet",
@@ -35,7 +34,6 @@ def get_base_args() -> Any:
         lru_rank=8,
         koopman_use_noise=False,
         koopman_noise_scale=1.0,
-        learnable_init_state=False,
         dt_ref=1.0,
         inj_k=2.0,
         dynamics_mode="advection",
@@ -71,7 +69,6 @@ def check_once(args: Any, device: torch.device) -> None:
             out_gen_num=L,
             listT=listT_i,
             listT_future=listT_future,
-            static_feats=None,
             revin_stats=stats,
         )
 
@@ -95,7 +92,6 @@ def check_once(args: Any, device: torch.device) -> None:
             x_p,
             mode="p",
             listT=listT_p,
-            static_feats=None,
             revin_stats=stats,
         )
 
