@@ -605,7 +605,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             return self.forward_advection(x, last_hidden_in, dt_seq)
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, conv_type: str = "conv"):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, cond_channels: Optional[int] = None, conv_type: str = "conv"):
         super().__init__()
         self.dw_conv = PeriodicConv2d(int(channels), int(channels), kernel_size=int(kernel_size), conv_type=str(conv_type))
         self.norm = SpatialGroupNorm(get_safe_groups(int(channels)), int(channels))
@@ -878,7 +878,7 @@ class UniPhyBackbone(nn.Module):
         return x, last_hidden_outs
 
 class FeatureEmbedding(nn.Module):
-    def __init__(self, input_ch: int, input_size: Tuple[int, int], emb_ch: int, hidden_factor: Tuple[int, int] = (2, 2)):
+    def __init__(self, input_ch: int, input_size: Tuple[int, int], emb_ch: int, hidden_factor: Tuple[int, int] = (2, 2), **kwargs):
         super().__init__()
         self.input_ch = int(input_ch)
         self.input_size = tuple(input_size)
