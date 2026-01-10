@@ -553,14 +553,17 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         
         flow_raw, forcing_raw = self.estimator(x_flat)
         
-        flow = flow_raw.view(B, L, 2, H, W) * self.flow_scale
-        forcing = forcing_raw.view(B, L, C, H, W)
+        if listT is not None:
+            dt_scale = (listT / self.dt_ref).view(B, L, 1, 1, 1).to(x.device, x.dtype)
+        else:
+            dt_scale = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
+
+        flow = flow_raw.view(B, L, 2, H, W) * self.flow_scale * dt_scale
+        forcing = forcing_raw.view(B, L, C, H, W) * dt_scale
 
         if self.use_noise and self.training:
             noise = torch.randn_like(forcing) * self.noise_scale
-            if listT is not None:
-                dt_scale = (listT / self.dt_ref).view(B, L, 1, 1, 1)
-                noise = noise * torch.sqrt(dt_scale.clamp_min(1e-6))
+            noise = noise * torch.sqrt(dt_scale.clamp_min(1e-6))
             forcing = forcing + noise
 
         if self.init_state is not None and static_feats is not None and last_hidden_in is None:
