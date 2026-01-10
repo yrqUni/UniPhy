@@ -35,10 +35,8 @@ MODEL_ARG_KEYS = [
     "emb_ch",
     "convlru_num_blocks",
     "lru_rank",
-    "static_ch",
     "down_mode",
     "dist_mode",
-    "learnable_init_state",
     "ffn_ratio",
     "ConvType",
     "Arch",
@@ -76,13 +74,12 @@ class Args:
         self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
-        self.static_ch = 6
         self.hidden_factor = (7, 12)
         self.emb_ch = 64
         self.convlru_num_blocks = 6
         self.lru_rank = 64
-        self.down_mode = "shuffle"  # Options: avg, shuffle, conv
-        self.dist_mode = "gaussian"  # Options: gaussian, laplace
+        self.down_mode = "shuffle"
+        self.dist_mode = "gaussian"
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 27
@@ -116,10 +113,9 @@ class Args:
         self.wandb_group = ""
         self.wandb_mode = "online"
         self.train_mode = "p_only"
-        self.learnable_init_state = True
         self.ffn_ratio = 1.5
-        self.ConvType = "dcn"  # Options: conv, dcn
-        self.Arch = "unet"  # Options: unet, no_unet
+        self.ConvType = "dcn"
+        self.Arch = "unet"
         self.grad_accum_steps = 1
         self.enable_no_sync = True
         self.log_every = 1
@@ -129,8 +125,8 @@ class Args:
         self.dt_ref = 1.0
         self.inj_k = 2.0
         self.max_velocity = 5.0
-        self.dynamics_mode = "advection"  # Options: advection, spectral
-        self.interpolation_mode = "bilinear"  # Options: bilinear, nearest
+        self.dynamics_mode = "advection"
+        self.interpolation_mode = "bilinear"
         self.spectral_modes_h = 12
         self.spectral_modes_w = 12
         self.check_args()
@@ -474,17 +470,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         except Exception:
             pass
 
-    static_pt_path = "/nfs/ConvLRU/Exp/ERA5/static_feats.pt"
-    static_data_cpu = None
-    if int(args.static_ch) > 0:
-        if os.path.isfile(static_pt_path):
-            if rank == 0:
-                logging.info(f"Loading static features from {static_pt_path}")
-                print(f"Loading static features from {static_pt_path}")
-            static_data_cpu = torch.load(static_pt_path, map_location="cpu")
-        else:
-            raise FileNotFoundError(f"Static features enabled but {static_pt_path} not found!")
-
     if args.ckpt and os.path.isfile(args.ckpt):
         ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f"cuda:{local_rank}")
         if ckpt_model_args:
@@ -558,10 +543,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         for g in opt.param_groups:
             g["lr"] = float(args.lr)
 
-    static_gpu: Optional[torch.Tensor] = None
-    if int(args.static_ch) > 0 and static_data_cpu is not None:
-        static_gpu = static_data_cpu.to(device=torch.device(f"cuda:{local_rank}"), dtype=torch.float32, non_blocking=True)
-
     amp_dtype = torch.bfloat16 if str(args.amp_dtype).lower() == "bf16" else torch.float16
     use_amp = bool(args.use_amp)
 
@@ -602,10 +583,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             x = data_slice[:, :-1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
             target = data_slice[:, 1:].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
 
-            static_feats = None
-            if static_gpu is not None:
-                static_feats = static_gpu.unsqueeze(0).expand(x.size(0), -1, -1, -1)
-
             accum_count += 1
             is_accum_boundary = (accum_count % grad_accum_steps) == 0
             is_last_batch = train_step == len_train_dataloader
@@ -620,7 +597,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     revin_stats = revin_mod.stats(x)
 
-                    preds_out = model(x, mode="p", listT=listT, static_feats=static_feats, revin_stats=revin_stats)
+                    preds_out = model(x, mode="p", listT=listT, revin_stats=revin_stats)
                     preds = unwrap_preds(preds_out)
 
                     C_gt = target.shape[2]
@@ -672,7 +649,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 (loss / float(grad_accum_steps)).backward()
 
             if not will_step:
-                del data, data_slice, x, target, preds_out, preds, listT, static_feats, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
+                del data, data_slice, x, target, preds_out, preds, listT, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
                 continue
 
             if float(args.grad_clip) and float(args.grad_clip) > 0:
@@ -730,20 +707,20 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         log_dict[g_key] = float(v)
                     wandb.log(log_dict, step=int(global_step))
 
-                ckpt_every = max(1, int(len_train_dataloader * float(args.ckpt_step)))
-                if (train_step % ckpt_every == 0) or (train_step == len_train_dataloader):
-                    loss_for_ckpt = float(avg_loss) if avg_loss is not None else float(loss.detach().item())
-                    save_ckpt(
-                        model,
-                        opt,
-                        ep + 1,
-                        train_step,
-                        loss_for_ckpt,
-                        args,
-                        scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
-                    )
+            ckpt_every = max(1, int(len_train_dataloader * float(args.ckpt_step)))
+            if (train_step % ckpt_every == 0) or (train_step == len_train_dataloader):
+                loss_for_ckpt = float(avg_loss) if avg_loss is not None else float(loss.detach().item())
+                save_ckpt(
+                    model,
+                    opt,
+                    ep + 1,
+                    train_step,
+                    loss_for_ckpt,
+                    args,
+                    scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
+                )
 
-            del data, data_slice, x, target, preds_out, preds, listT, static_feats, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
+            del data, data_slice, x, target, preds_out, preds, listT, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
             if (train_step % 50) == 0:
                 gc.collect()
 
@@ -785,10 +762,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_data.device, cond_data.dtype, float(args.T))
                     target = data[:, cond_data.shape[1] : cond_data.shape[1] + out_gen_num].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
 
-                    static_feats = None
-                    if static_gpu is not None:
-                        static_feats = static_gpu.unsqueeze(0).expand(cond_data.size(0), -1, -1, -1)
-
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                         revin_stats = revin_mod.stats(cond_data)
                         preds_out = model(
@@ -797,7 +770,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             out_gen_num=out_gen_num,
                             listT=listT_cond,
                             listT_future=listT_future,
-                            static_feats=static_feats,
                             revin_stats=revin_stats,
                         )
                         preds = unwrap_preds(preds_out)
@@ -823,7 +795,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         if bool(getattr(args, "use_wandb", False)):
                             wandb.log({"eval/l1_loss": avg_total, "eval/epoch": ep + 1}, step=int(global_step))
 
-                    del data, target, cond_data, preds_out, preds, loss_eval, tot_tensor, listT_cond, listT_future, static_feats
+                    del data, target, cond_data, preds_out, preds, loss_eval, tot_tensor, listT_cond, listT_future
                     if eval_step % 20 == 0:
                         gc.collect()
 
