@@ -559,8 +559,8 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
 
         H0_flat = H0.permute(0, 1, 2, 3, 4).reshape(B, -1).contiguous()
         
-        if last_hidden_in is None:
-             X_flat[:, 0] = X_flat[:, 0] + A_flat[:, 0] * H0_flat
+        # FIX: Always inject the state (whether it's init_state or last_hidden_in)
+        X_flat[:, 0] = X_flat[:, 0] + A_flat[:, 0] * H0_flat
 
         Y_flat = pscan(A_flat, X_flat)
         Y = Y_flat.view(B, L, self.rank, C, H, self.Wf)
