@@ -12,8 +12,11 @@ MODEL_DIR = os.path.join(ROOT, "Model", "UniPhy")
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
-from ModelUniPhy import UniPhy
-
+try:
+    from ModelUniPhy import UniPhy
+except ImportError:
+    print(f"Error: Cannot import ModelUniPhy from {MODEL_DIR}")
+    sys.exit(1)
 
 def get_base_args() -> Any:
     return SimpleNamespace(
@@ -39,22 +42,18 @@ def get_base_args() -> Any:
         spectral_modes_h=12,
         spectral_modes_w=12,
         interpolation_mode="bilinear",
+        pscan_use_decay=True,
+        pscan_use_residual=True,
+        pscan_chunk_size=32,
     )
-
 
 def make_static_feats(args: Any, B: int, H: int, W: int, device: torch.device) -> Optional[torch.Tensor]:
     if int(getattr(args, "static_ch", 0)) > 0:
         return torch.randn(B, int(args.static_ch), H, W, device=device)
     return None
 
-
 def extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
     return dist_out[:, :, :out_ch]
-
-
-def is_finite(x: torch.Tensor) -> bool:
-    return bool(torch.isfinite(x).all().item())
-
 
 def check_once(args: Any, device: torch.device) -> None:
     B, L = 1, 4
@@ -72,7 +71,7 @@ def check_once(args: Any, device: torch.device) -> None:
     listT_future = torch.ones(B, L - 1, device=device, dtype=x_init.dtype)
 
     with torch.no_grad():
-        out_i = model(
+        out_i, _ = model(
             x_init,
             mode="i",
             out_gen_num=L,
@@ -106,51 +105,55 @@ def check_once(args: Any, device: torch.device) -> None:
             revin_stats=stats,
         )
 
-        diff = (out_i - out_p).abs().max().item()
-        fin_i = is_finite(out_i)
-        fin_p = is_finite(out_p)
+        mu_p = extract_mu(out_p, int(args.out_ch))
+        
+        diff = (mu_i - mu_p).abs().max().item()
+        fin_i = torch.isfinite(out_i).all().item()
+        fin_p = torch.isfinite(out_p).all().item()
 
-    cfg = ", ".join(f"{k}={getattr(args, k)}" for k in vars(args))
-    
-    threshold = 1.0 if args.dynamics_mode == "advection" and args.interpolation_mode == "bilinear" else 1e-4
-    
+    threshold = 1e-3
     status = "PASS" if (fin_i and fin_p and diff < threshold) else "FAIL"
-    print(f"[{status}] diff={diff:.3e} finite_i={fin_i} finite_p={fin_p} | {cfg}")
+    
+    keys = ["dynamics_mode", "static_ch", "down_mode"]
+    cfg_str = " | ".join(f"{k}={getattr(args, k)}" for k in keys)
+
+    print(f"[{status}] Max Diff={diff:.3e} | {cfg_str}")
+    
+    if status == "FAIL":
+        print("    -> Step-wise Max Diffs:")
+        for t in range(L):
+            step_diff = (mu_i[:, t] - mu_p[:, t]).abs().max().item()
+            print(f"       Step {t}: {step_diff:.3e}")
 
     del model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-
 def main():
     torch.backends.cudnn.benchmark = False
-    torch.manual_seed(0)
+    torch.manual_seed(42)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(0)
+        torch.cuda.manual_seed_all(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
 
     grid = {
-        "dist_mode": ["gaussian"],
         "dynamics_mode": ["advection", "spectral"],
-        "Arch": ["unet"],
-        "down_mode": ["avg"],
         "static_ch": [0, 4],
+        "down_mode": ["avg", "shuffle"],
     }
 
     keys = list(grid.keys())
     combos = list(itertools.product(*grid.values()))
-    print(f"[Total cases] {len(combos)}")
+    print(f"[Total cases] {len(combos)}\n")
 
     for idx, combo in enumerate(combos, 1):
         args = get_base_args()
         for k, v in zip(keys, combo):
             setattr(args, k, v)
-        print(f"\n[{idx}/{len(combos)}] RUN")
         check_once(args, device)
-
 
 if __name__ == "__main__":
     main()

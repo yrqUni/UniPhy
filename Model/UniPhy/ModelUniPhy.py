@@ -1303,5 +1303,5 @@ class UniPhy(nn.Module):
                 out_list.append(x_step_dist)
                 x_step_mean = x_step_dist[:, :, : self.revin.num_features] if x_step_dist.size(2) >= self.revin.num_features else x_step_dist
 
-        return torch.cat(out_list, dim=1)
+        return torch.cat(out_list, dim=1), last_hidden_outs
 
