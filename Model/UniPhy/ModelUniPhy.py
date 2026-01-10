@@ -557,14 +557,13 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
                 h0 = last_hidden_in.permute(0, 4, 1, 2, 3).contiguous()
                 H0 = torch.fft.rfft2(h0.float(), norm="ortho").to(torch.complex64)
 
-        H0_flat = H0.permute(0, 1, 2, 3, 4).reshape(B, -1).contiguous()
-
-        Y_forced = pscan(A_flat, X_flat.clone()) 
-        A_cum = torch.cumprod(A_flat, dim=1)
-        H_natural = A_cum * H0_flat.unsqueeze(1)
-        Y_flat = Y_forced + H_natural
+        Y_forced_flat = pscan(A_flat, X_flat.clone())
+        Y_forced = Y_forced_flat.view(B, L, self.rank, C, H, self.Wf)
         
-        Y = Y_flat.view(B, L, self.rank, C, H, self.Wf)
+        A_cum = torch.cumprod(A_koop, dim=1)
+        H_natural = A_cum * H0.unsqueeze(1)
+        
+        Y = Y_forced + H_natural
 
         h_space = torch.fft.irfft2(Y, s=(H, W), norm="ortho").to(x.dtype)
         h_stack = h_space.permute(0, 3, 1, 4, 5, 2).contiguous()
@@ -619,11 +618,8 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             out = self.gate(out)
             return x + out, h_new
 
-        # Parallel Mode
         h_forced = self.advection_pscan(flow, forcing)
         
-        # Consistent Natural Response for Advection: warp H0 step-by-step
-        # This matches iterative physics exactly, unlike simple cumsum
         flow_cum = torch.cumsum(flow, dim=1)
         h_natural_list = []
         for t in range(L):
