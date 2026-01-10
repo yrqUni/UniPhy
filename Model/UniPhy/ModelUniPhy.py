@@ -389,40 +389,6 @@ class TransportParameterEstimator(nn.Module):
         forcing = self.forcing_head(feat)
         return flow, forcing
 
-class LearnableStateMap(nn.Module):
-    def __init__(self, static_ch: int, emb_ch: int, H: int, W: int, W_freq: int, mode: str, rank: int = 64):
-        super().__init__()
-        self.static_ch = int(static_ch)
-        self.emb_ch = int(emb_ch)
-        self.H = H
-        self.W = W
-        self.W_freq = W_freq
-        self.mode = mode
-        self.rank = int(rank)
-        
-        if self.mode == "spectral":
-            self.mapper = nn.Sequential(
-                nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=3, padding=1),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool2d((self.H, self.W_freq)),
-                nn.Conv2d(self.emb_ch, self.emb_ch * self.rank, kernel_size=1),
-            )
-        else:
-            self.mapper = nn.Sequential(
-                nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=3, padding=1),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool2d((self.H, self.W)),
-                nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1),
-            )
-
-    def forward(self, static_feats: torch.Tensor) -> torch.Tensor:
-        out = self.mapper(static_feats)
-        if self.mode == "spectral":
-            B = static_feats.size(0)
-            out = out.view(B, self.emb_ch, self.rank, self.H, self.W_freq)
-            return out.permute(0, 2, 1, 3, 4)
-        return out
-
 def _match_dt_seq(dt_seq: torch.Tensor, L: int) -> torch.Tensor:
     if dt_seq.dim() != 2:
         raise ValueError(f"listT must be 2D [B,L], got {tuple(dt_seq.shape)}")
@@ -443,8 +409,6 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         rank: int = 64,
         dt_ref: float = 1.0,
         inj_k: float = 2.0,
-        static_ch: int = 0,
-        learnable_init_state: bool = False,
         use_noise: bool = False,
         noise_scale: float = 0.1,
         dynamics_mode: str = "spectral",
@@ -489,11 +453,6 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         else:
             raise ValueError(f"Unknown dynamics_mode: {self.dynamics_mode}")
 
-        if bool(learnable_init_state) and int(static_ch) > 0:
-            self.init_state = LearnableStateMap(int(static_ch), self.emb_ch, self.H, self.W, self.Wf, self.dynamics_mode, self.rank)
-        else:
-            self.init_state = None
-
     def _build_injection_freq(self, x: torch.Tensor, dt_seq: torch.Tensor) -> torch.Tensor:
         B, C, L, H, W = x.shape
         dt_ref = torch.tensor(self.dt_ref, device=x.device, dtype=x.dtype).clamp_min(1e-6)
@@ -513,19 +472,14 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
 
         return xinj * g.to(torch.complex64)
 
-    def _init_state_freq(self, B: int, device: torch.device, dtype: torch.dtype, static_feats: Optional[torch.Tensor]) -> torch.Tensor:
-        if self.init_state is None or static_feats is None:
-            return torch.zeros((B, self.rank, self.emb_ch, self.H, self.Wf), device=device, dtype=torch.complex64)
-        h0 = self.init_state(static_feats)
-        h0 = h0.to(torch.float32)
-        return torch.complex(h0, torch.zeros_like(h0))
+    def _init_state_freq(self, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.zeros((B, self.rank, self.emb_ch, self.H, self.Wf), device=device, dtype=torch.complex64)
 
     def forward_spectral(
         self,
         x: torch.Tensor,
         last_hidden_in: Optional[torch.Tensor],
-        dt_seq: torch.Tensor,
-        static_feats: Optional[torch.Tensor]
+        dt_seq: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, L, H, W = x.shape
         
@@ -549,7 +503,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         X_flat = X_inj.permute(0, 1, 2, 3, 4, 5).reshape(B, L, -1).contiguous()
 
         if last_hidden_in is None:
-            H0 = self._init_state_freq(B, x.device, x.dtype, static_feats)
+            H0 = self._init_state_freq(B, x.device, x.dtype)
         else:
             if last_hidden_in.dtype.is_complex:
                 H0 = last_hidden_in
@@ -584,8 +538,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         self,
         x: torch.Tensor,
         last_hidden_in: Optional[torch.Tensor],
-        dt_seq: torch.Tensor,
-        static_feats: Optional[torch.Tensor]
+        dt_seq: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, L, H, W = x.shape
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
@@ -601,9 +554,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             noise = noise * torch.sqrt(dt_scale.clamp_min(1e-6))
             forcing = forcing + noise
 
-        if self.init_state is not None and static_feats is not None and last_hidden_in is None:
-            h0 = self.init_state(static_feats) 
-        elif last_hidden_in is not None:
+        if last_hidden_in is not None:
             h0 = last_hidden_in
         else:
             h0 = torch.zeros(B, self.emb_ch, H, W, device=x.device, dtype=x.dtype)
@@ -643,7 +594,6 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         x: torch.Tensor,
         last_hidden_in: Optional[torch.Tensor] = None,
         listT: Optional[torch.Tensor] = None,
-        static_feats: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if (x.shape[-2], x.shape[-1]) != (self.H, self.W):
             raise ValueError(f"input spatial {(x.shape[-2], x.shape[-1])} must match layer {(self.H, self.W)}")
@@ -652,37 +602,24 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         dt_seq = _match_dt_seq(dt_seq_in, x.size(2))
 
         if self.dynamics_mode == "spectral":
-            return self.forward_spectral(x, last_hidden_in, dt_seq, static_feats)
+            return self.forward_spectral(x, last_hidden_in, dt_seq)
         else:
-            return self.forward_advection(x, last_hidden_in, dt_seq, static_feats)
+            return self.forward_advection(x, last_hidden_in, dt_seq)
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, cond_channels: Optional[int] = None, conv_type: str = "conv"):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, conv_type: str = "conv"):
         super().__init__()
         self.dw_conv = PeriodicConv2d(int(channels), int(channels), kernel_size=int(kernel_size), conv_type=str(conv_type))
         self.norm = SpatialGroupNorm(get_safe_groups(int(channels)), int(channels))
-        self.cond_channels_spatial = int(cond_channels) if cond_channels is not None else 0
-        self.cond_proj = nn.Conv2d(self.cond_channels_spatial, int(channels) * 2, kernel_size=1) if self.cond_channels_spatial > 0 else None
         self.pw_conv_in = nn.Linear(int(channels), int(channels) * 2)
         self.pw_conv_out = nn.Linear(int(channels), int(channels))
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, L, H, W = x.shape
         residual = x
         x = self.dw_conv(x)
         x = self.norm(x)
-        if self.cond_proj is not None and cond is not None:
-            cond_in = cond.unsqueeze(2) if cond.dim() == 4 else cond
-            if cond_in.shape[-2:] != x.shape[-2:]:
-                cond_rs = F.interpolate(cond_in.squeeze(2), size=x.shape[-2:], mode="bilinear", align_corners=False).unsqueeze(2)
-            else:
-                cond_rs = cond_in
-            
-            cond_flat = cond_rs.repeat(1, 1, L, 1, 1).permute(0, 2, 1, 3, 4).reshape(B * L, -1, H, W)
-            affine = self.cond_proj(cond_flat).view(B, L, -1, H, W).permute(0, 2, 1, 3, 4)
-            gamma, beta = torch.chunk(affine, 2, dim=1)
-            x = x * (1 + gamma) + beta
-
+        
         x = x.permute(0, 2, 3, 4, 1).contiguous()
         x = self.pw_conv_in(x)
         x_val, x_gate = torch.chunk(x, 2, dim=-1)
@@ -692,27 +629,25 @@ class GatedConvBlock(nn.Module):
         return residual + x
 
 class FeedForwardNetwork(nn.Module):
-    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], ffn_ratio: float = 4.0, static_ch: int = 0, conv_type: str = "conv"):
+    def __init__(self, emb_ch: int, input_shape: Tuple[int, int], ffn_ratio: float = 4.0, conv_type: str = "conv"):
         super().__init__()
         self.emb_ch = int(emb_ch)
         self.ffn_ratio = float(ffn_ratio)
         self.hidden_dim = int(self.emb_ch * self.ffn_ratio)
         self.hidden_size = (int(input_shape[0]), int(input_shape[1]))
-        self.static_ch = int(static_ch)
         self.conv_type = str(conv_type)
         self.c_in = nn.Linear(self.emb_ch, self.hidden_dim)
-        cond_ch = self.emb_ch if self.static_ch > 0 else None
-        self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, cond_channels=cond_ch, conv_type=self.conv_type)
+        self.block = GatedConvBlock(self.hidden_dim, self.hidden_size, kernel_size=7, conv_type=self.conv_type)
         self.c_out = nn.Linear(self.hidden_dim, self.emb_ch)
         self.act = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = x.permute(0, 2, 3, 4, 1)
         x = self.c_in(x)
         x = self.act(x)
         x = x.permute(0, 4, 1, 2, 3)
-        x = self.block(x, cond=cond)
+        x = self.block(x)
         x = x.permute(0, 2, 3, 4, 1)
         x = self.c_out(x)
         x = x.permute(0, 4, 1, 2, 3)
@@ -729,11 +664,9 @@ class UniPhyBlock(nn.Module):
         x: torch.Tensor,
         last_hidden_in: Optional[torch.Tensor] = None,
         listT: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
-        static_feats: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_mid, h_out = self.prl_layer(x, last_hidden_in, listT=listT, static_feats=static_feats)
-        x_out = self.feed_forward(x_mid, cond=cond)
+        x_mid, h_out = self.prl_layer(x, last_hidden_in, listT=listT)
+        x_out = self.feed_forward(x_mid)
         return x_out, h_out
 
 class BottleneckAttention(nn.Module):
@@ -880,15 +813,13 @@ class UniPhyBackbone(nn.Module):
         x: torch.Tensor,
         last_hidden_ins: Optional[List[torch.Tensor]] = None,
         listT: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
-        static_feats: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         if not self.use_unet:
             last_hidden_outs: List[torch.Tensor] = []
             assert self.uniphy_blocks is not None
             for idx, blk in enumerate(self.uniphy_blocks):
                 h_in = last_hidden_ins[idx] if (last_hidden_ins is not None and idx < len(last_hidden_ins)) else None
-                x, h_out = blk(x, h_in, listT=listT, cond=cond, static_feats=static_feats)
+                x, h_out = blk(x, h_in, listT=listT)
                 last_hidden_outs.append(h_out)
             return x, last_hidden_outs
 
@@ -899,10 +830,7 @@ class UniPhyBackbone(nn.Module):
         hs_in_up = last_hidden_ins[num_down:] if last_hidden_ins is not None else [None] * len(self.up_blocks)
 
         for i, blk in enumerate(self.down_blocks):
-            curr_cond = cond
-            if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
-                curr_cond = F.interpolate(curr_cond, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            x, h_out = blk(x, hs_in_down[i], listT=listT, cond=curr_cond, static_feats=static_feats)
+            x, h_out = blk(x, hs_in_down[i], listT=listT)
             last_hidden_outs.append(h_out)
             if i < len(self.down_blocks) - 1:
                 skips.append(x)
@@ -949,22 +877,18 @@ class UniPhyBackbone(nn.Module):
             x_fused = self.fusion(x_flat)
             x = x_fused.view(B, L, -1, H, W).permute(0, 2, 1, 3, 4)
 
-            curr_cond = cond
-            if curr_cond is not None and curr_cond.shape[-2:] != x.shape[-2:]:
-                curr_cond = F.interpolate(curr_cond, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            x, h_out = blk(x, hs_in_up[i], listT=listT, cond=curr_cond, static_feats=static_feats)
+            x, h_out = blk(x, hs_in_up[i], listT=listT)
             last_hidden_outs.append(h_out)
 
         return x, last_hidden_outs
 
 class FeatureEmbedding(nn.Module):
-    def __init__(self, input_ch: int, input_size: Tuple[int, int], emb_ch: int, static_ch: int = 0, hidden_factor: Tuple[int, int] = (2, 2)):
+    def __init__(self, input_ch: int, input_size: Tuple[int, int], emb_ch: int, hidden_factor: Tuple[int, int] = (2, 2), **kwargs):
         super().__init__()
         self.input_ch = int(input_ch)
         self.input_size = tuple(input_size)
         self.emb_ch = int(emb_ch)
         self.emb_hidden_ch = self.emb_ch
-        self.static_ch = int(static_ch)
         self.rH, self.rW = int(hidden_factor[0]), int(hidden_factor[1])
         self.input_ch_total = self.input_ch + 4
         self.patch_embed = nn.Conv2d(
@@ -981,15 +905,8 @@ class FeatureEmbedding(nn.Module):
             self.input_downsp_shape = (self.emb_ch, int(H), int(W))
         self.register_buffer("grid_embed", self._make_grid(self.input_size), persistent=False)
         self.hidden_size = (int(self.input_downsp_shape[1]), int(self.input_downsp_shape[2]))
-        if self.static_ch > 0:
-            self.static_embed = nn.Sequential(
-                nn.Conv2d(self.static_ch, self.emb_ch, kernel_size=(self.rH + 2, self.rW + 2), stride=(self.rH, self.rW), padding=(1, 1)),
-                nn.SiLU(),
-            )
-        else:
-            self.static_embed = None
-        cond_ch = self.emb_ch if self.static_ch > 0 else None
-        self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7, cond_channels=cond_ch)])
+        
+        self.c_hidden = nn.ModuleList([GatedConvBlock(self.emb_hidden_ch, self.hidden_size, kernel_size=7)])
         self.c_out = nn.Conv2d(self.emb_hidden_ch, self.emb_ch, kernel_size=1)
         self.activation = nn.SiLU()
         self.norm = SpatialGroupNorm(get_safe_groups(self.emb_ch), self.emb_ch)
@@ -1002,7 +919,7 @@ class FeatureEmbedding(nn.Module):
         emb = torch.stack([torch.sin(grid_lat), torch.cos(grid_lat), torch.sin(grid_lon), torch.cos(grid_lon)], dim=0)
         return emb.unsqueeze(0).unsqueeze(2)
 
-    def forward(self, x: torch.Tensor, static_feats: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
             raise ValueError(f"Embedding expects [B,L,C,H,W], got {tuple(x.shape)}")
         x = x.permute(0, 2, 1, 3, 4).contiguous()
@@ -1017,18 +934,14 @@ class FeatureEmbedding(nn.Module):
         _, C_emb, H_emb, W_emb = x_emb.shape
         x = x_emb.view(B, L, C_emb, H_emb, W_emb).permute(0, 2, 1, 3, 4)
 
-        cond = None
-        if self.static_ch > 0 and self.static_embed is not None and static_feats is not None:
-            cond = self.static_embed(static_feats)
-            
         for layer in self.c_hidden:
-            x = layer(x, cond=cond)
+            x = layer(x)
             
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C_emb, H_emb, W_emb)
         x_out = self.c_out(x_flat)
         x = x_out.view(B, L, -1, H_emb, W_emb).permute(0, 2, 1, 3, 4)
         x = self.norm(x)
-        return x, cond
+        return x
 
 class ProbabilisticDecoder(nn.Module):
     def __init__(self, out_ch: int, emb_ch: int, dist_mode: str = "gaussian", hidden_factor: Tuple[int, int] = (2, 2)):
@@ -1144,10 +1057,9 @@ class UniPhy(nn.Module):
         input_ch = int(getattr(args, "input_ch", 1))
         input_size = tuple(getattr(args, "input_size", (64, 64)))
         emb_ch = int(getattr(args, "emb_ch", 64))
-        static_ch = int(getattr(args, "static_ch", 0))
         hidden_factor = getattr(args, "hidden_factor", (2, 2))
 
-        self.embedding = FeatureEmbedding(input_ch, input_size, emb_ch, static_ch, hidden_factor)
+        self.embedding = FeatureEmbedding(input_ch, input_size, emb_ch, 0, hidden_factor)
 
         num_blocks = int(getattr(args, "convlru_num_blocks", 2))
         arch = getattr(args, "Arch", "unet")
@@ -1156,7 +1068,6 @@ class UniPhy(nn.Module):
         rank = int(getattr(args, "lru_rank", 64))
         dt_ref = float(getattr(args, "dt_ref", 1.0))
         inj_k = float(getattr(args, "inj_k", 2.0))
-        learnable_init_state = bool(getattr(args, "learnable_init_state", False))
         
         koopman_use_noise = bool(getattr(args, "koopman_use_noise", False))
         koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
@@ -1172,8 +1083,8 @@ class UniPhy(nn.Module):
             "rank": rank,
             "dt_ref": dt_ref,
             "inj_k": inj_k,
-            "static_ch": static_ch,
-            "learnable_init_state": learnable_init_state,
+            "static_ch": 0,
+            "learnable_init_state": False,
             "use_noise": koopman_use_noise,
             "noise_scale": koopman_noise_scale,
             "dynamics_mode": dynamics_mode,
@@ -1185,7 +1096,7 @@ class UniPhy(nn.Module):
 
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
         conv_type = str(getattr(args, "ConvType", "conv"))
-        ffn_args = {"ffn_ratio": ffn_ratio, "static_ch": static_ch, "conv_type": conv_type}
+        ffn_args = {"ffn_ratio": ffn_ratio, "static_ch": 0, "conv_type": conv_type}
 
         spectral_modes_h = int(getattr(args, "spectral_modes_h", 12))
         spectral_modes_w = int(getattr(args, "spectral_modes_w", 12))
@@ -1229,14 +1140,12 @@ class UniPhy(nn.Module):
         revin_stats: Optional[RevINStats] = None,
     ):
         cond = None
-        if self.embedding.static_ch > 0 and self.embedding.static_embed is not None and static_feats is not None:
-            cond = self.embedding.static_embed(static_feats)
 
         if mode == "p":
             stats = revin_stats if revin_stats is not None else self.revin.stats(x)
             x_norm = self.revin(x, "norm", stats=stats)
-            x_emb, _ = self.embedding(x_norm, static_feats=static_feats)
-            x_hid, last_hidden_outs = self.uniphy_model(x_emb, listT=listT, cond=cond, static_feats=static_feats)
+            x_emb = self.embedding(x_norm)
+            x_hid, last_hidden_outs = self.uniphy_model(x_emb, listT=listT, cond=cond)
             out = self.decoder(x_hid, cond=cond)
             out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
             if str(self.decoder.dist_mode).lower() == "gaussian":
@@ -1259,8 +1168,8 @@ class UniPhy(nn.Module):
 
         out_list: List[torch.Tensor] = []
         x_norm = self.revin(x, "norm", stats=stats)
-        x_emb, _ = self.embedding(x_norm, static_feats=static_feats)
-        x_hidden, last_hidden_outs = self.uniphy_model(x_emb, listT=listT0, cond=cond, static_feats=static_feats)
+        x_emb = self.embedding(x_norm)
+        x_hidden, last_hidden_outs = self.uniphy_model(x_emb, listT=listT0, cond=cond)
         x_dec0 = self.decoder(x_hidden, cond=cond)
         x_step_dist = x_dec0.permute(0, 2, 1, 3, 4).contiguous()
         x_step_dist = x_step_dist[:, -1:, :, :, :]
@@ -1294,8 +1203,8 @@ class UniPhy(nn.Module):
             else:
                 x_step_norm = curr_x
 
-            x_in, _ = self.embedding(x_step_norm, static_feats=static_feats)
-            x_hidden, last_hidden_outs = self.uniphy_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond, static_feats=static_feats)
+            x_in = self.embedding(x_step_norm)
+            x_hidden, last_hidden_outs = self.uniphy_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
             x_dec = self.decoder(x_hidden, cond=cond)
             x_step_dist = x_dec.permute(0, 2, 1, 3, 4).contiguous()
             x_step_dist = x_step_dist[:, -1:, :, :, :]
