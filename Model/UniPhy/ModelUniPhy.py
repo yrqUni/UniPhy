@@ -102,10 +102,10 @@ def get_safe_groups(channels: int, target: int = 4) -> int:
         return target
     return 1
 
-def warp_image_step(x: torch.Tensor, flow: torch.Tensor, mode: str = 'bilinear') -> torch.Tensor:
+def warp_image_step(x: torch.Tensor, flow: torch.Tensor, mode: str = 'bilinear', padding_mode: str = 'border') -> torch.Tensor:
     B, C, H, W = x.shape
     grid = warp_common(flow, B, H, W)
-    return F.grid_sample(x, grid, mode=mode, padding_mode='zeros', align_corners=False)
+    return F.grid_sample(x, grid, mode=mode, padding_mode=padding_mode, align_corners=False)
 
 class SpatialGroupNorm(nn.GroupNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -545,18 +545,14 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         self,
         x: torch.Tensor,
         last_hidden_in: Optional[torch.Tensor],
-        listT: Optional[torch.Tensor],
+        dt_seq: torch.Tensor,
         static_feats: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, L, H, W = x.shape
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
         
         flow_raw, forcing_raw = self.estimator(x_flat)
-        
-        if listT is not None:
-            dt_scale = (listT / self.dt_ref).view(B, L, 1, 1, 1).to(x.device, x.dtype)
-        else:
-            dt_scale = torch.ones(B, L, 1, 1, 1, device=x.device, dtype=x.dtype)
+        dt_scale = (dt_seq / self.dt_ref).view(B, L, 1, 1, 1).to(x.device, x.dtype)
 
         flow = flow_raw.view(B, L, 2, H, W) * self.flow_scale * dt_scale
         forcing = forcing_raw.view(B, L, C, H, W) * dt_scale
@@ -575,7 +571,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             forcing_step = forcing[:, 0]
             h_prev = last_hidden_in
             
-            h_warped = warp_image_step(h_prev, flow_step, mode=self.interpolation_mode)
+            h_warped = warp_image_step(h_prev, flow_step, mode=self.interpolation_mode, padding_mode="border")
             h_new = h_warped + forcing_step
             
             out = self.norm(h_new.unsqueeze(2)).squeeze(2)
@@ -600,11 +596,13 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         if (x.shape[-2], x.shape[-1]) != (self.H, self.W):
             raise ValueError(f"input spatial {(x.shape[-2], x.shape[-1])} must match layer {(self.H, self.W)}")
 
+        dt_seq_in = torch.ones(x.size(0), x.size(2), device=x.device, dtype=x.dtype) if listT is None else listT.to(x.device, x.dtype)
+        dt_seq = _match_dt_seq(dt_seq_in, x.size(2))
+
         if self.dynamics_mode == "spectral":
-            dt_seq = torch.ones(x.size(0), x.size(2), device=x.device, dtype=x.dtype) if listT is None else _match_dt_seq(listT.to(x.device, x.dtype), x.size(2))
             return self.forward_spectral(x, last_hidden_in, dt_seq, static_feats)
         else:
-            return self.forward_advection(x, last_hidden_in, listT, static_feats)
+            return self.forward_advection(x, last_hidden_in, dt_seq, static_feats)
 
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, cond_channels: Optional[int] = None, conv_type: str = "conv"):
