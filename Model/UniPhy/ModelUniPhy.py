@@ -559,8 +559,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
 
         H0_flat = H0.permute(0, 1, 2, 3, 4).reshape(B, -1).contiguous()
 
-        # [Decoupled Logic for Spectral]
-        Y_forced = pscan(A_flat, X_flat)
+        Y_forced = pscan(A_flat, X_flat.clone()) 
         A_cum = torch.cumprod(A_flat, dim=1)
         H_natural = A_cum * H0_flat.unsqueeze(1)
         Y_flat = Y_forced + H_natural
@@ -609,7 +608,6 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             h0 = torch.zeros(B, self.emb_ch, H, W, device=x.device, dtype=x.dtype)
 
         if last_hidden_in is not None:
-            # Iterative Mode
             flow_step = flow[:, 0] 
             forcing_step = forcing[:, 0]
             
@@ -621,15 +619,12 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             out = self.gate(out)
             return x + out, h_new
 
-        # Parallel Mode [Decoupled Logic for Advection]
+        # Parallel Mode
         h_forced = self.advection_pscan(flow, forcing)
         
-        # Calculate Natural Response: H_natural = warp(H0, cumsum(Flow))
+        # Consistent Natural Response for Advection: warp H0 step-by-step
+        # This matches iterative physics exactly, unlike simple cumsum
         flow_cum = torch.cumsum(flow, dim=1)
-        # Warp H0 by cumulative flow at each step t
-        # We process each step t to avoid writing a custom kernel for now, or use a loop for H_natural
-        # Since this is "Natural Response", it depends only on H0.
-        # Efficient way:
         h_natural_list = []
         for t in range(L):
             flow_t = flow_cum[:, t]
