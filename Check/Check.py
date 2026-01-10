@@ -24,7 +24,7 @@ def get_base_args() -> Any:
         out_ch=2,
         input_size=(32, 32),
         emb_ch=16,
-        static_ch=0,
+        static_ch=0, 
         hidden_factor=(2, 2),
         ConvType="conv",
         Arch="unet",
@@ -35,7 +35,7 @@ def get_base_args() -> Any:
         lru_rank=8,
         koopman_use_noise=False,
         koopman_noise_scale=1.0,
-        learnable_init_state=True,
+        learnable_init_state=False,
         dt_ref=1.0,
         inj_k=2.0,
         dynamics_mode="advection",
@@ -46,11 +46,6 @@ def get_base_args() -> Any:
         pscan_use_residual=True,
         pscan_chunk_size=32,
     )
-
-def make_static_feats(args: Any, B: int, H: int, W: int, device: torch.device) -> Optional[torch.Tensor]:
-    if int(getattr(args, "static_ch", 0)) > 0:
-        return torch.randn(B, int(args.static_ch), H, W, device=device)
-    return None
 
 def extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
     return dist_out[:, :, :out_ch]
@@ -63,7 +58,6 @@ def check_once(args: Any, device: torch.device) -> None:
     model = UniPhy(args).to(device).eval()
 
     x_init = torch.randn(B, 1, C, H, W, device=device)
-    static_feats = make_static_feats(args, B, H, W, device)
     
     stats = model.revin.stats(x_init)
     
@@ -77,7 +71,7 @@ def check_once(args: Any, device: torch.device) -> None:
             out_gen_num=L,
             listT=listT_i,
             listT_future=listT_future,
-            static_feats=static_feats,
+            static_feats=None,
             revin_stats=stats,
         )
 
@@ -101,7 +95,7 @@ def check_once(args: Any, device: torch.device) -> None:
             x_p,
             mode="p",
             listT=listT_p,
-            static_feats=static_feats,
+            static_feats=None,
             revin_stats=stats,
         )
 
@@ -114,7 +108,7 @@ def check_once(args: Any, device: torch.device) -> None:
     threshold = 1e-3
     status = "PASS" if (fin_i and fin_p and diff < threshold) else "FAIL"
     
-    keys = ["dynamics_mode", "static_ch", "down_mode"]
+    keys = ["dynamics_mode", "down_mode"]
     cfg_str = " | ".join(f"{k}={getattr(args, k)}" for k in keys)
 
     print(f"[{status}] Max Diff={diff:.3e} | {cfg_str}")
@@ -141,7 +135,6 @@ def main():
 
     grid = {
         "dynamics_mode": ["advection", "spectral"],
-        "static_ch": [0, 4],
         "down_mode": ["avg", "shuffle"],
     }
 

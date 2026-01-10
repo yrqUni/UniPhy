@@ -1059,7 +1059,7 @@ class UniPhy(nn.Module):
         emb_ch = int(getattr(args, "emb_ch", 64))
         hidden_factor = getattr(args, "hidden_factor", (2, 2))
 
-        self.embedding = FeatureEmbedding(input_ch, input_size, emb_ch, 0, hidden_factor)
+        self.embedding = FeatureEmbedding(input_ch, input_size, emb_ch, hidden_factor)
 
         num_blocks = int(getattr(args, "convlru_num_blocks", 2))
         arch = getattr(args, "Arch", "unet")
@@ -1083,8 +1083,6 @@ class UniPhy(nn.Module):
             "rank": rank,
             "dt_ref": dt_ref,
             "inj_k": inj_k,
-            "static_ch": 0,
-            "learnable_init_state": False,
             "use_noise": koopman_use_noise,
             "noise_scale": koopman_noise_scale,
             "dynamics_mode": dynamics_mode,
@@ -1096,7 +1094,7 @@ class UniPhy(nn.Module):
 
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
         conv_type = str(getattr(args, "ConvType", "conv"))
-        ffn_args = {"ffn_ratio": ffn_ratio, "static_ch": 0, "conv_type": conv_type}
+        ffn_args = {"ffn_ratio": ffn_ratio, "conv_type": conv_type}
 
         spectral_modes_h = int(getattr(args, "spectral_modes_h", 12))
         spectral_modes_w = int(getattr(args, "spectral_modes_w", 12))
@@ -1135,7 +1133,6 @@ class UniPhy(nn.Module):
         out_gen_num: Optional[int] = None,
         listT: Optional[torch.Tensor] = None,
         listT_future: Optional[torch.Tensor] = None,
-        static_feats: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         revin_stats: Optional[RevINStats] = None,
     ):
@@ -1145,8 +1142,8 @@ class UniPhy(nn.Module):
             stats = revin_stats if revin_stats is not None else self.revin.stats(x)
             x_norm = self.revin(x, "norm", stats=stats)
             x_emb = self.embedding(x_norm)
-            x_hid, last_hidden_outs = self.uniphy_model(x_emb, listT=listT, cond=cond)
-            out = self.decoder(x_hid, cond=cond)
+            x_hid, last_hidden_outs = self.uniphy_model(x_emb, listT=listT)
+            out = self.decoder(x_hid)
             out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
             if str(self.decoder.dist_mode).lower() == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
@@ -1169,8 +1166,8 @@ class UniPhy(nn.Module):
         out_list: List[torch.Tensor] = []
         x_norm = self.revin(x, "norm", stats=stats)
         x_emb = self.embedding(x_norm)
-        x_hidden, last_hidden_outs = self.uniphy_model(x_emb, listT=listT0, cond=cond)
-        x_dec0 = self.decoder(x_hidden, cond=cond)
+        x_hidden, last_hidden_outs = self.uniphy_model(x_emb, listT=listT0)
+        x_dec0 = self.decoder(x_hidden)
         x_step_dist = x_dec0.permute(0, 2, 1, 3, 4).contiguous()
         x_step_dist = x_step_dist[:, -1:, :, :, :]
 
@@ -1204,8 +1201,8 @@ class UniPhy(nn.Module):
                 x_step_norm = curr_x
 
             x_in = self.embedding(x_step_norm)
-            x_hidden, last_hidden_outs = self.uniphy_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt, cond=cond)
-            x_dec = self.decoder(x_hidden, cond=cond)
+            x_hidden, last_hidden_outs = self.uniphy_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt)
+            x_dec = self.decoder(x_hidden)
             x_step_dist = x_dec.permute(0, 2, 1, 3, 4).contiguous()
             x_step_dist = x_step_dist[:, -1:, :, :, :]
 
