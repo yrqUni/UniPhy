@@ -385,21 +385,16 @@ class GridSamplePScan(nn.Module):
         device = flows.device
         dtype = flows.dtype
         B_f, L_f, _, H_f, W_f = flows.shape
-        is_low_res_flow = (H_f != H) or (W_f != W)
-
+        
         cum_flows = torch.cumsum(flows.float(), dim=1)
         
         out_fused = torch.zeros(B, L, C, H, W, device=device, dtype=dtype)
-        decay_val = torch.exp(self.decay_log).item() if self.use_decay else None
+        decay_val = None 
 
         for t_start in range(0, L, self.chunk_size):
             t_end = min(t_start + self.chunk_size, L)
             curr_t_len = t_end - t_start
             
-            img_t_slice = None
-            if self.use_residual:
-                img_t_slice = images[:, t_start:t_end].unsqueeze(2)
-
             t_idx = torch.arange(t_start, t_end, device=device).view(curr_t_len, 1)
 
             min_k = 0
@@ -415,23 +410,6 @@ class GridSamplePScan(nn.Module):
                         continue
                 
                 res_flow_chunk = None
-                if self.use_residual:
-                    img_t = img_t_slice.expand(-1, -1, curr_k_len, -1, -1, -1)
-                    img_k = images[:, k_start:k_end].unsqueeze(1).expand(-1, curr_t_len, -1, -1, -1, -1)
-                    
-                    feat_diff = torch.cat([img_t, img_k], dim=3)
-                    feat_diff_flat = feat_diff.reshape(-1, 2 * C, H, W)
-
-                    if is_low_res_flow:
-                        feat_diff_flat = F.interpolate(feat_diff_flat, size=(H_f, W_f), mode='bilinear', align_corners=False)
-                    
-                    res_flow_chunk = self.res_conv(feat_diff_flat).view(B, curr_t_len, curr_k_len, 2, H_f, W_f).float()
-                    
-                    if is_low_res_flow:
-                         res_flow_chunk = F.interpolate(res_flow_chunk.view(-1, 2, H_f, W_f), size=(H, W), mode='bilinear', align_corners=False)
-                         res_flow_chunk = res_flow_chunk.view(B, curr_t_len, curr_k_len, 2, H, W)
-                    
-                    res_flow_chunk = res_flow_chunk.contiguous()
 
                 k_idx = torch.arange(k_start, k_end, device=device).view(1, curr_k_len)
                 mask = (k_idx <= t_idx)
