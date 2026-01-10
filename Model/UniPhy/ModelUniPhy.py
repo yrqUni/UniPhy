@@ -605,12 +605,13 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             return self.forward_advection(x, last_hidden_in, dt_seq)
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, cond_channels: Optional[int] = None, conv_type: str = "conv"):
+    def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, conv_type: str = "conv"):
         super().__init__()
         self.dw_conv = PeriodicConv2d(int(channels), int(channels), kernel_size=int(kernel_size), conv_type=str(conv_type))
         self.norm = SpatialGroupNorm(get_safe_groups(int(channels)), int(channels))
         self.pw_conv_in = nn.Linear(int(channels), int(channels) * 2)
         self.pw_conv_out = nn.Linear(int(channels), int(channels))
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, L, H, W = x.shape
@@ -621,7 +622,7 @@ class GatedConvBlock(nn.Module):
         x = x.permute(0, 2, 3, 4, 1).contiguous()
         x = self.pw_conv_in(x)
         x_val, x_gate = torch.chunk(x, 2, dim=-1)
-        x = x_val * F.sigmoid(x_gate)
+        x = x_val * self.sigmoid(x_gate)
         x = self.pw_conv_out(x)
         x = x.permute(0, 4, 1, 2, 3)
         return residual + x
