@@ -1042,7 +1042,13 @@ class ProbabilisticDecoder(nn.Module):
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
         
         x_flat = self.pre_shuffle_conv(x_flat)
-        x_flat = F.pixel_shuffle(x_flat, self.rH) 
+        
+        B_flat, C_tot, H_in, W_in = x_flat.shape
+        C_out = C_tot // (self.rH * self.rW)
+        x_flat = x_flat.view(B_flat, C_out, self.rH, self.rW, H_in, W_in)
+        x_flat = x_flat.permute(0, 1, 4, 2, 5, 3)
+        x_flat = x_flat.reshape(B_flat, C_out, H_in * self.rH, W_in * self.rW)
+        
         x_flat = self.activation(x_flat)
         x_flat = self.c_out(x_flat)
         
