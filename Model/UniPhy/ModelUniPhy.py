@@ -213,8 +213,9 @@ class EfficientSpatialGating(nn.Module):
         g = self.global_pool(x_flat).view(B * L, C, 1)
         g_gate = self.global_mlp(g).view(B, L, C, 1, 1).permute(0, 2, 1, 3, 4)
         
-        lat = x_flat.mean(dim=3).view(B * L, C, 1)
-        lat_gate = self.lat_mlp(lat).view(B, L, C, 1, 1).permute(0, 2, 1, 3, 4)
+        # Pool over width (dim 3) to keep height info for gating
+        lat = x_flat.mean(dim=3).view(B * L, C, H)
+        lat_gate = self.lat_mlp(lat).view(B, L, C, H, 1).permute(0, 2, 1, 3, 4)
         
         return x * g_gate * lat_gate
 
@@ -611,9 +612,10 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             h_warped = warp_image_step(h_prev, flow_step, mode=self.interpolation_mode, padding_mode="border")
             h_new = h_warped + forcing_step
             
-            out = self.norm(h_new.unsqueeze(2)).squeeze(2)
+            out = h_new.unsqueeze(2)
+            out = self.norm(out)
             out = self.gate(out)
-            return x + out.unsqueeze(2), h_new
+            return x + out, h_new
 
         h_seq = self.advection_pscan(flow, forcing)
         
