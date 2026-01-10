@@ -854,6 +854,7 @@ class UniPhyBackbone(nn.Module):
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
                 self.up_blocks.append(UniPhyBlock(C, (h_up, w_up), prl_args, ffn_args))
+                self.up_blocks.append(UniPhyBlock(C, (h_up, w_up), prl_args, ffn_args))
                 self.csa_blocks.append(CrossScaleGate(C))
 
             self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
@@ -912,6 +913,8 @@ class UniPhyBackbone(nn.Module):
         x = self.mid_spectral(x)
 
         for i, blk in enumerate(self.up_blocks):
+            if i >= len(self.csa_blocks):
+                break
             B, C, L, H, W = x.shape
             x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
             x_up = self.upsample(x_flat)
@@ -1059,14 +1062,14 @@ class ProbabilisticDecoder(nn.Module):
             mu, log_sigma = torch.chunk(x, 2, dim=1)
             with torch.amp.autocast("cuda", enabled=False):
                 log_sigma = torch.clamp(log_sigma, min=-5.0, max=5.0)
-                sigma = F.softplus(log_sigma.float()).to(mu.dtype) + 1e-6
+                sigma = F.softplus(log_sigma.float()).to(mu.dtype) + 1e-3
             return torch.cat([mu, sigma], dim=1)
 
         if self.dist_mode == "laplace":
             mu, log_b = torch.chunk(x, 2, dim=1)
             with torch.amp.autocast("cuda", enabled=False):
                 log_b = torch.clamp(log_b, min=-5.0, max=5.0)
-                b = F.softplus(log_b.float()).to(mu.dtype) + 1e-6
+                b = F.softplus(log_b.float()).to(mu.dtype) + 1e-3
             return torch.cat([mu, b], dim=1)
 
         return x
