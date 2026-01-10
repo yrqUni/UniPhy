@@ -562,7 +562,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         A_cum = torch.cumprod(A_koop, dim=1)
         H_natural = A_cum * H0.unsqueeze(1)
 
-        Y_forced_flat = pscan(A_flat, X_flat.clone())
+        Y_forced_flat = pscan(A_flat.clone(), X_flat.clone())
         Y_forced = Y_forced_flat.view(B, L, self.rank, C, H, self.Wf)
         
         Y = Y_forced + H_natural
