@@ -801,7 +801,6 @@ class UniPhyBackbone(nn.Module):
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
                 self.up_blocks.append(UniPhyBlock(C, (h_up, w_up), prl_args, ffn_args))
-                self.up_blocks.append(UniPhyBlock(C, (h_up, w_up), prl_args, ffn_args))
                 self.csa_blocks.append(CrossScaleGate(C))
 
             self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
@@ -855,8 +854,6 @@ class UniPhyBackbone(nn.Module):
         x = self.mid_spectral(x)
 
         for i, blk in enumerate(self.up_blocks):
-            if i >= len(self.csa_blocks):
-                break
             B, C, L, H, W = x.shape
             x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
             x_up = self.upsample(x_flat)
@@ -967,7 +964,7 @@ class ProbabilisticDecoder(nn.Module):
         self.c_out = nn.Conv2d(out_ch_after_up, self.final_out_ch, kernel_size=1)
         self.activation = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, L, H, W = x.shape
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
         
@@ -1136,8 +1133,6 @@ class UniPhy(nn.Module):
         timestep: Optional[torch.Tensor] = None,
         revin_stats: Optional[RevINStats] = None,
     ):
-        cond = None
-
         if mode == "p":
             stats = revin_stats if revin_stats is not None else self.revin.stats(x)
             x_norm = self.revin(x, "norm", stats=stats)
