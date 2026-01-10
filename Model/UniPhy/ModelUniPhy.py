@@ -117,15 +117,19 @@ class SpatialGroupNorm(nn.GroupNorm):
         return super().forward(x)
 
 class DeformConv2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1, bias: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1, bias: bool = False, groups: int = 1):
         super().__init__()
         self.kernel_size = int(kernel_size)
         self.padding = int(padding)
+        self.groups = int(groups)
+        
+        offset_groups = self.groups
         self.conv_offset = nn.Conv2d(
             int(in_channels),
-            int(2 * kernel_size * kernel_size + kernel_size * kernel_size),
+            int(2 * offset_groups * kernel_size * kernel_size + offset_groups * kernel_size * kernel_size),
             kernel_size=int(kernel_size),
             padding=int(padding),
+            groups=self.groups
         )
         self.conv_dcn = torchvision.ops.DeformConv2d(
             int(in_channels),
@@ -133,6 +137,7 @@ class DeformConv2d(nn.Module):
             kernel_size=int(kernel_size),
             padding=int(padding),
             bias=bool(bias),
+            groups=self.groups
         )
         nn.init.constant_(self.conv_offset.weight, 0)
         nn.init.constant_(self.conv_offset.bias, 0)
@@ -149,11 +154,27 @@ class PeriodicConv3d(nn.Module):
         super().__init__()
         self.pad_sp = int(kernel_size) // 2
         self.conv_type = str(conv_type)
+        
         if self.conv_type == "dcn":
-            self.spatial_conv = DeformConv2d(int(in_channels), int(out_channels), kernel_size=int(kernel_size), padding=0, bias=False)
+            self.spatial_conv = DeformConv2d(
+                int(in_channels), 
+                int(in_channels), 
+                kernel_size=int(kernel_size), 
+                padding=0, 
+                bias=False, 
+                groups=int(in_channels)
+            )
         else:
-            self.spatial_conv = nn.Conv2d(int(in_channels), int(out_channels), kernel_size=int(kernel_size), padding=0, bias=False)
-        self.depth_conv = nn.Conv3d(int(out_channels), int(out_channels), kernel_size=(1, 1, 1), padding=0, bias=True)
+            self.spatial_conv = nn.Conv2d(
+                int(in_channels), 
+                int(in_channels), 
+                kernel_size=int(kernel_size), 
+                padding=0, 
+                bias=False, 
+                groups=int(in_channels)
+            )
+        
+        self.depth_conv = nn.Conv3d(int(in_channels), int(out_channels), kernel_size=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, D, H, W = x.shape
@@ -161,39 +182,39 @@ class PeriodicConv3d(nn.Module):
         x_sp = F.pad(x_sp, (self.pad_sp, self.pad_sp, 0, 0), mode="circular")
         x_sp = F.pad(x_sp, (0, 0, self.pad_sp, self.pad_sp), mode="replicate")
         x_sp = self.spatial_conv(x_sp)
-        x_sp = x_sp.reshape(B, D, -1, H, W).permute(0, 2, 1, 3, 4).contiguous()
+        x_sp = x_sp.reshape(B, D, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
         return self.depth_conv(x_sp)
 
-class LatitudeGating(nn.Module):
+class EfficientSpatialGating(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
-        self.channels = int(channels)
-        mid_channels = max(self.channels // reduction, 4)
-        self.fc1 = nn.Linear(self.channels, mid_channels)
-        self.fc2 = nn.Linear(mid_channels, self.channels)
-        self.act = nn.SiLU()
-        self.sigmoid = nn.Sigmoid()
+        mid_channels = max(channels // reduction, 4)
+        
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        self.global_mlp = nn.Sequential(
+            nn.Conv1d(channels, mid_channels, 1),
+            nn.SiLU(),
+            nn.Conv1d(mid_channels, channels, 1),
+            nn.Sigmoid()
+        )
+        
+        self.lat_mlp = nn.Sequential(
+            nn.Conv1d(channels, mid_channels, 1),
+            nn.SiLU(),
+            nn.Conv1d(mid_channels, channels, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 5:
-            B, C, L, H, W = x.shape
-            y = x.mean(dim=-1)
-            y = y.permute(0, 2, 3, 1)
-            y = self.fc1(y)
-            y = self.act(y)
-            y = self.fc2(y)
-            y = self.sigmoid(y)
-            y = y.permute(0, 3, 1, 2).unsqueeze(-1)
-        else:
-            B, C, H, W = x.shape
-            y = x.mean(dim=-1)
-            y = y.permute(0, 2, 1)
-            y = self.fc1(y)
-            y = self.act(y)
-            y = self.fc2(y)
-            y = self.sigmoid(y)
-            y = y.permute(0, 2, 1).unsqueeze(-1)
-        return x * y
+        B, C, L, H, W = x.shape
+        
+        g = self.global_pool(x).view(B, C, 1)
+        g_gate = self.global_mlp(g).view(B, C, 1, 1, 1)
+        
+        lat = x.mean(dim=(2, 4)).view(B, C, H)
+        lat_gate = self.lat_mlp(lat).view(B, C, 1, H, 1)
+        
+        return x * g_gate * lat_gate
 
 class SpectralMixer(nn.Module):
     def __init__(self, rank: int):
@@ -260,12 +281,21 @@ class DynamicsParameterEstimator(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.global_fc = nn.Linear(ch, ch)
         self.pool = nn.AdaptiveAvgPool2d((1, self.w_freq))
-        self.head = nn.Linear(ch, self.emb_ch * self.rank * 3)
-        nn.init.zeros_(self.head.weight)
+        
+        bottleneck = max(32, self.rank * 4)
+        output_dim = self.emb_ch * self.rank * 3
+        
+        self.head = nn.Sequential(
+            nn.Conv2d(ch, bottleneck, 1),
+            nn.SiLU(),
+            nn.Conv2d(bottleneck, output_dim, 1)
+        )
+        
+        nn.init.zeros_(self.head[-1].weight)
         with torch.no_grad():
-            self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 0].fill_(1.0)
-            nn.init.uniform_(self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 1], -0.01, 0.01)
-            self.head.bias.view(self.emb_ch, self.rank, 3)[:, :, 2].fill_(-5.0)
+            self.head[-1].bias.view(self.emb_ch, self.rank, 3)[:, :, 0].fill_(1.0)
+            nn.init.uniform_(self.head[-1].bias.view(self.emb_ch, self.rank, 3)[:, :, 1], -0.01, 0.01)
+            self.head[-1].bias.view(self.emb_ch, self.rank, 3)[:, :, 2].fill_(-5.0)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, C, H, W = x.shape
@@ -274,10 +304,12 @@ class DynamicsParameterEstimator(nn.Module):
         glob = torch.sigmoid(self.global_fc(glob)).view(B, C, 1, 1)
         feat = feat * glob
         feat = self.pool(feat)
-        feat = feat.permute(0, 2, 3, 1).reshape(B, 1, self.w_freq, C)
+        feat = feat.permute(0, 2, 3, 1).reshape(B, 1, self.w_freq, C).permute(0, 3, 1, 2)
+        
         params = self.head(feat)
-        params = params.view(B, 1, self.w_freq, self.emb_ch, self.rank, 3)
+        params = params.permute(0, 2, 3, 1).view(B, 1, self.w_freq, self.emb_ch, self.rank, 3)
         params = params.permute(0, 1, 3, 2, 4, 5).contiguous()
+        
         nu_rate = F.softplus(params[..., 0])
         theta_rate = torch.tanh(params[..., 1]) * math.pi
         sigma = torch.sigmoid(params[..., 2])
@@ -430,7 +462,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         self.interpolation_mode = str(interpolation_mode).lower()
 
         self.norm = SpatialGroupNorm(get_safe_groups(self.emb_ch), self.emb_ch)
-        self.gate = LatitudeGating(self.emb_ch)
+        self.gate = EfficientSpatialGating(self.emb_ch)
 
         if self.dynamics_mode == "spectral":
             self.koopman = SpectralDynamics(self.emb_ch, self.rank, self.Wf)
