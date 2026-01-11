@@ -1122,16 +1122,16 @@ class UniPhy(nn.Module):
                 elif p.dim() > 1:
                     nn.init.xavier_uniform_(p)
 
-   def forward(
-        self,
-        x: torch.Tensor,
-        mode: str = "p",
-        out_gen_num: Optional[int] = None,
-        listT: Optional[torch.Tensor] = None,
-        listT_future: Optional[torch.Tensor] = None,
-        timestep: Optional[torch.Tensor] = None,
-        revin_stats: Optional[RevINStats] = None,
-        sample: bool = False,
+    def forward(
+         self,
+         x: torch.Tensor,
+         mode: str = "p",
+         out_gen_num: Optional[int] = None,
+         listT: Optional[torch.Tensor] = None,
+         listT_future: Optional[torch.Tensor] = None,
+         timestep: Optional[torch.Tensor] = None,
+         revin_stats: Optional[RevINStats] = None,
+         sample: bool = False,
     ):
         if mode == "p":
             stats = revin_stats if revin_stats is not None else self.revin.stats(x)

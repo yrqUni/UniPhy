@@ -57,20 +57,20 @@ def check_once(args: Any, device: torch.device) -> None:
 
     x_init = torch.randn(B, 1, C, H, W, device=device)
     
-    stats = model.revin.stats(x_init)
-    
     listT_i = torch.ones(B, 1, device=device, dtype=x_init.dtype)
     listT_future = torch.ones(B, L - 1, device=device, dtype=x_init.dtype)
 
     with torch.no_grad():
-        out_i, _ = model(
+        out_i_cpu, _ = model(
             x_init,
             mode="i",
             out_gen_num=L,
             listT=listT_i,
             listT_future=listT_future,
-            revin_stats=stats,
+            sample=False,
         )
+        
+        out_i = out_i_cpu.to(device)
 
         mu_i = extract_mu(out_i, int(args.out_ch))
 
@@ -92,7 +92,6 @@ def check_once(args: Any, device: torch.device) -> None:
             x_p,
             mode="p",
             listT=listT_p,
-            revin_stats=stats,
         )
 
         mu_p = extract_mu(out_p, int(args.out_ch))
