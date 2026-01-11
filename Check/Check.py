@@ -61,7 +61,7 @@ def check_once(args: Any, device: torch.device) -> None:
     listT_future = torch.ones(B, L - 1, device=device, dtype=x_init.dtype)
 
     with torch.no_grad():
-        out_i_cpu, _ = model(
+        out_i_det_cpu, _ = model(
             x_init,
             mode="i",
             out_gen_num=L,
@@ -69,10 +69,19 @@ def check_once(args: Any, device: torch.device) -> None:
             listT_future=listT_future,
             sample=False,
         )
+        out_i_det = out_i_det_cpu.to(device)
         
-        out_i = out_i_cpu.to(device)
+        out_i_sample_cpu, _ = model(
+            x_init,
+            mode="i",
+            out_gen_num=L,
+            listT=listT_i,
+            listT_future=listT_future,
+            sample=True,
+        )
+        out_i_sample = out_i_sample_cpu.to(device)
 
-        mu_i = extract_mu(out_i, int(args.out_ch))
+        mu_i = extract_mu(out_i_det, int(args.out_ch))
 
         p_inputs = [x_init]
         for t in range(L - 1):
@@ -96,23 +105,30 @@ def check_once(args: Any, device: torch.device) -> None:
 
         mu_p = extract_mu(out_p, int(args.out_ch))
         
-        diff = (mu_i - mu_p).abs().max().item()
-        fin_i = torch.isfinite(out_i).all().item()
+        diff_det = (mu_i - mu_p).abs().max().item()
+        
+        fin_i_det = torch.isfinite(out_i_det).all().item()
+        fin_i_sample = torch.isfinite(out_i_sample).all().item()
         fin_p = torch.isfinite(out_p).all().item()
+        
+        runs_ok = fin_i_det and fin_i_sample and fin_p
+        eq_ok = diff_det < 1e-3
 
-    threshold = 1e-3
-    status = "PASS" if (fin_i and fin_p and diff < threshold) else "FAIL"
+    status = "PASS" if (runs_ok and eq_ok) else "FAIL"
     
-    keys = ["dynamics_mode", "down_mode"]
+    keys = ["dynamics_mode", "dist_mode"]
     cfg_str = " | ".join(f"{k}={getattr(args, k)}" for k in keys)
 
-    print(f"[{status}] Max Diff={diff:.3e} | {cfg_str}")
+    print(f"[{status}] Det Diff={diff_det:.3e} | {cfg_str}")
     
     if status == "FAIL":
-        print("    -> Step-wise Max Diffs:")
-        for t in range(L):
-            step_diff = (mu_i[:, t] - mu_p[:, t]).abs().max().item()
-            print(f"       Step {t}: {step_diff:.3e}")
+        if not runs_ok:
+            print(f"    -> Finite Check: Det={fin_i_det}, Sample={fin_i_sample}, P={fin_p}")
+        if not eq_ok:
+            print("    -> Step-wise Max Diffs (Det vs P):")
+            for t in range(L):
+                step_diff = (mu_i[:, t] - mu_p[:, t]).abs().max().item()
+                print(f"       Step {t}: {step_diff:.3e}")
 
     del model
     gc.collect()
@@ -130,7 +146,8 @@ def main():
 
     grid = {
         "dynamics_mode": ["advection", "spectral"],
-        "down_mode": ["avg", "shuffle"],
+        "dist_mode": ["gaussian", "mse"],
+        "down_mode": ["avg"],
     }
 
     keys = list(grid.keys())

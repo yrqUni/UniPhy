@@ -1123,15 +1123,15 @@ class UniPhy(nn.Module):
                     nn.init.xavier_uniform_(p)
 
     def forward(
-         self,
-         x: torch.Tensor,
-         mode: str = "p",
-         out_gen_num: Optional[int] = None,
-         listT: Optional[torch.Tensor] = None,
-         listT_future: Optional[torch.Tensor] = None,
-         timestep: Optional[torch.Tensor] = None,
-         revin_stats: Optional[RevINStats] = None,
-         sample: bool = False,
+        self,
+        x: torch.Tensor,
+        mode: str = "p",
+        out_gen_num: Optional[int] = None,
+        listT: Optional[torch.Tensor] = None,
+        listT_future: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+        revin_stats: Optional[RevINStats] = None,
+        sample: bool = False,
     ):
         if mode == "p":
             stats = revin_stats if revin_stats is not None else self.revin.stats(x)
@@ -1180,10 +1180,12 @@ class UniPhy(nn.Module):
             else:
                 curr_mean = cond_stats.mean
                 curr_std = cond_stats.stdev
+            
+            warmup_stats = RevINStats(mean=curr_mean, stdev=curr_std)
 
             if mu.size(2) == self.revin.num_features:
-                mu_denorm = mu * curr_std + curr_mean
-                scale_denorm = scale * curr_std
+                mu_denorm = self.revin(mu, "denorm", stats=warmup_stats)
+                scale_denorm = scale * warmup_stats.stdev
             else:
                 mu_denorm = mu
                 scale_denorm = scale
