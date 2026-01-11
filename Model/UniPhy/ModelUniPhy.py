@@ -1174,7 +1174,6 @@ class UniPhy(nn.Module):
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
 
-            # Removed incorrect slicing logic
             warmup_stats = cond_stats
 
             if mu.size(2) == self.revin.num_features:
@@ -1192,7 +1191,6 @@ class UniPhy(nn.Module):
             else:
                 curr_x_phys = mu_denorm
         else:
-            # Added missing denorm for MSE mode
             if x_step_dist.size(2) == self.revin.num_features:
                  x_step_denorm = self.revin(x_step_dist, "denorm", stats=cond_stats)
             else:
@@ -1242,7 +1240,6 @@ class UniPhy(nn.Module):
                 else:
                     curr_x_phys = mu_denorm
             else:
-                 # Added missing denorm for MSE mode loop
                 if x_step_dist.size(2) == self.revin.num_features:
                      x_step_denorm = self.revin(x_step_dist, "denorm", stats=step_stats)
                 else:
