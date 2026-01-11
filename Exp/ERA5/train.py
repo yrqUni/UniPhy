@@ -132,11 +132,13 @@ class Args:
 
     def check_args(self) -> None:
         if bool(self.use_compile):
-            print("[Warning] Torch Compile is currently disabled/unstable. Forcing use_compile=False.")
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print("[Warning] Torch Compile is currently disabled/unstable. Forcing use_compile=False.")
             self.use_compile = False
-        
+
         if bool(self.use_amp):
-            print("[Warning] AMP is currently disabled/unstable. Forcing use_amp=False.")
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print("[Warning] AMP is currently disabled/unstable. Forcing use_amp=False.")
             self.use_amp = False
 
         if int(self.grad_accum_steps) < 1:
@@ -192,10 +194,11 @@ def extract_model_args(args_obj: Any) -> Dict[str, Any]:
 def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], verbose: bool = True) -> None:
     if not model_args_dict:
         return
+    is_master = not dist.is_initialized() or dist.get_rank() == 0
     for k, v in model_args_dict.items():
         if hasattr(args_obj, k):
             old = getattr(args_obj, k)
-            if verbose and old != v:
+            if verbose and old != v and is_master:
                 msg = f"[Args] restore '{k}': {old} -> {v}"
                 print(msg)
                 if dist.is_initialized() and dist.get_rank() == 0:
@@ -205,7 +208,8 @@ def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], v
 
 def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
     if not os.path.isfile(ckpt_path):
-        print(f"[Args] ckpt not found: {ckpt_path}")
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"[Args] ckpt not found: {ckpt_path}")
         return None
     ckpt = torch.load(ckpt_path, map_location=map_location)
     model_args = ckpt.get("model_args", None)
@@ -277,7 +281,8 @@ def load_ckpt(
     restore_model_args: bool = False,
 ) -> Tuple[int, int]:
     if not os.path.isfile(ckpt_path):
-        print("No checkpoint Found")
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print("No checkpoint Found")
         return 0, 0
     checkpoint = torch.load(ckpt_path, map_location=map_location)
     if restore_model_args and args is not None:
@@ -387,14 +392,14 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
                     tag = f"u{idx}"
                 except Exception:
                     pass
-            
+
             if "global" in name:
                 tag += "_g"
             elif "lat" in name:
                 tag += "_l"
             elif "pw_conv_in" in name:
                 tag += "_pw"
-            
+
             def _hook(mod: torch.nn.Module, inp: Tuple[Any, ...], out: torch.Tensor, tag_local: Any = tag) -> None:
                 with torch.no_grad():
                     _LRU_GATE_MEAN[tag_local] = float(out.mean().detach())
@@ -479,8 +484,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if args.ckpt and os.path.isfile(args.ckpt):
         ckpt_model_args = load_model_args_from_ckpt(args.ckpt, map_location=f"cuda:{local_rank}")
         if ckpt_model_args:
-            print("[Args] applying model args from ckpt before building model.")
             if rank == 0:
+                print("[Args] applying model args from ckpt before building model.")
                 logging.info("[Args] applying model args from ckpt before building model.")
             apply_model_args(args, ckpt_model_args, verbose=True)
 
@@ -645,8 +650,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         loss = loss + dummy_loss
 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"[Warning] NaN/Inf loss detected at step {global_step}. Skipping step.")
                     if rank == 0:
+                        print(f"[Warning] NaN/Inf loss detected at step {global_step}. Skipping step.")
                         logging.warning(f"NaN/Inf loss detected at step {global_step}")
                     opt.zero_grad(set_to_none=True)
                     continue
@@ -668,7 +673,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             global_step += 1
 
-            is_log_step = ((global_step % int(args.log_every)) == 0 or train_step == len_train_dataloader)
+            is_log_step = (global_step % int(args.log_every)) == 0 or train_step == len_train_dataloader
             is_wandb_step = bool(getattr(args, "use_wandb", False)) and ((global_step % int(args.wandb_every)) == 0 or train_step == len_train_dataloader)
 
             avg_loss = None
@@ -713,16 +718,17 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             ckpt_every = max(1, int(len_train_dataloader * float(args.ckpt_step)))
             if (train_step % ckpt_every == 0) or (train_step == len_train_dataloader):
-                loss_for_ckpt = float(avg_loss) if avg_loss is not None else float(loss.detach().item())
-                save_ckpt(
-                    model,
-                    opt,
-                    ep + 1,
-                    train_step,
-                    loss_for_ckpt,
-                    args,
-                    scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
-                )
+                if rank == 0:
+                    loss_for_ckpt = float(avg_loss) if avg_loss is not None else float(loss.detach().item())
+                    save_ckpt(
+                        model,
+                        opt,
+                        ep + 1,
+                        train_step,
+                        loss_for_ckpt,
+                        args,
+                        scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
+                    )
 
             del data, data_slice, x, target, preds_out, preds, listT, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
             if (train_step % 50) == 0:
