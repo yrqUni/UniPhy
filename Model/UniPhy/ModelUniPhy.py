@@ -1174,7 +1174,14 @@ class UniPhy(nn.Module):
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
             
-            warmup_stats = cond_stats
+            # [Fix] Correct slicing for Time dimension (dim 1)
+            # This ensures we get the stats corresponding to the LAST frame of the input condition
+            if cond_stats.mean.ndim == 5 and cond_stats.mean.size(1) > 1:
+                curr_mean = cond_stats.mean[:, -1:, :, :, :]
+                curr_std = cond_stats.stdev[:, -1:, :, :, :]
+                warmup_stats = RevINStats(mean=curr_mean, stdev=curr_std)
+            else:
+                warmup_stats = cond_stats
             
             if mu.size(2) == self.revin.num_features:
                 mu_denorm = self.revin(mu, "denorm", stats=warmup_stats)
@@ -1192,7 +1199,14 @@ class UniPhy(nn.Module):
                 curr_x_phys = mu_denorm
         else:
             if x_step_dist.size(2) == self.revin.num_features:
-                 x_step_denorm = self.revin(x_step_dist, "denorm", stats=cond_stats)
+                 # [Fix] Also apply slicing fix for non-distributional mode
+                 if cond_stats.mean.ndim == 5 and cond_stats.mean.size(1) > 1:
+                    curr_mean = cond_stats.mean[:, -1:, :, :, :]
+                    curr_std = cond_stats.stdev[:, -1:, :, :, :]
+                    warmup_stats = RevINStats(mean=curr_mean, stdev=curr_std)
+                 else:
+                    warmup_stats = cond_stats
+                 x_step_denorm = self.revin(x_step_dist, "denorm", stats=warmup_stats)
             else:
                  x_step_denorm = x_step_dist
             
