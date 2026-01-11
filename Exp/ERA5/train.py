@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# Adjust paths as per your environment
 sys.path.append("/nfs/ConvLRU/Model/UniPhy")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
@@ -166,7 +167,9 @@ def setup_logging(args: Args) -> None:
     if not dist.is_initialized() or dist.get_rank() != 0:
         return
     os.makedirs(args.log_path, exist_ok=True)
-    log_filename = os.path.join(args.log_path, f"training_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_filename = os.path.join(
+        args.log_path, f"training_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
     logging.basicConfig(
         filename=log_filename,
         level=logging.INFO,
@@ -250,7 +253,15 @@ def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.M
     return new_state_dict
 
 
-def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
+def save_ckpt(
+    model: torch.nn.Module,
+    opt: torch.optim.Optimizer,
+    epoch: int,
+    step: int,
+    loss: float,
+    args: Args,
+    scheduler: Optional[Any] = None,
+) -> None:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     state: Dict[str, Any] = {
         "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
@@ -429,7 +440,9 @@ def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
     return float(total_norm_sq**0.5 if cnt > 0 else 0.0), float(max_abs), int(cnt)
 
 
-def make_listT_from_arg_T(B: int, L: int, device: torch.device, dtype: torch.dtype, T: Optional[float]) -> Optional[torch.Tensor]:
+def make_listT_from_arg_T(
+    B: int, L: int, device: torch.device, dtype: torch.dtype, T: Optional[float]
+) -> Optional[torch.Tensor]:
     if T is None or T < 0:
         return None
     return torch.full((B, L), float(T), device=device, dtype=dtype)
@@ -584,14 +597,24 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 data_slice = data.index_select(1, indices.cpu())
                 dt_indices = indices[1:] - indices[:-1]
                 listT_vals = dt_indices.float() * float(args.T)
-                listT = listT_vals.unsqueeze(0).repeat(B_full, 1).to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True)
+                listT = (
+                    listT_vals.unsqueeze(0)
+                    .repeat(B_full, 1)
+                    .to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True)
+                )
             else:
                 data_slice = data
                 listT_vals = [float(args.T)] * (data.shape[1] - 1)
-                listT = torch.tensor(listT_vals, device=torch.device(f"cuda:{local_rank}"), dtype=torch.float32).view(1, -1).repeat(B_full, 1)
+                listT = (
+                    torch.tensor(listT_vals, device=torch.device(f"cuda:{local_rank}"), dtype=torch.float32)
+                    .view(1, -1)
+                    .repeat(B_full, 1)
+                )
 
             x = data_slice[:, :-1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
-            target = data_slice[:, 1:].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+            target = (
+                data_slice[:, 1:].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+            )
 
             accum_count += 1
             is_accum_boundary = (accum_count % grad_accum_steps) == 0
@@ -619,7 +642,11 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     elif dist_mode == "laplace":
                         mu = preds[:, :, :C_gt]
                         b = preds[:, :, C_gt:]
-                        mu_denorm = revin_mod(mu, "denorm", stats=revin_stats) if mu.shape[2] == revin_mod.num_features else mu
+                        mu_denorm = (
+                            revin_mod(mu, "denorm", stats=revin_stats)
+                            if mu.shape[2] == revin_mod.num_features
+                            else mu
+                        )
                         b_denorm = b * revin_stats.stdev if b.shape[2] == revin_mod.num_features else b
                         preds_denorm = torch.cat([mu_denorm, b_denorm], dim=2)
                         loss_main = laplace_nll_loss_weighted(preds_denorm, target_real)
@@ -659,7 +686,21 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 (loss / float(grad_accum_steps)).backward()
 
             if not will_step:
-                del data, data_slice, x, target, preds_out, preds, listT, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
+                del (
+                    data,
+                    data_slice,
+                    x,
+                    target,
+                    preds_out,
+                    preds,
+                    listT,
+                    loss,
+                    loss_main,
+                    gdl_loss,
+                    spec_loss,
+                    p_det,
+                    target_real,
+                )
                 continue
 
             if float(args.grad_clip) and float(args.grad_clip) > 0:
@@ -674,7 +715,9 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             global_step += 1
 
             is_log_step = (global_step % int(args.log_every)) == 0 or train_step == len_train_dataloader
-            is_wandb_step = bool(getattr(args, "use_wandb", False)) and ((global_step % int(args.wandb_every)) == 0 or train_step == len_train_dataloader)
+            is_wandb_step = bool(getattr(args, "use_wandb", False)) and (
+                (global_step % int(args.wandb_every)) == 0 or train_step == len_train_dataloader
+            )
 
             avg_loss = None
             avg_l1 = None
@@ -691,7 +734,11 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             if rank == 0:
                 if is_log_step:
-                    current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
+                    current_lr = (
+                        scheduler.get_last_lr()[0]
+                        if bool(args.use_scheduler) and scheduler is not None
+                        else opt.param_groups[0]["lr"]
+                    )
                     gate_str = format_gate_means()
                     msg = f"Ep {ep + 1} - step {train_step}/{len_train_dataloader} - L: {avg_loss:.4f} - L1: {avg_l1:.4f} - LR: {current_lr:.2e} - {gate_str}"
                     if isinstance(train_iter, tqdm):
@@ -699,7 +746,11 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     logging.info(msg)
 
                 if is_wandb_step:
-                    current_lr = scheduler.get_last_lr()[0] if bool(args.use_scheduler) and scheduler is not None else opt.param_groups[0]["lr"]
+                    current_lr = (
+                        scheduler.get_last_lr()[0]
+                        if bool(args.use_scheduler) and scheduler is not None
+                        else opt.param_groups[0]["lr"]
+                    )
                     grad_norm, _, _ = get_grad_stats(model)
                     log_dict: Dict[str, Any] = {
                         "train/epoch": ep + 1,
@@ -730,7 +781,21 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         scheduler if (bool(args.use_scheduler) and scheduler is not None) else None,
                     )
 
-            del data, data_slice, x, target, preds_out, preds, listT, loss, loss_main, gdl_loss, spec_loss, p_det, target_real
+            del (
+                data,
+                data_slice,
+                x,
+                target,
+                preds_out,
+                preds,
+                listT,
+                loss,
+                loss_main,
+                gdl_loss,
+                spec_loss,
+                p_det,
+                target_real,
+            )
             if (train_step % 50) == 0:
                 gc.collect()
 
@@ -758,19 +823,35 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 prefetch_factor=1,
                 persistent_workers=False,
             )
-            eval_iter = tqdm(eval_dataloader, desc=f"Eval Epoch {ep + 1}/{args.epochs}") if rank == 0 else eval_dataloader
+            eval_iter = (
+                tqdm(eval_dataloader, desc=f"Eval Epoch {ep + 1}/{args.epochs}") if rank == 0 else eval_dataloader
+            )
             with torch.no_grad():
                 for eval_step, data in enumerate(eval_iter, start=1):
                     B_full, L_full, _, _, _ = data.shape
                     half = int(args.eval_data_n_frames) // 2
-                    cond_data = data[:, :half].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+                    cond_data = (
+                        data[:, :half]
+                        .to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True)
+                        .to(torch.float32)
+                    )
 
                     listT_cond_vals = [float(args.T)] * cond_data.shape[1]
-                    listT_cond = torch.tensor(listT_cond_vals, device=cond_data.device, dtype=cond_data.dtype).view(1, -1).repeat(cond_data.size(0), 1)
+                    listT_cond = (
+                        torch.tensor(listT_cond_vals, device=cond_data.device, dtype=cond_data.dtype)
+                        .view(1, -1)
+                        .repeat(cond_data.size(0), 1)
+                    )
 
                     out_gen_num = int(L_full - cond_data.shape[1])
-                    listT_future = make_listT_from_arg_T(B_full, out_gen_num, cond_data.device, cond_data.dtype, float(args.T))
-                    target = data[:, cond_data.shape[1] : cond_data.shape[1] + out_gen_num].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
+                    listT_future = make_listT_from_arg_T(
+                        B_full, out_gen_num, cond_data.device, cond_data.dtype, float(args.T)
+                    )
+                    target = (
+                        data[:, cond_data.shape[1] : cond_data.shape[1] + out_gen_num]
+                        .to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True)
+                        .to(torch.float32)
+                    )
 
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                         revin_stats = revin_mod.stats(cond_data)
@@ -781,15 +862,21 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             listT=listT_cond,
                             listT_future=listT_future,
                             revin_stats=revin_stats,
+                            sample=False,  # Added sample=False for deterministic evaluation
                         )
                         preds = unwrap_preds(preds_out)
+
+                        # Updated: Move preds (CPU) to target device (GPU) for loss calc
+                        preds = preds.to(device=target.device)
 
                         target_real = revin_mod(target, "denorm", stats=revin_stats)
 
                         if preds.shape[2] >= 2 * target.shape[2]:
                             preds_cmp = preds[:, :, : target.shape[2]]
                         else:
-                            preds_cmp = preds[:, :, : target.shape[2]] if preds.shape[2] >= target.shape[2] else preds
+                            preds_cmp = (
+                                preds[:, :, : target.shape[2]] if preds.shape[2] >= target.shape[2] else preds
+                            )
 
                         loss_eval = F.l1_loss(preds_cmp, target_real)
 
