@@ -540,7 +540,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, L, H, W = x.shape
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
-        
+
         flow_raw, forcing_raw = self.estimator(x_flat)
         dt_scale = (dt_seq / self.dt_ref).view(B, L, 1, 1, 1).to(x.device, x.dtype)
 
@@ -553,38 +553,62 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             forcing = forcing + noise
 
         if last_hidden_in is not None:
+            flow_step = flow[:, 0]
+            forcing_step = forcing[:, 0]
+            C_emb = self.emb_ch
+
+            if last_hidden_in.shape[1] == C_emb:
+                h_base = last_hidden_in
+                h_residual = torch.zeros_like(h_base)
+                cum_flow = torch.zeros(B, 2, H, W, device=x.device, dtype=x.dtype)
+            else:
+                h_base = last_hidden_in[:, :C_emb]
+                h_residual = last_hidden_in[:, C_emb : 2 * C_emb]
+                cum_flow = last_hidden_in[:, 2 * C_emb :]
+
+            cum_flow_new = cum_flow + flow_step
+
+            h_base_warped = warp_image_step(
+                h_base, cum_flow_new, mode=self.interpolation_mode, padding_mode="zeros"
+            )
+
+            h_residual_warped = warp_image_step(
+                h_residual, flow_step, mode=self.interpolation_mode, padding_mode="zeros"
+            )
+            h_residual_new = h_residual_warped + forcing_step
+
+            h_physical_out = h_base_warped + h_residual_new
+
+            h_next = torch.cat([h_base, h_residual_new, cum_flow_new], dim=1)
+
+            out = h_physical_out.unsqueeze(2)
+            out = self.norm(out)
+            out = self.gate(out)
+            return x + out, h_next
+
+        if last_hidden_in is not None:
             h0 = last_hidden_in
         else:
             h0 = torch.zeros(B, self.emb_ch, H, W, device=x.device, dtype=x.dtype)
 
-        if last_hidden_in is not None:
-            flow_step = flow[:, 0] 
-            forcing_step = forcing[:, 0]
-            
-            h_warped = warp_image_step(h0, flow_step, mode=self.interpolation_mode, padding_mode="border")
-            h_new = h_warped + forcing_step
-            
-            out = h_new.unsqueeze(2)
-            out = self.norm(out)
-            out = self.gate(out)
-            return x + out, h_new
-
         h_forced = self.advection_pscan(flow, forcing)
-        
+
         flow_cum = torch.cumsum(flow, dim=1)
         h_natural_list = []
         for t in range(L):
             flow_t = flow_cum[:, t]
-            h_nat_t = warp_image_step(h0, flow_t, mode=self.interpolation_mode, padding_mode="border")
+            h_nat_t = warp_image_step(
+                h0, flow_t, mode=self.interpolation_mode, padding_mode="zeros"
+            )
             h_natural_list.append(h_nat_t)
         h_natural = torch.stack(h_natural_list, dim=1)
-        
+
         h_seq = h_forced + h_natural
-        
+
         h_seq_perm = h_seq.permute(0, 2, 1, 3, 4)
         out = self.norm(h_seq_perm)
         out = self.gate(out)
-        
+
         return x + out, h_seq[:, -1]
 
     def forward(
