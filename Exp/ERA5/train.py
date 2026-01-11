@@ -112,7 +112,6 @@ class Args:
         self.wandb_run_name = ""
         self.wandb_group = ""
         self.wandb_mode = "online"
-        self.train_mode = "p_only"
         self.ffn_ratio = 1.5
         self.ConvType = "dcn"
         self.Arch = "unet"
@@ -555,7 +554,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
     grad_accum_steps = int(args.grad_accum_steps)
     use_no_sync = bool(args.enable_no_sync)
-    train_mode = str(getattr(args, "train_mode", "p_only")).lower()
     dist_mode = str(getattr(args, "dist_mode", "gaussian")).lower()
 
     global_step = int(start_epoch) * len_train_dataloader
@@ -707,7 +705,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/loss_spec": float(spec_loss.detach().item()),
                         "train/lr": float(current_lr),
                         "train/grad_norm": float(grad_norm),
-                        "train/train_mode": str(train_mode),
                     }
                     for k, v in _LRU_GATE_MEAN.items():
                         g_key = f"train/gate_{k}"
