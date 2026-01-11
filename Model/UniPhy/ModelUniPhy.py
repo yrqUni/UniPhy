@@ -1122,7 +1122,7 @@ class UniPhy(nn.Module):
                 elif p.dim() > 1:
                     nn.init.xavier_uniform_(p)
 
-    def forward(
+   def forward(
         self,
         x: torch.Tensor,
         mode: str = "p",
@@ -1131,6 +1131,7 @@ class UniPhy(nn.Module):
         listT_future: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         revin_stats: Optional[RevINStats] = None,
+        sample: bool = False,
     ):
         if mode == "p":
             stats = revin_stats if revin_stats is not None else self.revin.stats(x)
@@ -1139,6 +1140,7 @@ class UniPhy(nn.Module):
             x_hid, last_hidden_outs = self.uniphy_model(x_emb, listT=listT)
             out = self.decoder(x_hid)
             out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
+
             if str(self.decoder.dist_mode).lower() == "gaussian":
                 mu, sigma = torch.chunk(out_tensor, 2, dim=2)
                 if mu.size(2) == self.revin.num_features:
@@ -1154,49 +1156,67 @@ class UniPhy(nn.Module):
 
         B = x.size(0)
         listT0 = torch.ones(B, x.size(1), device=x.device, dtype=x.dtype) if listT is None else listT
-
-        stats = revin_stats if revin_stats is not None else self.revin.stats(x)
-
+        cond_stats = revin_stats if revin_stats is not None else self.revin.stats(x)
         out_list: List[torch.Tensor] = []
-        x_norm = self.revin(x, "norm", stats=stats)
+
+        x_norm = self.revin(x, "norm", stats=cond_stats)
         x_emb = self.embedding(x_norm)
         x_hidden, last_hidden_outs = self.uniphy_model(x_emb, listT=listT0)
         x_dec0 = self.decoder(x_hidden)
+
         x_step_dist = x_dec0.permute(0, 2, 1, 3, 4).contiguous()
         x_step_dist = x_step_dist[:, -1:, :, :, :]
 
         dist_mode = str(self.decoder.dist_mode).lower()
+
         if dist_mode in ["gaussian", "laplace"]:
             out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
+
+            if cond_stats.mean.ndim == 5 and cond_stats.mean.size(2) > 1:
+                curr_mean = cond_stats.mean[:, :, -1:, :, :]
+                curr_std = cond_stats.stdev[:, :, -1:, :, :]
+            else:
+                curr_mean = cond_stats.mean
+                curr_std = cond_stats.stdev
+
             if mu.size(2) == self.revin.num_features:
-                mu_denorm = self.revin(mu, "denorm", stats=stats)
-                scale_denorm = scale * stats.stdev
+                mu_denorm = mu * curr_std + curr_mean
+                scale_denorm = scale * curr_std
             else:
                 mu_denorm = mu
                 scale_denorm = scale
-            out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2))
-            x_step_mean = mu_denorm
+
+            out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2).cpu())
+
+            if sample:
+                epsilon = torch.randn_like(mu_denorm)
+                curr_x_phys = mu_denorm + scale_denorm * epsilon
+            else:
+                curr_x_phys = mu_denorm
         else:
-            out_list.append(x_step_dist)
-            x_step_mean = x_step_dist[:, :, : self.revin.num_features] if x_step_dist.size(2) >= self.revin.num_features else x_step_dist
+            out_list.append(x_step_dist.cpu())
+            curr_x_phys = x_step_dist[:, :, : self.revin.num_features]
 
         future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype) if listT_future is None else listT_future
+
         for t in range(int(out_gen_num) - 1):
             dt = future[:, t : t + 1]
-            curr_x = x_step_mean
-            if curr_x.shape[1] != 1:
-                curr_x = curr_x[:, -1:, :, :, :]
-            
-            if curr_x.size(2) == self.revin.num_features:
-                x_step_norm = self.revin(curr_x, "norm", stats=stats)
+            if curr_x_phys.shape[1] != 1:
+                curr_x_phys = curr_x_phys[:, -1:, :, :, :]
+
+            step_stats = self.revin.stats(curr_x_phys)
+
+            if curr_x_phys.size(2) == self.revin.num_features:
+                x_step_norm = self.revin(curr_x_phys, "norm", stats=step_stats)
             else:
-                x_step_norm = curr_x
+                x_step_norm = curr_x_phys
 
             x_in = self.embedding(x_step_norm)
             x_hidden, last_hidden_outs = self.uniphy_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt)
             x_dec = self.decoder(x_hidden)
+
             x_step_dist = x_dec.permute(0, 2, 1, 3, 4).contiguous()
             x_step_dist = x_step_dist[:, -1:, :, :, :]
 
@@ -1204,17 +1224,24 @@ class UniPhy(nn.Module):
                 out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
                 mu = x_step_dist[:, :, :out_ch, :, :]
                 scale = x_step_dist[:, :, out_ch:, :, :]
+
                 if mu.size(2) == self.revin.num_features:
-                    mu_denorm = self.revin(mu, "denorm", stats=stats)
-                    scale_denorm = scale * stats.stdev
+                    mu_denorm = self.revin(mu, "denorm", stats=step_stats)
+                    scale_denorm = scale * step_stats.stdev
                 else:
                     mu_denorm = mu
                     scale_denorm = scale
-                out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2))
-                x_step_mean = mu_denorm
+
+                out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2).cpu())
+
+                if sample:
+                    epsilon = torch.randn_like(mu_denorm)
+                    curr_x_phys = mu_denorm + scale_denorm * epsilon
+                else:
+                    curr_x_phys = mu_denorm
             else:
-                out_list.append(x_step_dist)
-                x_step_mean = x_step_dist[:, :, : self.revin.num_features] if x_step_dist.size(2) >= self.revin.num_features else x_step_dist
+                out_list.append(x_step_dist.cpu())
+                curr_x_phys = x_step_dist[:, :, : self.revin.num_features]
 
         return torch.cat(out_list, dim=1), last_hidden_outs
 
