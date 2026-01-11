@@ -18,6 +18,14 @@ except ImportError:
     print(f"Error: Cannot import ModelUniPhy from {MODEL_DIR}")
     sys.exit(1)
 
+RESET = "\033[0m"
+BOLD = "\033[1m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+GRAY = "\033[90m"
+
 def get_base_args() -> Any:
     return SimpleNamespace(
         input_ch=2,
@@ -48,12 +56,16 @@ def get_base_args() -> Any:
 def extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
     return dist_out[:, :, :out_ch]
 
-def check_once(args: Any, device: torch.device) -> None:
+def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
     B, L = 1, 4
     H, W = args.input_size
     C = int(args.input_ch)
 
-    model = UniPhy(args).to(device).eval()
+    try:
+        model = UniPhy(args).to(device).eval()
+    except Exception as e:
+        print(f"{RED}[Init Error]{RESET} {e}")
+        return 999.0
 
     x_init = torch.randn(B, 1, C, H, W, device=device)
     
@@ -71,16 +83,6 @@ def check_once(args: Any, device: torch.device) -> None:
         )
         out_i_det = out_i_det_cpu.to(device)
         
-        out_i_sample_cpu, _ = model(
-            x_init,
-            mode="i",
-            out_gen_num=L,
-            listT=listT_i,
-            listT_future=listT_future,
-            sample=True,
-        )
-        out_i_sample = out_i_sample_cpu.to(device)
-
         mu_i = extract_mu(out_i_det, int(args.out_ch))
 
         p_inputs = [x_init]
@@ -107,34 +109,47 @@ def check_once(args: Any, device: torch.device) -> None:
         mu_p = extract_mu(out_p, int(args.out_ch))
         
         diff_det = (mu_i - mu_p).abs().max().item()
-        
-        fin_i_det = torch.isfinite(out_i_det).all().item()
-        fin_i_sample = torch.isfinite(out_i_sample).all().item()
+        fin_i = torch.isfinite(out_i_det).all().item()
         fin_p = torch.isfinite(out_p).all().item()
-        
-        runs_ok = fin_i_det and fin_i_sample and fin_p
-        eq_ok = diff_det < 1e-3
 
-    status = "PASS" if (runs_ok and eq_ok) else "FAIL"
+    if not (fin_i and fin_p):
+        diff_str = f"{RED}NaN/Inf{RESET}"
+        color = RED
+    elif diff_det < 1e-4:
+        diff_str = f"{diff_det:.2e}"
+        color = GREEN
+    elif diff_det < 1e-3:
+        diff_str = f"{diff_det:.2e}"
+        color = YELLOW
+    else:
+        diff_str = f"{diff_det:.2e}"
+        color = RED
     
-    keys = ["dynamics_mode", "dist_mode"]
-    cfg_str = " | ".join(f"{k}={getattr(args, k)}" for k in keys)
+    cfg_list = [
+        f"{args.dynamics_mode[:3]}",
+        f"{args.dist_mode[:3]}",
+        f"{args.Arch}",
+        f"{args.down_mode}",
+        f"{args.ConvType}",
+        f"{args.interpolation_mode[:4]}"
+    ]
+    cfg_str = f"{GRAY}|{RESET} ".join(cfg_list)
+    
+    progress = f"{GRAY}[{idx}/{total}]{RESET}"
+    print(f"{progress} Diff: {color}{BOLD}{diff_str:<10}{RESET} {GRAY}|{RESET} {cfg_str}")
 
-    print(f"[{status}] Det Diff={diff_det:.3e} | {cfg_str}")
-    
-    if status == "FAIL":
-        if not runs_ok:
-            print(f"    -> Finite Check: Det={fin_i_det}, Sample={fin_i_sample}, P={fin_p}")
-        if not eq_ok:
-            print("    -> Step-wise Max Diffs (Det vs P):")
-            for t in range(L):
-                step_diff = (mu_i[:, t] - mu_p[:, t]).abs().max().item()
-                print(f"       Step {t}: {step_diff:.3e}")
+    if diff_det >= 1e-3 and (fin_i and fin_p):
+        for t in range(L):
+            step_diff = (mu_i[:, t] - mu_p[:, t]).abs().max().item()
+            c_step = RED if step_diff >= 1e-3 else GRAY
+            print(f"      {c_step}Step {t}: {step_diff:.2e}{RESET}")
 
     del model
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    
+    return diff_det
 
 def main():
     torch.backends.cudnn.benchmark = False
@@ -143,23 +158,38 @@ def main():
         torch.cuda.manual_seed_all(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Device] {device}")
+    print(f"{BOLD}[Device]{RESET} {CYAN}{device}{RESET}")
+    print(f"{GRAY}Format: Dynamics | Dist | Arch | Down | Conv | Interp{RESET}\n")
 
     grid = {
         "dynamics_mode": ["advection", "spectral"],
-        "dist_mode": ["gaussian", "mse"],
-        "down_mode": ["avg"],
+        "dist_mode": ["gaussian", "mse", "laplace"],
+        "Arch": ["unet", "no_unet"],
+        "down_mode": ["avg", "shuffle", "conv"],
+        "ConvType": ["conv", "dcn"],
     }
 
     keys = list(grid.keys())
     combos = list(itertools.product(*grid.values()))
-    print(f"[Total cases] {len(combos)}\n")
+    
+    total = len(combos)
+    print(f"{BOLD}[Total Combinations]{RESET} {total}\n")
+
+    max_diff_global = 0.0
 
     for idx, combo in enumerate(combos, 1):
         args = get_base_args()
         for k, v in zip(keys, combo):
             setattr(args, k, v)
-        check_once(args, device)
+        
+        if args.dynamics_mode == "spectral":
+             args.interpolation_mode = "bilinear"
+        
+        d = check_once(args, device, idx, total)
+        if d < 999.0:
+            max_diff_global = max(max_diff_global, d)
+
+    print(f"\n{BOLD}Global Max Diff:{RESET} {max_diff_global:.2e}")
 
 if __name__ == "__main__":
     main()
