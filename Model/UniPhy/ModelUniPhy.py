@@ -1112,7 +1112,7 @@ class UniPhy(nn.Module):
         self.decoder = ProbabilisticDecoder(out_ch, emb_ch, dist_mode, hidden_factor)
         self.revin = RevIN(input_ch, affine=True)
 
-        skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion", "dct_matrix", "grid_embed", "sobel"]
+        skip_contains = ["norm", "params_log", "prior", "post_ifft", "forcing", "dispersion", "dct_matrix", "grid_embed", "sobel", "revin"]
         with torch.no_grad():
             for n, p in self.named_parameters():
                 if any(tok in n for tok in skip_contains):
@@ -1173,16 +1173,16 @@ class UniPhy(nn.Module):
             out_ch = int(getattr(self.args, "out_ch", x_step_dist.size(2) // 2))
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
-
+            
             warmup_stats = cond_stats
-
+            
             if mu.size(2) == self.revin.num_features:
                 mu_denorm = self.revin(mu, "denorm", stats=warmup_stats)
                 scale_denorm = scale * warmup_stats.stdev
             else:
                 mu_denorm = mu
                 scale_denorm = scale
-
+            
             out_list.append(torch.cat([mu_denorm, scale_denorm], dim=2).cpu())
 
             if sample:
