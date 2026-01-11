@@ -101,6 +101,7 @@ def check_once(args: Any, device: torch.device) -> None:
             x_p,
             mode="p",
             listT=listT_p,
+            revin_stats=None, 
         )
 
         mu_p = extract_mu(out_p, int(args.out_ch))
