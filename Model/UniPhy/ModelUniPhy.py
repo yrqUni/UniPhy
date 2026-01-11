@@ -1174,14 +1174,8 @@ class UniPhy(nn.Module):
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
 
-            if cond_stats.mean.ndim == 5 and cond_stats.mean.size(2) > 1:
-                curr_mean = cond_stats.mean[:, :, -1:, :, :]
-                curr_std = cond_stats.stdev[:, :, -1:, :, :]
-            else:
-                curr_mean = cond_stats.mean
-                curr_std = cond_stats.stdev
-            
-            warmup_stats = RevINStats(mean=curr_mean, stdev=curr_std)
+            # Removed incorrect slicing logic
+            warmup_stats = cond_stats
 
             if mu.size(2) == self.revin.num_features:
                 mu_denorm = self.revin(mu, "denorm", stats=warmup_stats)
@@ -1198,8 +1192,14 @@ class UniPhy(nn.Module):
             else:
                 curr_x_phys = mu_denorm
         else:
-            out_list.append(x_step_dist.cpu())
-            curr_x_phys = x_step_dist[:, :, : self.revin.num_features]
+            # Added missing denorm for MSE mode
+            if x_step_dist.size(2) == self.revin.num_features:
+                 x_step_denorm = self.revin(x_step_dist, "denorm", stats=cond_stats)
+            else:
+                 x_step_denorm = x_step_dist
+            
+            out_list.append(x_step_denorm.cpu())
+            curr_x_phys = x_step_denorm[:, :, : self.revin.num_features]
 
         future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype) if listT_future is None else listT_future
 
@@ -1242,8 +1242,14 @@ class UniPhy(nn.Module):
                 else:
                     curr_x_phys = mu_denorm
             else:
-                out_list.append(x_step_dist.cpu())
-                curr_x_phys = x_step_dist[:, :, : self.revin.num_features]
+                 # Added missing denorm for MSE mode loop
+                if x_step_dist.size(2) == self.revin.num_features:
+                     x_step_denorm = self.revin(x_step_dist, "denorm", stats=step_stats)
+                else:
+                     x_step_denorm = x_step_dist
+                
+                out_list.append(x_step_denorm.cpu())
+                curr_x_phys = x_step_denorm[:, :, : self.revin.num_features]
 
         return torch.cat(out_list, dim=1), last_hidden_outs
 
