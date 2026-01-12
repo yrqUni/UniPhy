@@ -19,8 +19,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.append("/nfs/ConvLRU/Model/UniPhy")
-sys.path.append("/nfs/ConvLRU/Exp/ERA5")
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
+sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhy
