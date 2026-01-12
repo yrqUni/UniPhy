@@ -629,29 +629,22 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     revin_stats = revin_mod.stats(x)
 
-                    preds_out = model(x, mode="p", listT=listT, revin_stats=revin_stats)
+                    preds_out = model(x, mode="p", listT=listT, revin_stats=revin_stats, return_norm=True)
                     preds = unwrap_preds(preds_out)
 
                     C_gt = target.shape[2]
-                    target_real = revin_mod(target, "denorm", stats=revin_stats)
+                    target_norm = revin_mod(target, "norm", stats=revin_stats)
 
                     if dist_mode == "gaussian":
-                        loss_main = gaussian_nll_loss_weighted(preds, target_real)
+                        loss_main = gaussian_nll_loss_weighted(preds, target_norm)
                         p_det = preds[:, :, :C_gt]
                     elif dist_mode == "laplace":
                         mu = preds[:, :, :C_gt]
                         b = preds[:, :, C_gt:]
-                        mu_denorm = (
-                            revin_mod(mu, "denorm", stats=revin_stats)
-                            if mu.shape[2] == revin_mod.num_features
-                            else mu
-                        )
-                        b_denorm = b * revin_stats.stdev if b.shape[2] == revin_mod.num_features else b
-                        preds_denorm = torch.cat([mu_denorm, b_denorm], dim=2)
-                        loss_main = laplace_nll_loss_weighted(preds_denorm, target_real)
-                        p_det = mu_denorm
+                        loss_main = laplace_nll_loss_weighted(preds, target_norm)
+                        p_det = mu
                     else:
-                        loss_main = latitude_weighted_l1(preds, target_real)
+                        loss_main = latitude_weighted_l1(preds, target_norm)
                         p_det = preds[:, :, :C_gt] if preds.shape[2] >= C_gt else preds
 
                     loss = torch.tensor(0.0, device=x.device)
@@ -660,12 +653,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                     gdl_loss = torch.tensor(0.0, device=x.device)
                     if "gdl" in args.loss and should_compute("gdl", global_step + 1, args):
-                        gdl_loss = gradient_difference_loss(p_det, target_real)
+                        gdl_loss = gradient_difference_loss(p_det, target_norm)
                         loss = loss + 0.5 * gdl_loss
 
                     spec_loss = torch.tensor(0.0, device=x.device)
                     if "spec" in args.loss and should_compute("spec", global_step + 1, args):
-                        spec_loss = spectral_loss(p_det, target_real)
+                        spec_loss = spectral_loss(p_det, target_norm)
                         loss = loss + 0.1 * spec_loss
 
                     if isinstance(model, DDP):
@@ -698,7 +691,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     gdl_loss,
                     spec_loss,
                     p_det,
-                    target_real,
+                    target_norm,
                 )
                 continue
 
@@ -723,7 +716,9 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             if is_log_step or is_wandb_step:
                 with torch.no_grad():
-                    metric_l1 = F.l1_loss(p_det, target_real)
+                    p_det_real = revin_mod(p_det, "denorm", stats=revin_stats)
+                    target_real = target
+                    metric_l1 = F.l1_loss(p_det_real, target_real)
                     loss_tensor = loss.detach()
                     l1_tensor = metric_l1.detach()
                     dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -793,7 +788,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 gdl_loss,
                 spec_loss,
                 p_det,
-                target_real,
+                target_norm,
             )
             if (train_step % 50) == 0:
                 gc.collect()
@@ -861,13 +856,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             listT=listT_cond,
                             listT_future=listT_future,
                             revin_stats=revin_stats,
-                            sample=False, 
+                            sample=False,
                         )
                         preds = unwrap_preds(preds_out)
 
                         preds = preds.to(device=target.device)
 
-                        target_real = revin_mod(target, "denorm", stats=revin_stats)
+                        target_real = target
 
                         if preds.shape[2] >= 2 * target.shape[2]:
                             preds_cmp = preds[:, :, : target.shape[2]]
