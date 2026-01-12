@@ -19,7 +19,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Adjust paths as per your environment
 sys.path.append("/nfs/ConvLRU/Model/UniPhy")
 sys.path.append("/nfs/ConvLRU/Exp/ERA5")
 
@@ -862,11 +861,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             listT=listT_cond,
                             listT_future=listT_future,
                             revin_stats=revin_stats,
-                            sample=False,  # Added sample=False for deterministic evaluation
+                            sample=False, 
                         )
                         preds = unwrap_preds(preds_out)
 
-                        # Updated: Move preds (CPU) to target device (GPU) for loss calc
                         preds = preds.to(device=target.device)
 
                         target_real = revin_mod(target, "denorm", stats=revin_stats)
