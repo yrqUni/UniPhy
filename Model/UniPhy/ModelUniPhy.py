@@ -256,7 +256,10 @@ class LowFreqSpectralMixer(nn.Module):
 
         pad_y = 4 
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W).float()
-        x_padded = F.pad(x_flat, (0, 0, pad_y, pad_y), mode="reflect")
+        if x_flat.size(2) <= pad_y:
+            x_padded = F.pad(x_flat, (0, 0, pad_y, pad_y), mode='replicate')
+        else:
+            x_padded = F.pad(x_flat, (0, 0, pad_y, pad_y), mode='reflect')
         H_pad = H + 2 * pad_y
 
         xf = torch.fft.rfft2(x_padded, norm="ortho")
