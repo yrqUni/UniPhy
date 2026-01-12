@@ -463,7 +463,7 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
             pscan_use_residual = kwargs.get("pscan_use_residual", True)
             pscan_chunk_size = kwargs.get("pscan_chunk_size", 32)
             
-            self.advection_pscan = GridSamplePScan(
+            self.advection_pscan = GridSample(
                 mode=self.interpolation_mode,
                 channels=self.emb_ch,
                 use_decay=pscan_use_decay,
