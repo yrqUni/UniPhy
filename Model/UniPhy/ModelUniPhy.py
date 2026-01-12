@@ -254,17 +254,13 @@ class LowFreqSpectralMixer(nn.Module):
         mh = min(self.modes_h, H)
         mw = min(self.modes_w, W // 2 + 1)
 
-        # [Topology Fix] Y-Axis Mirror Padding to mitigate polar discontinuity
-        # We pad H (dim 2) with reflection to smooth the North-South boundary for FFT
         pad_y = 4 
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W).float()
         x_padded = F.pad(x_flat, (0, 0, pad_y, pad_y), mode="reflect")
         H_pad = H + 2 * pad_y
 
-        # FFT on padded tensor
         xf = torch.fft.rfft2(x_padded, norm="ortho")
         
-        # Select low freq (keeping modes count same)
         xlow = xf[:, :, :mh, :mw]
         
         re = xlow.real
@@ -274,14 +270,11 @@ class LowFreqSpectralMixer(nn.Module):
         re2, im2 = torch.chunk(z, 2, dim=1)
         xlow2 = torch.complex(re2, im2)
         
-        # Reconstruct high freq from padded signal (to keep padding consistent)
         xf2 = xf.clone()
         xf2[:, :, :mh, :mw] = xlow2
         
-        # iFFT back to padded spatial domain
         y_padded = torch.fft.irfft2(xf2, s=(H_pad, W), norm="ortho").to(x.dtype)
         
-        # Crop the padding (remove top/bottom reflections)
         y = y_padded[:, :, pad_y : H_pad - pad_y, :]
         
         y = y.reshape(B, L, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
@@ -1218,8 +1211,6 @@ class UniPhy(nn.Module):
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
             
-            # [Fix] Correct slicing for Time dimension (dim 1)
-            # This ensures we get the stats corresponding to the LAST frame of the input condition
             if cond_stats.mean.ndim == 5 and cond_stats.mean.size(1) > 1:
                 curr_mean = cond_stats.mean[:, -1:, :, :, :]
                 curr_std = cond_stats.stdev[:, -1:, :, :, :]
@@ -1243,7 +1234,6 @@ class UniPhy(nn.Module):
                 curr_x_phys = mu_denorm
         else:
             if x_step_dist.size(2) == self.revin.num_features:
-                 # [Fix] Also apply slicing fix for non-distributional mode
                  if cond_stats.mean.ndim == 5 and cond_stats.mean.size(1) > 1:
                     curr_mean = cond_stats.mean[:, -1:, :, :, :]
                     curr_std = cond_stats.stdev[:, -1:, :, :, :]
