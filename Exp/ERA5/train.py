@@ -105,7 +105,7 @@ class Args:
         self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
-        self.sample_k = 9
+        self.sample_k = 8
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
