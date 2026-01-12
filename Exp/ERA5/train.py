@@ -109,7 +109,7 @@ class Args:
         self.sample_k = 9
         self.use_wandb = True
         self.wandb_project = "ERA5"
-        self.wandb_entity = "ConvLRU"
+        self.wandb_entity = "UniPhy"
         self.wandb_run_name = ""
         self.wandb_group = ""
         self.wandb_mode = "online"
