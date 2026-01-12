@@ -80,8 +80,8 @@ class Args:
         self.lru_rank = 64
         self.down_mode = "shuffle"
         self.dist_mode = "gaussian"
-        self.data_root = "/nfs/ERA5_data/data_norm"
-        self.year_range = [2000, 2021]
+        self.data_root = "/nfs/ERA5_data/data_org"
+        self.year_range = [2017, 2021]
         self.train_data_n_frames = 27
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
