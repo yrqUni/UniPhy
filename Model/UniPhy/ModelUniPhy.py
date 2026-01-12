@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from PScan import pscan
-from GridSamplePScan import GridSamplePScan, warp_common
+from GridSample import GridSample, warp_common
 
 @triton.autotune(
     configs=[

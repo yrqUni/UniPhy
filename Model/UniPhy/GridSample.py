@@ -264,10 +264,16 @@ def fused_pscan_backward_kernel_2d(
             grad_d = grad_curr * wd
 
             grad_img_k_ptr = grad_img_base_ptr + k_abs * stride_img_l
-            tl.atomic_add(grad_img_k_ptr + y0 * stride_img_h + x0 * stride_img_w, grad_a, mask=mask_ops & c_x0 & c_y0)
-            tl.atomic_add(grad_img_k_ptr + y1 * stride_img_h + x0 * stride_img_w, grad_b, mask=mask_ops & c_x0 & c_y1)
-            tl.atomic_add(grad_img_k_ptr + y0 * stride_img_h + x1 * stride_img_w, grad_c, mask=mask_ops & c_x1 & c_y0)
-            tl.atomic_add(grad_img_k_ptr + y1 * stride_img_h + x1 * stride_img_w, grad_d, mask=mask_ops & c_x1 & c_y1)
+            # [TOPOLOGY FIX] Recalculate coordinates for gradients
+            x0_r = (x0 % W + W) % W
+            x1_r = (x1 % W + W) % W
+            y0_c = tl.maximum(0, tl.minimum(H - 1, y0))
+            y1_c = tl.maximum(0, tl.minimum(H - 1, y1))
+
+            tl.atomic_add(grad_img_k_ptr + y0_c * stride_img_h + x0_r * stride_img_w, grad_a, mask=mask_ops)
+            tl.atomic_add(grad_img_k_ptr + y1_c * stride_img_h + x0_r * stride_img_w, grad_b, mask=mask_ops)
+            tl.atomic_add(grad_img_k_ptr + y0_c * stride_img_h + x1_r * stride_img_w, grad_c, mask=mask_ops)
+            tl.atomic_add(grad_img_k_ptr + y1_c * stride_img_h + x1_r * stride_img_w, grad_d, mask=mask_ops)
             
             if grad_flow_ptr is not None:
                 grad_flow_k_ptr = grad_flow_ptr + b_idx * stride_flow_b + k_abs * stride_flow_l
@@ -283,7 +289,7 @@ def fused_pscan_backward_kernel_2d(
                 tl.atomic_add(grad_res_ptr + res_base_grad + 0 * stride_res_c + off_flow_x, grad_gx, mask=mask_ops)
                 tl.atomic_add(grad_res_ptr + res_base_grad + 1 * stride_res_c + off_flow_x, grad_gy, mask=mask_ops)
 
-class TritonPScanFunction(Function):
+class TritonFunction(Function):
     @staticmethod
     def forward(ctx, images, cum_flows, res_flows, mask, decay_dist, decay_val, k_start_offset, t_start_offset):
         ctx.save_for_backward(images, cum_flows, res_flows, mask, decay_dist)
@@ -301,14 +307,18 @@ class TritonPScanFunction(Function):
         grid_dim = (triton.cdiv(H * W, BLOCK_H * BLOCK_W), B * T_chunk * C)
         
         use_res_flow = res_flows is not None
-        r_stride = res_flows.stride() if use_res_flow else (0,0,0,0,0,0)
-        
+        if use_res_flow:
+            s = res_flows.stride()
+            rs_b, rs_t, rs_k, rs_c, rs_h, rs_w = s[0], 0, s[1], s[2], s[3], s[4]
+        else:
+            rs_b, rs_t, rs_k, rs_c, rs_h, rs_w = 0, 0, 0, 0, 0, 0
+
         fused_pscan_forward_kernel_2d[grid_dim](
             images, cum_flows, res_flows, out, mask, decay_dist,
             B, C, L, H, W, T_chunk, K_chunk,
             images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
             cum_flows.stride(0), cum_flows.stride(1), cum_flows.stride(2), cum_flows.stride(3), cum_flows.stride(4),
-            r_stride[0], r_stride[1], r_stride[2], r_stride[3], r_stride[4], r_stride[5],
+            rs_b, rs_t, rs_k, rs_c, rs_h, rs_w,
             out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4),
             k_start_offset, t_start_offset,
             decay_val if decay_val is not None else 0.0,
@@ -341,15 +351,19 @@ class TritonPScanFunction(Function):
         
         grad_output = grad_output.contiguous()
         use_res_flow = res_flows is not None
-        r_stride = res_flows.stride() if use_res_flow else (0,0,0,0,0,0)
-        
+        if use_res_flow:
+            s = res_flows.stride()
+            rs_b, rs_t, rs_k, rs_c, rs_h, rs_w = s[0], 0, s[1], s[2], s[3], s[4]
+        else:
+            rs_b, rs_t, rs_k, rs_c, rs_h, rs_w = 0, 0, 0, 0, 0, 0
+
         fused_pscan_backward_kernel_2d[grid_dim](
             grad_output, images, cum_flows, res_flows, mask, decay_dist,
             grad_images, grad_cum_flows, grad_res_flows,
             B, C, L, H, W, T_chunk, K_chunk,
             images.stride(0), images.stride(1), images.stride(2), images.stride(3), images.stride(4),
             cum_flows.stride(0), cum_flows.stride(1), cum_flows.stride(2), cum_flows.stride(3), cum_flows.stride(4),
-            r_stride[0], r_stride[1], r_stride[2], r_stride[3], r_stride[4], r_stride[5],
+            rs_b, rs_t, rs_k, rs_c, rs_h, rs_w,
             grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3), grad_output.stride(4),
             k_start_offset, t_start_offset,
             decay_val if decay_val is not None else 0.0,
@@ -359,7 +373,7 @@ class TritonPScanFunction(Function):
         
         return grad_images, grad_cum_flows, grad_res_flows, None, None, None, None, None
 
-class GridSamplePScan(nn.Module):
+class GridSample(nn.Module):
     def __init__(self, mode='bilinear', channels=None, use_decay=True, use_residual=True, chunk_size=32, window_size=None):
         super().__init__()
         self.mode = mode
@@ -369,11 +383,11 @@ class GridSamplePScan(nn.Module):
         self.window_size = window_size
         
         if self.use_decay:
-            self.decay_log = nn.Parameter(torch.tensor(-2.0))
+            self.decay_log = nn.Parameter(torch.tensor(-2.0), requires_grad=False)
 
         if self.use_residual:
             self.res_conv = nn.Sequential(
-                nn.Conv2d(channels * 2, channels // 2, kernel_size=1),
+                nn.Conv2d(channels, channels // 2, kernel_size=1),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(channels // 2, 2, kernel_size=1)
             )
@@ -410,6 +424,12 @@ class GridSamplePScan(nn.Module):
                         continue
                 
                 res_flow_chunk = None
+                if self.use_residual:
+                    img_chunk = images[:, k_start:k_end]
+                    b_chk, t_chk, c, h, w = img_chunk.shape
+                    img_flat = img_chunk.reshape(b_chk * t_chk, c, h, w)
+                    res_flat = self.res_conv(img_flat)
+                    res_flow_chunk = res_flat.view(b_chk, t_chk, 2, h, w)
 
                 k_idx = torch.arange(k_start, k_end, device=device).view(1, curr_k_len)
                 mask = (k_idx <= t_idx)
@@ -420,7 +440,7 @@ class GridSamplePScan(nn.Module):
                 mask = mask.float().contiguous().unsqueeze(0).expand(B, -1, -1)
                 dist = (t_idx - k_idx).float().contiguous().unsqueeze(0).expand(B, -1, -1)
 
-                acc_chunk = TritonPScanFunction.apply(images, cum_flows, res_flow_chunk, mask, dist, decay_val, k_start, t_start)
+                acc_chunk = TritonFunction.apply(images, cum_flows, res_flow_chunk, mask, dist, decay_val, k_start, t_start)
                 out_fused[:, t_start:t_end] += acc_chunk
 
         return out_fused
@@ -430,5 +450,5 @@ def pscan_flow(flows, images, mode='bilinear'):
         flows = flows.permute(0, 1, 4, 2, 3)
     
     C = images.shape[2]
-    return GridSamplePScan(mode=mode, channels=C, use_decay=True, use_residual=True, chunk_size=32).to(images.device)(flows, images)
+    return GridSample(mode=mode, channels=C, use_decay=True, use_residual=True, chunk_size=32).to(images.device)(flows, images)
 

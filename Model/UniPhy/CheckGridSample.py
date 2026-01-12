@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from GridSamplePScan import GridSamplePScan
+from GridSample import GridSample
 
 def get_base_grid(B, H, W, device, dtype):
     step_y = 2.0 / H
@@ -57,7 +57,7 @@ def check_strict_logic(device="cuda"):
     flows = torch.stack([shifts_x, shifts_y], dim=2)
     images = torch.randn(B, L, C, H, W, device=device)
 
-    model = GridSamplePScan(mode='nearest', channels=C, use_decay=False, use_residual=False, chunk_size=2).to(device)
+    model = GridSample(mode='nearest', channels=C, use_decay=False, use_residual=False, chunk_size=2).to(device)
 
     with torch.no_grad():
         out_pscan = model(flows, images)
@@ -78,8 +78,8 @@ def check_chunk_consistency(device="cuda"):
     flows = torch.randn(B, L, 2, H, W, device=device)
     images = torch.randn(B, L, C, H, W, device=device)
 
-    model_small_chunk = GridSamplePScan(mode='bilinear', channels=C, use_decay=False, use_residual=False, chunk_size=2).to(device)
-    model_large_chunk = GridSamplePScan(mode='bilinear', channels=C, use_decay=False, use_residual=False, chunk_size=L).to(device)
+    model_small_chunk = GridSample(mode='bilinear', channels=C, use_decay=False, use_residual=False, chunk_size=2).to(device)
+    model_large_chunk = GridSample(mode='bilinear', channels=C, use_decay=False, use_residual=False, chunk_size=L).to(device)
 
     with torch.no_grad():
         out_small = model_small_chunk(flows, images)
@@ -102,7 +102,7 @@ def check_resolution_mismatch(device="cuda"):
     flows = torch.randn(B, L, 2, H_flow, W_flow, device=device)
     images = torch.randn(B, L, C, H, W, device=device)
 
-    model = GridSamplePScan(mode='bilinear', channels=C, use_decay=False, use_residual=False, chunk_size=4).to(device)
+    model = GridSample(mode='bilinear', channels=C, use_decay=False, use_residual=False, chunk_size=4).to(device)
 
     try:
         out = model(flows, images)
@@ -122,7 +122,7 @@ def check_full_module_grad(device="cuda"):
     flows = torch.randn(B, L, 2, H, W, device=device, requires_grad=True)
     images = torch.randn(B, L, C, H, W, device=device, requires_grad=True)
 
-    model = GridSamplePScan(mode='bilinear', channels=C, use_decay=True, use_residual=True, chunk_size=2).to(device)
+    model = GridSample(mode='bilinear', channels=C, use_decay=True, use_residual=True, chunk_size=2).to(device)
     
     out = model(flows, images)
     loss = out.sum()
