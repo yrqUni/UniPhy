@@ -7,6 +7,8 @@ import imageio
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../Model/UniPhy")))
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
+
 try:
     from ModelUniPhy import UniPhy
 except ImportError:
@@ -42,6 +44,12 @@ def get_args():
         interpolation_mode="bilinear",
         spectral_modes_h=12,
         spectral_modes_w=12,
+        conservative_dynamics=False,
+        use_pde_refinement=False,
+        pde_viscosity=1e-3,
+        pscan_use_decay=True,
+        pscan_use_residual=True,
+        pscan_chunk_size=32,
         data_root="/nfs/ERA5_data/data_org",
         year_range=[2017, 2021],
         T=6, 
@@ -104,15 +112,24 @@ def render_frame(t, gt, pred_mean, pred_std, sample1, sample2, channel_idx=0):
     return image
 
 def main():
+    plt.switch_backend('Agg')
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on {device}")
 
-    model = UniPhy(args).to(device)
-
     if os.path.exists(args.checkpoint_path):
         print(f"Loading checkpoint from {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        
+        if 'model_args' in checkpoint:
+            model_args_ckpt = checkpoint['model_args']
+            for k, v in model_args_ckpt.items():
+                if hasattr(args, k):
+                    setattr(args, k, v)
+            print("Updated args from checkpoint.")
+            
+        model = UniPhy(args).to(device)
+        
         state_dict = checkpoint.get('model', checkpoint)
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -121,6 +138,7 @@ def main():
         model.load_state_dict(new_state_dict, strict=False)
     else:
         print(f"Warning: Checkpoint {args.checkpoint_path} not found. Using random weights.")
+        model = UniPhy(args).to(device)
 
     model.eval()
 
