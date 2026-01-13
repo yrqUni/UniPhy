@@ -48,6 +48,12 @@ MODEL_ARG_KEYS = [
     "interpolation_mode",
     "spectral_modes_h",
     "spectral_modes_w",
+    "conservative_dynamics",
+    "use_pde_refinement",
+    "pde_viscosity",
+    "pscan_use_decay",
+    "pscan_use_residual",
+    "pscan_chunk_size",
 ]
 
 
@@ -128,6 +134,12 @@ class Args:
         self.interpolation_mode = "bilinear"
         self.spectral_modes_h = 12
         self.spectral_modes_w = 12
+        self.conservative_dynamics = False
+        self.use_pde_refinement = False
+        self.pde_viscosity = 1e-3
+        self.pscan_use_decay = True
+        self.pscan_use_residual = True
+        self.pscan_chunk_size = 32
         self.check_args()
 
     def check_args(self) -> None:
