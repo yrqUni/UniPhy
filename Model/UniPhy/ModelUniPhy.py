@@ -284,11 +284,13 @@ class LowFreqSpectralMixer(nn.Module):
         return x + self.residual_scale * y
 
 class DynamicsParameterEstimator(nn.Module):
-    def __init__(self, in_ch: int, emb_ch: int, rank: int, w_freq: int):
+    def __init__(self, in_ch: int, emb_ch: int, rank: int, w_freq: int, conservative: bool = False):
         super().__init__()
         self.w_freq = int(w_freq)
         self.emb_ch = int(emb_ch)
         self.rank = int(rank)
+        self.conservative = conservative 
+        
         ch = int(in_ch)
         self.conv = nn.Sequential(
             nn.Conv2d(ch, ch, 3, 1, 1),
@@ -328,18 +330,22 @@ class DynamicsParameterEstimator(nn.Module):
         params = params.permute(0, 2, 3, 1).view(B, 1, self.w_freq, self.emb_ch, self.rank, 3)
         params = params.permute(0, 1, 3, 2, 4, 5).contiguous()
         
-        nu_rate = F.softplus(params[..., 0])
+        if self.conservative:
+            nu_rate = torch.zeros_like(params[..., 0]) 
+        else:
+            nu_rate = F.softplus(params[..., 0])
+
         theta_rate = torch.tanh(params[..., 1]) * math.pi
         sigma = torch.sigmoid(params[..., 2])
         return nu_rate, theta_rate, sigma
 
 class SpectralDynamics(nn.Module):
-    def __init__(self, channels: int, rank: int, w_freq: int):
+    def __init__(self, channels: int, rank: int, w_freq: int, conservative: bool = False):
         super().__init__()
         self.channels = int(channels)
         self.rank = int(rank)
         self.w_freq = int(w_freq)
-        self.estimator = DynamicsParameterEstimator(self.channels, self.channels, self.rank, self.w_freq)
+        self.estimator = DynamicsParameterEstimator(self.channels, self.channels, self.rank, self.w_freq, conservative=conservative)
         self.mixer = SpectralMixer(self.rank)
 
     def compute_params(self, x_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1111,6 +1117,8 @@ class UniPhy(nn.Module):
         dynamics_mode = getattr(args, "dynamics_mode", "spectral")
         interpolation_mode = getattr(args, "interpolation_mode", "bilinear")
         
+        conservative_dynamics = bool(getattr(args, "conservative_dynamics", False))
+
         pscan_use_decay = bool(getattr(args, "pscan_use_decay", True))
         pscan_use_residual = bool(getattr(args, "pscan_use_residual", True))
         pscan_chunk_size = int(getattr(args, "pscan_chunk_size", 32))
@@ -1123,6 +1131,7 @@ class UniPhy(nn.Module):
             "noise_scale": koopman_noise_scale,
             "dynamics_mode": dynamics_mode,
             "interpolation_mode": interpolation_mode,
+            "conservative_dynamics": conservative_dynamics,
             "pscan_use_decay": pscan_use_decay,
             "pscan_use_residual": pscan_use_residual,
             "pscan_chunk_size": pscan_chunk_size,

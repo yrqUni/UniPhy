@@ -51,6 +51,7 @@ def get_base_args() -> Any:
         pscan_use_decay=True,
         pscan_use_residual=True,
         pscan_chunk_size=32,
+        conservative_dynamics=False,
     )
 
 def extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
@@ -125,13 +126,16 @@ def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
         diff_str = f"{diff_det:.2e}"
         color = RED
     
+    cons_str = "Cons" if args.conservative_dynamics else "NonC"
+    
     cfg_list = [
         f"{args.dynamics_mode[:3]}",
         f"{args.dist_mode[:3]}",
         f"{args.Arch}",
         f"{args.down_mode}",
         f"{args.ConvType}",
-        f"{args.interpolation_mode[:4]}"
+        f"{args.interpolation_mode[:4]}",
+        f"{cons_str}"
     ]
     cfg_str = f"{GRAY}|{RESET} ".join(cfg_list)
     
@@ -159,7 +163,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"{BOLD}[Device]{RESET} {CYAN}{device}{RESET}")
-    print(f"{GRAY}Format: Dynamics | Dist | Arch | Down | Conv | Interp{RESET}\n")
+    print(f"{GRAY}Format: Dyn | Dist | Arch | Down | Conv | Interp | Cons{RESET}\n")
 
     grid = {
         "dynamics_mode": ["advection", "spectral"],
@@ -167,11 +171,20 @@ def main():
         "Arch": ["unet", "no_unet"],
         "down_mode": ["avg", "shuffle", "conv"],
         "ConvType": ["conv", "dcn"],
+        "conservative_dynamics": [False, True],
     }
 
     keys = list(grid.keys())
     combos = list(itertools.product(*grid.values()))
     
+    final_combos = []
+    for combo in combos:
+        t = dict(zip(keys, combo))
+        if t["dynamics_mode"] == "advection" and t["conservative_dynamics"]:
+            continue
+        final_combos.append(combo)
+    
+    combos = final_combos
     total = len(combos)
     print(f"{BOLD}[Total Combinations]{RESET} {total}\n")
 
