@@ -264,7 +264,6 @@ def fused_pscan_backward_kernel_2d(
             grad_d = grad_curr * wd
 
             grad_img_k_ptr = grad_img_base_ptr + k_abs * stride_img_l
-            # [TOPOLOGY FIX] Recalculate coordinates for gradients
             x0_r = (x0 % W + W) % W
             x1_r = (x1 % W + W) % W
             y0_c = tl.maximum(0, tl.minimum(H - 1, y0))
