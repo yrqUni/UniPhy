@@ -52,6 +52,8 @@ def get_base_args() -> Any:
         pscan_use_residual=True,
         pscan_chunk_size=32,
         conservative_dynamics=False,
+        use_pde_refinement=False,
+        pde_viscosity=1e-3,
     )
 
 def extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
@@ -127,6 +129,7 @@ def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
         color = RED
     
     cons_str = "Cons" if args.conservative_dynamics else "NonC"
+    pde_str = "PDE" if args.use_pde_refinement else "NoPDE"
     
     cfg_list = [
         f"{args.dynamics_mode[:3]}",
@@ -135,7 +138,8 @@ def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
         f"{args.down_mode}",
         f"{args.ConvType}",
         f"{args.interpolation_mode[:4]}",
-        f"{cons_str}"
+        f"{cons_str}",
+        f"{pde_str}"
     ]
     cfg_str = f"{GRAY}|{RESET} ".join(cfg_list)
     
@@ -163,7 +167,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"{BOLD}[Device]{RESET} {CYAN}{device}{RESET}")
-    print(f"{GRAY}Format: Dyn | Dist | Arch | Down | Conv | Interp | Cons{RESET}\n")
+    print(f"{GRAY}Format: Dyn | Dist | Arch | Down | Conv | Interp | Cons | PDE{RESET}\n")
 
     grid = {
         "dynamics_mode": ["advection", "spectral"],
@@ -172,6 +176,7 @@ def main():
         "down_mode": ["avg", "shuffle", "conv"],
         "ConvType": ["conv", "dcn"],
         "conservative_dynamics": [False, True],
+        "use_pde_refinement": [False, True],
     }
 
     keys = list(grid.keys())

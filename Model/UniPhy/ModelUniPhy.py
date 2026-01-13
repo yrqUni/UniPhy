@@ -11,6 +11,7 @@ import triton.language as tl
 
 from PScan import pscan
 from GridSample import GridSample, warp_common
+from BarotropicVorticitySolver import BarotropicVorticitySolver
 
 @triton.autotune(
     configs=[
@@ -423,7 +424,7 @@ def _match_dt_seq(dt_seq: torch.Tensor, L: int) -> torch.Tensor:
     pad = dt_seq[:, -1:].repeat(1, L - dt_seq.size(1))
     return torch.cat([dt_seq, pad], dim=1)
 
-class ParallelPhysicalRecurrentLayer(nn.Module):
+class PhysicalRecurrentLayer(nn.Module):
     def __init__(
         self,
         emb_ch: int,
@@ -435,6 +436,9 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         noise_scale: float = 0.1,
         dynamics_mode: str = "spectral",
         interpolation_mode: str = "bilinear",
+        conservative_dynamics: bool = False,
+        use_pde_refinement: bool = False,
+        pde_viscosity: float = 1e-3,
         **kwargs
     ):
         super().__init__()
@@ -448,12 +452,31 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         self.noise_scale = float(noise_scale)
         self.dynamics_mode = str(dynamics_mode).lower()
         self.interpolation_mode = str(interpolation_mode).lower()
+        self.conservative_dynamics = bool(conservative_dynamics)
 
         self.norm = SpatialGroupNorm(get_safe_groups(self.emb_ch), self.emb_ch)
         self.gate = EfficientSpatialGating(self.emb_ch)
+        
+        self.use_pde_refinement = use_pde_refinement and (BarotropicVorticitySolver is not None)
+        
+        if self.use_pde_refinement:
+            self.pde_solver = BarotropicVorticitySolver(
+                height=self.H, 
+                width=self.W, 
+                dt=0.1,
+                viscosity=pde_viscosity
+            )
+            self.to_vorticity = nn.Conv2d(self.emb_ch, self.emb_ch, 1)
+            self.from_vorticity = nn.Conv2d(self.emb_ch, self.emb_ch, 1)
+            self.pde_weight = nn.Parameter(torch.tensor(0.01))
 
         if self.dynamics_mode == "spectral":
-            self.koopman = SpectralDynamics(self.emb_ch, self.rank, self.Wf)
+            self.koopman = SpectralDynamics(
+                self.emb_ch, 
+                self.rank, 
+                self.Wf, 
+                conservative=self.conservative_dynamics
+            )
             self.proj_out = nn.Linear(self.rank, 1)
             self.post_ifft_proj = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1)
             self.rank_scale = nn.Parameter(torch.ones(self.rank) * 0.001)
@@ -496,6 +519,28 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
 
     def _init_state_freq(self, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return torch.zeros((B, self.rank, self.emb_ch, self.H, self.Wf), device=device, dtype=torch.complex64)
+
+    def split_frequency(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, C, L, H, W = x.shape
+        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
+        
+        x_freq = torch.fft.rfft2(x_reshaped.float(), norm="ortho")
+        
+        cutoff_h, cutoff_w = H // 8, W // 8
+        
+        mask_low = torch.zeros_like(x_freq)
+        mask_low[:, :, :cutoff_h, :cutoff_w] = 1.0
+        
+        x_low_freq = x_freq * mask_low
+        x_high_freq = x_freq * (1.0 - mask_low)
+        
+        x_low = torch.fft.irfft2(x_low_freq, s=(H, W), norm="ortho").to(x.dtype)
+        x_high = torch.fft.irfft2(x_high_freq, s=(H, W), norm="ortho").to(x.dtype)
+        
+        x_low = x_low.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+        x_high = x_high.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+        
+        return x_low, x_high
 
     def forward_spectral(
         self,
@@ -645,10 +690,28 @@ class ParallelPhysicalRecurrentLayer(nn.Module):
         dt_seq_in = torch.ones(x.size(0), x.size(2), device=x.device, dtype=x.dtype) if listT is None else listT.to(x.device, x.dtype)
         dt_seq = _match_dt_seq(dt_seq_in, x.size(2))
 
-        if self.dynamics_mode == "spectral":
-            return self.forward_spectral(x, last_hidden_in, dt_seq)
+        if self.use_pde_refinement:
+            x_low, x_high = self.split_frequency(x)
+            x_main = x_low 
         else:
-            return self.forward_advection(x, last_hidden_in, dt_seq)
+            x_main = x
+            x_high = None
+
+        if self.dynamics_mode == "spectral":
+            out_main, h_last = self.forward_spectral(x_main, last_hidden_in, dt_seq)
+        else:
+            out_main, h_last = self.forward_advection(x_main, last_hidden_in, dt_seq)
+            
+        if self.use_pde_refinement and x_high is not None:
+            B, C, L, H, W = x_high.shape
+            zeta_in = self.to_vorticity(x_high.permute(0, 2, 1, 3, 4).reshape(B*L, C, H, W))
+            zeta_out = self.pde_solver(zeta_in, steps=1)
+            pde_residual = self.from_vorticity(zeta_out)
+            pde_residual = pde_residual.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+            out = out_main + x_high + self.pde_weight * pde_residual
+            return out, h_last
+        else:
+            return out_main, h_last
 
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, conv_type: str = "conv"):
@@ -701,7 +764,7 @@ class FeedForwardNetwork(nn.Module):
 class UniPhyBlock(nn.Module):
     def __init__(self, emb_ch: int, input_shape: Tuple[int, int], prl_args: Dict[str, Any], ffn_args: Dict[str, Any]):
         super().__init__()
-        self.prl_layer = ParallelPhysicalRecurrentLayer(emb_ch, input_shape, **prl_args)
+        self.prl_layer = PhysicalRecurrentLayer(emb_ch, input_shape, **prl_args)
         self.feed_forward = FeedForwardNetwork(emb_ch, input_shape, **ffn_args)
 
     def forward(
@@ -1118,6 +1181,9 @@ class UniPhy(nn.Module):
         interpolation_mode = getattr(args, "interpolation_mode", "bilinear")
         
         conservative_dynamics = bool(getattr(args, "conservative_dynamics", False))
+        
+        use_pde_refinement = bool(getattr(args, "use_pde_refinement", False))
+        pde_viscosity = float(getattr(args, "pde_viscosity", 1e-3))
 
         pscan_use_decay = bool(getattr(args, "pscan_use_decay", True))
         pscan_use_residual = bool(getattr(args, "pscan_use_residual", True))
@@ -1131,6 +1197,8 @@ class UniPhy(nn.Module):
             "noise_scale": koopman_noise_scale,
             "dynamics_mode": dynamics_mode,
             "interpolation_mode": interpolation_mode,
+            "use_pde_refinement": use_pde_refinement,
+            "pde_viscosity": pde_viscosity,
             "conservative_dynamics": conservative_dynamics,
             "pscan_use_decay": pscan_use_decay,
             "pscan_use_residual": pscan_use_residual,
