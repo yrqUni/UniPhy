@@ -69,6 +69,7 @@ def koopman_A_kernel(
 
     dt = tl.load(dt_ptr + idx_b * stride_dt_b + idx_l * stride_dt_l, mask=mask, other=0.0)
 
+    # Note: nu/theta do not depend on H, so idx_h is skipped in offset calculation
     nu_off = (
         idx_b * stride_nu_b
         + idx_l * stride_nu_l
@@ -705,10 +706,19 @@ class PhysicalRecurrentLayer(nn.Module):
         if self.use_pde_refinement and x_high is not None:
             B, C, L, H, W = x_high.shape
             zeta_in = self.to_vorticity(x_high.permute(0, 2, 1, 3, 4).reshape(B*L, C, H, W))
+            
+            # PDE Evolution
             zeta_out = self.pde_solver(zeta_in, steps=1)
-            pde_residual = self.from_vorticity(zeta_out)
-            pde_residual = pde_residual.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
-            out = out_main + x_high + self.pde_weight * pde_residual
+            
+            # Calculate Increment
+            zeta_inc = zeta_out - zeta_in
+            
+            # Map back increment
+            pde_inc = self.from_vorticity(zeta_inc)
+            pde_inc = pde_inc.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+            
+            # Residual Connection: Main + HighFreq_Input + Weighted_HighFreq_Increment
+            out = out_main + x_high + self.pde_weight * pde_inc
             return out, h_last
         else:
             return out_main, h_last
