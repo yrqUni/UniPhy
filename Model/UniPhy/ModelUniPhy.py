@@ -51,9 +51,9 @@ def koopman_A_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    n = B * L * R * C * H * Wf
-    block_start = pid * BLOCK_SIZE
-    offs = block_start + tl.arange(0, BLOCK_SIZE)
+    n = B.to(tl.int64) * L * R * C * H * Wf
+    block_start = pid.to(tl.int64) * BLOCK_SIZE
+    offs = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offs < n
 
     idx_wf = offs % Wf
@@ -704,7 +704,7 @@ class PhysicalRecurrentLayer(nn.Module):
             
         if self.use_pde_refinement and x_high is not None:
             B, C, L, H, W = x_high.shape
-            zeta_in = self.to_vorticity(x_high.permute(0, 2, 1, 3, 4).reshape(B*L, C, H, W))
+            zeta_in = self.to_vorticity(out_main.permute(0, 2, 1, 3, 4).reshape(B*L, C, H, W))
             
             zeta_out = self.pde_solver(zeta_in, steps=1)
             
