@@ -20,11 +20,14 @@ except ImportError:
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-CYAN = "\033[36m"
-GRAY = "\033[90m"
+DIM = "\033[2m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+WHITE = "\033[97m"
 
 def get_base_args() -> Any:
     return SimpleNamespace(
@@ -59,6 +62,9 @@ def get_base_args() -> Any:
 def extract_mu(dist_out: torch.Tensor, out_ch: int) -> torch.Tensor:
     return dist_out[:, :, :out_ch]
 
+def format_cell(text: str, width: int, color: str = "") -> str:
+    return f"{color}{text:^{width}}{RESET}"
+
 def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
     B, L = 1, 4
     H, W = args.input_size
@@ -85,7 +91,6 @@ def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
             sample=False,
         )
         out_i_det = out_i_det_cpu.to(device)
-        
         mu_i = extract_mu(out_i_det, int(args.out_ch))
 
         p_inputs = [x_init]
@@ -102,12 +107,7 @@ def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
         x_p = torch.cat(p_inputs, dim=1)
         listT_p = torch.ones(B, L, device=device, dtype=x_init.dtype)
 
-        out_p, _ = model(
-            x_p,
-            mode="p",
-            listT=listT_p,
-        )
-
+        out_p, _ = model(x_p, mode="p", listT=listT_p)
         mu_p = extract_mu(out_p, int(args.out_ch))
         
         diff_det = (mu_i - mu_p).abs().max().item()
@@ -115,41 +115,63 @@ def check_once(args: Any, device: torch.device, idx: int, total: int) -> float:
         fin_p = torch.isfinite(out_p).all().item()
 
     if not (fin_i and fin_p):
-        diff_str = f"{RED}NaN/Inf{RESET}"
-        color = RED
+        diff_str = "NaN/Inf"
+        diff_color = RED + BOLD
+        status_icon = "✗"
+    elif diff_det < 1e-6:
+        diff_str = f"{diff_det:.1e}"
+        diff_color = CYAN
+        status_icon = "✓"
     elif diff_det < 1e-4:
-        diff_str = f"{diff_det:.2e}"
-        color = GREEN
-    elif diff_det < 1e-3:
-        diff_str = f"{diff_det:.2e}"
-        color = YELLOW
+        diff_str = f"{diff_det:.1e}"
+        diff_color = GREEN
+        status_icon = "✓"
+    elif diff_det < 1e-2:
+        diff_str = f"{diff_det:.1e}"
+        diff_color = YELLOW
+        status_icon = "~"
+    elif diff_det < 1.0:
+        diff_str = f"{diff_det:.1e}"
+        diff_color = MAGENTA
+        status_icon = "!"
     else:
-        diff_str = f"{diff_det:.2e}"
-        color = RED
-    
+        diff_str = f"{diff_det:.1e}"
+        diff_color = RED
+        status_icon = "✗"
+
     cons_str = "Cons" if args.conservative_dynamics else "NonC"
     pde_str = "PDE" if args.use_pde_refinement else "NoPDE"
+    arch_str = "UNet" if args.Arch == "unet" else "Flat"
     
-    cfg_list = [
-        f"{args.dynamics_mode[:3]}",
-        f"{args.dist_mode[:3]}",
-        f"{args.Arch}",
-        f"{args.down_mode}",
-        f"{args.ConvType}",
-        f"{args.interpolation_mode[:4]}",
-        f"{cons_str}",
-        f"{pde_str}"
+    cols = [
+        (args.dynamics_mode[:3], 5, CYAN),
+        (args.dist_mode[:3], 5, BLUE),
+        (arch_str, 6, WHITE),
+        (args.down_mode[:4], 5, DIM),
+        (args.ConvType[:4], 4, DIM),
+        (args.interpolation_mode[:4], 4, DIM),
+        (cons_str, 4, DIM),
+        (pde_str, 5, DIM),
     ]
-    cfg_str = f"{GRAY}|{RESET} ".join(cfg_list)
     
-    progress = f"{GRAY}[{idx}/{total}]{RESET}"
-    print(f"{progress} Diff: {color}{BOLD}{diff_str:<10}{RESET} {GRAY}|{RESET} {cfg_str}")
+    cfg_str = f"{DIM}│{RESET}".join([format_cell(c[0], c[1], c[2]) for c in cols])
+    
+    print(f"{DIM}[{idx:03d}/{total:03d}]{RESET} {diff_color}{status_icon} {diff_str:<8}{RESET} {DIM}│{RESET} {cfg_str}")
 
-    if diff_det >= 1e-3 and (fin_i and fin_p):
+    if diff_det >= 1e-2 and (fin_i and fin_p):
+        print(f"        {DIM}└─ Step-wise Max Diff:{RESET}")
         for t in range(L):
             step_diff = (mu_i[:, t] - mu_p[:, t]).abs().max().item()
-            c_step = RED if step_diff >= 1e-3 else GRAY
-            print(f"      {c_step}Step {t}: {step_diff:.2e}{RESET}")
+            
+            if step_diff < 1e-4: c_s = DIM
+            elif step_diff < 1e-2: c_s = YELLOW
+            else: c_s = RED
+            
+            bar_len = int(min(step_diff * 10, 10))
+            bar = "█" * bar_len
+            
+            print(f"           {c_s}t={t}: {step_diff:.1e} {bar}{RESET}")
+        print("")
 
     del model
     gc.collect()
@@ -165,8 +187,16 @@ def main():
         torch.cuda.manual_seed_all(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"{BOLD}[Device]{RESET} {CYAN}{device}{RESET}")
-    print(f"{GRAY}Format: Dyn | Dist | Arch | Down | Conv | Interp | Cons | PDE{RESET}\n")
+    print(f"\n{BOLD}UniPhy Consistency Check{RESET}")
+    print(f"{DIM}Device: {device}{RESET}\n")
+
+    header_cols = [
+        ("Dyn", 5), ("Dist", 5), ("Arch", 6), ("Down", 5), 
+        ("Conv", 4), ("Intp", 4), ("Cons", 4), ("PDE", 5)
+    ]
+    header_str = f"{DIM}│{RESET}".join([f"{h[0]:^{h[1]}}" for h in header_cols])
+    print(f"           {BOLD}Diff     {RESET} {DIM}│{RESET} {BOLD}{header_str}{RESET}")
+    print(f"{DIM}{'─'*80}{RESET}")
 
     grid = {
         "dynamics_mode": ["advection", "spectral"],
@@ -190,7 +220,6 @@ def main():
     
     combos = final_combos
     total = len(combos)
-    print(f"{BOLD}[Total Combinations]{RESET} {total}\n")
 
     max_diff_global = 0.0
 
@@ -206,7 +235,8 @@ def main():
         if d < 999.0:
             max_diff_global = max(max_diff_global, d)
 
-    print(f"\n{BOLD}Global Max Diff:{RESET} {max_diff_global:.2e}")
+    print(f"\n{DIM}{'─'*80}{RESET}")
+    print(f"{BOLD}Global Max Diff:{RESET} {max_diff_global:.2e}\n")
 
 if __name__ == "__main__":
     main()
