@@ -1,7 +1,7 @@
 import sys
 import torch
 
-from pscan import pscan
+from PScan import pscan
 
 
 def ref_scan(A, X):
