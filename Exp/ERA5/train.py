@@ -56,7 +56,6 @@ MODEL_ARG_KEYS = [
     "pscan_chunk_size",
 ]
 
-
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -71,9 +70,7 @@ def set_random_seed(seed: int, deterministic: bool = False) -> None:
             torch.backends.cudnn.deterministic = False
             torch.backends.cudnn.benchmark = True
 
-
 set_random_seed(1017, deterministic=False)
-
 
 class Args:
     def __init__(self) -> None:
@@ -86,9 +83,9 @@ class Args:
         self.lru_rank = 64
         self.down_mode = "shuffle"
         self.dist_mode = "gaussian"
-        self.data_root = "/nfs/ERA5_data/data_org"
-        self.year_range = [2017, 2021]
-        self.train_data_n_frames = 27
+        self.data_root = "/nfs/ERA5_data/data_norm"
+        self.year_range = [2000, 2021]
+        self.train_data_n_frames = 21
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ""
@@ -111,7 +108,7 @@ class Args:
         self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
-        self.sample_k = 8
+        self.sample_k = 7
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
@@ -156,7 +153,6 @@ class Args:
         if int(self.grad_accum_steps) < 1:
             raise ValueError("grad_accum_steps must be >= 1")
 
-
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
@@ -168,11 +164,9 @@ def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, lo
     )
     torch.cuda.set_device(local_rank)
 
-
 def cleanup_ddp() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
-
 
 def setup_logging(args: Args) -> None:
     if not dist.is_initialized() or dist.get_rank() != 0:
@@ -188,7 +182,6 @@ def setup_logging(args: Args) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-
 def keep_latest_ckpts(ckpt_dir: str) -> None:
     ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
     if len(ckpt_files) <= 10:
@@ -200,10 +193,8 @@ def keep_latest_ckpts(ckpt_dir: str) -> None:
         except Exception:
             pass
 
-
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
     return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
-
 
 def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], verbose: bool = True) -> None:
     if not model_args_dict:
@@ -218,7 +209,6 @@ def apply_model_args(args_obj: Any, model_args_dict: Optional[Dict[str, Any]], v
                 if dist.is_initialized() and dist.get_rank() == 0:
                     logging.info(msg)
             setattr(args_obj, k, v)
-
 
 def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Optional[Dict[str, Any]]:
     if not os.path.isfile(ckpt_path):
@@ -236,7 +226,6 @@ def load_model_args_from_ckpt(ckpt_path: str, map_location: str = "cpu") -> Opti
     torch.cuda.empty_cache()
     return model_args
 
-
 def get_prefix(keys: List[str]) -> str:
     if not keys:
         return ""
@@ -246,7 +235,6 @@ def get_prefix(keys: List[str]) -> str:
     if key.startswith("module."):
         return "module."
     return ""
-
 
 def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     model_keys = list(model.state_dict().keys())
@@ -262,7 +250,6 @@ def adapt_state_dict_keys(state_dict: Dict[str, torch.Tensor], model: torch.nn.M
             new_k = model_prefix + new_k
         new_state_dict[new_k] = v
     return new_state_dict
-
 
 def save_ckpt(
     model: torch.nn.Module,
@@ -291,7 +278,6 @@ def save_ckpt(
     del state
     gc.collect()
     torch.cuda.empty_cache()
-
 
 def load_ckpt(
     model: torch.nn.Module,
@@ -330,9 +316,7 @@ def load_ckpt(
         logging.info(f"Loaded checkpoint from {ckpt_path} (epoch={epoch}, step={step})")
     return epoch, step
 
-
 _LAT_WEIGHT_CACHE: Dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
-
 
 def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     key = (H, device, dtype)
@@ -345,7 +329,6 @@ def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> to
     _LAT_WEIGHT_CACHE[key] = w
     return w
 
-
 def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     _, _, _, H, _ = preds.shape
     C_gt = targets.size(2)
@@ -356,7 +339,6 @@ def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> to
     nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
     return (nll * w).mean()
 
-
 def laplace_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     _, _, _, H, _ = preds.shape
     C_gt = targets.size(2)
@@ -366,7 +348,6 @@ def laplace_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> tor
     nll = torch.log(2 * b) + torch.abs(targets - mu) / b
     return (nll * w).mean()
 
-
 def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     _, _, C_pred, H, _ = preds.shape
     C_gt = targets.shape[2]
@@ -374,7 +355,6 @@ def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Te
         preds = preds[:, :, :C_gt]
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
-
 
 def gradient_difference_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     diff_y_pred = preds[:, :, :, 1:, :] - preds[:, :, :, :-1, :]
@@ -385,15 +365,12 @@ def gradient_difference_loss(preds: torch.Tensor, targets: torch.Tensor) -> torc
     loss_x = torch.mean(torch.abs(diff_x_pred - diff_x_gt))
     return loss_x + loss_y
 
-
 def spectral_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     fft_pred = torch.fft.rfft2(preds.float(), norm="ortho")
     fft_target = torch.fft.rfft2(targets.float(), norm="ortho")
     return (fft_pred.abs() - fft_target.abs()).abs().mean()
 
-
 _LRU_GATE_MEAN: Dict[Any, float] = {}
-
 
 def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
     model_to_hook = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
@@ -428,13 +405,11 @@ def register_lru_gate_hooks(ddp_model: torch.nn.Module) -> None:
 
             module.register_forward_hook(_hook)
 
-
 def format_gate_means() -> str:
     if not _LRU_GATE_MEAN:
         return "g=NA"
     keys = sorted(_LRU_GATE_MEAN.keys(), key=lambda k: str(k))
     return " ".join([f"g[{k}]={_LRU_GATE_MEAN[k]:.4f}" for k in keys])
-
 
 def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
     total_norm_sq = 0.0
@@ -450,14 +425,12 @@ def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
         max_abs = max(max_abs, g.abs().max().item())
     return float(total_norm_sq**0.5 if cnt > 0 else 0.0), float(max_abs), int(cnt)
 
-
 def make_listT_from_arg_T(
     B: int, L: int, device: torch.device, dtype: torch.dtype, T: Optional[float]
 ) -> Optional[torch.Tensor]:
     if T is None or T < 0:
         return None
     return torch.full((B, L), float(T), device=device, dtype=dtype)
-
 
 def setup_wandb(rank: int, args: Args) -> None:
     if rank != 0 or not bool(getattr(args, "use_wandb", False)):
@@ -473,7 +446,6 @@ def setup_wandb(rank: int, args: Args) -> None:
         wandb_kwargs["mode"] = args.wandb_mode
     wandb.init(**wandb_kwargs)
 
-
 def should_compute(loss_name: str, global_step: int, args: Args) -> bool:
     if loss_name == "gdl":
         return (global_step % int(args.gdl_every)) == 0
@@ -481,16 +453,10 @@ def should_compute(loss_name: str, global_step: int, args: Args) -> bool:
         return (global_step % int(args.spec_every)) == 0
     return True
 
-
 def unwrap_preds(preds_out: Any) -> torch.Tensor:
     if isinstance(preds_out, (tuple, list)):
         return preds_out[0]
     return preds_out
-
-
-def get_revin(ddp_model: torch.nn.Module) -> Any:
-    return ddp_model.module.revin if isinstance(ddp_model, DDP) else ddp_model.revin
-
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
@@ -588,8 +554,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     global_step = int(start_epoch) * len_train_dataloader
     opt.zero_grad(set_to_none=True)
 
-    revin_mod = get_revin(model)
-
     for ep in range(int(start_epoch), int(args.epochs)):
         train_sampler.set_epoch(ep)
         train_iter = tqdm(train_dataloader, desc=f"Epoch {ep + 1}/{args.epochs}") if rank == 0 else train_dataloader
@@ -639,13 +603,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with sync_ctx:
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    revin_stats = revin_mod.stats(x)
 
-                    preds_out = model(x, mode="p", listT=listT, revin_stats=revin_stats, return_norm=True)
+                    preds_out = model(x, mode="p", listT=listT)
                     preds = unwrap_preds(preds_out)
 
                     C_gt = target.shape[2]
-                    target_norm = revin_mod(target, "norm", stats=revin_stats)
+                    target_norm = target
 
                     if dist_mode == "gaussian":
                         loss_main = gaussian_nll_loss_weighted(preds, target_norm)
@@ -738,7 +701,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             if is_log_step or is_wandb_step:
                 with torch.no_grad():
-                    p_det_real = revin_mod(p_det, "denorm", stats=revin_stats)
+                    p_det_real = p_det
                     target_real = target
                     metric_l1 = F.l1_loss(p_det_real, target_real)
                     loss_tensor = loss.detach()
@@ -870,14 +833,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     )
 
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        revin_stats = revin_mod.stats(cond_data)
                         preds_out = model(
                             cond_data,
                             mode="i",
                             out_gen_num=out_gen_num,
                             listT=listT_cond,
                             listT_future=listT_future,
-                            revin_stats=revin_stats,
                             sample=False,
                         )
                         preds = unwrap_preds(preds_out)
@@ -920,7 +881,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if rank == 0 and bool(getattr(args, "use_wandb", False)):
         wandb.finish()
     cleanup_ddp()
-
 
 if __name__ == "__main__":
     args = Args()

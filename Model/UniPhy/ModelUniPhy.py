@@ -1074,10 +1074,13 @@ class ProbabilisticDecoder(nn.Module):
             padding=1,
         )
         
-        self.final_out_ch = self.output_ch * 2
-        if self.dist_mode == "mdn":
+        if self.dist_mode in ["gaussian", "laplace"]:
+            self.final_out_ch = self.output_ch * 2
+        elif self.dist_mode == "mdn":
             self.num_mixtures = 3
             self.final_out_ch = self.output_ch * 3 * self.num_mixtures
+        else:
+            self.final_out_ch = self.output_ch
 
         self.c_out = nn.Conv2d(out_ch_after_up, self.final_out_ch, kernel_size=1)
         self.activation = nn.SiLU()
@@ -1134,15 +1137,15 @@ class UniPhy(nn.Module):
         rank = int(getattr(args, "lru_rank", 64))
         dt_ref = float(getattr(args, "dt_ref", 1.0))
         inj_k = float(getattr(args, "inj_k", 2.0))
-
+        
         koopman_use_noise = bool(getattr(args, "koopman_use_noise", False))
         koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
-
+        
         dynamics_mode = getattr(args, "dynamics_mode", "spectral")
         interpolation_mode = getattr(args, "interpolation_mode", "bilinear")
-
+        
         conservative_dynamics = bool(getattr(args, "conservative_dynamics", False))
-
+        
         use_pde_refinement = bool(getattr(args, "use_pde_refinement", False))
         pde_viscosity = float(getattr(args, "pde_viscosity", 1e-3))
 
@@ -1236,7 +1239,7 @@ class UniPhy(nn.Module):
             out_ch = x_step_dist.size(2) // 2
             mu = x_step_dist[:, :, :out_ch, :, :]
             scale = x_step_dist[:, :, out_ch:, :, :]
-
+            
             out_list.append(x_step_dist.cpu())
 
             if sample:
@@ -1266,7 +1269,7 @@ class UniPhy(nn.Module):
                 out_ch = x_step_dist.size(2) // 2
                 mu = x_step_dist[:, :, :out_ch, :, :]
                 scale = x_step_dist[:, :, out_ch:, :, :]
-
+                
                 out_list.append(x_step_dist.cpu())
 
                 if sample:

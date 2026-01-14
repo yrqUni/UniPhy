@@ -170,8 +170,6 @@ def main():
     input_seq = full_seq[:, :cond_len]
     gt_seq = full_seq[:, cond_len:]
 
-    revin_stats = model.revin.stats(input_seq)
-    
     listT_cond = torch.full((B, cond_len), float(args.dt_ref), device=device)
     listT_future = torch.full((B, pred_len), float(args.dt_ref), device=device)
 
@@ -183,7 +181,6 @@ def main():
             out_gen_num=pred_len,
             listT=listT_cond,
             listT_future=listT_future,
-            revin_stats=revin_stats,
             sample=False
         )
 
@@ -204,7 +201,6 @@ def main():
             out_gen_num=pred_len,
             listT=listT_cond,
             listT_future=listT_future,
-            revin_stats=revin_stats,
             sample=True
         )
     sample1 = out_s1_cpu.numpy()
@@ -219,7 +215,6 @@ def main():
             out_gen_num=pred_len,
             listT=listT_cond,
             listT_future=listT_future,
-            revin_stats=revin_stats,
             sample=True
         )
     sample2 = out_s2_cpu.numpy()
