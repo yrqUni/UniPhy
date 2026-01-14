@@ -1122,7 +1122,7 @@ class RevINStats:
     stdev: torch.Tensor
 
 class RevIN(nn.Module):
-    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
+    def __init__(self, num_features: int, eps: float = 1e-3, affine: bool = True):
         super().__init__()
         self.num_features = int(num_features)
         self.eps = float(eps)
