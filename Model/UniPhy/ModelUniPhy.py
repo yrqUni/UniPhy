@@ -50,9 +50,9 @@ def koopman_A_kernel(
     stride_o_wf,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    n = B.to(tl.int64) * L * R * C * H * Wf
-    block_start = pid.to(tl.int64) * BLOCK_SIZE
+    pid = tl.program_id(0).to(tl.int64)
+    n = B * L * R * C * H * Wf
+    block_start = pid * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offs < n
 
