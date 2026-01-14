@@ -707,14 +707,19 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 )
                 continue
 
-            current_grad_norm = 0.0
+            grad_norm_pre = 0.0
+            grad_norm_post = 0.0
             if float(args.grad_clip) and float(args.grad_clip) > 0:
                 norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
-                current_grad_norm = norm_tensor.item()
+                grad_norm_pre = norm_tensor.item()
+                gn_val, _, _ = get_grad_stats(model)
+                grad_norm_post = gn_val
             else:
                 gn_val, _, _ = get_grad_stats(model)
-                current_grad_norm = gn_val
-
+                grad_norm_pre = gn_val
+                grad_norm_post = gn_val
+            
+            current_grad_norm = grad_norm_pre
             opt.step()
             opt.zero_grad(set_to_none=True)
 
@@ -770,7 +775,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         "train/loss_gdl": float(gdl_loss.detach().item()),
                         "train/loss_spec": float(spec_loss.detach().item()),
                         "train/lr": float(current_lr),
-                        "train/grad_norm": float(current_grad_norm),
+                        "train/grad_norm_pre": float(grad_norm_pre),
+                        "train/grad_norm_post": float(grad_norm_post),
                     }
                     for k, v in _LRU_GATE_MEAN.items():
                         g_key = f"train/gate_{k}"
