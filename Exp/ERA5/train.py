@@ -134,8 +134,8 @@ class Args:
         self.conservative_dynamics = False
         self.use_pde_refinement = False
         self.pde_viscosity = 1e-3
-        self.pscan_use_decay = True
-        self.pscan_use_residual = True
+        self.pscan_use_decay = False
+        self.pscan_use_residual = False
         self.pscan_chunk_size = 32
         self.check_args()
 
