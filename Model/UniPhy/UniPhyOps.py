@@ -23,9 +23,6 @@ class UniPhyLayer(nn.Module):
         self.advection = AdvectionStep(emb_ch)
         self.spectral = SpectralStep(emb_ch, rank=rank, w_freq=W//2+1)
 
-        self.gate_adv = nn.Sequential(nn.Conv2d(emb_ch, emb_ch, 1), nn.Sigmoid())
-        self.gate_spec = nn.Sequential(nn.Conv2d(emb_ch, emb_ch, 1), nn.Sigmoid())
-
         self.stream_fix = StreamFunctionMixing(emb_ch, H, W)
         self.out_proj = nn.Conv2d(emb_ch, emb_ch, 1)
         self.norm = nn.GroupNorm(4, emb_ch)
@@ -39,8 +36,8 @@ class UniPhyLayer(nn.Module):
 
         state = h_prev + x
 
-        h_adv = self.advection(state, dt_flat)
-        h_spec = self.spectral(state, dt_flat)
+        state = self.advection(state, dt_flat)
+        state = self.spectral(state, dt_flat)
 
         h_geo = self.clifford_in(state)
         h_geo_f = torch.fft.rfft2(h_geo, norm='ortho')
@@ -51,12 +48,9 @@ class UniPhyLayer(nn.Module):
         hr, hi = self.hamiltonian(z_real, z_imag, self.h_params_r, self.h_params_i, dt_flat, self.sigma)
         h_geo_next = torch.fft.irfft2(torch.complex(hr, hi), s=(H, W), norm='ortho')
 
-        g_a = self.gate_adv(state)
-        g_s = self.gate_spec(state)
+        state = h_geo_next
+        state_clean = self.stream_fix(state, dt_flat)
 
-        h_fused = g_a * h_adv + g_s * h_spec + h_geo_next
-        h_clean = self.stream_fix(h_fused, dt_flat)
-
-        out = self.norm(self.out_proj(h_clean))
-        return out, h_clean
+        out = self.norm(self.out_proj(state_clean))
+        return out, state_clean
 

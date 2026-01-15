@@ -279,7 +279,7 @@ class SpectralStep(nn.Module):
         
         feat_spec = feat_spec.sum(dim=1)
         
-        x_out_spec = torch.zeros_like(x_spec)
+        x_out_spec = x_spec.clone()
         x_out_spec[:, :, :, :self.w_freq] = feat_spec
         return torch.fft.irfft2(x_out_spec, s=(H, W), norm="ortho")
 
