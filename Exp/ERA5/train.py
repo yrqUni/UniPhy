@@ -86,6 +86,7 @@ class Args:
         self.grad_accum_steps = 1
         self.log_path = "./uniphy_base/logs"
         self.ckpt_dir = "./uniphy_base/ckpt"
+        self.ckpt = ""
         self.ckpt_step = 0.25
         self.log_every = 1
         self.wandb_every = 1
