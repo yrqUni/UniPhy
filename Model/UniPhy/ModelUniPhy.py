@@ -488,17 +488,23 @@ class FeatureEmbedding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
             raise ValueError(f"Embedding expects [B,L,C,H,W], got {tuple(x.shape)}")
-        x = x.permute(0, 2, 1, 3, 4).contiguous()
+        
         B, L, C, H, W = x.shape
         grid = self.grid_embed.expand(B, L, -1, -1, -1).to(x.device, x.dtype)
+        
         x = torch.cat([x, grid], dim=2)
+        
         x_flat = x.reshape(B * L, -1, H, W)
+        
         x_emb = self.patch_embed(x_flat)
         x_emb = self.activation(x_emb)
+        
         _, C_emb, H_emb, W_emb = x_emb.shape
         x = x_emb.view(B, L, C_emb, H_emb, W_emb).permute(0, 2, 1, 3, 4)
+        
         for layer in self.c_hidden:
             x = layer(x)
+            
         x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C_emb, H_emb, W_emb)
         x_out = self.c_out(x_flat)
         x = x_out.view(B, L, -1, H_emb, W_emb).permute(0, 2, 1, 3, 4)
