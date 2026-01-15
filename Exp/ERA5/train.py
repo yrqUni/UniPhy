@@ -34,26 +34,13 @@ MODEL_ARG_KEYS = [
     "hidden_factor",
     "emb_ch",
     "convlru_num_blocks",
-    "lru_rank",
     "down_mode",
     "dist_mode",
     "ffn_ratio",
     "ConvType",
     "Arch",
-    "koopman_use_noise",
-    "koopman_noise_scale",
     "dt_ref",
     "inj_k",
-    "dynamics_mode",
-    "interpolation_mode",
-    "spectral_modes_h",
-    "spectral_modes_w",
-    "conservative_dynamics",
-    "use_pde_refinement",
-    "pde_viscosity",
-    "pscan_use_decay",
-    "pscan_use_residual",
-    "pscan_chunk_size",
 ]
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
@@ -77,68 +64,48 @@ class Args:
         self.input_size = (721, 1440)
         self.input_ch = 30
         self.out_ch = 30
-        self.hidden_factor = (7, 12)
         self.emb_ch = 64
+        self.hidden_factor = (7, 12)
         self.convlru_num_blocks = 6
-        self.lru_rank = 64
+        self.ffn_ratio = 1.5
+        
+        self.Arch = "unet"
+        self.ConvType = "dcn"
         self.down_mode = "shuffle"
         self.dist_mode = "diffusion"
+        
+        self.dt_ref = 1.0
+        self.inj_k = 2.0
+        
+        self.train_batch_size = 1
+        self.eval_batch_size = 1
+        self.lr = 1e-5
+        self.weight_decay = 0.05
+        self.epochs = 128
+        self.grad_clip = 1.0
+        self.grad_accum_steps = 1
+        
+        self.loss = ["lat", "gdl", "spec"]
+        self.gdl_every = 1
+        self.spec_every = 1
+        self.sample_k = 6
+        self.T = 6
+        
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 18
         self.eval_data_n_frames = 4
-        self.eval_sample_num = 1
-        self.ckpt = ""
-        self.train_batch_size = 1
-        self.eval_batch_size = 1
-        self.epochs = 128
-        self.log_path = "./uniphy_base/logs"
-        self.ckpt_dir = "./uniphy_base/ckpt"
-        self.ckpt_step = 0.25
-        self.do_eval = False
-        self.use_tf32 = False
-        self.use_compile = False
-        self.lr = 1e-5
-        self.weight_decay = 0.05
-        self.use_scheduler = False
-        self.loss = ["lat", "gdl", "spec"]
-        self.gdl_every = 1
-        self.spec_every = 1
-        self.T = 6
         self.use_amp = False
         self.amp_dtype = "bf16"
-        self.grad_clip = 1.0
-        self.sample_k = 6
+        
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = ""
-        self.wandb_group = ""
         self.wandb_mode = "online"
-        self.ffn_ratio = 1.5
-        self.ConvType = "dcn"
-        self.Arch = "unet"
-        self.grad_accum_steps = 1
-        self.enable_no_sync = True
-        self.log_every = 1
-        self.wandb_every = 1
-        self.koopman_use_noise = True
-        self.koopman_noise_scale = 1.0
-        self.dt_ref = 1.0
-        self.inj_k = 2.0
-        self.max_velocity = 5.0
-        self.dynamics_mode = "geosym"
-        self.interpolation_mode = "bilinear"
-        self.spectral_modes_h = 12
-        self.spectral_modes_w = 12
-        self.conservative_dynamics = False
-        self.use_pde_refinement = False
-        self.pde_viscosity = 1e-3
-        self.pscan_use_decay = False
-        self.pscan_use_residual = False
-        self.pscan_chunk_size = 32
+        self.log_path = "./uniphy_base/logs"
+        self.ckpt_dir = "./uniphy_base/ckpt"
         self.check_args()
-
+        
     def check_args(self) -> None:
         if bool(self.use_compile):
             if not dist.is_initialized() or dist.get_rank() == 0:

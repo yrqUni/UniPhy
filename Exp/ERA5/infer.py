@@ -9,51 +9,32 @@ from types import SimpleNamespace
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../Model/UniPhy")))
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 
-try:
-    from ModelUniPhy import UniPhy
-except ImportError:
-    print("Error: ModelUniPhy not found.")
-    sys.exit(1)
-
-try:
-    from ERA5 import ERA5_Dataset
-except ImportError:
-    print("Error: ERA5_Dataset not found.")
-    sys.exit(1)
+from ModelUniPhy import UniPhy
+from ERA5 import ERA5_Dataset
 
 def get_args():
     return SimpleNamespace(
         input_size=(721, 1440),
         input_ch=30,
         out_ch=30,
-        hidden_factor=(7, 12),
         emb_ch=64,
+        hidden_factor=(7, 12),
         convlru_num_blocks=6,
-        lru_rank=64,
+        ffn_ratio=1.5,
+        
+        Arch="unet",
+        ConvType="dcn",
         down_mode="shuffle",
         dist_mode="diffusion",
-        ffn_ratio=1.5,
-        ConvType="dcn",
-        Arch="unet",
-        koopman_use_noise=True,
-        koopman_noise_scale=1.0,
+        
         dt_ref=1.0,
         inj_k=2.0,
-        max_velocity=5.0,
-        dynamics_mode="geosym",
-        interpolation_mode="bilinear",
-        spectral_modes_h=12,
-        spectral_modes_w=12,
-        conservative_dynamics=False,
-        use_pde_refinement=False,
-        pde_viscosity=1e-3,
-        pscan_use_decay=True,
-        pscan_use_residual=True,
-        pscan_chunk_size=32,
+        
         data_root="/nfs/ERA5_data/data_org",
         year_range=[2017, 2021],
-        T=6, 
+        T=6,
         forward_steps=4,
+        
         checkpoint_path="./uniphy_base/ckpt/latest.pth",
         save_path="result.gif",
         use_tf32=False,
