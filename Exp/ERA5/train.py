@@ -111,6 +111,7 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
+        self.wandb_run_name = self.ckpt
         self.wandb_mode = "online"
         self.log_path = "./uniphy_base/logs"
         self.ckpt_dir = "./uniphy_base/ckpt"
