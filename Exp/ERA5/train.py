@@ -84,6 +84,11 @@ class Args:
         self.epochs = 128
         self.grad_clip = 1.0
         self.grad_accum_steps = 1
+        self.log_path = "./uniphy_base/logs"
+        self.ckpt_dir = "./uniphy_base/ckpt"
+        self.ckpt_step = 0.25
+        self.log_every = 1
+        self.wandb_every = 1
         
         self.loss = ["lat", "gdl", "spec"]
         self.gdl_every = 1
