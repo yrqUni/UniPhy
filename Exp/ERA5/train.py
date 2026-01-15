@@ -529,7 +529,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             is_last_batch = train_step == len_train_dataloader
             will_step = is_accum_boundary or is_last_batch
 
-            if isinstance(model, DDP) and use_no_sync and not will_step:
+            if isinstance(model, DDP) and not will_step:
                 sync_ctx = model.no_sync()
             else:
                 sync_ctx = contextlib.nullcontext()
