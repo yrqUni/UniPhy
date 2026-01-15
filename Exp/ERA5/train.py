@@ -88,13 +88,14 @@ class Args:
         self.loss = ["lat", "gdl", "spec"]
         self.gdl_every = 1
         self.spec_every = 1
-        self.sample_k = 6
+        self.sample_k = 8
         self.T = 6
         
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 18
+        self.train_data_n_frames = 16
         self.eval_data_n_frames = 4
+        self.use_compile = False
         self.use_amp = False
         self.amp_dtype = "bf16"
         
