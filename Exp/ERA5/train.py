@@ -79,6 +79,7 @@ class Args:
         
         self.train_batch_size = 1
         self.eval_batch_size = 1
+        self.use_scheduler = False
         self.lr = 1e-5
         self.weight_decay = 0.05
         self.epochs = 128
