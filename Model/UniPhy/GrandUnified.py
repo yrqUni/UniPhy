@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 try:
-    from TritonOps import FusedHamiltonian, fused_curl_2d
+    from GrandUnifiedTritonOps import FusedHamiltonian, fused_curl_2d
     TRITON_AVAILABLE = True
 except ImportError:
     print("Notice: TritonOps not found. Running in PyTorch mode.")
