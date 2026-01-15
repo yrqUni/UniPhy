@@ -24,17 +24,19 @@ class QuantumSpectralPropagator(nn.Module):
         z_shifted = torch.fft.ifft2(z_shifted_spec, s=(H, W), norm='ortho')
         return z_shifted
 
-class DiffeomorphicAdvector(nn.Module):
+class StreamFunctionAdvector(nn.Module):
     def __init__(self, in_ch, h, w):
         super().__init__()
+        self.h = h
+        self.w = w
         
-        self.flow_net = nn.Sequential(
+        self.psi_net = nn.Sequential(
             nn.Conv2d(in_ch, 64, 3, padding=1),
             nn.InstanceNorm2d(64),
             nn.SiLU(),
             nn.Conv2d(64, 64, 3, padding=1),
             nn.SiLU(),
-            nn.Conv2d(64, 2, 3, padding=1)
+            nn.Conv2d(64, 1, 3, padding=1)
         )
         
         yy, xx = torch.meshgrid(
@@ -44,14 +46,27 @@ class DiffeomorphicAdvector(nn.Module):
         )
         self.register_buffer('grid_base', torch.stack((xx, yy), dim=-1))
 
+    def compute_curl(self, psi):
+        psi_pad = F.pad(psi, (1, 1, 1, 1), mode='replicate')
+        
+        d_psi_dy = (psi_pad[:, :, 2:, 1:-1] - psi_pad[:, :, :-2, 1:-1]) / 2.0
+        d_psi_dx = (psi_pad[:, :, 1:-1, 2:] - psi_pad[:, :, 1:-1, :-2]) / 2.0
+        
+        u = d_psi_dy
+        v = -d_psi_dx
+        
+        return torch.cat([u, v], dim=1)
+
     def forward(self, z, dt):
         B, C, H, W = z.shape
         
-        flow_field = self.flow_net(z.real) * dt
+        psi = self.psi_net(z.real) * dt
+        
+        velocity = self.compute_curl(psi) 
         
         flow_norm = torch.cat([
-            flow_field[:, 0:1] / (W/2), 
-            flow_field[:, 1:2] / (H/2)
+            velocity[:, 0:1] / (W/2), 
+            velocity[:, 1:2] / (H/2)
         ], dim=1).permute(0, 2, 3, 1)
         
         grid = self.grid_base.unsqueeze(0).expand(B, -1, -1, -1)
@@ -62,7 +77,7 @@ class DiffeomorphicAdvector(nn.Module):
         
         return torch.complex(z_real, z_imag)
 
-class SymplecticManifoldNet(nn.Module):
+class ConservativeSymplecticNet(nn.Module):
     def __init__(self, in_ch, out_ch, hidden_dim=16, h=64, w=128):
         super().__init__()
         
@@ -70,7 +85,7 @@ class SymplecticManifoldNet(nn.Module):
         self.encoder_imag = nn.Conv2d(in_ch, hidden_dim, 1)
         
         self.kinetic_op = QuantumSpectralPropagator(hidden_dim, h, w)
-        self.advection_op = DiffeomorphicAdvector(hidden_dim, h, w)
+        self.advection_op = StreamFunctionAdvector(hidden_dim, h, w)
         
         self.decoder = nn.Sequential(
             nn.Conv2d(hidden_dim * 2, 64, 3, padding=1),
@@ -84,9 +99,7 @@ class SymplecticManifoldNet(nn.Module):
         z = torch.complex(z_real, z_imag)
         
         z_half = self.kinetic_op(z, dt / 2.0)
-        
         z_adv = self.advection_op(z_half, dt)
-        
         z_final_latent = self.kinetic_op(z_adv, dt / 2.0)
         
         z_cat = torch.cat([z_final_latent.real, z_final_latent.imag], dim=1)
