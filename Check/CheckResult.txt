@@ -1,0 +1,43 @@
+Running checks on cuda
+
+Testing: Default Spectral Mode ...
+  [PASS] Forward/Backward successful. Time: 3.3326s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+--------------------------------------------------
+Testing: Spectral + Conservative ...
+  [PASS] Forward/Backward successful. Time: 0.4497s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+--------------------------------------------------
+Testing: Spectral + PDE Refinement ...
+  [PASS] Forward/Backward successful. Time: 0.8861s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+  PDE Refinement active: Checked.
+--------------------------------------------------
+Testing: Advection Mode ...
+  [PASS] Forward/Backward successful. Time: 0.7882s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+--------------------------------------------------
+Testing: GeoSym Mode (Clifford+Hamiltonian+Stream) ...
+  [PASS] Forward/Backward successful. Time: 0.9628s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+  GeoSym-SSM active: Checked.
+--------------------------------------------------
+Testing: GeoSym + PDE Refinement ...
+  [PASS] Forward/Backward successful. Time: 0.9155s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+  PDE Refinement active: Checked.
+  GeoSym-SSM active: Checked.
+--------------------------------------------------
+Testing: Advection + No Noise ...
+  [PASS] Forward/Backward successful. Time: 0.4544s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+--------------------------------------------------
+Testing: Spectral + Noise ...
+  [PASS] Forward/Backward successful. Time: 0.4716s
+  Output shape: torch.Size([2, 3, 2, 32, 64])
+--------------------------------------------------
+Testing: Diffusion Head Mode ...
+  [PASS] Forward/Backward successful. Time: 0.6242s
+  Output shape: torch.Size([2, 1, 3, 32, 64])
+  Diffusion Head active: Checked.
+--------------------------------------------------
