@@ -74,7 +74,7 @@ def render_frame(t, gt, pred_mean, pred_std, sample1, sample2, channel_idx=0):
 
     ax = axes[0, 1]
     im = ax.imshow(pred_mean[channel_idx], cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Prediction Mean (Deterministic/One-Step)")
+    ax.set_title("Prediction Mean")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
@@ -87,19 +87,19 @@ def render_frame(t, gt, pred_mean, pred_std, sample1, sample2, channel_idx=0):
 
     ax = axes[1, 0]
     im = ax.imshow(sample1[channel_idx], cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Stochastic Sample 1 (Diffusion)")
+    ax.set_title("Stochastic Sample 1")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
     ax = axes[1, 1]
     im = ax.imshow(sample2[channel_idx], cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Stochastic Sample 2 (Diffusion)")
+    ax.set_title("Stochastic Sample 2")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
     ax = axes[1, 2]
     im = ax.imshow(pred_std[channel_idx], cmap='viridis')
-    ax.set_title("Spread/Uncertainty")
+    ax.set_title("Uncertainty/Spread")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
@@ -166,52 +166,47 @@ def main():
     listT_cond = torch.full((B, cond_len), float(args.dt_ref), device=device)
     listT_future = torch.full((B, pred_len), float(args.dt_ref), device=device)
 
-    print("Running Deterministic/Mean Inference...")
-    with torch.no_grad():
-        out_det_cpu, _ = model(
-            input_seq,
-            mode="i",
-            out_gen_num=pred_len,
-            listT=listT_cond,
-            listT_future=listT_future,
-            sample=False
-        )
-    out_det = out_det_cpu.numpy()
+    print("Running Inference...")
     
-    if args.dist_mode in ["gaussian", "laplace"] and out_det.shape[2] == args.out_ch * 2:
-        mu_det = out_det[:, :, :args.out_ch]
-        sigma_det = out_det[:, :, args.out_ch:]
+    if args.dist_mode in ["gaussian", "laplace"]:
+        with torch.no_grad():
+            out, _ = model(
+                input_seq,
+                mode="i",
+                out_gen_num=pred_len,
+                listT=listT_cond,
+                listT_future=listT_future
+            )
+        out_cpu = out.cpu().numpy()
+        mu = out_cpu[:, :, :args.out_ch]
+        sigma = out_cpu[:, :, args.out_ch:]
+        
+        mu_det = mu
+        sigma_det = sigma
+        
+        noise1 = np.random.randn(*mu.shape)
+        noise2 = np.random.randn(*mu.shape)
+        sample1 = mu + sigma * noise1
+        sample2 = mu + sigma * noise2
+
     else:
-        mu_det = out_det
-        sigma_det = np.zeros_like(mu_det)
-
-    print("Running Stochastic Sample 1...")
-    with torch.no_grad():
-        out_s1_cpu, _ = model(
-            input_seq,
-            mode="i",
-            out_gen_num=pred_len,
-            listT=listT_cond,
-            listT_future=listT_future,
-            sample=True
-        )
-    sample1 = out_s1_cpu.numpy()
-    if args.dist_mode in ["gaussian", "laplace"] and sample1.shape[2] == args.out_ch * 2:
-         sample1 = sample1[:, :, :args.out_ch]
-
-    print("Running Stochastic Sample 2...")
-    with torch.no_grad():
-        out_s2_cpu, _ = model(
-            input_seq,
-            mode="i",
-            out_gen_num=pred_len,
-            listT=listT_cond,
-            listT_future=listT_future,
-            sample=True
-        )
-    sample2 = out_s2_cpu.numpy()
-    if args.dist_mode in ["gaussian", "laplace"] and sample2.shape[2] == args.out_ch * 2:
-         sample2 = sample2[:, :, :args.out_ch]
+        preds = []
+        for i in range(3):
+            with torch.no_grad():
+                out, _ = model(
+                    input_seq,
+                    mode="i",
+                    out_gen_num=pred_len,
+                    listT=listT_cond,
+                    listT_future=listT_future
+                )
+            preds.append(out.cpu().numpy())
+        
+        preds_stack = np.stack(preds, axis=0)
+        mu_det = np.mean(preds_stack, axis=0)
+        sigma_det = np.std(preds_stack, axis=0)
+        sample1 = preds[0]
+        sample2 = preds[1]
 
     gt_np = gt_seq.cpu().numpy()
     print("Generating GIF...")

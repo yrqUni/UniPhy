@@ -391,11 +391,6 @@ def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, int]:
         max_abs = max(max_abs, g.abs().max().item())
     return float(total_norm_sq**0.5 if cnt > 0 else 0.0), float(max_abs), int(cnt)
 
-def make_listT_from_arg_T(B: int, L: int, device: torch.device, dtype: torch.dtype, T: Optional[float]) -> Optional[torch.Tensor]:
-    if T is None or T < 0:
-        return None
-    return torch.full((B, L), float(T), device=device, dtype=dtype)
-
 def setup_wandb(rank: int, args: Args) -> None:
     if rank != 0 or not bool(getattr(args, "use_wandb", False)):
         return
