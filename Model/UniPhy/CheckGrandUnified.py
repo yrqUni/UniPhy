@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from GrandUnified import CliffordConv2d, StochasticHamiltonianSSM, StreamFunctionMixing, fused_curl_2d, FusedHamiltonian
+from GrandUnified import GrandUnifiedLayer, CliffordConv2d, StreamFunctionMixing, AdvectionStep, SpectralStep, fused_curl_2d, FusedHamiltonian
 
 def check_clifford_conv():
     print("Checking CliffordConv2d...")
@@ -11,25 +11,55 @@ def check_clifford_conv():
     assert out.shape == x.shape
     print("  Pass: Output shape matches input.")
 
-def check_stochastic_hamiltonian_ssm():
-    print("Checking StochasticHamiltonianSSM...")
-    B, C, H, W = 1, 16, 64, 64
-    z = torch.randn(B, C, H, W).cuda()
-    dt = torch.full((B,), 0.1).cuda()
-    model = StochasticHamiltonianSSM(hidden_dim=C, h=H, w=W).cuda()
-    out = model(z, dt)
-    assert out.shape == z.shape
-    print("  Pass: Forward execution successful.")
-
 def check_stream_function_mixing():
     print("Checking StreamFunctionMixing...")
     B, C, H, W = 2, 16, 64, 64
     z = torch.randn(B, C, H, W).cuda()
-    dt = torch.full((B,), 0.1).cuda() 
+    dt = torch.full((B,), 0.1).cuda()
     model = StreamFunctionMixing(in_ch=C, h=H, w=W).cuda()
     out = model(z, dt)
     assert out.shape == z.shape
     print("  Pass: Flow generation and grid sampling successful.")
+
+def check_advection_step():
+    print("Checking AdvectionStep...")
+    B, C, H, W = 2, 16, 64, 64
+    x = torch.randn(B, C, H, W).cuda()
+    dt = torch.full((B,), 0.1).cuda()
+    model = AdvectionStep(in_ch=C).cuda()
+    out = model(x, dt)
+    assert out.shape == x.shape
+    print("  Pass: Advection step successful.")
+
+def check_spectral_step():
+    print("Checking SpectralStep...")
+    B, C, H, W = 2, 16, 64, 64
+    x = torch.randn(B, C, H, W).cuda()
+    dt = torch.full((B,), 0.1).cuda()
+    # Fix: Explicitly pass w_freq = W // 2 + 1 to match RFFT output width
+    model = SpectralStep(in_ch=C, w_freq=W // 2 + 1).cuda()
+    out = model(x, dt)
+    assert out.shape == x.shape
+    print("  Pass: Spectral step successful.")
+
+def check_grand_unified_layer():
+    print("Checking GrandUnifiedLayer (The One)...")
+    B, C, H, W = 2, 16, 64, 64
+    x = torch.randn(B, C, H, W).cuda()
+    h_prev = torch.randn(B, C, H, W).cuda()
+    dt = torch.full((B,), 0.1).cuda()
+    
+    model = GrandUnifiedLayer(emb_ch=C, input_shape=(H, W)).cuda()
+    out, h_next = model(x, h_prev, dt)
+    
+    assert out.shape == x.shape
+    assert h_next.shape == x.shape
+    assert not torch.isnan(out).any()
+    print("  Pass: Forward execution successful.")
+    
+    out_none, h_next_none = model(x, None, dt)
+    assert out_none.shape == x.shape
+    print("  Pass: Forward execution with h_prev=None successful.")
 
 def check_fused_ops():
     print("Checking Low-level Triton Ops...")
@@ -40,7 +70,7 @@ def check_fused_ops():
     assert v.shape == psi.shape
     print("  Pass: Fused Curl 2D.")
 
-    B_ham = 2 
+    B_ham = 2
     C_ham = 16
     H_ham, W_ham = 64, 33
     z_real = torch.randn(B_ham, C_ham, H_ham, W_ham).cuda()
@@ -59,9 +89,11 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.set_default_device('cuda')
         check_clifford_conv()
-        check_stochastic_hamiltonian_ssm()
         check_stream_function_mixing()
+        check_advection_step()
+        check_spectral_step()
         check_fused_ops()
+        check_grand_unified_layer()
         print("\nAll checks passed successfully.")
     else:
         print("CUDA required for Triton kernels. Skipping checks.")
