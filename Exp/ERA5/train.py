@@ -101,6 +101,7 @@ class Args:
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 16
         self.eval_data_n_frames = 4
+        self.eval_sample_num = 1
         self.use_compile = False
         self.use_amp = False
         self.amp_dtype = "bf16"
