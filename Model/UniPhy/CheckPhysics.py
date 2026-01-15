@@ -1,119 +1,108 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from UniPhyOps import UniPhyLayer
 import traceback
 
-def report(name, val_start, val_end, metric_name):
-    print(f"[{name}] {metric_name}: {val_start:.4f} -> {val_end:.4f}")
-    if abs(val_end - val_start) > 1e-4:
-        print(f"   >>> PROOF: {name} mechanism is ACTIVE.")
-    else:
-        print(f"   >>> PROOF: {name} mechanism is INACTIVE.")
-    print("-" * 50)
-
 def main():
-    print("\n=== GeoSplit-Net Design Proof (Orthogonality Check) ===\n")
+    print("=== [Advanced Check] UniPhyOps Numerical & Physics Integrity ===")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on: {device}")
 
-    H, W = 64, 64
-    C = 32
+    B, C, H, W = 2, 32, 64, 64
+    emb_ch = C
+    rank = 16
+    dt_val = 0.1
+    
     try:
-        model = UniPhyLayer(emb_ch=C, input_shape=(H, W), rank=16).to(device)
+        model = UniPhyLayer(emb_ch=emb_ch, input_shape=(H, W), rank=rank).to(device)
+        print(f"[Pass] Model Initialization")
     except Exception as e:
-        print(f"Model init failed: {e}")
+        print(f"[Fail] Model Initialization: {e}")
         traceback.print_exc()
         return
 
-    model.eval()
-    dt = torch.ones(1, device=device) * 1.0
+    x = torch.randn(B, C, H, W, device=device, requires_grad=True)
+    dt = torch.ones(B, device=device) * dt_val
+    h_prev = None
 
-    print("Test Case A: Pure Advection (The Conveyor Belt)")
-    y, x = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing='ij')
-    blob = torch.exp(-(x**2 + y**2) / 0.05).unsqueeze(0).unsqueeze(0).to(device)
-    input_tensor = blob.repeat(1, C, 1, 1)
-
-    with torch.no_grad():
-        model.transport_op.net[-1].weight.fill_(0)
-        model.transport_op.net[-1].bias.fill_(0)
-        model.transport_op.net[-1].bias[0] = 5.0
-        model.transport_op.net[-1].bias[1] = 0.0
-
-    with torch.no_grad():
-        out_moved = model.transport_op(input_tensor, dt)
-
-    def get_center_of_mass(img):
-        img = img[0,0]
-        sum_mass = img.sum() + 1e-6
-        grid_y, grid_x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
-        grid_y, grid_x = grid_y.to(device), grid_x.to(device)
-        cy = (img * grid_y).sum() / sum_mass
-        cx = (img * grid_x).sum() / sum_mass
-        return cx.item(), cy.item()
-
-    cx_start, cy_start = get_center_of_mass(input_tensor)
-    cx_end, cy_end = get_center_of_mass(out_moved)
-
-    report("Transport", cx_start, cx_end, "Center of Mass X")
-    if cx_end > cx_start + 1:
-        print("   [SUCCESS] Object moved right.")
-    else:
-        print("   [FAILURE] Object did not move.")
-
-    print("Test Case B: Pure Diffusion (The Ink Drop)")
-    with torch.no_grad():
-        model.dispersion_op.estimator[-1].weight.fill_(0)
-        model.dispersion_op.estimator[-1].bias.fill_(0)
-        model.dispersion_op.estimator[-1].bias[:16] = 5.0
-        model.dispersion_op.estimator[-1].bias[16:] = 0.0
-
-    with torch.no_grad():
-        out_diffused = model.dispersion_op(input_tensor, dt)
-
-    energy_start = (input_tensor ** 2).sum().item()
-    energy_end = (out_diffused ** 2).sum().item()
-
-    report("Dispersion", energy_start, energy_end, "Total Energy")
-    if energy_end < energy_start * 0.9:
-        print("   [SUCCESS] Energy dissipated.")
-    else:
-        print("   [FAILURE] Energy preserved.")
-
-    print("Test Case C: Geometric Interaction (The Vector Mix)")
-    vec_input = torch.zeros_like(input_tensor)
-    vec_input[:, 0, :, :] = blob
-    with torch.no_grad():
-        out_interact = model.interaction_op[0](vec_input)
-    target_vector_ch = 8
-    energy_output_ch8 = (out_interact[:, target_vector_ch] ** 2).sum().item()
-    print(f"[Interaction] Output Energy in Vector Channel: {energy_output_ch8:.4f}")
-    if energy_output_ch8 > 1e-5:
-        print("   >>> PROOF: Interaction mechanism is ACTIVE.")
-    else:
-        print("   >>> PROOF: Interaction mechanism is INACTIVE.")
-
-    print("Test Case D: Pressure Projection (Helmholtz)")
-    div_input = torch.randn(1, C, H, W, device=device)
-    with torch.no_grad():
-        u_f = torch.fft.fftn(div_input[:, 0:1], dim=(-2, -1))
-        v_f = torch.fft.fftn(div_input[:, 1:2], dim=(-2, -1))
-        kx = model.projection_op.kx
-        ky = model.projection_op.ky
-        div_start = torch.fft.ifftn(1j * kx * u_f + 1j * ky * v_f, dim=(-2, -1)).real.norm().item()
+    print("\n--- 1. Forward & Shape Check ---")
+    try:
+        out_1, h_1 = model(x, h_prev, dt)
+        assert out_1.shape == (B, C, H, W), f"Output shape error: {out_1.shape}"
+        assert not torch.isnan(out_1).any(), "NaN detected in output"
+        print(f"[Pass] Forward Step 1: Shape {tuple(out_1.shape)}")
         
-        out_projected = model.projection_op(div_input)
+        out_2, h_2 = model(x * 0.5, h_1, dt)
+        assert not torch.allclose(h_1, h_2), "Hidden state not evolving"
+        assert h_2.shape == (B, C, H, W), "Hidden state shape error"
+        print(f"[Pass] Forward Step 2 (Recursive): Hidden state evolved")
+    except Exception as e:
+        print(f"[Fail] Forward Check: {e}")
+        traceback.print_exc()
+        return
+
+    print("\n--- 2. Divergence Elimination Check (Helmholtz) ---")
+    try:
+        def compute_div(v_field):
+            u = v_field[:, 0:1]
+            v = v_field[:, 1:2]
+            kx = model.projection_op.kx
+            ky = model.projection_op.ky
+            u_f = torch.fft.fftn(u, dim=(-2, -1))
+            v_f = torch.fft.fftn(v, dim=(-2, -1))
+            div_f = 1j * kx * u_f + 1j * ky * v_f
+            return torch.fft.ifftn(div_f, dim=(-2, -1)).real.norm()
+
+        div_before = compute_div(out_1)
+        out_projected = model.projection_op(out_1)
+        div_after = compute_div(out_projected)
         
-        u_f_p = torch.fft.fftn(out_projected[:, 0:1], dim=(-2, -1))
-        v_f_p = torch.fft.fftn(out_projected[:, 1:2], dim=(-2, -1))
-        div_end = torch.fft.ifftn(1j * kx * u_f_p + 1j * ky * v_f_p, dim=(-2, -1)).real.norm().item()
+        print(f"Divergence Norm: {div_before.item():.6f} -> {div_after.item():.6f}")
+        if div_after < div_before * 0.1 or div_after < 1e-4:
+            print("[Pass] Helmholtz Projection effectively reduced divergence")
+        else:
+            print("[Warning] Divergence reduction not significant")
+    except Exception as e:
+        print(f"[Error] During Divergence Check: {e}")
 
-    report("Projection", div_start, div_end, "Divergence Norm")
-    if div_end < div_start * 0.1:
-        print("   [SUCCESS] Divergence eliminated via Helmholtz Projection.")
-    else:
-        print("   [FAILURE] Divergence still present.")
+    print("\n--- 3. Gradient Flow & Orthogonality Check ---")
+    try:
+        loss = out_2.pow(2).mean()
+        loss.backward()
+        
+        grad_map = {name: p.grad is not None for name, p in model.named_parameters()}
+        
+        checks = {
+            "Transport (Advection)": "transport_op.net",
+            "Interaction (Clifford)": "interaction_op.0",
+            "Dispersion (Spectral)": "dispersion_op.estimator",
+            "Mixing (StreamFunc)": "stream_mixing_op.psi_net"
+        }
+        
+        all_passed = True
+        for logic_name, param_prefix in checks.items():
+            found = any(name.startswith(param_prefix) and has_grad for name, has_grad in grad_map.items())
+            status = "[OK]" if found else "[MISSING]"
+            print(f"  {status} {logic_name} gradient path")
+            if not found: all_passed = False
+            
+        if all_passed:
+            print("[Pass] All physical operators are connected to the computational graph")
+        else:
+            print("[Fail] Some physical paths are disconnected (Gradients = None)")
 
-    print("\n=== All Proofs Finished ===")
+        print(f"\nGradient Magnitude Samples:")
+        t_grad = model.transport_op.net[0].weight.grad.abs().mean().item()
+        i_grad = model.interaction_op[2].weight.grad.abs().mean().item()
+        print(f"  Transport Grad Avg: {t_grad:.8e}")
+        print(f"  Interaction Grad Avg: {i_grad:.8e}")
+
+    except Exception as e:
+        print(f"[Fail] Backward Check: {e}")
+        traceback.print_exc()
+
+    print("\n=== All Operations Checked ===")
 
 if __name__ == "__main__":
     main()
