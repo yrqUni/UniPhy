@@ -483,7 +483,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     amp_dtype = torch.bfloat16 if str(args.amp_dtype).lower() == "bf16" else torch.float16
     use_amp = bool(args.use_amp)
     grad_accum_steps = int(args.grad_accum_steps)
-    use_no_sync = bool(args.enable_no_sync)
     dist_mode = str(getattr(args, "dist_mode", "gaussian")).lower()
 
     global_step = int(start_epoch) * len_train_dataloader
