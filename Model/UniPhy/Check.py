@@ -25,8 +25,6 @@ def main():
         "out_ch": 1,
         "lru_rank": 8,
         "ffn_ratio": 2.0,
-        "koopman_use_noise": True,
-        "koopman_noise_scale": 0.1,
     }
 
     keys, values = zip(*param_grid.items())
@@ -42,31 +40,27 @@ def main():
     for i, params in enumerate(combinations):
         args_dict = {**fixed_args, **params}
         args = SimpleNamespace(**args_dict)
-        
+
         config_str = ", ".join(f"{k}={v}" for k, v in params.items())
         print(f"[{i+1}/{total}] Checking: {config_str}")
 
         try:
             model = UniPhy(args).to(device)
-            
-            B = 2
-            L = 4
+
+            B, L, C = 2, 4, args.input_ch
             H, W = args.input_size
-            C = args.input_ch
-            
-            x = torch.randn(B, C, L, H, W, device=device)
+
+            x = torch.randn(B, L, C, H, W, device=device)
             listT = torch.ones(B, L, device=device) * 0.1
 
             if args.dist_mode == "diffusion":
                 noise = torch.randn(B, L, args.out_ch, H, W, device=device)
-                t = torch.randint(0, 1000, (B * L,), device=device).long()
+                t = torch.randint(0, 100, (B * L,), device=device).long()
                 out_p, _ = model(x, mode='p', listT=listT, x_noisy=noise, t=t)
                 expected_out_ch = args.out_ch
-            
             elif args.dist_mode in ["gaussian", "laplace"]:
                 out_p, _ = model(x, mode='p', listT=listT)
                 expected_out_ch = args.out_ch * 2
-            
             else:
                 out_p, _ = model(x, mode='p', listT=listT)
                 expected_out_ch = args.out_ch
@@ -74,15 +68,15 @@ def main():
             expected_shape = (B, expected_out_ch, L, H, W)
             assert out_p.shape == expected_shape, \
                 f"Train Output shape mismatch: got {out_p.shape}, expected {expected_shape}"
-            
+
             loss = out_p.sum()
             loss.backward()
 
             out_gen_num = 3
             future_T = torch.ones(B, out_gen_num - 1, device=device) * 0.1
-            
+
             out_i, _ = model(x, mode='i', out_gen_num=out_gen_num, listT=listT, listT_future=future_T)
-            
+
             expected_infer_shape = (B, expected_out_ch, out_gen_num, H, W)
             assert out_i.shape == expected_infer_shape, \
                 f"Infer Output shape mismatch: got {out_i.shape}, expected {expected_infer_shape}"
@@ -96,7 +90,7 @@ def main():
             failed += 1
             print("\n!!! Stopping early to allow debugging of the first error !!!")
             sys.exit(1)
-        
+
         finally:
             if 'model' in locals(): del model
             if 'x' in locals(): del x
@@ -108,8 +102,6 @@ def main():
 
     print("-" * 60)
     print(f"Summary: {passed} Passed, {failed} Failed")
-    if failed > 0:
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()
