@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from GridSample import warp_common
 
 @triton.jit
 def fused_hamiltonian_kernel(
@@ -176,7 +175,7 @@ def koopman_A_kernel(
 class CliffordConv2d(nn.Module):
     def __init__(self, dim, kernel_size=3, padding=1):
         super().__init__()
-        self.dim = dim // 4 
+        self.dim = dim // 4
         if self.dim * 4 != dim:
             raise ValueError("Clifford channels must be divisible by 4")
         self.conv_s = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
@@ -222,7 +221,6 @@ class StreamFunctionMixing(nn.Module):
         u = (psi_pad[:, :, 2:, 1:-1] - psi_pad[:, :, :-2, 1:-1]) / 2.0
         v = -(psi_pad[:, :, 1:-1, 2:] - psi_pad[:, :, 1:-1, :-2]) / 2.0
         return u, v
-
 class AdvectionStep(nn.Module):
     def __init__(self, in_ch):
         super().__init__()
@@ -233,12 +231,29 @@ class AdvectionStep(nn.Module):
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+    
+    def get_base_grid(self, B, H, W, device, dtype):
+        step_y = 2.0 / H
+        step_x = 2.0 / W
+        start_y = -1.0 + step_y * 0.5
+        start_x = -1.0 + step_x * 0.5
+        grid_y = torch.linspace(start_y, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
+        grid_x = torch.linspace(start_x, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
+        return grid_y.view(1, H, 1), grid_x.view(1, 1, W)
+
+    def warp_common(self, flow, B, H, W):
+         base_grid_y, base_grid_x = self.get_base_grid(B, H, W, flow.device, flow.dtype)
+         flow_perm = flow.permute(0, 2, 3, 1)
+         final_x = base_grid_x + flow_perm[..., 0]
+         final_y = base_grid_y + flow_perm[..., 1]
+         final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
+         return torch.stack([final_x, final_y], dim=-1)
 
     def forward(self, x, dt):
         B, C, H, W = x.shape
         dt_view = dt.view(B, 1, 1, 1)
         flow = torch.tanh(self.net(x)) * dt_view
-        grid = warp_common(flow, B, H, W)
+        grid = self.warp_common(flow, B, H, W)
         x_adv = F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=False)
         return x_adv
 
@@ -266,60 +281,10 @@ class SpectralStep(nn.Module):
         decay = torch.exp(-nu * dt_view)
         angle = theta * dt_view
         operator = torch.complex(decay * torch.cos(angle), decay * torch.sin(angle))
-        
         feat_spec = x_spec[:, :, :, :self.w_freq]
         feat_spec = feat_spec.unsqueeze(1) * operator
         feat_spec = feat_spec.sum(dim=1)
-        
         x_out_spec = torch.zeros_like(x_spec)
         x_out_spec[:, :, :, :self.w_freq] = feat_spec
         return torch.fft.irfft2(x_out_spec, s=(H, W), norm="ortho")
-
-class GrandUnifiedLayer(nn.Module):
-    def __init__(self, emb_ch, input_shape, rank=32):
-        super().__init__()
-        H, W = input_shape
-        self.emb_ch = emb_ch
-        
-        self.clifford_in = CliffordConv2d(emb_ch, 3, 1)
-        self.hamiltonian = FusedHamiltonian.apply
-        self.h_params_r = nn.Parameter(torch.randn(emb_ch, H, W//2+1) * 0.01)
-        self.h_params_i = nn.Parameter(torch.randn(emb_ch, H, W//2+1) * 0.01)
-        self.sigma = nn.Parameter(torch.tensor(0.02))
-
-        self.advection = AdvectionStep(emb_ch)
-        self.spectral = SpectralStep(emb_ch, rank=rank, w_freq=W//2+1)
-        
-        self.gate_adv = nn.Sequential(nn.Conv2d(emb_ch, emb_ch, 1), nn.Sigmoid())
-        self.gate_spec = nn.Sequential(nn.Conv2d(emb_ch, emb_ch, 1), nn.Sigmoid())
-        
-        self.stream_fix = StreamFunctionMixing(emb_ch, H, W)
-        self.out_proj = nn.Conv2d(emb_ch, emb_ch, 1)
-        self.norm = nn.GroupNorm(4, emb_ch)
-
-    def forward(self, x, h_prev, dt):
-        B, C, H, W = x.shape
-        dt_flat = dt.view(-1)
-        
-        if h_prev is None:
-            h_prev = torch.zeros_like(x)
-        
-        state = h_prev + x
-        
-        h_adv = self.advection(state, dt_flat)
-        h_spec = self.spectral(state, dt_flat)
-        
-        h_geo = self.clifford_in(state)
-        h_geo_f = torch.fft.rfft2(h_geo, norm='ortho')
-        hr, hi = self.hamiltonian(h_geo_f.real, h_geo_f.imag, self.h_params_r, self.h_params_i, dt_flat, self.sigma)
-        h_geo_next = torch.fft.irfft2(torch.complex(hr, hi), s=(H, W), norm='ortho')
-        
-        g_a = self.gate_adv(state)
-        g_s = self.gate_spec(state)
-        
-        h_fused = g_a * h_adv + g_s * h_spec + h_geo_next
-        h_clean = self.stream_fix(h_fused, dt_flat)
-        
-        out = self.norm(self.out_proj(h_clean))
-        return out, h_clean
 

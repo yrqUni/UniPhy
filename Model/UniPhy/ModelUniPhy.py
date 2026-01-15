@@ -1,72 +1,15 @@
 import math
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-import triton
-import triton.language as tl
 
-from PScan import pscan
-from GridSample import GridSample, warp_common
-from BarotropicVorticitySolver import BarotropicVorticitySolver
-from GrandUnified import CliffordConv2d, StochasticHamiltonianSSM, StreamFunctionMixing
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 128, "num_warps": 4}, num_stages=3),
-        triton.Config({"BLOCK_SIZE": 256, "num_warps": 8}, num_stages=4),
-        triton.Config({"BLOCK_SIZE": 512, "num_warps": 8}, num_stages=4),
-        triton.Config({"BLOCK_SIZE": 1024, "num_warps": 8}, num_stages=4),
-    ],
-    key=["B", "L", "R", "C", "H", "Wf"],
-)
-@triton.jit
-def koopman_A_kernel(
-    nu_ptr, theta_ptr, dt_ptr, out_real_ptr, out_imag_ptr,
-    B, L, R, C, H, Wf,
-    stride_nu_b, stride_nu_l, stride_nu_r, stride_nu_c, stride_nu_wf,
-    stride_dt_b, stride_dt_l, stride_o_b, stride_o_l, stride_o_r, stride_o_c, stride_o_h, stride_o_wf,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int64)
-    n = B * L * R * C * H * Wf
-    block_start = pid * BLOCK_SIZE
-    offs = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
-    mask = offs < n
-    idx_wf = offs % Wf
-    tmp = offs // Wf
-    idx_h = tmp % H
-    tmp = tmp // H
-    idx_c = tmp % C
-    tmp = tmp // C
-    idx_r = tmp % R
-    tmp = tmp // R
-    idx_l = tmp % L
-    idx_b = tmp // L
-    dt = tl.load(dt_ptr + idx_b * stride_dt_b + idx_l * stride_dt_l, mask=mask, other=0.0)
-    nu_off = idx_b * stride_nu_b + idx_l * stride_nu_l + idx_r * stride_nu_r + idx_c * stride_nu_c + idx_wf * stride_nu_wf
-    nu = tl.load(nu_ptr + nu_off, mask=mask, other=0.0)
-    th = tl.load(theta_ptr + nu_off, mask=mask, other=0.0)
-    decay = tl.exp(-nu * dt)
-    ang = th * dt
-    c = tl.cos(ang)
-    s = tl.sin(ang)
-    out_r = decay * c
-    out_i = decay * s
-    o_off = idx_b * stride_o_b + idx_l * stride_o_l + idx_r * stride_o_r + idx_c * stride_o_c + idx_h * stride_o_h + idx_wf * stride_o_wf
-    tl.store(out_real_ptr + o_off, out_r, mask=mask)
-    tl.store(out_imag_ptr + o_off, out_i, mask=mask)
+from GrandUnified import GrandUnifiedLayer
 
 def get_safe_groups(channels: int, target: int = 4) -> int:
     return target if channels % target == 0 else 1
-
-def warp_image_step(x: torch.Tensor, flow: torch.Tensor, mode: str = 'bilinear', padding_mode: str = 'border') -> torch.Tensor:
-    B, C, H, W = x.shape
-    grid = warp_common(flow, B, H, W)
-    return F.grid_sample(x, grid, mode=mode, padding_mode=padding_mode, align_corners=False)
 
 class SpatialGroupNorm(nn.GroupNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -209,197 +152,6 @@ class PeriodicConv2d(nn.Module):
         x_sp = self.spatial_conv(x_sp)
         return self.depth_conv(x_sp).view(B, L, -1, H, W).permute(0, 2, 1, 3, 4)
 
-class EfficientSpatialGating(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        mid_channels = max(channels // reduction, 4)
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.global_mlp = nn.Sequential(
-            nn.Conv1d(channels, mid_channels, 1),
-            nn.SiLU(),
-            nn.Conv1d(mid_channels, channels, 1),
-            nn.Sigmoid()
-        )
-        self.lat_mlp = nn.Sequential(
-            nn.Conv1d(channels, mid_channels, 1),
-            nn.SiLU(),
-            nn.Conv1d(mid_channels, channels, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, L, H, W = x.shape
-        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
-        g = self.global_pool(x_flat).view(B * L, C, 1)
-        g_gate = self.global_mlp(g).view(B, L, C, 1, 1).permute(0, 2, 1, 3, 4)
-        lat = x_flat.mean(dim=3).view(B * L, C, H)
-        lat_gate = self.lat_mlp(lat).view(B, L, C, H, 1).permute(0, 2, 1, 3, 4)
-        return x * g_gate * lat_gate
-
-class SpectralMixer(nn.Module):
-    def __init__(self, rank: int):
-        super().__init__()
-        self.rank = int(rank)
-        self.mix_linear = nn.Linear(self.rank * 2, self.rank * 2)
-        nn.init.zeros_(self.mix_linear.weight)
-        nn.init.zeros_(self.mix_linear.bias)
-        with torch.no_grad():
-            self.mix_linear.weight.view(self.rank * 2, self.rank * 2).diagonal().fill_(1.0)
-
-    def forward(self, h_freq: torch.Tensor) -> torch.Tensor:
-        h_real = h_freq.real
-        h_imag = h_freq.imag
-        h_stacked = torch.cat([h_real, h_imag], dim=-1)
-        h_mixed = self.mix_linear(h_stacked)
-        h_real_out, h_imag_out = torch.chunk(h_mixed, 2, dim=-1)
-        return torch.complex(h_real_out, h_imag_out)
-
-class LowFreqSpectralMixer(nn.Module):
-    def __init__(self, channels: int, modes_h: int = 12, modes_w: int = 12, residual_scale: float = 1.0):
-        super().__init__()
-        self.channels = int(channels)
-        self.modes_h = int(modes_h)
-        self.modes_w = int(modes_w)
-        self.residual_scale = float(residual_scale)
-        self.mix = nn.Linear(self.channels * 2, self.channels * 2)
-        nn.init.zeros_(self.mix.weight)
-        nn.init.zeros_(self.mix.bias)
-        with torch.no_grad():
-            self.mix.weight.view(self.channels * 2, self.channels * 2).diagonal().fill_(1.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, L, H, W = x.shape
-        mh = min(self.modes_h, H)
-        mw = min(self.modes_w, W // 2 + 1)
-        pad_y = 4 
-        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W).float()
-        if x_flat.size(2) <= pad_y:
-            x_padded = F.pad(x_flat, (0, 0, pad_y, pad_y), mode='replicate')
-        else:
-            x_padded = F.pad(x_flat, (0, 0, pad_y, pad_y), mode='reflect')
-        H_pad = H + 2 * pad_y
-        xf = torch.fft.rfft2(x_padded, norm="ortho")
-        xlow = xf[:, :, :mh, :mw]
-        re = xlow.real
-        im = xlow.imag
-        z = torch.cat([re, im], dim=1).permute(0, 2, 3, 1).contiguous()
-        z = self.mix(z).permute(0, 3, 1, 2).contiguous()
-        re2, im2 = torch.chunk(z, 2, dim=1)
-        xlow2 = torch.complex(re2, im2)
-        xf2 = xf.clone()
-        xf2[:, :, :mh, :mw] = xlow2
-        y_padded = torch.fft.irfft2(xf2, s=(H_pad, W), norm="ortho").to(x.dtype)
-        y = y_padded[:, :, pad_y : H_pad - pad_y, :]
-        y = y.reshape(B, L, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
-        return x + self.residual_scale * y
-
-class DynamicsParameterEstimator(nn.Module):
-    def __init__(self, in_ch: int, emb_ch: int, rank: int, w_freq: int, conservative: bool = False):
-        super().__init__()
-        self.w_freq = int(w_freq)
-        self.emb_ch = int(emb_ch)
-        self.rank = int(rank)
-        self.conservative = conservative 
-        ch = int(in_ch)
-        self.conv = nn.Sequential(
-            nn.Conv2d(ch, ch, 3, 1, 1),
-            nn.SiLU(),
-            nn.Conv2d(ch, ch, 3, 1, 1),
-            nn.SiLU(),
-        )
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.global_fc = nn.Linear(ch, ch)
-        self.pool = nn.AdaptiveAvgPool2d((1, self.w_freq))
-        bottleneck = max(32, self.rank * 4)
-        output_dim = self.emb_ch * self.rank * 3
-        self.head = nn.Sequential(
-            nn.Conv2d(ch, bottleneck, 1),
-            nn.SiLU(),
-            nn.Conv2d(bottleneck, output_dim, 1)
-        )
-        nn.init.zeros_(self.head[-1].weight)
-        with torch.no_grad():
-            self.head[-1].bias.view(self.emb_ch, self.rank, 3)[:, :, 0].fill_(1.0)
-            nn.init.uniform_(self.head[-1].bias.view(self.emb_ch, self.rank, 3)[:, :, 1], -0.01, 0.01)
-            self.head[-1].bias.view(self.emb_ch, self.rank, 3)[:, :, 2].fill_(-5.0)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, C, H, W = x.shape
-        feat = self.conv(x)
-        glob = self.global_pool(feat).flatten(1)
-        glob = torch.sigmoid(self.global_fc(glob)).view(B, C, 1, 1)
-        feat = feat * glob
-        feat = self.pool(feat)
-        feat = feat.permute(0, 2, 3, 1).reshape(B, 1, self.w_freq, C).permute(0, 3, 1, 2)
-        params = self.head(feat)
-        params = params.permute(0, 2, 3, 1).view(B, 1, self.w_freq, self.emb_ch, self.rank, 3)
-        params = params.permute(0, 1, 3, 2, 4, 5).contiguous()
-        if self.conservative:
-            nu_rate = torch.zeros_like(params[..., 0]) 
-        else:
-            nu_rate = F.softplus(params[..., 0])
-        theta_rate = torch.tanh(params[..., 1]) * math.pi
-        sigma = torch.sigmoid(params[..., 2])
-        return nu_rate, theta_rate, sigma
-
-class SpectralDynamics(nn.Module):
-    def __init__(self, channels: int, rank: int, w_freq: int, conservative: bool = False):
-        super().__init__()
-        self.channels = int(channels)
-        self.rank = int(rank)
-        self.w_freq = int(w_freq)
-        self.estimator = DynamicsParameterEstimator(self.channels, self.channels, self.rank, self.w_freq, conservative=conservative)
-        self.mixer = SpectralMixer(self.rank)
-
-    def compute_params(self, x_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, L, C, H, W = x_seq.shape
-        x_flat = x_seq.reshape(B * L, C, H, W)
-        nu_rate, theta_rate, sigma = self.estimator(x_flat)
-        _, _, C_emb, Wf, R = nu_rate.shape
-        nu_rate = nu_rate.view(B, L, 1, C_emb, Wf, R)
-        theta_rate = theta_rate.view(B, L, 1, C_emb, Wf, R)
-        sigma = sigma.view(B, L, 1, C_emb, Wf, R)
-        return nu_rate, theta_rate, sigma
-
-    def build_A_koop(self, nu_rate: torch.Tensor, theta_rate: torch.Tensor, dt_seq: torch.Tensor, H: int) -> torch.Tensor:
-        B, L = dt_seq.shape
-        nu = nu_rate.squeeze(2).permute(0, 1, 4, 2, 3).contiguous()
-        th = theta_rate.squeeze(2).permute(0, 1, 4, 2, 3).contiguous()
-        B2, L2, R, C, Wf = nu.shape
-        if B2 != B or L2 != L:
-            raise ValueError(f"nu shape {nu.shape} incompatible with dt {dt_seq.shape}")
-        dt = dt_seq.contiguous()
-        out_real = torch.empty((B, L, R, C, H, Wf), device=dt.device, dtype=dt.dtype)
-        out_imag = torch.empty_like(out_real)
-        grid = lambda META: (triton.cdiv(B * L * R * C * H * Wf, META["BLOCK_SIZE"]),)
-        koopman_A_kernel[grid](
-            nu, th, dt, out_real, out_imag,
-            B, L, R, C, H, Wf,
-            *nu.stride(), *dt.stride(), *out_real.stride(),
-        )
-        return torch.complex(out_real, out_imag)
-
-class TransportParameterEstimator(nn.Module):
-    def __init__(self, in_ch: int, emb_ch: int):
-        super().__init__()
-        self.emb_ch = int(emb_ch)
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, 3, 1, 1),
-            nn.SiLU(),
-            nn.Conv2d(in_ch, in_ch, 3, 1, 1),
-            nn.SiLU()
-        )
-        self.flow_head = nn.Conv2d(in_ch, 2, 3, 1, 1)
-        self.forcing_head = nn.Conv2d(in_ch, emb_ch, 3, 1, 1)
-        nn.init.zeros_(self.flow_head.weight)
-        nn.init.zeros_(self.flow_head.bias)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        feat = self.net(x)
-        flow = torch.tanh(self.flow_head(feat))
-        forcing = self.forcing_head(feat)
-        return flow, forcing
-
 def _match_dt_seq(dt_seq: torch.Tensor, L: int) -> torch.Tensor:
     if dt_seq.dim() != 2:
         raise ValueError(f"listT must be 2D [B,L], got {tuple(dt_seq.shape)}")
@@ -417,255 +169,30 @@ class PhysicalRecurrentLayer(nn.Module):
         self,
         emb_ch: int,
         input_shape: Tuple[int, int],
-        rank: int = 64,
-        dt_ref: float = 1.0,
-        inj_k: float = 2.0,
-        use_noise: bool = False,
-        noise_scale: float = 0.1,
-        dynamics_mode: str = "spectral",
-        interpolation_mode: str = "bilinear",
-        conservative_dynamics: bool = False,
-        use_pde_refinement: bool = False,
-        pde_viscosity: float = 1e-3,
+        rank: int = 32,
         **kwargs
     ):
         super().__init__()
         self.emb_ch = int(emb_ch)
         self.H, self.W = int(input_shape[0]), int(input_shape[1])
-        self.Wf = self.W // 2 + 1
-        self.rank = int(rank)
-        self.dt_ref = float(dt_ref) if float(dt_ref) > 0 else 1.0
-        self.inj_k = max(float(inj_k), 0.0)
-        self.use_noise = bool(use_noise)
-        self.noise_scale = float(noise_scale)
-        self.dynamics_mode = str(dynamics_mode).lower()
-        self.interpolation_mode = str(interpolation_mode).lower()
-        self.conservative_dynamics = bool(conservative_dynamics)
-
-        self.norm = SpatialGroupNorm(get_safe_groups(self.emb_ch), self.emb_ch)
-        self.gate = EfficientSpatialGating(self.emb_ch)
-        
-        self.use_pde_refinement = use_pde_refinement and (BarotropicVorticitySolver is not None)
-        
-        if self.use_pde_refinement:
-            self.pde_solver = BarotropicVorticitySolver(
-                height=self.H, 
-                width=self.W, 
-                dt=0.1,
-                viscosity=pde_viscosity
-            )
-            self.to_vorticity = nn.Conv2d(self.emb_ch, self.emb_ch, 1)
-            self.from_vorticity = nn.Conv2d(self.emb_ch, self.emb_ch, 1)
-            self.pde_weight = nn.Parameter(torch.tensor(0.01))
-
-        if self.dynamics_mode == "spectral":
-            self.koopman = SpectralDynamics(
-                self.emb_ch, 
-                self.rank, 
-                self.Wf, 
-                conservative=self.conservative_dynamics
-            )
-            self.proj_out = nn.Linear(self.rank, 1)
-            self.post_ifft_proj = nn.Conv2d(self.emb_ch, self.emb_ch, kernel_size=1)
-            self.rank_scale = nn.Parameter(torch.ones(self.rank) * 0.001)
-        elif self.dynamics_mode == "advection":
-            self.estimator = TransportParameterEstimator(self.emb_ch, self.emb_ch)
-            self.flow_scale = nn.Parameter(torch.tensor(0.01))
-            pscan_use_decay = kwargs.get("pscan_use_decay", True)
-            pscan_use_residual = kwargs.get("pscan_use_residual", True)
-            pscan_chunk_size = kwargs.get("pscan_chunk_size", 32)
-            self.advection_pscan = GridSample(
-                mode=self.interpolation_mode,
-                channels=self.emb_ch,
-                use_decay=pscan_use_decay,
-                use_residual=pscan_use_residual,
-                chunk_size=pscan_chunk_size
-            )
-        elif self.dynamics_mode == "geosym":
-            self.clifford_norm = nn.GroupNorm(4, self.emb_ch)
-            self.clifford_conv = CliffordConv2d(self.emb_ch, kernel_size=3, padding=1)
-            self.ssm_evolve = StochasticHamiltonianSSM(self.emb_ch, self.H, self.W)
-            self.phys_mix = StreamFunctionMixing(self.emb_ch, self.H, self.W)
-            self.fusion = nn.Conv2d(self.emb_ch * 2, self.emb_ch, 1)
-        else:
-            raise ValueError(f"Unknown dynamics_mode: {self.dynamics_mode}")
-
-    def _build_injection_freq(self, x: torch.Tensor, dt_seq: torch.Tensor) -> torch.Tensor:
-        B, C, L, H, W = x.shape
-        dt_ref = torch.tensor(self.dt_ref, device=x.device, dtype=x.dtype).clamp_min(1e-6)
-        inj_k = torch.tensor(self.inj_k, device=x.device, dtype=x.dtype)
-        dt_scaled = (dt_seq / dt_ref).clamp_min(0.0)
-        g = 1.0 - torch.exp(-dt_scaled * inj_k)
-        g = g.view(B, L, 1, 1, 1, 1)
-        x_bl = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W).float()
-        xf = torch.fft.rfft2(x_bl, norm="ortho")
-        xf = xf.reshape(B, L, C, H, self.Wf).to(torch.complex64)
-        rs = self.rank_scale.to(x.device, x.dtype).view(1, 1, self.rank, 1, 1, 1)
-        xf = xf.unsqueeze(2).expand(B, L, self.rank, C, H, self.Wf)
-        xinj = xf * rs.to(torch.complex64)
-        return xinj * g.to(torch.complex64)
-
-    def _init_state_freq(self, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        return torch.zeros((B, self.rank, self.emb_ch, self.H, self.Wf), device=device, dtype=torch.complex64)
-
-    def split_frequency(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, C, L, H, W = x.shape
-        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
-        x_freq = torch.fft.rfft2(x_reshaped.float(), norm="ortho")
-        cutoff_h, cutoff_w = H // 8, W // 8
-        mask_low = torch.zeros_like(x_freq)
-        mask_low[:, :, :cutoff_h, :cutoff_w] = 1.0
-        x_low_freq = x_freq * mask_low
-        x_high_freq = x_freq * (1.0 - mask_low)
-        x_low = torch.fft.irfft2(x_low_freq, s=(H, W), norm="ortho").to(x.dtype)
-        x_high = torch.fft.irfft2(x_high_freq, s=(H, W), norm="ortho").to(x.dtype)
-        x_low = x_low.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
-        x_high = x_high.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
-        return x_low, x_high
-
-    def forward_spectral(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], dt_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, C, L, H, W = x.shape
-        x_perm = x.permute(0, 2, 1, 3, 4).contiguous()
-        nu_rate, theta_rate, sigma = self.koopman.compute_params(x_perm)
-        A_koop = self.koopman.build_A_koop(nu_rate, theta_rate, dt_seq, H)
-        X_inj = self._build_injection_freq(x, dt_seq)
-        if self.use_noise and self.training:
-             sig = sigma.squeeze(2).permute(0, 1, 4, 2, 3)
-             sig = sig.unsqueeze(-2)
-             dt_sqrt = torch.sqrt(dt_seq.view(B, L, 1, 1, 1, 1).clamp_min(1e-6))
-             noise_real = torch.randn_like(X_inj.real)
-             noise_imag = torch.randn_like(X_inj.imag)
-             noise = torch.complex(noise_real, noise_imag)
-             X_inj = X_inj + sig * self.noise_scale * dt_sqrt * noise
-        A_flat = A_koop.permute(0, 1, 2, 3, 4, 5).reshape(B, L, -1).contiguous()
-        X_flat = X_inj.permute(0, 1, 2, 3, 4, 5).reshape(B, L, -1).contiguous()
-        if last_hidden_in is None:
-            H0 = self._init_state_freq(B, x.device, x.dtype)
-        else:
-            if last_hidden_in.dtype.is_complex:
-                H0 = last_hidden_in
-            else:
-                h0 = last_hidden_in.permute(0, 4, 1, 2, 3).contiguous()
-                H0 = torch.fft.rfft2(h0.float(), norm="ortho").to(torch.complex64)
-        A_cum = torch.cumprod(A_koop, dim=1)
-        H_natural = A_cum * H0.unsqueeze(1)
-        Y_forced_flat = pscan(A_flat.clone(), X_flat.clone())
-        Y_forced = Y_forced_flat.view(B, L, self.rank, C, H, self.Wf)
-        Y = Y_forced + H_natural
-        h_space = torch.fft.irfft2(Y, s=(H, W), norm="ortho").to(x.dtype)
-        h_stack = h_space.permute(0, 3, 1, 4, 5, 2).contiguous()
-        h_last = h_stack[:, :, -1].contiguous()
-        out = self.proj_out(h_stack).squeeze(-1)
-        out = out.permute(0, 1, 4, 2, 3).reshape(B * L, C, H, W)
-        out = self.post_ifft_proj(out)
-        out = out.reshape(B, L, C, H, W).permute(0, 2, 1, 3, 4)
-        out = self.norm(out)
-        out = self.gate(out)
-        return x + out, h_last
-
-    def forward_advection(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], dt_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, C, L, H, W = x.shape
-        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
-        flow_raw, forcing_raw = self.estimator(x_flat)
-        dt_scale = (dt_seq / self.dt_ref).view(B, L, 1, 1, 1).to(x.device, x.dtype)
-        flow = flow_raw.view(B, L, 2, H, W) * self.flow_scale * dt_scale
-        forcing = forcing_raw.view(B, L, C, H, W) * dt_scale
-        if self.use_noise and self.training:
-            noise = torch.randn_like(forcing) * self.noise_scale
-            noise = noise * torch.sqrt(dt_scale.clamp_min(1e-6))
-            forcing = forcing + noise
-        if last_hidden_in is not None:
-            flow_step = flow[:, 0]
-            forcing_step = forcing[:, 0]
-            C_emb = self.emb_ch
-            if last_hidden_in.shape[1] == C_emb:
-                h_base = last_hidden_in
-                h_residual = torch.zeros_like(h_base)
-                cum_flow = torch.zeros(B, 2, H, W, device=x.device, dtype=x.dtype)
-            else:
-                h_base = last_hidden_in[:, :C_emb]
-                h_residual = last_hidden_in[:, C_emb : 2 * C_emb]
-                cum_flow = last_hidden_in[:, 2 * C_emb :]
-            cum_flow_new = cum_flow + flow_step
-            h_base_warped = warp_image_step(h_base, cum_flow_new, mode=self.interpolation_mode, padding_mode="zeros")
-            h_residual_warped = warp_image_step(h_residual, flow_step, mode=self.interpolation_mode, padding_mode="zeros")
-            h_residual_new = h_residual_warped + forcing_step
-            h_physical_out = h_base_warped + h_residual_new
-            h_next = torch.cat([h_base, h_residual_new, cum_flow_new], dim=1)
-            out = h_physical_out.unsqueeze(2)
-            out = self.norm(out)
-            out = self.gate(out)
-            return x + out, h_next
-        if last_hidden_in is not None:
-            h0 = last_hidden_in
-        else:
-            h0 = torch.zeros(B, self.emb_ch, H, W, device=x.device, dtype=x.dtype)
-        h_forced = self.advection_pscan(flow, forcing)
-        flow_cum = torch.cumsum(flow, dim=1)
-        h_natural_list = []
-        for t in range(L):
-            flow_t = flow_cum[:, t]
-            h_nat_t = warp_image_step(h0, flow_t, mode=self.interpolation_mode, padding_mode="zeros")
-            h_natural_list.append(h_nat_t)
-        h_natural = torch.stack(h_natural_list, dim=1)
-        h_seq = h_forced + h_natural
-        h_seq_perm = h_seq.permute(0, 2, 1, 3, 4)
-        out = self.norm(h_seq_perm)
-        out = self.gate(out)
-        return x + out, h_seq[:, -1]
-
-    def forward_geosym(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor], dt_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, C, L, H, W = x.shape
-        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
-        if last_hidden_in is None:
-            h_prev = torch.zeros_like(x_flat)
-        else:
-            h_prev = last_hidden_in
-        dt_flat = dt_seq.view(-1)
-        state_in = h_prev + x_flat
-        if state_in.shape[1] % 4 == 0:
-            geo_feat = self.clifford_norm(state_in)
-            geo_feat = self.clifford_conv(geo_feat)
-        else:
-            geo_feat = state_in
-        h_spec = self.ssm_evolve(state_in, dt_flat)
-        h_phys = self.phys_mix(h_spec, dt_flat)
-        combined = torch.cat([geo_feat, h_phys], dim=1)
-        h_next = self.fusion(combined)
-        out = h_next + x_flat * 0.1
-        out = out.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
-        return out, h_next
+        self.core = GrandUnifiedLayer(self.emb_ch, (self.H, self.W), rank=rank)
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor] = None, listT: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        if (x.shape[-2], x.shape[-1]) != (self.H, self.W):
-            raise ValueError(f"input spatial {(x.shape[-2], x.shape[-1])} must match layer {(self.H, self.W)}")
-        dt_seq_in = torch.ones(x.size(0), x.size(2), device=x.device, dtype=x.dtype) if listT is None else listT.to(x.device, x.dtype)
-        dt_seq = _match_dt_seq(dt_seq_in, x.size(2))
-        if self.use_pde_refinement:
-            x_low, x_high = self.split_frequency(x)
-            x_main = x_low 
-        else:
-            x_main = x
-            x_high = None
-        if self.dynamics_mode == "spectral":
-            out_main, h_last = self.forward_spectral(x_main, last_hidden_in, dt_seq)
-        elif self.dynamics_mode == "advection":
-            out_main, h_last = self.forward_advection(x_main, last_hidden_in, dt_seq)
-        elif self.dynamics_mode == "geosym":
-            out_main, h_last = self.forward_geosym(x_main, last_hidden_in, dt_seq)
-        else:
-            raise ValueError(f"Unknown dynamics mode {self.dynamics_mode}")
-        if self.use_pde_refinement and x_high is not None:
-            B, C, L, H, W = x_high.shape
-            zeta_in = self.to_vorticity(out_main.permute(0, 2, 1, 3, 4).reshape(B*L, C, H, W))
-            zeta_out = self.pde_solver(zeta_in, steps=1)
-            zeta_inc = zeta_out - zeta_in
-            pde_inc = self.from_vorticity(zeta_inc)
-            pde_inc = pde_inc.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
-            out = out_main + x_high + self.pde_weight * pde_inc
-            return out, h_last
-        else:
-            return out_main, h_last
+        B, C, L, H, W = x.shape
+        dt_seq_in = torch.ones(B, L, device=x.device, dtype=x.dtype) if listT is None else listT.to(x.device, x.dtype)
+        dt_seq = _match_dt_seq(dt_seq_in, L)
+
+        h = last_hidden_in
+        outputs = []
+        
+        for t in range(L):
+            x_t = x[:, :, t, :, :]
+            dt_t = dt_seq[:, t:t+1]
+            out, h = self.core(x_t, h, dt_t)
+            outputs.append(out)
+
+        x_out = torch.stack(outputs, dim=2)
+        return x + x_out, h
 
 class GatedConvBlock(nn.Module):
     def __init__(self, channels: int, hidden_size: Tuple[int, int], kernel_size: int = 7, conv_type: str = "conv"):
@@ -804,8 +331,6 @@ class UniPhyBackbone(nn.Module):
         down_mode: str,
         prl_args: Dict[str, Any],
         ffn_args: Dict[str, Any],
-        spectral_modes_h: int = 12,
-        spectral_modes_w: int = 12,
     ):
         super().__init__()
         self.arch_mode = str(arch_mode).lower()
@@ -824,7 +349,6 @@ class UniPhyBackbone(nn.Module):
             self.upsample = None
             self.fusion = None
             self.mid_attention = None
-            self.mid_spectral = None
         else:
             curr_H, curr_W = H, W
             encoder_res: List[Tuple[int, int]] = []
@@ -849,7 +373,6 @@ class UniPhyBackbone(nn.Module):
                     heads = h
                     break
             self.mid_attention = BottleneckAttention(C, num_heads=heads)
-            self.mid_spectral = LowFreqSpectralMixer(C, modes_h=spectral_modes_h, modes_w=spectral_modes_w, residual_scale=1.0)
 
             for i in range(layers - 2, -1, -1):
                 h_up, w_up = encoder_res[i]
@@ -897,9 +420,8 @@ class UniPhyBackbone(nn.Module):
                     _, _, H_d, W_d = x_down.shape
                     x = x_down.view(B, L, C, H_d, W_d).permute(0, 2, 1, 3, 4)
 
-        assert self.mid_attention is not None and self.mid_spectral is not None
+        assert self.mid_attention is not None
         x = self.mid_attention(x)
-        x = self.mid_spectral(x)
 
         for i, blk in enumerate(self.up_blocks):
             B, C, L, H, W = x.shape
@@ -1050,46 +572,14 @@ class UniPhy(nn.Module):
         down_mode = getattr(args, "down_mode", "avg")
 
         rank = int(getattr(args, "lru_rank", 64))
-        dt_ref = float(getattr(args, "dt_ref", 1.0))
-        inj_k = float(getattr(args, "inj_k", 2.0))
         
-        koopman_use_noise = bool(getattr(args, "koopman_use_noise", False))
-        koopman_noise_scale = float(getattr(args, "koopman_noise_scale", 1.0))
-        
-        dynamics_mode = getattr(args, "dynamics_mode", "spectral")
-        interpolation_mode = getattr(args, "interpolation_mode", "bilinear")
-        
-        conservative_dynamics = bool(getattr(args, "conservative_dynamics", False))
-        
-        use_pde_refinement = bool(getattr(args, "use_pde_refinement", False))
-        pde_viscosity = float(getattr(args, "pde_viscosity", 1e-3))
-
-        pscan_use_decay = bool(getattr(args, "pscan_use_decay", True))
-        pscan_use_residual = bool(getattr(args, "pscan_use_residual", True))
-        pscan_chunk_size = int(getattr(args, "pscan_chunk_size", 32))
-
         prl_args = {
             "rank": rank,
-            "dt_ref": dt_ref,
-            "inj_k": inj_k,
-            "use_noise": koopman_use_noise,
-            "noise_scale": koopman_noise_scale,
-            "dynamics_mode": dynamics_mode,
-            "interpolation_mode": interpolation_mode,
-            "use_pde_refinement": use_pde_refinement,
-            "pde_viscosity": pde_viscosity,
-            "conservative_dynamics": conservative_dynamics,
-            "pscan_use_decay": pscan_use_decay,
-            "pscan_use_residual": pscan_use_residual,
-            "pscan_chunk_size": pscan_chunk_size,
         }
 
         ffn_ratio = float(getattr(args, "ffn_ratio", 4.0))
         conv_type = str(getattr(args, "ConvType", "conv"))
         ffn_args = {"ffn_ratio": ffn_ratio, "conv_type": conv_type}
-
-        spectral_modes_h = int(getattr(args, "spectral_modes_h", 12))
-        spectral_modes_w = int(getattr(args, "spectral_modes_w", 12))
 
         self.uniphy_model = UniPhyBackbone(
             emb_ch,
@@ -1099,8 +589,6 @@ class UniPhy(nn.Module):
             down_mode,
             prl_args,
             ffn_args,
-            spectral_modes_h=spectral_modes_h,
-            spectral_modes_w=spectral_modes_w,
         )
 
         out_ch = int(getattr(args, "out_ch", 1))
