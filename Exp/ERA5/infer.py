@@ -31,7 +31,7 @@ def get_args():
         convlru_num_blocks=6,
         lru_rank=64,
         down_mode="shuffle",
-        dist_mode="gaussian",
+        dist_mode="diffusion",
         ffn_ratio=1.5,
         ConvType="dcn",
         Arch="unet",
@@ -40,7 +40,7 @@ def get_args():
         dt_ref=1.0,
         inj_k=2.0,
         max_velocity=5.0,
-        dynamics_mode="advection",
+        dynamics_mode="geosym",
         interpolation_mode="bilinear",
         spectral_modes_h=12,
         spectral_modes_w=12,
@@ -62,9 +62,7 @@ def get_args():
 
 def render_frame(t, gt, pred_mean, pred_std, sample1, sample2, channel_idx=0):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-
     cmap = 'jet'
-
     v_min = gt.min()
     v_max = gt.max()
 
@@ -76,7 +74,7 @@ def render_frame(t, gt, pred_mean, pred_std, sample1, sample2, channel_idx=0):
 
     ax = axes[0, 1]
     im = ax.imshow(pred_mean[channel_idx], cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Prediction Mean (Deterministic)")
+    ax.set_title("Prediction Mean (Deterministic/One-Step)")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
@@ -89,19 +87,19 @@ def render_frame(t, gt, pred_mean, pred_std, sample1, sample2, channel_idx=0):
 
     ax = axes[1, 0]
     im = ax.imshow(sample1[channel_idx], cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Stochastic Sample 1")
+    ax.set_title("Stochastic Sample 1 (Diffusion)")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
     ax = axes[1, 1]
     im = ax.imshow(sample2[channel_idx], cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Stochastic Sample 2")
+    ax.set_title("Stochastic Sample 2 (Diffusion)")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
     ax = axes[1, 2]
     im = ax.imshow(pred_std[channel_idx], cmap='viridis')
-    ax.set_title("Predicted Uncertainty (Sigma)")
+    ax.set_title("Spread/Uncertainty")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
 
@@ -120,16 +118,13 @@ def main():
     if os.path.exists(args.checkpoint_path):
         print(f"Loading checkpoint from {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
-        
         if 'model_args' in checkpoint:
             model_args_ckpt = checkpoint['model_args']
             for k, v in model_args_ckpt.items():
                 if hasattr(args, k):
                     setattr(args, k, v)
             print("Updated args from checkpoint.")
-            
         model = UniPhy(args).to(device)
-        
         state_dict = checkpoint.get('model', checkpoint)
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -141,7 +136,6 @@ def main():
         model = UniPhy(args).to(device)
 
     model.eval()
-
     cond_len = args.T
     pred_len = args.forward_steps
     total_len = cond_len + pred_len
@@ -166,14 +160,13 @@ def main():
 
     full_seq = full_seq.to(device)
     B, _, C, H, W = full_seq.shape
-
     input_seq = full_seq[:, :cond_len]
     gt_seq = full_seq[:, cond_len:]
 
     listT_cond = torch.full((B, cond_len), float(args.dt_ref), device=device)
     listT_future = torch.full((B, pred_len), float(args.dt_ref), device=device)
 
-    print("Running Deterministic Inference...")
+    print("Running Deterministic/Mean Inference...")
     with torch.no_grad():
         out_det_cpu, _ = model(
             input_seq,
@@ -183,17 +176,16 @@ def main():
             listT_future=listT_future,
             sample=False
         )
-
     out_det = out_det_cpu.numpy()
     
-    if out_det.shape[2] == args.out_ch * 2:
+    if args.dist_mode in ["gaussian", "laplace"] and out_det.shape[2] == args.out_ch * 2:
         mu_det = out_det[:, :, :args.out_ch]
         sigma_det = out_det[:, :, args.out_ch:]
     else:
         mu_det = out_det
         sigma_det = np.zeros_like(mu_det)
 
-    print("Running Stochastic Inference (Sample 1)...")
+    print("Running Stochastic Sample 1...")
     with torch.no_grad():
         out_s1_cpu, _ = model(
             input_seq,
@@ -204,10 +196,10 @@ def main():
             sample=True
         )
     sample1 = out_s1_cpu.numpy()
-    if sample1.shape[2] == args.out_ch * 2:
+    if args.dist_mode in ["gaussian", "laplace"] and sample1.shape[2] == args.out_ch * 2:
          sample1 = sample1[:, :, :args.out_ch]
 
-    print("Running Stochastic Inference (Sample 2)...")
+    print("Running Stochastic Sample 2...")
     with torch.no_grad():
         out_s2_cpu, _ = model(
             input_seq,
@@ -218,11 +210,10 @@ def main():
             sample=True
         )
     sample2 = out_s2_cpu.numpy()
-    if sample2.shape[2] == args.out_ch * 2:
+    if args.dist_mode in ["gaussian", "laplace"] and sample2.shape[2] == args.out_ch * 2:
          sample2 = sample2[:, :, :args.out_ch]
 
     gt_np = gt_seq.cpu().numpy()
-
     print("Generating GIF...")
     frames = []
     for t in range(pred_len):
