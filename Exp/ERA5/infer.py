@@ -159,9 +159,12 @@ def main():
         full_seq = torch.randn(1, total_len, args.input_ch, *args.input_size)
 
     full_seq = full_seq.to(device)
-    B, _, C, H, W = full_seq.shape
-    input_seq = full_seq[:, :cond_len]
-    gt_seq = full_seq[:, cond_len:]
+    
+    full_seq = full_seq.permute(0, 2, 1, 3, 4).contiguous()
+    
+    B, C, _, H, W = full_seq.shape
+    input_seq = full_seq[:, :, :cond_len]
+    gt_seq = full_seq[:, :, cond_len:]
 
     listT_cond = torch.full((B, cond_len), float(args.dt_ref), device=device)
     listT_future = torch.full((B, pred_len), float(args.dt_ref), device=device)
@@ -178,6 +181,9 @@ def main():
                 listT_future=listT_future
             )
         out_cpu = out.cpu().numpy()
+        
+        out_cpu = out_cpu.transpose(0, 2, 1, 3, 4)
+        
         mu = out_cpu[:, :, :args.out_ch]
         sigma = out_cpu[:, :, args.out_ch:]
         
@@ -200,7 +206,7 @@ def main():
                     listT=listT_cond,
                     listT_future=listT_future
                 )
-            preds.append(out.cpu().numpy())
+            preds.append(out.cpu().numpy().transpose(0, 2, 1, 3, 4))
         
         preds_stack = np.stack(preds, axis=0)
         mu_det = np.mean(preds_stack, axis=0)
@@ -208,7 +214,8 @@ def main():
         sample1 = preds[0]
         sample2 = preds[1]
 
-    gt_np = gt_seq.cpu().numpy()
+    gt_np = gt_seq.cpu().numpy().transpose(0, 2, 1, 3, 4)
+    
     print("Generating GIF...")
     frames = []
     for t in range(pred_len):

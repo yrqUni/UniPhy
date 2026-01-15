@@ -300,9 +300,9 @@ def get_latitude_weights(H: int, device: torch.device, dtype: torch.dtype) -> to
 
 def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     _, _, _, H, _ = preds.shape
-    C_gt = targets.size(2)
-    mu = preds[:, :, :C_gt]
-    sigma = preds[:, :, C_gt:]
+    C_gt = targets.size(1)
+    mu = preds[:, :C_gt]
+    sigma = preds[:, C_gt:]
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     var = sigma.pow(2)
     nll = 0.5 * (torch.log(var) + (targets - mu).pow(2) / var)
@@ -310,18 +310,18 @@ def gaussian_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> to
 
 def laplace_nll_loss_weighted(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     _, _, _, H, _ = preds.shape
-    C_gt = targets.size(2)
-    mu = preds[:, :, :C_gt]
-    b = preds[:, :, C_gt:]
+    C_gt = targets.size(1)
+    mu = preds[:, :C_gt]
+    b = preds[:, C_gt:]
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     nll = torch.log(2 * b) + torch.abs(targets - mu) / b
     return (nll * w).mean()
 
 def latitude_weighted_l1(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    _, _, C_pred, H, _ = preds.shape
-    C_gt = targets.shape[2]
+    _, C_pred, _, H, _ = preds.shape
+    C_gt = targets.shape[1]
     if C_pred > C_gt:
-        preds = preds[:, :, :C_gt]
+        preds = preds[:, :C_gt]
     w = get_latitude_weights(H, preds.device, preds.dtype).view(1, 1, 1, H, 1)
     return ((preds - targets).abs() * w).mean()
 
@@ -545,6 +545,9 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             x = data_slice[:, :-1].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
             target = data_slice[:, 1:].to(device=torch.device(f"cuda:{local_rank}"), non_blocking=True).to(torch.float32)
 
+            x = x.permute(0, 2, 1, 3, 4).contiguous()
+            target = target.permute(0, 2, 1, 3, 4).contiguous()
+
             accum_count += 1
             is_accum_boundary = (accum_count % grad_accum_steps) == 0
             is_last_batch = train_step == len_train_dataloader
@@ -558,16 +561,17 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             with sync_ctx:
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     if dist_mode == "diffusion":
-                        B, L, C, H, W = target.shape
+                        B, C, L, H, W = target.shape
                         t = torch.randint(0, T_diffusion, (B * L,), device=x.device).long()
                         noise = torch.randn_like(target)
-                        target_flat = target.reshape(B * L, C, H, W)
-                        noise_flat = noise.reshape(B * L, C, H, W)
+                        
+                        target_flat = target.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
+                        noise_flat = noise.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
                         
                         sqrt_alpha_t = sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
                         sqrt_one_minus_alpha_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
                         x_noisy_flat = sqrt_alpha_t * target_flat + sqrt_one_minus_alpha_t * noise_flat
-                        x_noisy = x_noisy_flat.reshape(B, L, C, H, W)
+                        x_noisy = x_noisy_flat.reshape(B, L, C, H, W).permute(0, 2, 1, 3, 4)
                         
                         preds_out = model(x, mode="p", listT=listT, x_noisy=x_noisy, t=t)
                         preds = unwrap_preds(preds_out)
@@ -579,13 +583,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         target_norm = target
                         if dist_mode == "gaussian":
                             loss_main = gaussian_nll_loss_weighted(preds, target_norm)
-                            p_det = preds[:, :, : target.shape[2]]
+                            p_det = preds[:, : target.shape[1]]
                         elif dist_mode == "laplace":
                             loss_main = laplace_nll_loss_weighted(preds, target_norm)
-                            p_det = preds[:, :, : target.shape[2]]
+                            p_det = preds[:, : target.shape[1]]
                         else:
                             loss_main = latitude_weighted_l1(preds, target_norm)
-                            p_det = preds[:, :, : target.shape[2]]
+                            p_det = preds[:, : target.shape[1]]
 
                     loss = loss_main
                     gdl_loss = torch.tensor(0.0, device=x.device)

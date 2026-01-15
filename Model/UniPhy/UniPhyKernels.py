@@ -102,11 +102,15 @@ class FusedHamiltonian(torch.autograd.Function):
 @triton.jit
 def stencil_curl_kernel(
     psi_ptr, u_ptr, v_ptr,
-    stride_b, stride_c, stride_h, stride_w,
+    stride_slice, stride_h, stride_w,
     H, W, BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr
 ):
     pid_h = tl.program_id(0)
     pid_w = tl.program_id(1)
+    pid_slice = tl.program_id(2)
+
+    offset_slice = pid_slice * stride_slice
+    
     off_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     off_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
     mask_h = off_h < H
@@ -117,7 +121,7 @@ def stencil_curl_kernel(
     idx_left = tl.maximum(off_w - 1, 0)
     idx_right = tl.minimum(off_w + 1, W - 1)
     
-    base_ptr = psi_ptr
+    base_ptr = psi_ptr + offset_slice
     ptr_up = base_ptr + (idx_up[:, None] * stride_h + off_w[None, :] * stride_w)
     ptr_down = base_ptr + (idx_down[:, None] * stride_h + off_w[None, :] * stride_w)
     ptr_left = base_ptr + (off_h[:, None] * stride_h + idx_left[None, :] * stride_w)
@@ -132,25 +136,35 @@ def stencil_curl_kernel(
     grad_x = (val_right - val_left) * 0.5
     
     offset_out = off_h[:, None] * stride_h + off_w[None, :] * stride_w
-    tl.store(u_ptr + offset_out, grad_y, mask=mask_h[:, None] & mask_w[None, :])
-    tl.store(v_ptr + offset_out, -grad_x, mask=mask_h[:, None] & mask_w[None, :])
+    
+    u_out_ptr = u_ptr + offset_slice
+    v_out_ptr = v_ptr + offset_slice
+    
+    tl.store(u_out_ptr + offset_out, grad_y, mask=mask_h[:, None] & mask_w[None, :])
+    tl.store(v_out_ptr + offset_out, -grad_x, mask=mask_h[:, None] & mask_w[None, :])
 
 def fused_curl_2d(psi):
     psi = psi.contiguous()
     B, C, H, W = psi.shape
     u = torch.empty_like(psi)
     v = torch.empty_like(psi)
+    
     total_slices = B * C
     psi_flat = psi.view(total_slices, H, W)
     u_flat = u.view(total_slices, H, W)
     v_flat = v.view(total_slices, H, W)
-    grid = lambda meta: (triton.cdiv(H, meta['BLOCK_H']), triton.cdiv(W, meta['BLOCK_W']))
-    for i in range(total_slices):
-        stencil_curl_kernel[grid](
-            psi_flat[i], u_flat[i], v_flat[i],
-            0, 0, psi_flat.stride(1), psi_flat.stride(2),
-            H, W, BLOCK_H=16, BLOCK_W=16
-        )
+    
+    grid = lambda meta: (triton.cdiv(H, meta['BLOCK_H']), triton.cdiv(W, meta['BLOCK_W']), total_slices)
+    
+    stride_slice = psi_flat.stride(0)
+    stride_h = psi_flat.stride(1)
+    stride_w = psi_flat.stride(2)
+    
+    stencil_curl_kernel[grid](
+        psi_flat, u_flat, v_flat,
+        stride_slice, stride_h, stride_w,
+        H, W, BLOCK_H=16, BLOCK_W=16
+    )
     return u, v
 
 class CliffordConv2d(nn.Module):
@@ -238,7 +252,7 @@ class SpectralStep(nn.Module):
         self.rank = rank
         self.w_freq = w_freq
         self.estimator = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, w_freq)),
+            nn.AdaptiveAvgPool2d((None, w_freq)),
             nn.Conv2d(in_ch, rank * 2, 1)
         )
         nn.init.uniform_(self.estimator[-1].weight, -0.01, 0.01)
@@ -247,13 +261,13 @@ class SpectralStep(nn.Module):
         B, C, H, W = x.shape
         x_spec = torch.fft.rfft2(x, norm="ortho")
         
-        params = self.estimator(x).view(B, self.rank * 2, 1, self.w_freq)
+        params = self.estimator(x)
         
         nu, theta = torch.chunk(params, 2, dim=1)
-        nu = F.softplus(nu).unsqueeze(-2)
-        theta = (torch.tanh(theta) * math.pi).unsqueeze(-2)
+        nu = F.softplus(nu)
+        theta = (torch.tanh(theta) * math.pi)
         
-        dt_view = dt.view(B, 1, 1, 1, 1)
+        dt_view = dt.view(B, 1, 1, 1)
         decay = torch.exp(-nu * dt_view)
         angle = theta * dt_view
         
@@ -261,7 +275,8 @@ class SpectralStep(nn.Module):
         
         feat_spec = x_spec[:, :, :, :self.w_freq]
         
-        feat_spec = feat_spec.unsqueeze(1) * operator
+        feat_spec = feat_spec.unsqueeze(1) * operator.unsqueeze(2)
+        
         feat_spec = feat_spec.sum(dim=1)
         
         x_out_spec = torch.zeros_like(x_spec)

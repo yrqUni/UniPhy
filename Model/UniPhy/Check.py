@@ -15,16 +15,18 @@ def main():
         "dist_mode": ["gaussian", "laplace", "diffusion"],
         "ConvType": ["conv", "dcn"],
         "hidden_factor": [(1, 1), (2, 2)],
+        "input_size": [(32, 32), (32, 48)],
         "convlru_num_blocks": [1, 2],
+        "emb_ch": [16, 32],
     }
 
     fixed_args = {
         "input_ch": 1,
-        "input_size": (32, 32),
-        "emb_ch": 16,
+        "out_ch": 1,
         "lru_rank": 8,
         "ffn_ratio": 2.0,
-        "out_ch": 1,
+        "koopman_use_noise": True,
+        "koopman_noise_scale": 0.1,
     }
 
     keys, values = zip(*param_grid.items())
@@ -35,6 +37,7 @@ def main():
     failed = 0
 
     print(f"Total combinations to check: {total}")
+    print("-" * 60)
 
     for i, params in enumerate(combinations):
         args_dict = {**fixed_args, **params}
@@ -46,45 +49,64 @@ def main():
         try:
             model = UniPhy(args).to(device)
             
-            B, C, L, H, W = 2, args.input_ch, 4, args.input_size[0], args.input_size[1]
+            B = 2
+            L = 4
+            H, W = args.input_size
+            C = args.input_ch
+            
             x = torch.randn(B, C, L, H, W, device=device)
             listT = torch.ones(B, L, device=device) * 0.1
 
-            if args.dist_mode in ["gaussian", "laplace"]:
-                expected_ch = args.out_ch * 2
-            else:
-                expected_ch = args.out_ch
-
-            out_p, _ = model(x, mode='p', listT=listT)
+            if args.dist_mode == "diffusion":
+                noise = torch.randn(B, L, args.out_ch, H, W, device=device)
+                t = torch.randint(0, 1000, (B * L,), device=device).long()
+                out_p, _ = model(x, mode='p', listT=listT, x_noisy=noise, t=t)
+                expected_out_ch = args.out_ch
             
-            assert out_p.shape == (B, expected_ch, L, H, W), \
-                f"Output shape mismatch (training): got {out_p.shape}, expected {(B, expected_ch, L, H, W)}"
+            elif args.dist_mode in ["gaussian", "laplace"]:
+                out_p, _ = model(x, mode='p', listT=listT)
+                expected_out_ch = args.out_ch * 2
+            
+            else:
+                out_p, _ = model(x, mode='p', listT=listT)
+                expected_out_ch = args.out_ch
+
+            expected_shape = (B, expected_out_ch, L, H, W)
+            assert out_p.shape == expected_shape, \
+                f"Train Output shape mismatch: got {out_p.shape}, expected {expected_shape}"
             
             loss = out_p.sum()
             loss.backward()
 
             out_gen_num = 3
             future_T = torch.ones(B, out_gen_num - 1, device=device) * 0.1
+            
             out_i, _ = model(x, mode='i', out_gen_num=out_gen_num, listT=listT, listT_future=future_T)
             
-            assert out_i.shape == (B, expected_ch, out_gen_num, H, W), \
-                f"Inference shape mismatch: got {out_i.shape}, expected {(B, expected_ch, out_gen_num, H, W)}"
+            expected_infer_shape = (B, expected_out_ch, out_gen_num, H, W)
+            assert out_i.shape == expected_infer_shape, \
+                f"Infer Output shape mismatch: got {out_i.shape}, expected {expected_infer_shape}"
 
             print(f"    -> PASS")
             passed += 1
-            
-            del model, x, listT, out_p, loss, out_i
-            torch.cuda.empty_cache()
 
         except Exception:
             print(f"    -> FAIL")
             traceback.print_exc()
             failed += 1
-            if failed >= 1: 
-                print("\n!!! Stopping early to allow debugging of the first error !!!")
-                sys.exit(1)
+            print("\n!!! Stopping early to allow debugging of the first error !!!")
+            sys.exit(1)
+        
+        finally:
+            if 'model' in locals(): del model
+            if 'x' in locals(): del x
+            if 'listT' in locals(): del listT
+            if 'loss' in locals(): del loss
+            if 'out_p' in locals(): del out_p
+            if 'out_i' in locals(): del out_i
+            torch.cuda.empty_cache()
 
-    print("-" * 50)
+    print("-" * 60)
     print(f"Summary: {passed} Passed, {failed} Failed")
     if failed > 0:
         sys.exit(1)
