@@ -149,17 +149,22 @@ class StreamFunctionMixing(nn.Module):
         yy, xx = torch.meshgrid(torch.linspace(-1, 1, h), torch.linspace(-1, 1, w), indexing='ij')
         self.register_buffer('grid_base', torch.stack((xx, yy), dim=-1))
 
-    def forward(self, z, dt):
+    def forward(self, z, dt, projection_op=None):
         B, C, H, W = z.shape
         dt_view = dt.view(B, 1, 1, 1)
         psi = self.psi_net(z) * dt_view
-        if not self.training and z.is_cuda:
-            u, v = fused_curl_2d(psi)
-        else:
-            u, v = self._curl_pytorch(psi)
+
+        u, v = self._curl_pytorch(psi)
+
+        if projection_op is not None:
+            v_field = torch.cat([u, v], dim=1)
+            v_field = projection_op(v_field)
+            u, v = v_field[:, 0:1], v_field[:, 1:2]
+
         flow_norm = torch.cat([u / (W/2), v / (H/2)], dim=1).permute(0, 2, 3, 1)
         grid = self.grid_base.unsqueeze(0).expand(B, -1, -1, -1)
         sampling_grid = grid - flow_norm
+
         z_out = F.grid_sample(z, sampling_grid, align_corners=True, mode='bilinear', padding_mode='border')
         return z_out
 
@@ -234,45 +239,4 @@ class SpectralStep(nn.Module):
         x_out_spec = x_spec.clone()
         x_out_spec[:, :, :, :self.w_freq] = feat_spec
         return torch.fft.irfft2(x_out_spec, s=(H, W), norm="ortho")
-
-class HelmholtzProjection(nn.Module):
-    def __init__(self, h, w):
-        super().__init__()
-        self.h = h
-        self.w = w
-        kx = torch.fft.fftfreq(w)
-        ky = torch.fft.fftfreq(h)
-        grid_ky, grid_kx = torch.meshgrid(ky, kx, indexing='ij')
-
-        k2 = grid_kx**2 + grid_ky**2
-        k2[0, 0] = 1.0
-        self.register_buffer('inv_laplacian', 1.0 / k2)
-        self.register_buffer('kx', grid_kx)
-        self.register_buffer('ky', grid_ky)
-
-    def forward(self, v_star):
-        B, C, H, W = v_star.shape
-        if C < 2:
-            return v_star
-
-        u = v_star[:, 0:1, :, :]
-        v = v_star[:, 1:2, :, :]
-
-        u_f = torch.fft.fftn(u, dim=(-2, -1))
-        v_f = torch.fft.fftn(v, dim=(-2, -1))
-
-        div_f = 1j * self.kx * u_f + 1j * self.ky * v_f
-        p_f = div_f * self.inv_laplacian
-
-        grad_px_f = 1j * self.kx * p_f
-        grad_py_f = 1j * self.ky * p_f
-
-        u_proj = u - torch.fft.ifftn(grad_px_f, dim=(-2, -1)).real
-        v_proj = v - torch.fft.ifftn(grad_py_f, dim=(-2, -1)).real
-
-        v_final = v_star.clone()
-        v_final[:, 0:1, :, :] = u_proj
-        v_final[:, 1:2, :, :] = v_proj
-
-        return v_final
 

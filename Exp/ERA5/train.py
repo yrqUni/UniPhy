@@ -85,7 +85,7 @@ class Args:
         self.dist_mode = "diffusion"
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 21
+        self.train_data_n_frames = 18
         self.eval_data_n_frames = 4
         self.eval_sample_num = 1
         self.ckpt = ""
@@ -108,7 +108,7 @@ class Args:
         self.use_amp = False
         self.amp_dtype = "bf16"
         self.grad_clip = 1.0
-        self.sample_k = 7
+        self.sample_k = 6
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
