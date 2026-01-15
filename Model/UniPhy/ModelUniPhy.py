@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -12,16 +12,7 @@ import triton.language as tl
 from PScan import pscan
 from GridSample import GridSample, warp_common
 from BarotropicVorticitySolver import BarotropicVorticitySolver
-
-try:
-    from GrandUnifiedTritonOps import FusedHamiltonian, fused_curl_2d
-    TRITON_AVAILABLE = True
-except ImportError:
-    try:
-        from TritonOps import FusedHamiltonian, fused_curl_2d
-        TRITON_AVAILABLE = True
-    except ImportError:
-        TRITON_AVAILABLE = False
+from GrandUnifiedTritonOps import FusedHamiltonian, fused_curl_2d
 
 @triton.autotune(
     configs=[
@@ -45,7 +36,6 @@ def koopman_A_kernel(
     block_start = pid * BLOCK_SIZE
     offs = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offs < n
-
     idx_wf = offs % Wf
     tmp = offs // Wf
     idx_h = tmp % H
@@ -56,21 +46,16 @@ def koopman_A_kernel(
     tmp = tmp // R
     idx_l = tmp % L
     idx_b = tmp // L
-
     dt = tl.load(dt_ptr + idx_b * stride_dt_b + idx_l * stride_dt_l, mask=mask, other=0.0)
-
     nu_off = idx_b * stride_nu_b + idx_l * stride_nu_l + idx_r * stride_nu_r + idx_c * stride_nu_c + idx_wf * stride_nu_wf
     nu = tl.load(nu_ptr + nu_off, mask=mask, other=0.0)
     th = tl.load(theta_ptr + nu_off, mask=mask, other=0.0)
-
     decay = tl.exp(-nu * dt)
     ang = th * dt
     c = tl.cos(ang)
     s = tl.sin(ang)
-
     out_r = decay * c
     out_i = decay * s
-
     o_off = idx_b * stride_o_b + idx_l * stride_o_l + idx_r * stride_o_r + idx_c * stride_o_c + idx_h * stride_o_h + idx_wf * stride_o_wf
     tl.store(out_real_ptr + o_off, out_r, mask=mask)
     tl.store(out_imag_ptr + o_off, out_i, mask=mask)
@@ -81,7 +66,6 @@ class CliffordConv2d(nn.Module):
         self.dim = dim // 4 
         if self.dim * 4 != dim:
             raise ValueError("Clifford channels must be divisible by 4")
-        
         self.conv_s = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
         self.conv_x = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
         self.conv_y = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
@@ -106,20 +90,13 @@ class StochasticHamiltonianSSM(nn.Module):
 
     def forward(self, z, dt):
         z_spec = torch.fft.rfft2(z, norm='ortho')
-        if TRITON_AVAILABLE and z.is_cuda:
-            sigma = F.softplus(self.noise_scale)
-            z_next_r, z_next_i = FusedHamiltonian.apply(
-                z_spec.real, z_spec.imag, 
-                self.hamiltonian_real, self.hamiltonian_imag, 
-                dt, sigma
-            )
-            z_shifted_spec = torch.complex(z_next_r, z_next_i)
-        else:
-            H_op = torch.complex(self.hamiltonian_real, self.hamiltonian_imag)
-            propagator = torch.exp(1j * H_op * dt)
-            sigma = F.softplus(self.noise_scale)
-            noise = torch.randn_like(z_spec) * sigma * math.sqrt(dt)
-            z_shifted_spec = z_spec * propagator + noise
+        sigma = F.softplus(self.noise_scale)
+        z_next_r, z_next_i = FusedHamiltonian.apply(
+            z_spec.real, z_spec.imag, 
+            self.hamiltonian_real, self.hamiltonian_imag, 
+            dt, sigma
+        )
+        z_shifted_spec = torch.complex(z_next_r, z_next_i)
         z_next = torch.fft.irfft2(z_shifted_spec, s=(z.shape[2], z.shape[3]), norm='ortho')
         return z_next
 
@@ -136,12 +113,10 @@ class StreamFunctionMixing(nn.Module):
 
     def forward(self, z, dt):
         B, C, H, W = z.shape
-        psi = self.psi_net(z) * dt
-        if TRITON_AVAILABLE and z.is_cuda and not self.training:
-            try:
-                u, v = fused_curl_2d(psi)
-            except:
-                u, v = self._curl_pytorch(psi)
+        dt_view = dt.view(B, 1, 1, 1)
+        psi = self.psi_net(z) * dt_view
+        if not self.training and z.is_cuda:
+            u, v = fused_curl_2d(psi)
         else:
             u, v = self._curl_pytorch(psi)
         flow_norm = torch.cat([u / (W/2), v / (H/2)], dim=1).permute(0, 2, 3, 1)
@@ -238,11 +213,18 @@ class DiffusionHead(nn.Module):
         self.final = nn.Conv2d(emb_ch, out_ch, 1)
 
     def forward(self, x_cond, x_noisy, t):
-        B, C, L, H, W = x_cond.shape
-        x_cond_flat = x_cond.reshape(B * L, C, H, W)
+        # x_cond comes in as [B, C, L, H, W] from Backbone
+        # We permute it to [B, L, C, H, W] to flatten B and L correctly
+        x_cond = x_cond.permute(0, 2, 1, 3, 4).contiguous()
+        B, L, C, H, W = x_cond.shape
+        
+        x_cond_flat = x_cond.view(B * L, C, H, W)
+        
+        # x_noisy is [B, L, C_out, H_up, W_up]
+        # We assume H_up = H * rH, W_up = W * rW
         x_noisy_flat = x_noisy.reshape(B * L, -1, H * self.rH, W * self.rW)
+        
         t_flat = t.reshape(B * L)
-
         time_emb = self.time_mlp(t_flat)
         
         x_cond_up = self.up_scale(x_cond_flat)
@@ -720,15 +702,15 @@ class PhysicalRecurrentLayer(nn.Module):
             h_prev = torch.zeros_like(x_flat)
         else:
             h_prev = last_hidden_in
-        dt = dt_seq.mean().item()
+        dt_flat = dt_seq.view(-1)
         state_in = h_prev + x_flat
         if state_in.shape[1] % 4 == 0:
             geo_feat = self.clifford_norm(state_in)
             geo_feat = self.clifford_conv(geo_feat)
         else:
             geo_feat = state_in
-        h_spec = self.ssm_evolve(state_in, dt)
-        h_phys = self.phys_mix(h_spec, dt)
+        h_spec = self.ssm_evolve(state_in, dt_flat)
+        h_phys = self.phys_mix(h_spec, dt_flat)
         combined = torch.cat([geo_feat, h_phys], dim=1)
         h_next = self.fusion(combined)
         out = h_next + x_flat * 0.1
@@ -1248,7 +1230,6 @@ class UniPhy(nn.Module):
                     for i in reversed(range(steps)):
                         t_tensor = torch.full((B * L,), i, device=x.device, dtype=torch.float)
                         pred_noise = self.decoder(x_hid, x_noisy, t_tensor)
-                        alpha = 1 - (i / steps)
                         x_noisy = x_noisy - 0.1 * pred_noise 
                     out = x_noisy
             else:

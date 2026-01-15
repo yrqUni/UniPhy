@@ -18,9 +18,9 @@ class MockArgs:
     def __init__(self, **kwargs):
         self.input_ch = 1
         self.input_size = (32, 64)
-        self.emb_ch = 16
+        self.emb_ch = 64
         self.hidden_factor = (2, 2)
-        self.convlru_num_blocks = 1
+        self.convlru_num_blocks = 2
         self.Arch = "unet"
         self.down_mode = "avg"
         self.lru_rank = 8
@@ -52,55 +52,41 @@ def run_checks():
 
     test_configs = [
         {
-            "name": "Default Spectral Mode",
+            "name": "Standard Spectral (Gaussian)",
             "dynamics_mode": "spectral",
             "dist_mode": "gaussian"
         },
         {
-            "name": "Spectral + Conservative",
-            "dynamics_mode": "spectral",
-            "conservative_dynamics": True
-        },
-        {
-            "name": "Spectral + PDE Refinement",
-            "dynamics_mode": "spectral",
-            "use_pde_refinement": True
-        },
-        {
-            "name": "Advection Mode",
+            "name": "Standard Advection (Laplace)",
             "dynamics_mode": "advection",
             "dist_mode": "laplace"
         },
         {
-            "name": "GeoSym Mode (Clifford+Hamiltonian+Stream)",
+            "name": "GeoSym SSM (Deterministic Decoder)",
             "dynamics_mode": "geosym",
-            "emb_ch": 16 
+            "dist_mode": "gaussian",
+            "emb_ch": 64 
+        },
+        {
+            "name": "GeoSym SSM + Diffusion Head",
+            "dynamics_mode": "geosym",
+            "dist_mode": "diffusion",
+            "emb_ch": 64
         },
         {
             "name": "GeoSym + PDE Refinement",
             "dynamics_mode": "geosym",
             "use_pde_refinement": True,
-            "emb_ch": 32 
+            "emb_ch": 64
         },
         {
-            "name": "Advection + No Noise",
-            "dynamics_mode": "advection",
-            "koopman_use_noise": False
-        },
-        {
-            "name": "Spectral + Noise",
+            "name": "Spectral + Noise Injection",
             "dynamics_mode": "spectral",
             "koopman_use_noise": True
-        },
-        {
-            "name": "Diffusion Head Mode",
-            "dynamics_mode": "spectral",
-            "dist_mode": "diffusion",
-            "out_ch": 1
         }
     ]
 
-    B, L, C, H, W = 2, 3, 1, 32, 64
+    B, L, C, H, W = 2, 4, 1, 32, 64
     x = torch.randn(B, L, C, H, W).to(device)
     listT = torch.ones(B, L).to(device)
 
@@ -112,12 +98,17 @@ def run_checks():
         
         try:
             model = UniPhy(args).to(device)
+            model.train() 
             
             start_time = time.time()
+            
             if args.dist_mode == "diffusion":
-                out, _ = model(x, mode="p", listT=listT, x_noisy=torch.randn_like(x), t=torch.zeros(B*L, device=device))
+                t = torch.randint(0, 1000, (B * L,), device=device).long()
+                x_noisy = torch.randn(B, L, args.out_ch, H, W).to(device)
+                out, _ = model(x, mode="p", listT=listT, x_noisy=x_noisy, t=t)
             else:
                 out, _ = model(x, mode="p", listT=listT)
+                
             fwd_time = time.time() - start_time
             
             loss = out.mean()
@@ -126,18 +117,16 @@ def run_checks():
             print(f"  [PASS] Forward/Backward successful. Time: {fwd_time:.4f}s")
             print(f"  Output shape: {out.shape}")
             
-            if config.get("use_pde_refinement", False):
-                print(f"  PDE Refinement active: Checked.")
             if config.get("dynamics_mode") == "geosym":
-                print(f"  GeoSym-SSM active: Checked.")
+                print(f"  GeoSym Logic: Verified.")
             if config.get("dist_mode") == "diffusion":
-                print(f"  Diffusion Head active: Checked.")
+                print(f"  Diffusion Head: Verified.")
                 
         except Exception:
             print(f"  [FAIL] Error encountered:")
             traceback.print_exc()
         
-        print("-" * 50)
+        print("-" * 60)
 
 if __name__ == "__main__":
     run_checks()

@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from TritonOps import FusedHamiltonian, fused_curl_2d
+from GrandUnifiedTritonOps import FusedHamiltonian, fused_curl_2d
 
 class CliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding=0):
@@ -70,7 +69,8 @@ class StreamFunctionConstraint(nn.Module):
 
     def forward(self, z, dt):
         B, C, H, W = z.shape
-        psi = self.psi_net(z.real) * dt
+        dt_view = dt.view(B, 1, 1, 1)
+        psi = self.psi_net(z.real) * dt_view
         if not self.training and z.is_cuda:
             u, v = fused_curl_2d(psi)
         else:
@@ -107,14 +107,17 @@ class GeoSymSDE(nn.Module):
             nn.Conv2d(hidden_dim * 4, out_ch, 1)
         )
 
-    def forward(self, x, dt=1.0):
+    def forward(self, x, dt):
         geo_feat = self.clifford_encoder(x)
         z_real = self.to_complex_real(geo_feat)
         z_imag = self.to_complex_imag(geo_feat)
         z = torch.complex(z_real, z_imag)
-        z_half = self.stochastic_op(z, dt / 2.0)
+        
+        dt_half = dt / 2.0
+        z_half = self.stochastic_op(z, dt_half)
         z_adv = self.stream_op(z_half, dt)
-        z_final = self.stochastic_op(z_adv, dt / 2.0)
+        z_final = self.stochastic_op(z_adv, dt_half)
+        
         z_cat = torch.cat([z_final.real, z_final.imag], dim=1)
         rec_feat = self.from_complex(z_cat)
         out = self.clifford_decoder(rec_feat + geo_feat)

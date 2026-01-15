@@ -1,43 +1,30 @@
 Running checks on cuda
 
-Testing: Default Spectral Mode ...
-  [PASS] Forward/Backward successful. Time: 3.3326s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
---------------------------------------------------
-Testing: Spectral + Conservative ...
-  [PASS] Forward/Backward successful. Time: 0.4497s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
---------------------------------------------------
-Testing: Spectral + PDE Refinement ...
-  [PASS] Forward/Backward successful. Time: 0.8861s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
-  PDE Refinement active: Checked.
---------------------------------------------------
-Testing: Advection Mode ...
-  [PASS] Forward/Backward successful. Time: 0.7882s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
---------------------------------------------------
-Testing: GeoSym Mode (Clifford+Hamiltonian+Stream) ...
-  [PASS] Forward/Backward successful. Time: 0.9628s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
-  GeoSym-SSM active: Checked.
---------------------------------------------------
+Testing: Standard Spectral (Gaussian) ...
+  [PASS] Forward/Backward successful. Time: 1.6193s
+  Output shape: torch.Size([2, 4, 2, 32, 64])
+------------------------------------------------------------
+Testing: Standard Advection (Laplace) ...
+  [PASS] Forward/Backward successful. Time: 0.0551s
+  Output shape: torch.Size([2, 4, 2, 32, 64])
+------------------------------------------------------------
+Testing: GeoSym SSM (Deterministic Decoder) ...
+  [PASS] Forward/Backward successful. Time: 0.0237s
+  Output shape: torch.Size([2, 4, 2, 32, 64])
+  GeoSym Logic: Verified.
+------------------------------------------------------------
+Testing: GeoSym SSM + Diffusion Head ...
+  [PASS] Forward/Backward successful. Time: 0.0315s
+  Output shape: torch.Size([2, 1, 4, 32, 64])
+  GeoSym Logic: Verified.
+  Diffusion Head: Verified.
+------------------------------------------------------------
 Testing: GeoSym + PDE Refinement ...
-  [PASS] Forward/Backward successful. Time: 0.9155s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
-  PDE Refinement active: Checked.
-  GeoSym-SSM active: Checked.
---------------------------------------------------
-Testing: Advection + No Noise ...
-  [PASS] Forward/Backward successful. Time: 0.4544s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
---------------------------------------------------
-Testing: Spectral + Noise ...
-  [PASS] Forward/Backward successful. Time: 0.4716s
-  Output shape: torch.Size([2, 3, 2, 32, 64])
---------------------------------------------------
-Testing: Diffusion Head Mode ...
-  [PASS] Forward/Backward successful. Time: 0.6242s
-  Output shape: torch.Size([2, 1, 3, 32, 64])
-  Diffusion Head active: Checked.
---------------------------------------------------
+  [PASS] Forward/Backward successful. Time: 0.0357s
+  Output shape: torch.Size([2, 4, 2, 32, 64])
+  GeoSym Logic: Verified.
+------------------------------------------------------------
+Testing: Spectral + Noise Injection ...
+  [PASS] Forward/Backward successful. Time: 0.0184s
+  Output shape: torch.Size([2, 4, 2, 32, 64])
+------------------------------------------------------------

@@ -1,21 +1,26 @@
 import torch
 import triton
 import triton.language as tl
-import math
 
 @triton.jit
 def fused_hamiltonian_kernel(
     z_real_ptr, z_imag_ptr,
     h_real_ptr, h_imag_ptr,
     noise_real_ptr, noise_imag_ptr,
+    dt_ptr,
     n_elements,
-    dt, sigma,
+    sample_size,
+    sigma,
     BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
+
+    batch_idx = offsets // sample_size
+    
+    dt = tl.load(dt_ptr + batch_idx, mask=mask, other=0.0)
 
     z_r = tl.load(z_real_ptr + offsets, mask=mask)
     z_i = tl.load(z_imag_ptr + offsets, mask=mask)
@@ -54,23 +59,28 @@ class FusedHamiltonian(torch.autograd.Function):
         noise_real = torch.randn_like(z_real)
         noise_imag = torch.randn_like(z_imag)
         
-        ctx.save_for_backward(z_real, z_imag, h_real, h_imag, noise_real, noise_imag)
-        ctx.dt = dt
+        ctx.save_for_backward(z_real, z_imag, h_real, h_imag, noise_real, noise_imag, dt)
         ctx.sigma_val = sigma_val
         
         n_elements = z_real.numel()
+        B = z_real.shape[0]
+        sample_size = n_elements // B
         
         out_real = z_real.clone()
         out_imag = z_imag.clone()
         
         grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
         
+        dt_flat = dt.view(-1).contiguous()
+
         fused_hamiltonian_kernel[grid](
             out_real, out_imag,
             h_real, h_imag,
             noise_real, noise_imag,
+            dt_flat,
             n_elements, 
-            float(dt), float(sigma_val), 
+            sample_size,
+            float(sigma_val),
             BLOCK_SIZE=1024
         )
         
@@ -78,20 +88,21 @@ class FusedHamiltonian(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out_real, grad_out_imag):
-        z_r, z_i, h_r, h_i, n_r, n_i = ctx.saved_tensors
-        dt = ctx.dt
+        z_r, z_i, h_r, h_i, n_r, n_i, dt = ctx.saved_tensors
+        
+        dt_expanded = dt.view(-1, 1, 1, 1)
         
         H = torch.complex(h_r, h_i)
-        prop = torch.exp(1j * H * dt)
+        prop = torch.exp(1j * H * dt_expanded)
         
         grad_out = torch.complex(grad_out_real, grad_out_imag)
         grad_z = grad_out * torch.conj(prop)
         
         z_in = torch.complex(z_r, z_i)
         z_out_det = z_in * prop
-        grad_H = grad_out * torch.conj(z_out_det) * 1j * dt
+        grad_H = grad_out * torch.conj(z_out_det) * 1j * dt_expanded
         
-        sqrt_dt = math.sqrt(dt)
+        sqrt_dt = torch.sqrt(dt_expanded)
         grad_sigma = torch.sum(grad_out_real * (sqrt_dt * n_r) + grad_out_imag * (sqrt_dt * n_i))
         
         return grad_z.real, grad_z.imag, grad_H.real, grad_H.imag, None, grad_sigma
@@ -138,7 +149,7 @@ def stencil_curl_kernel(
     tl.store(v_ptr + offset_out, -grad_x, mask=mask_h[:, None] & mask_w[None, :])
 
 def fused_curl_2d(psi):
-    psi = psi.contiguous() 
+    psi = psi.contiguous()
     B, C, H, W = psi.shape
     u = torch.empty_like(psi)
     v = torch.empty_like(psi)
