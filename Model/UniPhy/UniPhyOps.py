@@ -4,7 +4,8 @@ from UniPhyKernels import (
     CliffordConv2d,
     AdvectionStep,
     SpectralStep,
-    StreamFunctionMixing
+    StreamFunctionMixing,
+    HelmholtzProjection
 )
 
 class UniPhyLayer(nn.Module):
@@ -16,18 +17,18 @@ class UniPhyLayer(nn.Module):
         self.transport_op = AdvectionStep(emb_ch)
 
         self.interaction_op = nn.Sequential(
-            CliffordConv2d(emb_ch, 3, 1), 
-            nn.SiLU(), 
-            nn.Conv2d(emb_ch, emb_ch, 1) 
+            CliffordConv2d(emb_ch, 3, 1),
+            nn.SiLU(),
+            nn.Conv2d(emb_ch, emb_ch, 1)
         )
         nn.init.zeros_(self.interaction_op[-1].weight)
-        nn.init.eye_(self.interaction_op[-1].weight[:, :, 0, 0]) 
+        nn.init.eye_(self.interaction_op[-1].weight[:, :, 0, 0])
         nn.init.zeros_(self.interaction_op[-1].bias)
 
-
         self.dispersion_op = SpectralStep(emb_ch, rank=rank, w_freq=W//2+1)
-
-        self.constraint_op = StreamFunctionMixing(emb_ch, H, W)
+        
+        self.stream_mixing_op = StreamFunctionMixing(emb_ch, H, W)
+        self.projection_op = HelmholtzProjection(H, W)
         
         self.norm = nn.GroupNorm(4, emb_ch)
 
@@ -41,14 +42,15 @@ class UniPhyLayer(nn.Module):
         u = h_prev + x
         
         u = self.transport_op(u, dt_flat)
-
+        
         u_interaction = self.interaction_op(u)
-        u = u + u_interaction 
+        u = u + u_interaction
 
         u_spec_delta = self.dispersion_op(u, dt_flat)
         u = u + u_spec_delta
 
-        u = self.constraint_op(u, dt_flat)
+        u = self.stream_mixing_op(u, dt_flat)
+        u = self.projection_op(u)
 
         out = self.norm(u)
         
