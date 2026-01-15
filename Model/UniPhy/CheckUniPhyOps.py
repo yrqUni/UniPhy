@@ -56,7 +56,7 @@ def main():
         return
 
     try:
-        loss = out_2.sum() + h_2.sum()
+        loss = out_2.mean() + h_2.mean()
         loss.backward()
         
         params_checked = []
@@ -81,6 +81,7 @@ def main():
             
         print(f"Gradient Norm Check:")
         print(f"  Sigma grad: {model.sigma.grad}")
+        print(f"  Advection last layer grad norm: {model.advection.net[-1].weight.grad.norm().item():.4f}")
         print(f"  Advection weight grad norm: {model.advection.net[0].weight.grad.norm().item():.4f}")
         
     except Exception as e:
