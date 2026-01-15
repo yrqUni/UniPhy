@@ -44,7 +44,11 @@ class UniPhyLayer(nn.Module):
 
         h_geo = self.clifford_in(state)
         h_geo_f = torch.fft.rfft2(h_geo, norm='ortho')
-        hr, hi = self.hamiltonian(h_geo_f.real, h_geo_f.imag, self.h_params_r, self.h_params_i, dt_flat, self.sigma)
+        
+        z_real = h_geo_f.real.contiguous()
+        z_imag = h_geo_f.imag.contiguous()
+        
+        hr, hi = self.hamiltonian(z_real, z_imag, self.h_params_r, self.h_params_i, dt_flat, self.sigma)
         h_geo_next = torch.fft.irfft2(torch.complex(hr, hi), s=(H, W), norm='ortho')
 
         g_a = self.gate_adv(state)

@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-from GrandUnified import GrandUnifiedLayer
+from UniPhyOps import UniPhyLayer
 
 def get_safe_groups(channels: int, target: int = 4) -> int:
     return target if channels % target == 0 else 1
@@ -175,7 +175,7 @@ class PhysicalRecurrentLayer(nn.Module):
         super().__init__()
         self.emb_ch = int(emb_ch)
         self.H, self.W = int(input_shape[0]), int(input_shape[1])
-        self.core = GrandUnifiedLayer(self.emb_ch, (self.H, self.W), rank=rank)
+        self.core = UniPhyLayer(self.emb_ch, (self.H, self.W), rank=rank)
 
     def forward(self, x: torch.Tensor, last_hidden_in: Optional[torch.Tensor] = None, listT: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, L, H, W = x.shape
@@ -483,16 +483,16 @@ class FeatureEmbedding(nn.Module):
         lon = torch.linspace(0, 2 * math.pi, int(W))
         grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
         emb = torch.stack([torch.sin(grid_lat), torch.cos(grid_lat), torch.sin(grid_lon), torch.cos(grid_lon)], dim=0)
-        return emb.unsqueeze(0).unsqueeze(2)
+        return emb.unsqueeze(0).unsqueeze(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
             raise ValueError(f"Embedding expects [B,L,C,H,W], got {tuple(x.shape)}")
         x = x.permute(0, 2, 1, 3, 4).contiguous()
-        B, C, L, H, W = x.shape
-        grid = self.grid_embed.expand(B, -1, L, -1, -1).to(x.device, x.dtype)
-        x = torch.cat([x, grid], dim=1)
-        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, -1, H, W)
+        B, L, C, H, W = x.shape
+        grid = self.grid_embed.expand(B, L, -1, -1, -1).to(x.device, x.dtype)
+        x = torch.cat([x, grid], dim=2)
+        x_flat = x.reshape(B * L, -1, H, W)
         x_emb = self.patch_embed(x_flat)
         x_emb = self.activation(x_emb)
         _, C_emb, H_emb, W_emb = x_emb.shape
@@ -541,20 +541,22 @@ class ProbabilisticDecoder(nn.Module):
         x_flat = self.activation(x_flat)
         x_flat = self.c_out(x_flat)
         _, C_out, H_out, W_out = x_flat.shape
-        x = x_flat.view(B, L, C_out, H_out, W_out).permute(0, 2, 1, 3, 4)
+        x = x_flat.view(B, L, C_out, H_out, W_out)
         if self.dist_mode == "gaussian":
-            mu, log_sigma = torch.chunk(x, 2, dim=1)
+            mu, log_sigma = torch.chunk(x, 2, dim=2)
             with torch.amp.autocast("cuda", enabled=False):
                 log_sigma = torch.clamp(log_sigma, min=-5.0, max=5.0)
                 sigma = F.softplus(log_sigma.float()).to(mu.dtype) + 1e-3
-            return torch.cat([mu, sigma], dim=1)
+            x_res = torch.cat([mu, sigma], dim=2)
+            return x_res.permute(0, 2, 1, 3, 4)
         if self.dist_mode == "laplace":
-            mu, log_b = torch.chunk(x, 2, dim=1)
+            mu, log_b = torch.chunk(x, 2, dim=2)
             with torch.amp.autocast("cuda", enabled=False):
                 log_b = torch.clamp(log_b, min=-5.0, max=5.0)
                 b = F.softplus(log_b.float()).to(mu.dtype) + 1e-3
-            return torch.cat([mu, b], dim=1)
-        return x
+            x_res = torch.cat([mu, b], dim=2)
+            return x_res.permute(0, 2, 1, 3, 4)
+        return x.permute(0, 2, 1, 3, 4)
 
 class UniPhy(nn.Module):
     def __init__(self, args: Any):
@@ -631,18 +633,18 @@ class UniPhy(nn.Module):
                     out = self.decoder(x_hid, x_noisy, t)
                 else:
                     B, C, L, H, W = x.shape
-                    rH, rW = self.decoder.rH, self.decoder.rW
-                    x_noisy = torch.randn(B, L, self.decoder.out_ch, H * rH, W * rW, device=x.device, dtype=x.dtype)
+                    x_noisy = torch.randn(B, L, self.decoder.out_ch, H, W, device=x.device, dtype=x.dtype)
                     steps = 10
                     for i in reversed(range(steps)):
                         t_tensor = torch.full((B * L,), i, device=x.device, dtype=torch.float)
                         pred_noise = self.decoder(x_hid, x_noisy, t_tensor)
                         x_noisy = x_noisy - 0.1 * pred_noise 
                     out = x_noisy
+                out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
             else:
                 out = self.decoder(x_hid)
+                out_tensor = out
             
-            out_tensor = out.permute(0, 2, 1, 3, 4).contiguous()
             return out_tensor, last_hidden_outs
 
         if out_gen_num is None or int(out_gen_num) <= 0:
@@ -657,35 +659,40 @@ class UniPhy(nn.Module):
         
         if isinstance(self.decoder, DiffusionHead):
             B, C, L, H, W = x.shape
-            rH, rW = self.decoder.rH, self.decoder.rW
-            x_noisy = torch.randn(B, L, self.decoder.out_ch, H * rH, W * rW, device=x.device, dtype=x.dtype)
+            x_noisy = torch.randn(B, L, self.decoder.out_ch, H, W, device=x.device, dtype=x.dtype)
             t_tensor = torch.zeros(B * L, device=x.device)
             out = self.decoder(x_hidden, x_noisy, t_tensor)
-            x_dec0 = out
+            x_dec0 = out.permute(0, 2, 1, 3, 4).contiguous()
         else:
             x_dec0 = self.decoder(x_hidden)
 
-        x_step_dist = x_dec0.permute(0, 2, 1, 3, 4).contiguous()
-        x_step_dist = x_step_dist[:, -1:, :, :, :]
-        out_list.append(x_step_dist.cpu())
-        curr_x_phys = x_step_dist
+        x_step_dist = x_dec0
+        x_step_dist_slice = x_step_dist[:, :, -1:, :, :]
+        
+        out_list.append(x_step_dist_slice.cpu())
+        curr_x_phys = x_step_dist_slice
 
         future = torch.ones(B, int(out_gen_num) - 1, device=x.device, dtype=x.dtype) if listT_future is None else listT_future
 
         for t in range(int(out_gen_num) - 1):
             dt = future[:, t : t + 1]
-            if curr_x_phys.shape[1] != 1:
-                curr_x_phys = curr_x_phys[:, -1:, :, :, :]
-            x_in = self.embedding(curr_x_phys)
+            if curr_x_phys.shape[2] != 1:
+                curr_x_phys = curr_x_phys[:, :, -1:, :, :]
+            
+            x_next_input = curr_x_phys[:, :self.embedding.input_ch, :, :, :]
+            
+            x_in = self.embedding(x_next_input)
             x_hidden, last_hidden_outs = self.uniphy_model(x_in, last_hidden_ins=last_hidden_outs, listT=dt)
             if isinstance(self.decoder, DiffusionHead):
-                x_dec = self.decoder(x_hidden, torch.randn_like(curr_x_phys), torch.zeros(B, device=x.device))
+                x_noisy_t = torch.randn(B, 1, self.decoder.out_ch, H, W, device=x.device, dtype=x.dtype)
+                x_dec = self.decoder(x_hidden, x_noisy_t, torch.zeros(B, device=x.device))
+                x_dec = x_dec.permute(0, 2, 1, 3, 4)
             else:
                 x_dec = self.decoder(x_hidden)
-            x_step_dist = x_dec.permute(0, 2, 1, 3, 4).contiguous()
-            x_step_dist = x_step_dist[:, -1:, :, :, :]
+            
+            x_step_dist = x_dec
             out_list.append(x_step_dist.cpu())
             curr_x_phys = x_step_dist
 
-        return torch.cat(out_list, dim=1), last_hidden_outs
+        return torch.cat(out_list, dim=2), last_hidden_outs
 

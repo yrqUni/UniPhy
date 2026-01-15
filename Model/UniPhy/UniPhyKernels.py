@@ -16,26 +16,38 @@ def fused_hamiltonian_kernel(
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
+    
     batch_idx = offsets // sample_size
+    
+    idx_in_sample = offsets % sample_size
+    
     dt = tl.load(dt_ptr + batch_idx, mask=mask, other=0.0)
+    
     z_r = tl.load(z_real_ptr + offsets, mask=mask)
     z_i = tl.load(z_imag_ptr + offsets, mask=mask)
-    h_r = tl.load(h_real_ptr + offsets, mask=mask)
-    h_i = tl.load(h_imag_ptr + offsets, mask=mask)
+    
+    h_r = tl.load(h_real_ptr + idx_in_sample, mask=mask)
+    h_i = tl.load(h_imag_ptr + idx_in_sample, mask=mask)
+    
     real_arg = -h_i * dt
     imag_arg = h_r * dt
     mag = tl.exp(real_arg)
     cos_v = tl.cos(imag_arg)
     sin_v = tl.sin(imag_arg)
+    
     prop_r = mag * cos_v
     prop_i = mag * sin_v
+    
     out_r = z_r * prop_r - z_i * prop_i
     out_i = z_r * prop_i + z_i * prop_r
+    
     noise_r = tl.load(noise_real_ptr + offsets, mask=mask)
     noise_i = tl.load(noise_imag_ptr + offsets, mask=mask)
+    
     scale = sigma * tl.sqrt(dt)
     out_r = out_r + scale * noise_r
     out_i = out_i + scale * noise_i
+    
     tl.store(z_real_ptr + offsets, out_r, mask=mask)
     tl.store(z_imag_ptr + offsets, out_i, mask=mask)
 
@@ -50,10 +62,13 @@ class FusedHamiltonian(torch.autograd.Function):
         n_elements = z_real.numel()
         B = z_real.shape[0]
         sample_size = n_elements // B
+        
         out_real = z_real.clone()
         out_imag = z_imag.clone()
+        
         grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
         dt_flat = dt.view(-1).contiguous()
+        
         fused_hamiltonian_kernel[grid](
             out_real, out_imag, h_real, h_imag,
             noise_real, noise_imag, dt_flat,
@@ -68,13 +83,20 @@ class FusedHamiltonian(torch.autograd.Function):
         dt_expanded = dt.view(-1, 1, 1, 1)
         H = torch.complex(h_r, h_i)
         prop = torch.exp(1j * H * dt_expanded)
+        
         grad_out = torch.complex(grad_out_real, grad_out_imag)
         grad_z = grad_out * torch.conj(prop)
+        
         z_in = torch.complex(z_r, z_i)
         z_out_det = z_in * prop
         grad_H = grad_out * torch.conj(z_out_det) * 1j * dt_expanded
+        
+        if grad_H.shape[0] > 1:
+            grad_H = grad_H.sum(dim=0)
+            
         sqrt_dt = torch.sqrt(dt_expanded)
         grad_sigma = torch.sum(grad_out_real * (sqrt_dt * n_r) + grad_out_imag * (sqrt_dt * n_i))
+        
         return grad_z.real, grad_z.imag, grad_H.real, grad_H.imag, None, grad_sigma
 
 @triton.jit
@@ -89,21 +111,26 @@ def stencil_curl_kernel(
     off_w = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
     mask_h = off_h < H
     mask_w = off_w < W
+    
     idx_up = tl.maximum(off_h - 1, 0)
     idx_down = tl.minimum(off_h + 1, H - 1)
     idx_left = tl.maximum(off_w - 1, 0)
     idx_right = tl.minimum(off_w + 1, W - 1)
+    
     base_ptr = psi_ptr
     ptr_up = base_ptr + (idx_up[:, None] * stride_h + off_w[None, :] * stride_w)
     ptr_down = base_ptr + (idx_down[:, None] * stride_h + off_w[None, :] * stride_w)
     ptr_left = base_ptr + (off_h[:, None] * stride_h + idx_left[None, :] * stride_w)
     ptr_right = base_ptr + (off_h[:, None] * stride_h + idx_right[None, :] * stride_w)
+    
     val_up = tl.load(ptr_up, mask=mask_h[:, None] & mask_w[None, :], other=0.0)
     val_down = tl.load(ptr_down, mask=mask_h[:, None] & mask_w[None, :], other=0.0)
     val_left = tl.load(ptr_left, mask=mask_h[:, None] & mask_w[None, :], other=0.0)
     val_right = tl.load(ptr_right, mask=mask_h[:, None] & mask_w[None, :], other=0.0)
+    
     grad_y = (val_down - val_up) * 0.5
     grad_x = (val_right - val_left) * 0.5
+    
     offset_out = off_h[:, None] * stride_h + off_w[None, :] * stride_w
     tl.store(u_ptr + offset_out, grad_y, mask=mask_h[:, None] & mask_w[None, :])
     tl.store(v_ptr + offset_out, -grad_x, mask=mask_h[:, None] & mask_w[None, :])
@@ -125,52 +152,6 @@ def fused_curl_2d(psi):
             H, W, BLOCK_H=16, BLOCK_W=16
         )
     return u, v
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 128, "num_warps": 4}, num_stages=3),
-        triton.Config({"BLOCK_SIZE": 256, "num_warps": 8}, num_stages=4),
-        triton.Config({"BLOCK_SIZE": 512, "num_warps": 8}, num_stages=4),
-        triton.Config({"BLOCK_SIZE": 1024, "num_warps": 8}, num_stages=4),
-    ],
-    key=["B", "L", "R", "C", "H", "Wf"],
-)
-@triton.jit
-def koopman_A_kernel(
-    nu_ptr, theta_ptr, dt_ptr, out_real_ptr, out_imag_ptr,
-    B, L, R, C, H, Wf,
-    stride_nu_b, stride_nu_l, stride_nu_r, stride_nu_c, stride_nu_wf,
-    stride_dt_b, stride_dt_l, stride_o_b, stride_o_l, stride_o_r, stride_o_c, stride_o_h, stride_o_wf,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int64)
-    n = B * L * R * C * H * Wf
-    block_start = pid * BLOCK_SIZE
-    offs = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
-    mask = offs < n
-    idx_wf = offs % Wf
-    tmp = offs // Wf
-    idx_h = tmp % H
-    tmp = tmp // H
-    idx_c = tmp % C
-    tmp = tmp // C
-    idx_r = tmp % R
-    tmp = tmp // R
-    idx_l = tmp % L
-    idx_b = tmp // L
-    dt = tl.load(dt_ptr + idx_b * stride_dt_b + idx_l * stride_dt_l, mask=mask, other=0.0)
-    nu_off = idx_b * stride_nu_b + idx_l * stride_nu_l + idx_r * stride_nu_r + idx_c * stride_nu_c + idx_wf * stride_nu_wf
-    nu = tl.load(nu_ptr + nu_off, mask=mask, other=0.0)
-    th = tl.load(theta_ptr + nu_off, mask=mask, other=0.0)
-    decay = tl.exp(-nu * dt)
-    ang = th * dt
-    c = tl.cos(ang)
-    s = tl.sin(ang)
-    out_r = decay * c
-    out_i = decay * s
-    o_off = idx_b * stride_o_b + idx_l * stride_o_l + idx_r * stride_o_r + idx_c * stride_o_c + idx_h * stride_o_h + idx_wf * stride_o_wf
-    tl.store(out_real_ptr + o_off, out_r, mask=mask)
-    tl.store(out_imag_ptr + o_off, out_i, mask=mask)
 
 class CliffordConv2d(nn.Module):
     def __init__(self, dim, kernel_size=3, padding=1):
@@ -221,6 +202,7 @@ class StreamFunctionMixing(nn.Module):
         u = (psi_pad[:, :, 2:, 1:-1] - psi_pad[:, :, :-2, 1:-1]) / 2.0
         v = -(psi_pad[:, :, 1:-1, 2:] - psi_pad[:, :, 1:-1, :-2]) / 2.0
         return u, v
+
 class AdvectionStep(nn.Module):
     def __init__(self, in_ch):
         super().__init__()
@@ -231,29 +213,21 @@ class AdvectionStep(nn.Module):
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
-    
-    def get_base_grid(self, B, H, W, device, dtype):
-        step_y = 2.0 / H
-        step_x = 2.0 / W
-        start_y = -1.0 + step_y * 0.5
-        start_x = -1.0 + step_x * 0.5
-        grid_y = torch.linspace(start_y, 1.0 - step_y * 0.5, H, device=device, dtype=dtype)
-        grid_x = torch.linspace(start_x, 1.0 - step_x * 0.5, W, device=device, dtype=dtype)
-        return grid_y.view(1, H, 1), grid_x.view(1, 1, W)
-
-    def warp_common(self, flow, B, H, W):
-         base_grid_y, base_grid_x = self.get_base_grid(B, H, W, flow.device, flow.dtype)
-         flow_perm = flow.permute(0, 2, 3, 1)
-         final_x = base_grid_x + flow_perm[..., 0]
-         final_y = base_grid_y + flow_perm[..., 1]
-         final_x = torch.remainder(final_x + 1.0, 2.0) - 1.0
-         return torch.stack([final_x, final_y], dim=-1)
 
     def forward(self, x, dt):
         B, C, H, W = x.shape
         dt_view = dt.view(B, 1, 1, 1)
         flow = torch.tanh(self.net(x)) * dt_view
-        grid = self.warp_common(flow, B, H, W)
+        
+        y = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype)
+        x_coord = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype)
+        grid_y, grid_x = torch.meshgrid(y, x_coord, indexing='ij')
+        base_grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+        
+        flow_perm = flow.permute(0, 2, 3, 1)
+        
+        grid = base_grid - flow_perm
+        
         x_adv = F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=False)
         return x_adv
 
@@ -271,19 +245,25 @@ class SpectralStep(nn.Module):
 
     def forward(self, x, dt):
         B, C, H, W = x.shape
-        Wf = W // 2 + 1
         x_spec = torch.fft.rfft2(x, norm="ortho")
+        
         params = self.estimator(x).view(B, self.rank * 2, 1, self.w_freq)
+        
         nu, theta = torch.chunk(params, 2, dim=1)
         nu = F.softplus(nu).unsqueeze(-2)
         theta = (torch.tanh(theta) * math.pi).unsqueeze(-2)
+        
         dt_view = dt.view(B, 1, 1, 1, 1)
         decay = torch.exp(-nu * dt_view)
         angle = theta * dt_view
+        
         operator = torch.complex(decay * torch.cos(angle), decay * torch.sin(angle))
+        
         feat_spec = x_spec[:, :, :, :self.w_freq]
+        
         feat_spec = feat_spec.unsqueeze(1) * operator
         feat_spec = feat_spec.sum(dim=1)
+        
         x_out_spec = torch.zeros_like(x_spec)
         x_out_spec[:, :, :, :self.w_freq] = feat_spec
         return torch.fft.irfft2(x_out_spec, s=(H, W), norm="ortho")
