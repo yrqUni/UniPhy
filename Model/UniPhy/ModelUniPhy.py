@@ -13,6 +13,16 @@ from PScan import pscan
 from GridSample import GridSample, warp_common
 from BarotropicVorticitySolver import BarotropicVorticitySolver
 
+try:
+    from GrandUnifiedTritonOps import FusedHamiltonian, fused_curl_2d
+    TRITON_AVAILABLE = True
+except ImportError:
+    try:
+        from TritonOps import FusedHamiltonian, fused_curl_2d
+        TRITON_AVAILABLE = True
+    except ImportError:
+        TRITON_AVAILABLE = False
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": 128, "num_warps": 4}, num_stages=3),
@@ -97,6 +107,98 @@ def koopman_A_kernel(
     )
     tl.store(out_real_ptr + o_off, out_r, mask=mask)
     tl.store(out_imag_ptr + o_off, out_i, mask=mask)
+
+class CliffordConv2d(nn.Module):
+    def __init__(self, dim, kernel_size=3, padding=1):
+        super().__init__()
+        self.dim = dim // 4 
+        if self.dim * 4 != dim:
+            raise ValueError("Clifford channels must be divisible by 4")
+        
+        self.conv_s = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
+        self.conv_x = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
+        self.conv_y = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
+        self.conv_b = nn.Conv2d(self.dim, self.dim, kernel_size, padding=padding)
+
+    def forward(self, x):
+        s, vx, vy, b = torch.chunk(x, 4, dim=1)
+        
+        out_s = self.conv_s(s) - self.conv_x(vx) - self.conv_y(vy) - self.conv_b(b)
+        out_x = self.conv_x(s) + self.conv_s(vx) - self.conv_b(vy) + self.conv_y(b)
+        out_y = self.conv_y(s) + self.conv_b(vx) + self.conv_s(vy) - self.conv_x(b)
+        out_b = self.conv_b(s) + self.conv_y(vx) - self.conv_x(vy) + self.conv_s(b)
+        
+        return torch.cat([out_s, out_x, out_y, out_b], dim=1)
+
+class StochasticHamiltonianSSM(nn.Module):
+    def __init__(self, hidden_dim, h, w):
+        super().__init__()
+        self.freq_h = h
+        self.freq_w = w // 2 + 1
+        
+        self.hamiltonian_real = nn.Parameter(torch.randn(hidden_dim, self.freq_h, self.freq_w) * 0.01)
+        self.hamiltonian_imag = nn.Parameter(torch.randn(hidden_dim, self.freq_h, self.freq_w) * 0.01)
+        self.noise_scale = nn.Parameter(torch.tensor(0.02))
+
+    def forward(self, z, dt):
+        z_spec = torch.fft.rfft2(z, norm='ortho')
+        
+        if TRITON_AVAILABLE and z.is_cuda:
+            sigma = F.softplus(self.noise_scale)
+            z_next_r, z_next_i = FusedHamiltonian.apply(
+                z_spec.real, z_spec.imag, 
+                self.hamiltonian_real, self.hamiltonian_imag, 
+                dt, sigma
+            )
+            z_shifted_spec = torch.complex(z_next_r, z_next_i)
+        else:
+            H_op = torch.complex(self.hamiltonian_real, self.hamiltonian_imag)
+            propagator = torch.exp(1j * H_op * dt)
+            
+            sigma = F.softplus(self.noise_scale)
+            noise = torch.randn_like(z_spec) * sigma * math.sqrt(dt)
+            
+            z_shifted_spec = z_spec * propagator + noise
+            
+        z_next = torch.fft.irfft2(z_shifted_spec, s=(z.shape[2], z.shape[3]), norm='ortho')
+        return z_next
+
+class StreamFunctionMixing(nn.Module):
+    def __init__(self, in_ch, h, w):
+        super().__init__()
+        self.psi_net = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, padding=1, groups=in_ch),
+            nn.SiLU(),
+            nn.Conv2d(in_ch, 1, 3, padding=1)
+        )
+        yy, xx = torch.meshgrid(torch.linspace(-1, 1, h), torch.linspace(-1, 1, w), indexing='ij')
+        self.register_buffer('grid_base', torch.stack((xx, yy), dim=-1))
+
+    def forward(self, z, dt):
+        B, C, H, W = z.shape
+        
+        psi = self.psi_net(z) * dt
+        
+        if TRITON_AVAILABLE and z.is_cuda and not self.training:
+            try:
+                u, v = fused_curl_2d(psi)
+            except:
+                u, v = self._curl_pytorch(psi)
+        else:
+            u, v = self._curl_pytorch(psi)
+            
+        flow_norm = torch.cat([u / (W/2), v / (H/2)], dim=1).permute(0, 2, 3, 1)
+        grid = self.grid_base.unsqueeze(0).expand(B, -1, -1, -1)
+        sampling_grid = grid - flow_norm
+        
+        z_out = F.grid_sample(z, sampling_grid, align_corners=True, mode='bilinear', padding_mode='border')
+        return z_out
+
+    def _curl_pytorch(self, psi):
+        psi_pad = F.pad(psi, (1, 1, 1, 1), mode='replicate')
+        u = (psi_pad[:, :, 2:, 1:-1] - psi_pad[:, :, :-2, 1:-1]) / 2.0
+        v = -(psi_pad[:, :, 1:-1, 2:] - psi_pad[:, :, 1:-1, :-2]) / 2.0
+        return u, v
 
 def get_safe_groups(channels: int, target: int = 4) -> int:
     if channels % target == 0:
@@ -495,6 +597,12 @@ class PhysicalRecurrentLayer(nn.Module):
                 use_residual=pscan_use_residual,
                 chunk_size=pscan_chunk_size
             )
+        elif self.dynamics_mode == "geosym":
+            self.clifford_norm = nn.GroupNorm(4, self.emb_ch)
+            self.clifford_conv = CliffordConv2d(self.emb_ch, kernel_size=3, padding=1)
+            self.ssm_evolve = StochasticHamiltonianSSM(self.emb_ch, self.H, self.W)
+            self.phys_mix = StreamFunctionMixing(self.emb_ch, self.H, self.W)
+            self.fusion = nn.Conv2d(self.emb_ch * 2, self.emb_ch, 1)
         else:
             raise ValueError(f"Unknown dynamics_mode: {self.dynamics_mode}")
 
@@ -678,6 +786,42 @@ class PhysicalRecurrentLayer(nn.Module):
 
         return x + out, h_seq[:, -1]
 
+    def forward_geosym(
+        self,
+        x: torch.Tensor,
+        last_hidden_in: Optional[torch.Tensor],
+        dt_seq: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, C, L, H, W = x.shape
+        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * L, C, H, W)
+        
+        if last_hidden_in is None:
+            h_prev = torch.zeros_like(x_flat)
+        else:
+            h_prev = last_hidden_in
+
+        dt = dt_seq.mean().item()
+        
+        state_in = h_prev + x_flat
+        
+        if state_in.shape[1] % 4 == 0:
+            geo_feat = self.clifford_norm(state_in)
+            geo_feat = self.clifford_conv(geo_feat)
+        else:
+            geo_feat = state_in
+            
+        h_spec = self.ssm_evolve(state_in, dt)
+        
+        h_phys = self.phys_mix(h_spec, dt)
+        
+        combined = torch.cat([geo_feat, h_phys], dim=1)
+        h_next = self.fusion(combined)
+        
+        out = h_next + x_flat * 0.1
+        
+        out = out.view(B, L, C, H, W).permute(0, 2, 1, 3, 4)
+        return out, h_next
+
     def forward(
         self,
         x: torch.Tensor,
@@ -699,8 +843,12 @@ class PhysicalRecurrentLayer(nn.Module):
 
         if self.dynamics_mode == "spectral":
             out_main, h_last = self.forward_spectral(x_main, last_hidden_in, dt_seq)
-        else:
+        elif self.dynamics_mode == "advection":
             out_main, h_last = self.forward_advection(x_main, last_hidden_in, dt_seq)
+        elif self.dynamics_mode == "geosym":
+            out_main, h_last = self.forward_geosym(x_main, last_hidden_in, dt_seq)
+        else:
+            raise ValueError(f"Unknown dynamics mode {self.dynamics_mode}")
             
         if self.use_pde_refinement and x_high is not None:
             B, C, L, H, W = x_high.shape
