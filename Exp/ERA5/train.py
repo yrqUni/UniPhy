@@ -98,7 +98,8 @@ class Args:
         self.use_compile = False
         self.use_amp = False
         self.amp_dtype = "bf16"
-        
+        self.use_tf32 = False
+
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
