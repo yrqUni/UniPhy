@@ -377,8 +377,6 @@ def setup_wandb(rank: int, args: Args) -> None:
         wandb_kwargs["entity"] = args.wandb_entity
     if args.wandb_run_name is not None and str(args.wandb_run_name) != "":
         wandb_kwargs["name"] = args.wandb_run_name
-    if args.wandb_group is not None:
-        wandb_kwargs["group"] = args.wandb_group
     if args.wandb_mode is not None:
         wandb_kwargs["mode"] = args.wandb_mode
     wandb.init(**wandb_kwargs)
