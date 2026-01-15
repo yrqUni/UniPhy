@@ -4,8 +4,8 @@ from UniPhyKernels import (
     CliffordConv2d,
     AdvectionStep,
     SpectralStep,
-    StreamFunctionMixing,
-    HelmholtzProjection
+    HelmholtzProjection,
+    StreamFunctionMixing
 )
 
 class UniPhyLayer(nn.Module):
@@ -49,7 +49,7 @@ class UniPhyLayer(nn.Module):
         u_spec_delta = self.dispersion_op(u, dt_flat)
         u = u + u_spec_delta
 
-        u = self.stream_mixing_op(u, dt_flat)
+        u = self.stream_mixing_op(u, dt_flat, projection_op=self.projection_op)
         u = self.projection_op(u)
 
         out = self.norm(u)
