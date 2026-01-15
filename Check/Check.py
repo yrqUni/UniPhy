@@ -91,12 +91,16 @@ def run_checks():
             "name": "Spectral + Noise",
             "dynamics_mode": "spectral",
             "koopman_use_noise": True
+        },
+        {
+            "name": "Diffusion Head Mode",
+            "dynamics_mode": "spectral",
+            "dist_mode": "diffusion",
+            "out_ch": 1
         }
     ]
 
     B, L, C, H, W = 2, 3, 1, 32, 64
-    
-    # FIX: Shape must be [B, L, C, H, W] for the model input
     x = torch.randn(B, L, C, H, W).to(device)
     listT = torch.ones(B, L).to(device)
 
@@ -110,7 +114,10 @@ def run_checks():
             model = UniPhy(args).to(device)
             
             start_time = time.time()
-            out, _ = model(x, mode="p", listT=listT)
+            if args.dist_mode == "diffusion":
+                out, _ = model(x, mode="p", listT=listT, x_noisy=torch.randn_like(x), t=torch.zeros(B*L, device=device))
+            else:
+                out, _ = model(x, mode="p", listT=listT)
             fwd_time = time.time() - start_time
             
             loss = out.mean()
@@ -123,6 +130,8 @@ def run_checks():
                 print(f"  PDE Refinement active: Checked.")
             if config.get("dynamics_mode") == "geosym":
                 print(f"  GeoSym-SSM active: Checked.")
+            if config.get("dist_mode") == "diffusion":
+                print(f"  Diffusion Head active: Checked.")
                 
         except Exception:
             print(f"  [FAIL] Error encountered:")
