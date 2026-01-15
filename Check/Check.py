@@ -80,7 +80,7 @@ def run_checks():
             "name": "GeoSym + PDE Refinement",
             "dynamics_mode": "geosym",
             "use_pde_refinement": True,
-            "emb_ch": 32
+            "emb_ch": 32 
         },
         {
             "name": "Advection + No Noise",
@@ -95,7 +95,9 @@ def run_checks():
     ]
 
     B, L, C, H, W = 2, 3, 1, 32, 64
-    x = torch.randn(B, C, L, H, W).to(device)
+    
+    # FIX: Shape must be [B, L, C, H, W] for the model input
+    x = torch.randn(B, L, C, H, W).to(device)
     listT = torch.ones(B, L).to(device)
 
     for config in test_configs:
