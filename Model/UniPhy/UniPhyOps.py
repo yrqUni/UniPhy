@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from UniPhyKernels import (
     CliffordConv2d,
-    FusedHamiltonian,
     AdvectionStep,
     SpectralStep,
     StreamFunctionMixing
@@ -14,17 +13,22 @@ class UniPhyLayer(nn.Module):
         H, W = input_shape
         self.emb_ch = emb_ch
 
-        self.clifford_in = CliffordConv2d(emb_ch, 3, 1)
-        self.hamiltonian = FusedHamiltonian.apply
-        self.h_params_r = nn.Parameter(torch.randn(emb_ch, H, W//2+1) * 0.01)
-        self.h_params_i = nn.Parameter(torch.randn(emb_ch, H, W//2+1) * 0.01)
-        self.sigma = nn.Parameter(torch.tensor(0.02))
+        self.transport_op = AdvectionStep(emb_ch)
 
-        self.advection = AdvectionStep(emb_ch)
-        self.spectral = SpectralStep(emb_ch, rank=rank, w_freq=W//2+1)
+        self.interaction_op = nn.Sequential(
+            CliffordConv2d(emb_ch, 3, 1), 
+            nn.SiLU(), 
+            nn.Conv2d(emb_ch, emb_ch, 1) 
+        )
+        nn.init.zeros_(self.interaction_op[-1].weight)
+        nn.init.eye_(self.interaction_op[-1].weight[:, :, 0, 0]) 
+        nn.init.zeros_(self.interaction_op[-1].bias)
 
-        self.stream_fix = StreamFunctionMixing(emb_ch, H, W)
-        self.out_proj = nn.Conv2d(emb_ch, emb_ch, 1)
+
+        self.dispersion_op = SpectralStep(emb_ch, rank=rank, w_freq=W//2+1)
+
+        self.constraint_op = StreamFunctionMixing(emb_ch, H, W)
+        
         self.norm = nn.GroupNorm(4, emb_ch)
 
     def forward(self, x, h_prev, dt):
@@ -34,23 +38,19 @@ class UniPhyLayer(nn.Module):
         if h_prev is None:
             h_prev = torch.zeros_like(x)
 
-        state = h_prev + x
-
-        state = self.advection(state, dt_flat)
-        state = self.spectral(state, dt_flat)
-
-        h_geo = self.clifford_in(state)
-        h_geo_f = torch.fft.rfft2(h_geo, norm='ortho')
+        u = h_prev + x
         
-        z_real = h_geo_f.real.contiguous()
-        z_imag = h_geo_f.imag.contiguous()
+        u = self.transport_op(u, dt_flat)
+
+        u_interaction = self.interaction_op(u)
+        u = u + u_interaction 
+
+        u_spec_delta = self.dispersion_op(u, dt_flat)
+        u = u + u_spec_delta
+
+        u = self.constraint_op(u, dt_flat)
+
+        out = self.norm(u)
         
-        hr, hi = self.hamiltonian(z_real, z_imag, self.h_params_r, self.h_params_i, dt_flat, self.sigma)
-        h_geo_next = torch.fft.irfft2(torch.complex(hr, hi), s=(H, W), norm='ortho')
-
-        state = h_geo_next
-        state_clean = self.stream_fix(state, dt_flat)
-
-        out = self.norm(self.out_proj(state_clean))
-        return out, state_clean
+        return out, u
 

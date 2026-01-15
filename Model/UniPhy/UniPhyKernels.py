@@ -51,54 +51,6 @@ def fused_hamiltonian_kernel(
     tl.store(z_real_ptr + offsets, out_r, mask=mask)
     tl.store(z_imag_ptr + offsets, out_i, mask=mask)
 
-class FusedHamiltonian(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, z_real, z_imag, h_real, h_imag, dt, sigma_tensor):
-        sigma_val = sigma_tensor.item()
-        noise_real = torch.randn_like(z_real)
-        noise_imag = torch.randn_like(z_imag)
-        ctx.save_for_backward(z_real, z_imag, h_real, h_imag, noise_real, noise_imag, dt)
-        ctx.sigma_val = sigma_val
-        n_elements = z_real.numel()
-        B = z_real.shape[0]
-        sample_size = n_elements // B
-        
-        out_real = z_real.clone()
-        out_imag = z_imag.clone()
-        
-        grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-        dt_flat = dt.view(-1).contiguous()
-        
-        fused_hamiltonian_kernel[grid](
-            out_real, out_imag, h_real, h_imag,
-            noise_real, noise_imag, dt_flat,
-            n_elements, sample_size, float(sigma_val),
-            BLOCK_SIZE=1024
-        )
-        return out_real, out_imag
-
-    @staticmethod
-    def backward(ctx, grad_out_real, grad_out_imag):
-        z_r, z_i, h_r, h_i, n_r, n_i, dt = ctx.saved_tensors
-        dt_expanded = dt.view(-1, 1, 1, 1)
-        H = torch.complex(h_r, h_i)
-        prop = torch.exp(1j * H * dt_expanded)
-        
-        grad_out = torch.complex(grad_out_real, grad_out_imag)
-        grad_z = grad_out * torch.conj(prop)
-        
-        z_in = torch.complex(z_r, z_i)
-        z_out_det = z_in * prop
-        grad_H = grad_out * torch.conj(z_out_det) * 1j * dt_expanded
-        
-        if grad_H.shape[0] > 1:
-            grad_H = grad_H.sum(dim=0)
-            
-        sqrt_dt = torch.sqrt(dt_expanded)
-        grad_sigma = torch.sum(grad_out_real * (sqrt_dt * n_r) + grad_out_imag * (sqrt_dt * n_i))
-        
-        return grad_z.real, grad_z.imag, grad_H.real, grad_H.imag, None, grad_sigma
-
 @triton.jit
 def stencil_curl_kernel(
     psi_ptr, u_ptr, v_ptr,

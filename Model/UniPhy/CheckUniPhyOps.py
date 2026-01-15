@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from UniPhyOps import UniPhyLayer
+import traceback
 
 def main():
     print("Checking UniPhyOps.py...")
@@ -10,7 +11,7 @@ def main():
         print("Running on GPU")
     else:
         device = torch.device("cpu")
-        print("Running on CPU (Warning: Triton kernels require GPU)")
+        print("Running on CPU")
 
     B, C, H, W = 2, 32, 64, 64
     emb_ch = C
@@ -38,7 +39,6 @@ def main():
         print(f"[Pass] Forward Step 1 (h_prev=None): Output {out_1.shape}")
     except Exception as e:
         print(f"[Fail] Forward Step 1: {e}")
-        import traceback
         traceback.print_exc()
         return
 
@@ -65,11 +65,9 @@ def main():
                 params_checked.append(name)
         
         required_grads = [
-            'h_params_r', 
-            'h_params_i', 
-            'sigma', 
-            'advection.net.0.weight', 
-            'clifford_in.conv_s.weight'
+            'transport_op.net.0.weight',
+            'interaction_op.0.conv_s.weight',
+            'dispersion_op.estimator.1.weight'
         ]
         
         missing_grads = [name for name in required_grads if not any(name in p for p in params_checked)]
@@ -80,13 +78,11 @@ def main():
             print(f"[Pass] Backward Pass: Gradients computed successfully")
             
         print(f"Gradient Norm Check:")
-        print(f"  Sigma grad: {model.sigma.grad}")
-        print(f"  Advection last layer grad norm: {model.advection.net[-1].weight.grad.norm().item():.4f}")
-        print(f"  Advection weight grad norm: {model.advection.net[0].weight.grad.norm().item():.4f}")
+        print(f"  Transport grad norm: {model.transport_op.net[0].weight.grad.norm().item():.4f}")
+        print(f"  Interaction grad norm: {model.interaction_op[0].conv_s.weight.grad.norm().item():.4f}")
         
     except Exception as e:
         print(f"[Fail] Backward Pass: {e}")
-        import traceback
         traceback.print_exc()
         return
 
