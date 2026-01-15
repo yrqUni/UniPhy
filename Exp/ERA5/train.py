@@ -67,7 +67,7 @@ class Args:
         self.emb_ch = 64
         self.hidden_factor = (7, 12)
         self.convlru_num_blocks = 6
-        self.ffn_ratio = 1.5
+        self.ffn_ratio = 1.25
         
         self.Arch = "unet"
         self.ConvType = "dcn"
