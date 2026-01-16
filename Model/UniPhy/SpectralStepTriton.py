@@ -5,6 +5,16 @@ import math
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_W': 128, 'num_warps': 4}, num_stages=3),
+        triton.Config({'BLOCK_W': 128, 'num_warps': 8}, num_stages=3),
+        triton.Config({'BLOCK_W': 256, 'num_warps': 4}, num_stages=3),
+        triton.Config({'BLOCK_W': 256, 'num_warps': 8}, num_stages=3),
+        triton.Config({'BLOCK_W': 512, 'num_warps': 8}, num_stages=3),
+    ],
+    key=['W', 'RANK', 'B', 'H'],
+)
 @triton.jit
 def spectral_fwd_kernel(
     out_r_ptr, out_i_ptr,
@@ -53,6 +63,13 @@ def spectral_fwd_kernel(
     tl.store(out_r_ptr + out_off, acc_r, mask=mask)
     tl.store(out_i_ptr + out_off, acc_i, mask=mask)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_W': 128, 'num_warps': 4}, num_stages=3),
+        triton.Config({'BLOCK_W': 256, 'num_warps': 8}, num_stages=3),
+    ],
+    key=['W', 'RANK', 'B', 'H'],
+)
 @triton.jit
 def spectral_bwd_kernel(
     dnu_ptr, dtheta_ptr,
@@ -97,14 +114,11 @@ def spectral_bwd_kernel(
         cos_a = tl.cos(angle)
         sin_a = tl.sin(angle)
         
-        term_r = decay * cos_a
-        term_i = decay * sin_a
+        d_term_real_dnu = -dt * decay * cos_a
+        d_term_imag_dnu = -dt * decay * sin_a
         
-        d_term_real_dnu = -dt * term_r
-        d_term_imag_dnu = -dt * term_i
-        
-        d_term_real_dtheta = -dt * term_i
-        d_term_imag_dtheta = dt * term_r
+        d_term_real_dtheta = -dt * decay * sin_a
+        d_term_imag_dtheta = dt * decay * cos_a
         
         d_nu = g_r * d_term_real_dnu + g_i * d_term_imag_dnu
         d_theta = g_r * d_term_real_dtheta + g_i * d_term_imag_dtheta
@@ -126,8 +140,7 @@ class SpectralFilterFunction(torch.autograd.Function):
         filter_real = torch.empty((B, H, w_freq), device=nu.device, dtype=torch.float32)
         filter_imag = torch.empty((B, H, w_freq), device=nu.device, dtype=torch.float32)
         
-        BLOCK_W = 128
-        grid = (B, H * triton.cdiv(w_freq, BLOCK_W))
+        grid = lambda META: (B, H * triton.cdiv(w_freq, META['BLOCK_W']))
         
         spectral_fwd_kernel[grid](
             filter_real, filter_imag,
@@ -136,7 +149,7 @@ class SpectralFilterFunction(torch.autograd.Function):
             filter_real.stride(0), filter_real.stride(1), filter_real.stride(2),
             nu.stride(0), nu.stride(1), nu.stride(2), nu.stride(3),
             dt.stride(0),
-            RANK=R, W=w_freq, BLOCK_W=BLOCK_W
+            RANK=R, W=w_freq
         )
         
         ctx.save_for_backward(nu, theta, dt)
@@ -149,11 +162,13 @@ class SpectralFilterFunction(torch.autograd.Function):
         R = ctx.rank
         B, _, H, _ = nu.shape
         
+        grad_real = grad_real.contiguous()
+        grad_imag = grad_imag.contiguous()
+        
         dnu = torch.empty_like(nu)
         dtheta = torch.empty_like(theta)
         
-        BLOCK_W = 128
-        grid = (B, H * triton.cdiv(w_freq, BLOCK_W))
+        grid = lambda META: (B, H * triton.cdiv(w_freq, META['BLOCK_W']))
         
         spectral_bwd_kernel[grid](
             dnu, dtheta,
@@ -163,7 +178,7 @@ class SpectralFilterFunction(torch.autograd.Function):
             nu.stride(0), nu.stride(1), nu.stride(2), nu.stride(3),
             grad_real.stride(0), grad_real.stride(1), grad_real.stride(2),
             dt.stride(0),
-            RANK=R, W=w_freq, BLOCK_W=BLOCK_W
+            RANK=R, W=w_freq
         )
         
         return dnu, dtheta, None, None
@@ -196,9 +211,9 @@ class SpectralStep(nn.Module):
         
         filter_real, filter_imag = SpectralFilterFunction.apply(nu, theta, dt, self.w_freq)
         
-        target_spec = x_spec[:, :, :, :self.w_freq]
         filter_complex = torch.complex(filter_real, filter_imag).unsqueeze(1)
         
+        target_spec = x_spec[:, :, :, :self.w_freq]
         out_spec = target_spec * filter_complex
         
         x_final_spec = torch.zeros_like(x_spec)
