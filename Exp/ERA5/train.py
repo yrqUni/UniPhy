@@ -67,14 +67,14 @@ def format_params(num):
 def log_model_stats(model: torch.nn.Module, rank: int) -> None:
     if rank != 0:
         return
-    
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+
     msg = (
         f"\n{'='*40}\n"
         f"Model Statistics:\n"
-        f"Total Parameters:     {format_params(total_params)}\n"
+        f"Total Parameters:      {format_params(total_params)}\n"
         f"Trainable Parameters: {format_params(trainable_params)}\n"
         f"{'='*40}\n"
     )
@@ -85,50 +85,53 @@ class Args:
     def __init__(self) -> None:
         self.input_shape = (721, 1440)
         self.in_channels = 30
-        self.dim = 1536
-        self.patch_size = 4
-        self.num_layers = 24
+        self.dim = 1152
+        self.patch_size = 16
+        self.num_layers = 6
         self.para_pool_expansion = 4
         self.conserve_energy = True
-        
-        self.dt_ref = 1.0
+
+        self.dt_ref = 6.0
         self.train_batch_size = 1
         self.eval_batch_size = 1
-        
+
         self.use_scheduler = True
         self.lr = 1e-4
         self.weight_decay = 0.05
         self.epochs = 100
-        
+
         self.grad_clip = 1.0
         self.grad_accum_steps = 1
-        
+
         self.log_every = 10
         self.wandb_every = 10
         self.ckpt_step = 0.5
-        
+
         self.log_path = "./uniphy_logs"
         self.ckpt_dir = "./uniphy_ckpt"
         self.ckpt = ""
-        
+
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 4
+        self.train_data_n_frames = 20
+        self.sample_k = 8
         self.eval_sample_num = 1
-        
+
         self.use_tf32 = True
 
         self.use_wandb = True
-        self.wandb_project = "UniPhy-ERA5"
+        self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = "UniPhy_Large_A100"
+        self.wandb_run_name = self.ckpt
         self.wandb_mode = "online"
 
         self.check_args()
-        
+
     def check_args(self) -> None:
         if int(self.grad_accum_steps) < 1:
             raise ValueError("grad_accum_steps must be >= 1")
+        if self.sample_k > self.train_data_n_frames:
+            raise ValueError("sample_k must be <= train_data_n_frames")
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
@@ -185,18 +188,18 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
 def load_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, ckpt_path: str, scheduler: Optional[Any] = None, map_location: str = "cpu") -> Tuple[int, int]:
     if not os.path.isfile(ckpt_path): return 0, 0
     checkpoint = torch.load(ckpt_path, map_location=map_location)
-    
+
     state_dict = checkpoint["model"]
     new_state_dict = {}
     for k, v in state_dict.items():
         new_k = k.replace("module.", "") if k.startswith("module.") else k
         new_state_dict[new_k] = v
-        
+
     model.load_state_dict(new_state_dict, strict=False)
     opt.load_state_dict(checkpoint["optimizer"])
     if scheduler and "scheduler" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler"])
-    
+
     return checkpoint.get("epoch", 0), checkpoint.get("step", 0)
 
 def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float]:
@@ -229,7 +232,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     ).cuda(local_rank)
 
     log_model_stats(model, rank)
-    
+
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     setup_wandb(rank, args)
 
@@ -286,41 +289,50 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
 
     global_step = int(start_epoch) * len(train_dataloader)
-    
+
     for ep in range(start_epoch, args.epochs):
         train_sampler.set_epoch(ep)
         train_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}/{args.epochs}") if rank == 0 else train_dataloader
-        
+
         for train_step, data in enumerate(train_iter, start=1):
             model.train()
-            
-            x = data[:, :-1].to(f"cuda:{local_rank}", non_blocking=True).float()
-            target = data[:, 1:].to(f"cuda:{local_rank}", non_blocking=True).float()
-            
+
+            data = data.to(f"cuda:{local_rank}", non_blocking=True).float()
+            B, T_total, C, H, W = data.shape
+
+            indices_list = [sorted(random.sample(range(T_total), args.sample_k)) for _ in range(B)]
+            indices = torch.tensor(indices_list, device=data.device)
+
+            batch_idx = torch.arange(B, device=data.device).unsqueeze(1)
+            sampled_data = data[batch_idx, indices]
+
+            x = sampled_data[:, :-1]
+            target = sampled_data[:, 1:]
+
+            dt = (indices[:, 1:] - indices[:, :-1]).float() * args.dt_ref
             B, T_seq, C, H, W = target.shape
-            dt = torch.full((B, T_seq), args.dt_ref, device=x.device)
 
             is_accum = (train_step % args.grad_accum_steps != 0)
             sync_ctx = model.no_sync() if is_accum else contextlib.nullcontext()
 
             with sync_ctx:
                 z_pred, _ = model(x, dt)
-                
+
                 z_flat = z_pred.reshape(B * T_seq, -1, z_pred.shape[-2], z_pred.shape[-1])
                 target_flat = target.reshape(B * T_seq, C, H, W)
-                
+
                 t = torch.randint(0, T_diffusion, (B * T_seq,), device=x.device).long()
                 noise = torch.randn_like(target_flat)
-                
+
                 sqrt_alpha_t = sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
                 sqrt_one_minus_alpha_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
                 x_noisy = sqrt_alpha_t * target_flat + sqrt_one_minus_alpha_t * noise
-                
+
                 decoder_module = model.module.decoder if isinstance(model, DDP) else model.decoder
                 pred_noise = decoder_module(z_flat, x_noisy, t)
-                
+
                 loss = F.mse_loss(pred_noise, noise)
-                
+
                 if torch.isnan(loss) or torch.isinf(loss):
                     opt.zero_grad(set_to_none=True)
                     continue
@@ -333,13 +345,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             grad_norm, max_grad = 0.0, 0.0
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            
+
             grad_norm, max_grad = get_grad_stats(model)
-            
+
             opt.step()
             opt.zero_grad(set_to_none=True)
             if scheduler: scheduler.step()
-            
+
             global_step += 1
 
             if rank == 0:
@@ -350,7 +362,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     msg = f"Ep {ep+1} - {train_step}/{len(train_dataloader)} | Loss: {loss_val:.4e} | GN: {grad_norm:.2f}"
                     if isinstance(train_iter, tqdm): train_iter.set_description(msg)
                     logging.info(msg)
-                    
+
                     if args.use_wandb and (train_step % args.wandb_every == 0):
                         wandb.log({
                             "train/loss": loss_val,
