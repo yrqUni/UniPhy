@@ -23,69 +23,55 @@ def get_args():
         num_layers=24,
         para_pool_expansion=4,
         conserve_energy=True,
-
+        decoder_type="ensemble",
+        ensemble_size=8,
+        diffusion_steps=20,
         dt_ref=1.0,
         data_root="/nfs/ERA5_data/data_norm",
         year_range=[2017, 2021],
-        
         ctx_len=4,
         pred_len=4,
-        ensemble_size=8,
-        diffusion_steps=20,
-
         checkpoint_path="./uniphy_ckpt/latest.pth",
         save_path="result.gif",
-        
         use_tf32=True
     )
 
 def render_frame(t, gt, pred_mean, pred_std, sample1, sample2, channel_idx=0):
     fig, axes = plt.subplots(2, 3, figsize=(24, 12))
     cmap = 'jet'
-    
-    v_min = gt.min()
-    v_max = gt.max()
-
+    v_min, v_max = gt.min(), gt.max()
     ax = axes[0, 0]
     im = ax.imshow(gt, cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title(f"Ground Truth (t={t+1})")
+    ax.set_title(f"GT (t={t+1})")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
-
     ax = axes[0, 1]
     im = ax.imshow(pred_mean, cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Ensemble Mean")
+    ax.set_title("Mean")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
-
     ax = axes[0, 2]
-    error = np.abs(gt - pred_mean)
-    im = ax.imshow(error, cmap='inferno')
-    ax.set_title("Absolute Error")
+    im = ax.imshow(np.abs(gt - pred_mean), cmap='inferno')
+    ax.set_title("Error")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
-
     ax = axes[1, 0]
     im = ax.imshow(sample1, cmap=cmap, vmin=v_min, vmax=v_max)
     ax.set_title("Member 1")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
-
     ax = axes[1, 1]
     im = ax.imshow(sample2, cmap=cmap, vmin=v_min, vmax=v_max)
     ax.set_title("Member 2")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
-
     ax = axes[1, 2]
     im = ax.imshow(pred_std, cmap='viridis')
     ax.set_title("Uncertainty")
     plt.colorbar(im, ax=ax)
     ax.axis('off')
-
     plt.tight_layout()
     fig.canvas.draw()
-    
     image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
     image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     plt.close(fig)
@@ -95,13 +81,9 @@ def main():
     plt.switch_backend('Agg')
     args = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running on {device}")
-    
     if args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-
-    print("Building Model...")
     model = UniPhyModel(
         input_shape=args.input_shape,
         in_channels=args.in_channels,
@@ -109,96 +91,59 @@ def main():
         patch_size=args.patch_size,
         num_layers=args.num_layers,
         para_pool_expansion=args.para_pool_expansion,
-        conserve_energy=args.conserve_energy
+        conserve_energy=args.conserve_energy,
+        decoder_type=args.decoder_type,
+        ensemble_size=args.ensemble_size
     ).to(device)
-
     if os.path.exists(args.checkpoint_path):
-        print(f"Loading checkpoint from {args.checkpoint_path}")
-        checkpoint = torch.load(args.checkpoint_path, map_location=device)
-        
-        state_dict = checkpoint.get('model', checkpoint)
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            name = k.replace("module.", "") if k.startswith("module.") else k
-            new_state_dict[name] = v
-            
-        model.load_state_dict(new_state_dict, strict=False)
-    else:
-        print(f"Warning: Checkpoint {args.checkpoint_path} not found! Using random weights.")
-
+        ckpt = torch.load(args.checkpoint_path, map_location=device)
+        sd = ckpt.get('model', ckpt)
+        nsd = {k.replace("module.", ""): v for k, v in sd.items()}
+        model.load_state_dict(nsd, strict=False)
     model.eval()
-
-    total_len = args.ctx_len + args.pred_len
+    t_len = args.ctx_len + args.pred_len
     try:
-        dataset = ERA5_Dataset(
-            input_dir=args.data_root,
-            year_range=args.year_range,
-            is_train=False,
-            sample_len=total_len,
-            eval_sample=1,
-            max_cache_size=1,
-            rank=0,
-            gpus=1
+        ds = ERA5_Dataset(
+            input_dir=args.data_root, year_range=args.year_range, is_train=False,
+            sample_len=t_len, eval_sample=1, max_cache_size=1, rank=0, gpus=1
         )
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
-        data_iter = iter(dataloader)
-        full_seq = next(data_iter)
-    except Exception as e:
-        print(f"Dataset load failed ({e}), creating dummy data.")
-        full_seq = torch.randn(1, total_len, args.in_channels, *args.input_shape)
-
+        full_seq = next(iter(torch.utils.data.DataLoader(ds, batch_size=1)))
+    except:
+        full_seq = torch.randn(1, t_len, args.in_channels, *args.input_shape)
     full_seq = full_seq.to(device).float()
-    
     input_seq = full_seq[:, :args.ctx_len]
     gt_seq = full_seq[:, args.ctx_len:]
-    
-    B, _, C, H, W = input_seq.shape
-    
-    ctx_dt = torch.full((B, args.ctx_len), args.dt_ref, device=device)
-    future_dt = args.dt_ref
-
-    print(f"Running Ensemble Inference ({args.ensemble_size} members)...")
-    
-    ensemble_preds = []
-    
-    for i in tqdm(range(args.ensemble_size)):
-        pred = model.inference(
+    with torch.no_grad():
+        preds = model.inference(
             context_x=input_seq,
-            context_dt=ctx_dt,
+            context_dt=torch.full((1, args.ctx_len), args.dt_ref, device=device),
             future_steps=args.pred_len,
-            future_dt=future_dt,
-            diffusion_steps=args.diffusion_steps
+            future_dt=args.dt_ref,
+            diffusion_steps=args.diffusion_steps,
+            num_ensemble=args.ensemble_size
         )
-        ensemble_preds.append(pred.cpu().numpy())
-
-    ensemble_stack = np.stack(ensemble_preds, axis=0)
-    
-    pred_mean = np.mean(ensemble_stack, axis=0)
-    pred_std = np.std(ensemble_stack, axis=0)
-    
-    sample1 = ensemble_stack[0]
-    sample2 = ensemble_stack[1] if args.ensemble_size > 1 else ensemble_stack[0]
+    p_np = preds.cpu().numpy()
     gt_np = gt_seq.cpu().numpy()
-
-    print("Generating GIF...")
+    if args.decoder_type == "ensemble":
+        e_stack = np.transpose(p_np, (2, 0, 1, 3, 4, 5))
+    else:
+        e_stack = np.expand_dims(p_np, axis=0)
+    p_mean = np.mean(e_stack, axis=0)
+    p_std = np.std(e_stack, axis=0)
+    s1 = e_stack[0]
+    s2 = e_stack[min(1, len(e_stack)-1)]
     frames = []
-    
-    viz_ch = 0 
-    
     for t in range(args.pred_len):
         frame = render_frame(
             t,
-            gt=gt_np[0, t, viz_ch],
-            pred_mean=pred_mean[0, t, viz_ch],
-            pred_std=pred_std[0, t, viz_ch],
-            sample1=sample1[0, t, viz_ch],
-            sample2=sample2[0, t, viz_ch],
-            channel_idx=viz_ch
+            gt=gt_np[0, t, 0],
+            pred_mean=p_mean[0, t, 0],
+            pred_std=p_std[0, t, 0],
+            sample1=s1[0, t, 0],
+            sample2=s2[0, t, 0]
         )
         frames.append(frame)
-
     imageio.mimsave(args.save_path, frames, fps=2)
-    print(f"Saved visualization to {args.save_path}")
 
 if __name__ == "__main__":
     main()
