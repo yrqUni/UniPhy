@@ -83,13 +83,13 @@ class Args:
     def __init__(self) -> None:
         self.input_shape = (721, 1440)
         self.in_channels = 30
-        self.dim = 1152
+        self.dim = 832
         self.patch_size = 16
         self.num_layers = 6
         self.para_pool_expansion = 4
         self.conserve_energy = True
         self.decoder_type = "ensemble"
-        self.ensemble_size = 8
+        self.ensemble_size = 4
         self.dt_ref = 6.0
         self.train_batch_size = 1
         self.eval_batch_size = 1
