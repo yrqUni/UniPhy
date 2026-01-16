@@ -19,13 +19,13 @@ def get_args():
     parser.add_argument("--H", type=int, default=721)
     parser.add_argument("--W", type=int, default=1440)
     parser.add_argument("--C", type=int, default=30)
-    parser.add_argument("--T", type=int, default=4)
+    parser.add_argument("--T", type=int, default=8)
     parser.add_argument("--min_search_dim", type=int, default=64)
     parser.add_argument("--max_search_dim", type=int, default=2048)
     parser.add_argument("--dim_step", type=int, default=64)
     parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 8, 12, 16, 24])
-    parser.add_argument("--patch_size", type=int, default=32)
-    parser.add_argument("--expansion", type=int, default=1)
+    parser.add_argument("--patch_size", type=int, default=16)
+    parser.add_argument("--expansion", type=int, default=2)
     return parser.parse_args()
 
 def format_params(num):
