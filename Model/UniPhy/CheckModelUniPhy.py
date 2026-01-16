@@ -22,15 +22,18 @@ def check_model_structure():
     B, T, C = 2, 5, 4
     x = torch.randn(B, T, C, H, W, device=device)
     dt = torch.rand(B, T, device=device)
-
     for dtype in ['diffusion', 'ensemble']:
         print(f"Testing Decoder Type: {dtype}")
         model = UniPhyModel(input_shape=(H, W), in_channels=4, dim=32, num_layers=2, decoder_type=dtype).to(device)
         z_pred, states = model(x, dt)
         expected_H, expected_W = H // 4, W // 4
         if z_pred.shape[-2:] != (expected_H, expected_W):
-            raise ValueError(f"{dtype} Latent shape mismatch.")
-        print(f"[{dtype}] Latent Output: {z_pred.shape} PASS")
+            color = "\033[91m"
+            reset = "\033[0m"
+            raise ValueError(f"{dtype} Latent shape mismatch. {color}FAIL{reset}")
+        color = "\033[92m"
+        reset = "\033[0m"
+        print(f"[{dtype}] Latent Output: {z_pred.shape} {color}PASS{reset}")
 
 def check_latent_conservation():
     print("\n--- 2. Latent Energy Conservation (Free Evolution) ---")

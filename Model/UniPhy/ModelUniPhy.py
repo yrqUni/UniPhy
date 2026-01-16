@@ -140,6 +140,7 @@ class UniPhyModel(nn.Module):
 
     def forward(self, x, dt):
         B, T, C, H, W = x.shape
+        x = x.contiguous()
         x_flat = x.view(B * T, C, H, W)
         z = self.encoder(x_flat)
         _, D, Hl, Wl = z.shape
