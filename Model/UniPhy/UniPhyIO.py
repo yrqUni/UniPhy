@@ -177,3 +177,69 @@ class UniPhyDiffusionDecoder(nn.Module):
                 img = img + torch.sqrt(beta_t) * torch.randn_like(img)
         return img
 
+class UniPhyEnsembleDecoder(nn.Module):
+    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10):
+        super().__init__()
+        self.patch_size = patch_size
+        self.padder = Padder(patch_size)
+        self.ensemble_size = ensemble_size
+        self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
+        self.member_emb = nn.Embedding(ensemble_size, model_channels)
+        self.block1 = TimeAwareResBlock(model_channels, model_channels * 2, model_channels)
+        self.block2 = TimeAwareResBlock(model_channels * 2, model_channels * 2, model_channels)
+        self.block3 = TimeAwareResBlock(model_channels * 2, model_channels, model_channels)
+        self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
+
+    def forward(self, z_latent, x_ref, member_idx=None):
+        is_5d = x_ref.ndim == 5
+        if is_5d:
+            B, T, C, H, W = x_ref.shape
+            x_flat = x_ref.view(B * T, C, H, W)
+            if z_latent.ndim == 5:
+                z_flat = z_latent.view(B * T, *z_latent.shape[2:])
+            else:
+                z_flat = z_latent
+        else:
+            B = x_ref.shape[0]
+            T = 1
+            x_flat = x_ref
+            z_flat = z_latent
+
+        _ = self.padder.pad(x_flat)
+        
+        if z_flat.is_complex():
+            z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
+        else:
+            z_cat = z_flat
+            
+        x_feat = self.latent_proj(z_cat)
+        
+        if member_idx is None:
+            member_idx = torch.zeros((x_feat.shape[0],), dtype=torch.long, device=x_feat.device)
+        elif member_idx.numel() == B and is_5d:
+            member_idx = member_idx.repeat_interleave(T)
+            
+        m_emb = self.member_emb(member_idx)
+        h = self.block1(x_feat, m_emb)
+        h = self.block2(h, m_emb)
+        h = self.block3(h, m_emb)
+        
+        out = self.final_proj(h)
+        out = F.pixel_shuffle(out, self.patch_size)
+        out = self.padder.unpad(out)
+        
+        if is_5d:
+            _, C_o, H_o, W_o = out.shape
+            out = out.view(B, T, C_o, H_o, W_o)
+        return out
+
+    def generate_ensemble(self, z_latent, x_ref, num_members=None):
+        num_members = num_members or self.ensemble_size
+        B = x_ref.shape[0]
+        results = []
+        for i in range(num_members):
+            m_idx = torch.full((B,), i, device=z_latent.device, dtype=torch.long)
+            res = self.forward(z_latent, x_ref, member_idx=m_idx)
+            results.append(res.unsqueeze(1))
+        return torch.cat(results, dim=1)
+

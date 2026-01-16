@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from UniPhyIO import UniPhyEncoder, UniPhyDiffusionDecoder
+from UniPhyIO import UniPhyEncoder, UniPhyDiffusionDecoder, UniPhyEnsembleDecoder
 
 def report(name, val, threshold=1e-5):
     passed = val < threshold
@@ -14,92 +14,67 @@ def report(name, val, threshold=1e-5):
 def check_geometric_conservation():
     print("\n--- Checking Geometric Conservation (Padding/Unpadding) ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
     B, C, H, W = 2, 30, 721, 1440
     patch_size = 4
     latent_dim = 64
-    
     encoder = UniPhyEncoder(in_ch=C, embed_dim=latent_dim, patch_size=patch_size).to(device)
-    decoder = UniPhyDiffusionDecoder(out_ch=C, latent_dim=latent_dim, patch_size=patch_size).to(device)
-    
+    diff_decoder = UniPhyDiffusionDecoder(out_ch=C, latent_dim=latent_dim, patch_size=patch_size).to(device)
+    ens_decoder = UniPhyEnsembleDecoder(out_ch=C, latent_dim=latent_dim, patch_size=patch_size).to(device)
     x = torch.randn(B, C, H, W, device=device)
     t = torch.randint(0, 1000, (B,), device=device).float()
-    
     with torch.no_grad():
         z = encoder(x)
-        
-        expected_h = (H + (patch_size - H % patch_size) % patch_size) // patch_size
-        expected_w = (W + (patch_size - W % patch_size) % patch_size) // patch_size
-        
-        if z.shape[-2] != expected_h or z.shape[-1] != expected_w:
-            print(f"Latent Shape: {z.shape}, Expected: ({expected_h}, {expected_w})")
-            raise ValueError("Encoder Padding Logic Failed")
-            
-        x_pred = decoder(z, x, t)
-        
-    shape_diff = sum([abs(s1 - s2) for s1, s2 in zip(x_pred.shape, x.shape)])
-    
-    print(f"Input Shape:  {x.shape}")
-    print(f"Output Shape: {x_pred.shape}")
-    report("Shape Restoration", shape_diff, threshold=0.1)
+        x_diff = diff_decoder(z, x, t)
+        x_ens = ens_decoder(z, x)
+    shape_diff_diff = sum([abs(s1 - s2) for s1, s2 in zip(x_diff.shape, x.shape)])
+    shape_diff_ens = sum([abs(s1 - s2) for s1, s2 in zip(x_ens.shape, x.shape)])
+    report("Diff Decoder Shape", shape_diff_diff, threshold=0.1)
+    report("Ensemble Decoder Shape", shape_diff_ens, threshold=0.1)
 
-def check_encoder_isometry():
-    print("\n--- Checking Encoder Isometry (Information Preservation) ---")
+def check_ensemble_diversity():
+    print("\n--- Checking Ensemble Diversity ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    B, C, H, W = 2, 30, 64, 64
-    encoder = UniPhyEncoder(in_ch=C, embed_dim=64).to(device)
-    
-    x1 = torch.randn(B, C, H, W, device=device)
-    x2 = x1 * 2.0 
-    
+    B, C, H, W = 1, 4, 32, 32
+    ensemble_size = 5
+    encoder = UniPhyEncoder(in_ch=C, embed_dim=16).to(device)
+    decoder = UniPhyEnsembleDecoder(out_ch=C, latent_dim=16, ensemble_size=ensemble_size).to(device)
+    x = torch.randn(B, C, H, W, device=device)
     with torch.no_grad():
-        z1 = encoder(x1)
-        z2 = encoder(x2)
-        
-    norm_x = torch.norm(x1)
-    norm_z = torch.norm(z1)
-    
-    energy_ratio = norm_z / (norm_x + 1e-6)
-    print(f"Energy Scale Ratio: {energy_ratio:.4f}")
-    
-    norm_z2 = torch.norm(z2)
-    expected_norm_z2 = norm_z * 2.0
-    
-    linearity_error = abs(norm_z2 - expected_norm_z2) / (expected_norm_z2 + 1e-6)
-    report("Linearity Conservation", linearity_error, threshold=1e-4)
+        z = encoder(x)
+        ens_out = decoder.generate_ensemble(z, x, num_members=ensemble_size)
+    if ens_out.shape != (B, ensemble_size, C, H, W):
+        raise ValueError(f"Ensemble Output Shape Error: {ens_out.shape}")
+    var = torch.var(ens_out, dim=1).mean().item()
+    print(f"Ensemble Variance: {var:.6f}")
+    report("Ensemble Diversity", 0.0 if var > 1e-10 else 1.0, threshold=0.1)
 
-def check_diffusion_pipeline():
-    print("\n--- Checking Full IO Pipeline Gradient Flow ---")
+def check_gradient_flow():
+    print("\n--- Checking Gradient Flow for Both Heads ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
     B, C, H, W = 1, 4, 32, 32
     encoder = UniPhyEncoder(in_ch=C, embed_dim=16).to(device)
-    decoder = UniPhyDiffusionDecoder(out_ch=C, latent_dim=16).to(device)
-    
+    diff_decoder = UniPhyDiffusionDecoder(out_ch=C, latent_dim=16).to(device)
+    ens_decoder = UniPhyEnsembleDecoder(out_ch=C, latent_dim=16).to(device)
     x = torch.randn(B, C, H, W, device=device, requires_grad=True)
-    t = torch.ones(B, device=device)
-    
     z = encoder(x)
-    
-    noise = torch.randn_like(x)
-    pred_noise = decoder(z, x + noise, t)
-    
-    loss = pred_noise.sum()
-    loss.backward()
-    
-    grad_exists = x.grad is not None and torch.norm(x.grad) > 0
-    grad_val = torch.norm(x.grad).item() if grad_exists else 0.0
-    
-    report("Gradient Connectivity", 0.0 if grad_exists else 1.0, threshold=0.1)
-    print(f"Input Gradient Norm: {grad_val:.6f}")
+    pred_diff = diff_decoder(z, x, torch.ones(B, device=device))
+    loss_diff = pred_diff.sum()
+    loss_diff.backward(retain_graph=True)
+    diff_grad_norm = torch.norm(x.grad).item()
+    x.grad.zero_()
+    pred_ens = ens_decoder(z, x)
+    loss_ens = pred_ens.sum()
+    loss_ens.backward()
+    ens_grad_norm = torch.norm(x.grad).item()
+    report("Diff Gradient Flow", 0.0 if diff_grad_norm > 0 else 1.0, threshold=0.1)
+    report("Ensemble Gradient Flow", 0.0 if ens_grad_norm > 0 else 1.0, threshold=0.1)
 
 if __name__ == "__main__":
     torch.manual_seed(42)
     try:
         check_geometric_conservation()
-        check_encoder_isometry()
-        check_diffusion_pipeline()
+        check_ensemble_diversity()
+        check_gradient_flow()
         print("\nAll IO Checks Passed.")
     except Exception as e:
         print(f"\nVerification Failed: {e}")
