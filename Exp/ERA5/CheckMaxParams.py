@@ -26,8 +26,8 @@ def get_args():
     parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 6, 8, 12, 16, 24])
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--expansion", type=int, default=4)
-    parser.add_argument("--decoder_type", type=str, default="ensemble", choices=["diffusion", "ensemble"])
-    parser.add_argument("--ensemble_size", type=int, default=4)
+    parser.add_argument("--decoder_type", type=str, default="diffusion", choices=["diffusion", "ensemble"])
+    parser.add_argument("--ensemble_size", type=int, default=8)
     return parser.parse_args()
 
 def format_params(num):
@@ -39,6 +39,10 @@ def check_config_fit(args, dim, layers, device):
     model = None
     optimizer = None
     try:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        gc.collect()
+
         model = UniPhyModel(
             input_shape=(args.H, args.W),
             in_channels=args.C,
@@ -78,22 +82,19 @@ def check_config_fit(args, dim, layers, device):
         end_evt.record()
         torch.cuda.synchronize()
         elapsed_time = start_evt.elapsed_time(end_evt)
+        peak_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
 
         optimizer.zero_grad(set_to_none=True)
         del model, optimizer, x, dt, z, loss
         if 'pred_ens' in locals(): del pred_ens
-        torch.cuda.empty_cache()
-        gc.collect()
-        return True, num_params, elapsed_time
+        return True, num_params, elapsed_time, peak_mem
 
     except Exception as e:
         if "out of memory" not in str(e).lower():
             traceback.print_exc()
         if model is not None: del model
         if optimizer is not None: del optimizer
-        torch.cuda.empty_cache()
-        gc.collect()
-        return False, 0, 0
+        return False, 0, 0, 0
 
 def main():
     if int(os.environ.get("RANK", 0)) != 0: return
@@ -102,26 +103,26 @@ def main():
     
     results = []
     for layers in sorted(args.search_layers):
-        best_dim, best_params, best_time = 0, 0, 0
+        best_dim, best_params, best_time, best_mem = 0, 0, 0, 0
         for dim in range(args.min_search_dim, args.max_search_dim + 1, args.dim_step):
-            success, params, step_time = check_config_fit(args, dim, layers, device)
+            success, params, step_time, mem = check_config_fit(args, dim, layers, device)
             if success:
-                best_dim, best_params, best_time = dim, params, step_time
-                print(f"Layers {layers} | Dim {dim:<5} [OK] {format_params(params)} | {step_time:.1f}ms")
+                best_dim, best_params, best_time, best_mem = dim, params, step_time, mem
+                print(f"Layers {layers} | Dim {dim:<5} [OK] {format_params(params)} | {step_time:.1f}ms | VRAM: {mem:.2f}GB")
             else:
                 print(f"Layers {layers} | Dim {dim:<5} [FAIL/OOM]")
                 break
         if best_dim > 0:
-            results.append((best_params, layers, best_dim, best_time))
+            results.append((best_params, layers, best_dim, best_time, best_mem))
         else:
             break
 
-    print("\n" + "="*90)
-    print(f"{'Rank':<5} | {'Params':<12} | {'Layers':<8} | {'Max Dim':<8} | {'Step Time':<12} | {'Type':<10}")
-    print("-" * 90)
+    print("\n" + "="*105)
+    print(f"{'Rank':<5} | {'Params':<12} | {'Layers':<8} | {'Max Dim':<8} | {'Step Time':<12} | {'Peak VRAM':<12} | {'Type':<10}")
+    print("-" * 105)
     sorted_res = sorted(results, key=lambda x: x[0], reverse=True)
-    for i, (params, layers, dim, t) in enumerate(sorted_res):
-        print(f"{i+1:<5} | {format_params(params):<12} | {layers:<8} | {dim:<8} | {t:>9.1f} ms | {args.decoder_type:<10}")
+    for i, (params, layers, dim, t, m) in enumerate(sorted_res):
+        print(f"{i+1:<5} | {format_params(params):<12} | {layers:<8} | {dim:<8} | {t:>9.1f} ms | {m:>9.2f} GB | {args.decoder_type:<10}")
 
 if __name__ == "__main__":
     main()
