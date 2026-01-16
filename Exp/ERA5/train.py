@@ -83,7 +83,7 @@ class Args:
     def __init__(self) -> None:
         self.input_shape = (721, 1440)
         self.in_channels = 30
-        self.dim = 512
+        self.dim = 256
         self.patch_size = 16
         self.num_layers = 6
         self.para_pool_expansion = 4
@@ -91,10 +91,10 @@ class Args:
         self.decoder_type = "ensemble"
         self.ensemble_size = 4
         self.dt_ref = 6.0
-        self.train_batch_size = 1
+        self.train_batch_size = 2
         self.eval_batch_size = 1
         self.use_scheduler = True
-        self.lr = 1e-4
+        self.lr = 1e-5
         self.weight_decay = 0.05
         self.epochs = 100
         self.grad_clip = 1.0
@@ -114,7 +114,7 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = ""
+        self.wandb_run_name = self.ckpt
         self.wandb_mode = "online"
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
@@ -134,8 +134,7 @@ def setup_logging(args: Args) -> None:
 
 def setup_wandb(rank: int, args: Args) -> None:
     if rank != 0 or not bool(getattr(args, "use_wandb", False)): return
-    run_name = args.wandb_run_name if args.wandb_run_name else f"UniPhy_{args.decoder_type}"
-    wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=run_name, config=vars(args))
+    wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run_name, config=vars(args))
 
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
     return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
@@ -208,7 +207,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     train_ds = ERA5_Dataset(
         input_dir=args.data_root, year_range=args.year_range, is_train=True,
         sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num,
-        max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size()
+        max_cache_size=128, rank=dist.get_rank(), gpus=dist.get_world_size()
     )
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=True, drop_last=True)
     train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, persistent_workers=True)
