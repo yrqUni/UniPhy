@@ -26,8 +26,9 @@ def get_args():
     parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 6, 8, 12, 16, 24])
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--expansion", type=int, default=4)
-    parser.add_argument("--decoder_type", type=str, default="diffusion", choices=["diffusion", "ensemble"])
-    parser.add_argument("--ensemble_size", type=int, default=8)
+    parser.add_argument("--decoder_type", type=str, default="ensemble", choices=["diffusion", "ensemble"])
+    parser.add_argument("--ensemble_size", type=int, default=4)
+    parser.add_argument("--device_id", type=int, default=0)
     return parser.parse_args()
 
 def format_params(num):
@@ -35,12 +36,13 @@ def format_params(num):
     elif num >= 1e6: return f"{num / 1e6:.2f}M"
     else: return f"{num}"
 
-def check_config_fit(args, dim, layers, device):
+def check_config_fit(args, dim, layers, device_id):
     model = None
     optimizer = None
+    device = torch.device(f"cuda:{device_id}")
     try:
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.reset_peak_memory_stats(device_id)
         gc.collect()
 
         model = UniPhyModel(
@@ -64,7 +66,7 @@ def check_config_fit(args, dim, layers, device):
         start_evt = torch.cuda.Event(enable_timing=True)
         end_evt = torch.cuda.Event(enable_timing=True)
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
         start_evt.record()
 
         z, _ = model(x, dt)
@@ -80,13 +82,14 @@ def check_config_fit(args, dim, layers, device):
         optimizer.step()
 
         end_evt.record()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
         elapsed_time = start_evt.elapsed_time(end_evt)
-        peak_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        peak_mem = torch.cuda.max_memory_allocated(device_id) / (1024 ** 3)
 
         optimizer.zero_grad(set_to_none=True)
         del model, optimizer, x, dt, z, loss
         if 'pred_ens' in locals(): del pred_ens
+        torch.cuda.empty_cache()
         return True, num_params, elapsed_time, peak_mem
 
     except Exception as e:
@@ -94,18 +97,18 @@ def check_config_fit(args, dim, layers, device):
             traceback.print_exc()
         if model is not None: del model
         if optimizer is not None: del optimizer
+        torch.cuda.empty_cache()
         return False, 0, 0, 0
 
 def main():
     if int(os.environ.get("RANK", 0)) != 0: return
     args = get_args()
-    device = torch.device("cuda:0")
     
     results = []
     for layers in sorted(args.search_layers):
         best_dim, best_params, best_time, best_mem = 0, 0, 0, 0
         for dim in range(args.min_search_dim, args.max_search_dim + 1, args.dim_step):
-            success, params, step_time, mem = check_config_fit(args, dim, layers, device)
+            success, params, step_time, mem = check_config_fit(args, dim, layers, args.device_id)
             if success:
                 best_dim, best_params, best_time, best_mem = dim, params, step_time, mem
                 print(f"Layers {layers} | Dim {dim:<5} [OK] {format_params(params)} | {step_time:.1f}ms | VRAM: {mem:.2f}GB")
