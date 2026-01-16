@@ -26,15 +26,14 @@ def get_args():
     parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 6, 8, 12, 16, 24])
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--expansion", type=int, default=4)
+    parser.add_argument("--decoder_type", type=str, default="ensemble", choices=["diffusion", "ensemble"])
+    parser.add_argument("--ensemble_size", type=int, default=4)
     return parser.parse_args()
 
 def format_params(num):
-    if num >= 1e9:
-        return f"{num / 1e9:.2f}B"
-    elif num >= 1e6:
-        return f"{num / 1e6:.2f}M"
-    else:
-        return f"{num}"
+    if num >= 1e9: return f"{num / 1e9:.2f}B"
+    elif num >= 1e6: return f"{num / 1e6:.2f}M"
+    else: return f"{num}"
 
 def check_config_fit(args, dim, layers, device):
     model = None
@@ -47,7 +46,9 @@ def check_config_fit(args, dim, layers, device):
             patch_size=args.patch_size,
             num_layers=layers,
             para_pool_expansion=args.expansion,
-            conserve_energy=True
+            conserve_energy=True,
+            decoder_type=args.decoder_type,
+            ensemble_size=args.ensemble_size
         ).to(device)
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -57,17 +58,21 @@ def check_config_fit(args, dim, layers, device):
         dt = torch.ones(args.bs, args.T, device=device)
 
         z, _ = model(x, dt)
-        
-        if z.is_complex():
-            loss = z.abs().sum()
+
+        if args.decoder_type == "diffusion":
+            loss = z.abs().sum() if z.is_complex() else z.sum()
         else:
-            loss = z.sum()
-            
+            x_ref = x.view(-1, args.C, args.H, args.W)
+            z_flat = z.reshape(-1, *z.shape[2:])
+            pred_ens = model.decoder.generate_ensemble(z_flat, x_ref=x_ref)
+            loss = pred_ens.sum()
+
         loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         del model, optimizer, x, dt, z, loss
+        if 'pred_ens' in locals(): del pred_ens
         torch.cuda.empty_cache()
         gc.collect()
         return True, num_params
@@ -76,7 +81,6 @@ def check_config_fit(args, dim, layers, device):
         if "out of memory" not in str(e).lower():
             print(f"\n[ERROR at Dim {dim}, Layers {layers}]:")
             traceback.print_exc()
-        
         if model is not None: del model
         if optimizer is not None: del optimizer
         torch.cuda.empty_cache()
@@ -87,7 +91,7 @@ def main():
     if int(os.environ.get("RANK", 0)) != 0: return
     args = get_args()
     device = torch.device("cuda:0")
-
+    print(f"Search Config: Type={args.decoder_type}, EnsSize={args.ensemble_size if args.decoder_type=='ensemble' else 'N/A'}")
     print(args)
 
     results = []
@@ -103,17 +107,14 @@ def main():
                 print(f"  > Dim {dim:<5} [OK] {format_params(params)}")
             else:
                 print(f"  > Dim {dim:<5} [FAIL/OOM]")
-                break 
+                break
+        if best_dim > 0: results.append((best_params, layers, best_dim))
+        else: break
 
-        if best_dim > 0:
-            results.append((best_params, layers, best_dim))
-        else:
-            break
-
-    print("\n" + "="*60)
-    print(f"{'Rank':<5} | {'Params':<15} | {'Layers':<8} | {'Max Dim':<8}")
+    print("\n" + "="*70)
+    print(f"{'Rank':<5} | {'Params':<15} | {'Layers':<8} | {'Max Dim':<8} | {'Type':<10}")
     for i, (params, layers, dim) in enumerate(sorted(results, key=lambda x: x[0], reverse=True)):
-        print(f"{i+1:<5} | {format_params(params):<15} | {layers:<8} | {dim:<8}")
+        print(f"{i+1:<5} | {format_params(params):<15} | {layers:<8} | {dim:<8} | {args.decoder_type:<10}")
 
 if __name__ == "__main__":
     main()

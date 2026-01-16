@@ -18,6 +18,8 @@ ARGS = {
     "expansion": 2,
     "bs": 1,
     "T": 4,
+    "decoder_type": "ensemble",
+    "ensemble_size": 8,
     "device": "cuda:0"
 }
 
@@ -26,8 +28,6 @@ class MemoryProfiler:
         self.model = model
         self.hooks = []
         self.report = []
-        self.param_mem = 0
-        
         torch.cuda.reset_peak_memory_stats()
         self.base_mem = torch.cuda.memory_allocated() / 1024**2
 
@@ -41,14 +41,12 @@ class MemoryProfiler:
         mem_prev = getattr(module, '_mem_prev', 0)
         mem_curr = self._get_gpu_mem()
         delta = mem_curr - mem_prev
-        
         out_shape = "None"
         if isinstance(output, torch.Tensor):
             out_shape = list(output.shape)
         elif isinstance(output, (tuple, list)) and len(output) > 0:
             if isinstance(output[0], torch.Tensor):
                 out_shape = list(output[0].shape)
-
         self.report.append({
             "Layer": str(module.__class__.__name__),
             "Name": getattr(module, '_name', 'Unknown'),
@@ -60,7 +58,7 @@ class MemoryProfiler:
 
     def register_hooks(self):
         for name, module in self.model.named_modules():
-            if len(list(module.children())) == 0 or isinstance(module, (UniPhyModel, nn.Sequential)): 
+            if len(list(module.children())) == 0 or isinstance(module, (UniPhyModel, nn.Sequential)):
                 module._name = name
                 self.hooks.append(module.register_forward_pre_hook(self._hook_pre))
                 self.hooks.append(module.register_forward_hook(self._hook_post))
@@ -72,26 +70,22 @@ class MemoryProfiler:
     def print_summary(self):
         df = pd.DataFrame(self.report)
         print("\n" + "="*80)
-        print(f"GPU Memory Profile Report (Top 20 Consumers)")
+        print(f"GPU Memory Profile Report (Top 20 Consumers) | Type: {ARGS['decoder_type']}")
         print("="*80)
-        
         df_sorted = df.sort_values(by="Delta (Activations) (MB)", ascending=False)
-        
         print(df_sorted.head(20).to_string(index=False))
-        
         print("-" * 80)
         peak = torch.cuda.max_memory_allocated() / 1024**2
         print(f"Base Model Weights: {self.base_mem:.2f} MB")
-        print(f"Peak Memory During Forward: {peak:.2f} MB")
+        print(f"Peak Memory During Forward + Decode: {peak:.2f} MB")
         print(f"Total Increase: {peak - self.base_mem:.2f} MB")
         print("="*80)
 
 def main():
     torch.cuda.empty_cache()
     device = torch.device(ARGS["device"])
+    print(f"Initializing Model: Dim={ARGS['dim']}, Decoder={ARGS['decoder_type']}, Ens={ARGS['ensemble_size']}...")
 
-    print(f"Initializing Model with H={ARGS['H']}, W={ARGS['W']}, P={ARGS['patch_size']}...")
-    
     model = UniPhyModel(
         input_shape=(ARGS['H'], ARGS['W']),
         in_channels=ARGS['C'],
@@ -99,24 +93,34 @@ def main():
         patch_size=ARGS['patch_size'],
         num_layers=ARGS['num_layers'],
         para_pool_expansion=ARGS['expansion'],
-        conserve_energy=True
+        conserve_energy=True,
+        decoder_type=ARGS['decoder_type'],
+        ensemble_size=ARGS['ensemble_size']
     ).to(device)
-    
-    model.eval()
 
+    model.eval()
     profiler = MemoryProfiler(model)
     profiler.register_hooks()
 
-    print("Running Forward Pass...")
     x = torch.randn(ARGS['bs'], ARGS['T'], ARGS['C'], ARGS['H'], ARGS['W'], device=device)
-    dt = torch.ones(ARGS['bs'], ARGS['T'], device=device) 
+    dt = torch.ones(ARGS['bs'], ARGS['T'], device=device)
 
+    print("Running Full Forward Pass (Transformer + Decoder)...")
     with torch.no_grad():
         try:
-            _ = model(x, dt)
+            z, _ = model(x, dt)
+            z_flat = z.reshape(-1, *z.shape[2:])
+            x_ref = x.view(-1, ARGS['C'], ARGS['H'], ARGS['W'])
+            
+            if ARGS['decoder_type'] == "diffusion":
+                t = torch.zeros((z_flat.shape[0],), device=device).long()
+                _ = model.decoder(z_flat, x_ref, t)
+            else:
+                _ = model.decoder.generate_ensemble(z_flat, x_ref=x_ref)
+                
         except RuntimeError as e:
-            print(f"OOM during profiling! Last captured stats will be printed.\nError: {e}")
-    
+            print(f"OOM during profiling!\nError: {e}")
+
     profiler.remove_hooks()
     profiler.print_summary()
 

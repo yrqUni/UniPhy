@@ -34,8 +34,19 @@ MODEL_ARG_KEYS = [
     "patch_size",
     "num_layers",
     "para_pool_expansion",
-    "conserve_energy"
+    "conserve_energy",
+    "decoder_type",
+    "ensemble_size"
 ]
+
+def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    target = target.unsqueeze(1)
+    mae = torch.mean(torch.abs(pred_ensemble - target), dim=1)
+    M = pred_ensemble.shape[1]
+    pred_sorted, _ = torch.sort(pred_ensemble, dim=1)
+    indices = torch.arange(1, M + 1, device=pred_ensemble.device).view(1, M, 1, 1, 1)
+    spread = torch.mean(pred_sorted * (2 * indices - M - 1), dim=1) / M
+    return (mae - spread).mean()
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
@@ -54,30 +65,17 @@ def set_random_seed(seed: int, deterministic: bool = False) -> None:
 set_random_seed(1017, deterministic=False)
 
 def format_params(num):
-    if num >= 1e9:
-        readable = f"{num / 1e9:.2f}B"
-    elif num >= 1e6:
-        readable = f"{num / 1e6:.2f}M"
-    elif num >= 1e3:
-        readable = f"{num / 1e3:.2f}K"
-    else:
-        readable = f"{num}"
+    if num >= 1e9: readable = f"{num / 1e9:.2f}B"
+    elif num >= 1e6: readable = f"{num / 1e6:.2f}M"
+    elif num >= 1e3: readable = f"{num / 1e3:.2f}K"
+    else: readable = f"{num}"
     return f"{num:,} ({readable})"
 
 def log_model_stats(model: torch.nn.Module, rank: int) -> None:
-    if rank != 0:
-        return
-
+    if rank != 0: return
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    msg = (
-        f"\n{'='*40}\n"
-        f"Model Statistics:\n"
-        f"Total Parameters:      {format_params(total_params)}\n"
-        f"Trainable Parameters: {format_params(trainable_params)}\n"
-        f"{'='*40}\n"
-    )
+    msg = f"\n{'='*40}\nModel Stats:\nTotal: {format_params(total_params)}\nTrainable: {format_params(trainable_params)}\n{'='*40}\n"
     print(msg)
     logging.info(msg)
 
@@ -90,48 +88,34 @@ class Args:
         self.num_layers = 6
         self.para_pool_expansion = 4
         self.conserve_energy = True
-
+        self.decoder_type = "ensemble"
+        self.ensemble_size = 8
         self.dt_ref = 6.0
         self.train_batch_size = 1
         self.eval_batch_size = 1
-
         self.use_scheduler = True
         self.lr = 1e-4
         self.weight_decay = 0.05
         self.epochs = 100
-
         self.grad_clip = 1.0
         self.grad_accum_steps = 1
-
         self.log_every = 10
         self.wandb_every = 10
         self.ckpt_step = 0.5
-
         self.log_path = "./uniphy_logs"
         self.ckpt_dir = "./uniphy_ckpt"
         self.ckpt = ""
-
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 20
         self.sample_k = 8
         self.eval_sample_num = 1
-
         self.use_tf32 = True
-
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = self.ckpt
+        self.wandb_run_name = ""
         self.wandb_mode = "online"
-
-        self.check_args()
-
-    def check_args(self) -> None:
-        if int(self.grad_accum_steps) < 1:
-            raise ValueError("grad_accum_steps must be >= 1")
-        if self.sample_k > self.train_data_n_frames:
-            raise ValueError("sample_k must be <= train_data_n_frames")
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
@@ -140,38 +124,26 @@ def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, lo
     torch.cuda.set_device(local_rank)
 
 def cleanup_ddp() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    if dist.is_initialized(): dist.destroy_process_group()
 
 def setup_logging(args: Args) -> None:
-    if not dist.is_initialized() or dist.get_rank() != 0:
-        return
+    if not dist.is_initialized() or dist.get_rank() != 0: return
     os.makedirs(args.log_path, exist_ok=True)
     log_filename = os.path.join(args.log_path, f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    logging.basicConfig(filename=log_filename, level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    logging.basicConfig(filename=log_filename, level=logging.INFO, format="%(asctime)s - %(message)s")
 
 def setup_wandb(rank: int, args: Args) -> None:
-    if rank != 0 or not bool(getattr(args, "use_wandb", False)):
-        return
-    wandb_kwargs: Dict[str, Any] = {"project": args.wandb_project, "config": vars(args)}
-    if args.wandb_entity: wandb_kwargs["entity"] = args.wandb_entity
-    if args.wandb_run_name: wandb_kwargs["name"] = args.wandb_run_name
-    wandb.init(**wandb_kwargs)
-
-def keep_latest_ckpts(ckpt_dir: str) -> None:
-    ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
-    if len(ckpt_files) <= 5: return
-    ckpt_files.sort(key=os.path.getmtime, reverse=True)
-    for file_path in ckpt_files[5:]:
-        try: os.remove(file_path)
-        except Exception: pass
+    if rank != 0 or not bool(getattr(args, "use_wandb", False)): return
+    run_name = args.wandb_run_name if args.wandb_run_name else f"UniPhy_{args.decoder_type}"
+    wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=run_name, config=vars(args))
 
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
     return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
 
 def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
+    if dist.get_rank() != 0: return
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    state: Dict[str, Any] = {
+    state = {
         "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
         "optimizer": opt.state_dict(),
         "epoch": epoch,
@@ -183,23 +155,19 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
     if scheduler: state["scheduler"] = scheduler.state_dict()
     ckpt_path = os.path.join(args.ckpt_dir, f"e{epoch}_s{step}_l{loss:.4f}.pth")
     torch.save(state, ckpt_path)
-    keep_latest_ckpts(args.ckpt_dir)
+    files = glob.glob(os.path.join(args.ckpt_dir, "*.pth"))
+    if len(files) > 5:
+        files.sort(key=os.path.getmtime)
+        for f in files[:-5]: os.remove(f)
 
 def load_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, ckpt_path: str, scheduler: Optional[Any] = None, map_location: str = "cpu") -> Tuple[int, int]:
     if not os.path.isfile(ckpt_path): return 0, 0
     checkpoint = torch.load(ckpt_path, map_location=map_location)
-
-    state_dict = checkpoint["model"]
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        new_k = k.replace("module.", "") if k.startswith("module.") else k
-        new_state_dict[new_k] = v
-
-    model.load_state_dict(new_state_dict, strict=False)
+    sd = checkpoint["model"]
+    new_sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(new_sd, strict=False)
     opt.load_state_dict(checkpoint["optimizer"])
-    if scheduler and "scheduler" in checkpoint:
-        scheduler.load_state_dict(checkpoint["scheduler"])
-
+    if scheduler and "scheduler" in checkpoint: scheduler.load_state_dict(checkpoint["scheduler"])
     return checkpoint.get("epoch", 0), checkpoint.get("step", 0)
 
 def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float]:
@@ -208,15 +176,13 @@ def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float]:
     for p in model.parameters():
         if p.grad is None: continue
         g = p.grad.data
-        n = g.norm(2).item()
-        total_norm_sq += n * n
+        total_norm_sq += g.norm(2).item() ** 2
         max_abs = max(max_abs, g.abs().max().item())
     return float(total_norm_sq**0.5), float(max_abs)
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
     if rank == 0: setup_logging(args)
-
     if args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -228,161 +194,96 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         patch_size=args.patch_size,
         num_layers=args.num_layers,
         para_pool_expansion=args.para_pool_expansion,
-        conserve_energy=args.conserve_energy
+        conserve_energy=args.conserve_energy,
+        decoder_type=args.decoder_type,
+        ensemble_size=args.ensemble_size
     ).cuda(local_rank)
 
     log_model_stats(model, rank)
-
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     setup_wandb(rank, args)
 
-    train_dataset = ERA5_Dataset(
-        input_dir=args.data_root,
-        year_range=args.year_range,
-        is_train=True,
-        sample_len=args.train_data_n_frames,
-        eval_sample=args.eval_sample_num,
-        max_cache_size=8,
-        rank=dist.get_rank(),
-        gpus=dist.get_world_size(),
+    train_ds = ERA5_Dataset(
+        input_dir=args.data_root, year_range=args.year_range, is_train=True,
+        sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num,
+        max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size()
     )
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=False, drop_last=True)
-    train_dataloader = DataLoader(
-        train_dataset,
-        sampler=train_sampler,
-        batch_size=args.train_batch_size,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-    )
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=False, drop_last=True)
+    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
     optim_groups = [
-        {"params": decay_params, "weight_decay": args.weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
+        {"params": [p for p in param_dict.values() if p.dim() >= 2], "weight_decay": args.weight_decay},
+        {"params": [p for p in param_dict.values() if p.dim() < 2], "weight_decay": 0.0},
     ]
     opt = torch.optim.AdamW(optim_groups, lr=args.lr)
+    scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len(train_loader)//args.grad_accum_steps, epochs=args.epochs) if args.use_scheduler else None
 
-    scheduler = None
-    if args.use_scheduler:
-        scheduler = lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=args.lr,
-            steps_per_epoch=len(train_dataloader) // args.grad_accum_steps,
-            epochs=args.epochs,
-        )
+    start_ep, global_step = 0, 0
+    if args.ckpt: start_ep, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
 
-    start_epoch = 0
-    if args.ckpt:
-        start_epoch, _ = load_ckpt(
-            model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}"
-        )
+    T_diff = 1000
+    betas = torch.linspace(1e-4, 0.02, T_diff).cuda(local_rank)
+    alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
 
-    T_diffusion = 1000
-    beta_start, beta_end = 1e-4, 0.02
-    betas = torch.linspace(beta_start, beta_end, T_diffusion).cuda(local_rank)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-
-    global_step = int(start_epoch) * len(train_dataloader)
-
-    for ep in range(start_epoch, args.epochs):
+    for ep in range(start_ep, args.epochs):
         train_sampler.set_epoch(ep)
-        train_iter = tqdm(train_dataloader, desc=f"Epoch {ep+1}/{args.epochs}") if rank == 0 else train_dataloader
-
+        train_iter = tqdm(train_loader, desc=f"Ep {ep+1}") if rank == 0 else train_loader
         for train_step, data in enumerate(train_iter, start=1):
             model.train()
-
             data = data.to(f"cuda:{local_rank}", non_blocking=True).float()
-            B, T_total, C, H, W = data.shape
-
-            indices_list = [sorted(random.sample(range(T_total), args.sample_k)) for _ in range(B)]
-            indices = torch.tensor(indices_list, device=data.device)
-
-            batch_idx = torch.arange(B, device=data.device).unsqueeze(1)
-            sampled_data = data[batch_idx, indices]
-
-            x = sampled_data[:, :-1]
-            target = sampled_data[:, 1:]
-
+            B, T_tot, C, H, W = data.shape
+            indices = torch.tensor([sorted(random.sample(range(T_tot), args.sample_k)) for _ in range(B)], device=data.device)
+            sampled = data[torch.arange(B, device=data.device).unsqueeze(1), indices]
+            x_in, target = sampled[:, :-1], sampled[:, 1:]
             dt = (indices[:, 1:] - indices[:, :-1]).float() * args.dt_ref
             B, T_seq, C, H, W = target.shape
 
             is_accum = (train_step % args.grad_accum_steps != 0)
             sync_ctx = model.no_sync() if is_accum else contextlib.nullcontext()
-
             with sync_ctx:
-                z_pred, _ = model(x, dt)
-
-                z_flat = z_pred.reshape(B * T_seq, -1, z_pred.shape[-2], z_pred.shape[-1])
+                z_pred, _ = model(x_in, dt)
+                z_flat = z_pred.reshape(B * T_seq, *z_pred.shape[2:])
                 target_flat = target.reshape(B * T_seq, C, H, W)
+                m_base = model.module if isinstance(model, DDP) else model
 
-                t = torch.randint(0, T_diffusion, (B * T_seq,), device=x.device).long()
-                noise = torch.randn_like(target_flat)
-
-                sqrt_alpha_t = sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
-                sqrt_one_minus_alpha_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
-                x_noisy = sqrt_alpha_t * target_flat + sqrt_one_minus_alpha_t * noise
-
-                decoder_module = model.module.decoder if isinstance(model, DDP) else model.decoder
-                pred_noise = decoder_module(z_flat, x_noisy, t)
-
-                loss = F.mse_loss(pred_noise, noise)
+                if m_base.decoder_type == "diffusion":
+                    t = torch.randint(0, T_diff, (B * T_seq,), device=data.device).long()
+                    noise = torch.randn_like(target_flat)
+                    sqrt_at = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1)
+                    sqrt_ot = torch.sqrt(1.0 - alphas_cumprod[t]).view(-1, 1, 1, 1)
+                    x_noisy = sqrt_at * target_flat + sqrt_ot * noise
+                    pred_noise = m_base.decoder(z_flat, x_noisy, t)
+                    loss = F.mse_loss(pred_noise, noise)
+                else:
+                    x_ref = x_in.reshape(B * T_seq, C, H, W)
+                    pred_ens = m_base.decoder.generate_ensemble(z_flat, x_ref=x_ref)
+                    loss = crps_ensemble_loss(pred_ens, target_flat)
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     opt.zero_grad(set_to_none=True)
                     continue
-
                 (loss / args.grad_accum_steps).backward()
 
-            if is_accum:
-                continue
-
-            grad_norm, max_grad = 0.0, 0.0
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-            grad_norm, max_grad = get_grad_stats(model)
-
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-            if scheduler: scheduler.step()
-
-            global_step += 1
-
-            if rank == 0:
-                is_log = (train_step % args.log_every == 0)
-                if is_log:
-                    loss_val = loss.item()
-                    lr_val = opt.param_groups[0]["lr"]
-                    msg = f"Ep {ep+1} - {train_step}/{len(train_dataloader)} | Loss: {loss_val:.4e} | GN: {grad_norm:.2f}"
-                    if isinstance(train_iter, tqdm): train_iter.set_description(msg)
-                    logging.info(msg)
-
+            if not is_accum:
+                if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                gn, _ = get_grad_stats(model)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                if scheduler: scheduler.step()
+                global_step += 1
+                if rank == 0:
+                    if train_step % args.log_every == 0:
+                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | GN: {gn:.2f}"
+                        if isinstance(train_iter, tqdm): train_iter.set_description(msg)
+                        logging.info(msg)
                     if args.use_wandb and (train_step % args.wandb_every == 0):
-                        wandb.log({
-                            "train/loss": loss_val,
-                            "train/lr": lr_val,
-                            "train/grad_norm": grad_norm,
-                            "train/step": global_step
-                        })
-
-                ckpt_steps = int(len(train_dataloader) * args.ckpt_step)
-                if train_step % ckpt_steps == 0:
+                        wandb.log({"train/loss": loss.item(), "train/lr": opt.param_groups[0]["lr"], "train/gn": gn, "train/step": global_step})
+                if train_step % int(len(train_loader)*args.ckpt_step) == 0:
                     save_ckpt(model, opt, ep+1, train_step, loss.item(), args, scheduler)
-
     cleanup_ddp()
 
 if __name__ == "__main__":
-    args = Args()
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-    master_port = os.environ.get("MASTER_PORT", "12355")
-    run_ddp(rank, world_size, local_rank, master_addr, master_port, args)
+    a = Args()
+    run_ddp(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), int(os.environ["LOCAL_RANK"]), os.environ.get("MASTER_ADDR", "127.0.0.1"), os.environ.get("MASTER_PORT", "12355"), a)
 
