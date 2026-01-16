@@ -83,7 +83,7 @@ class Args:
     def __init__(self) -> None:
         self.input_shape = (721, 1440)
         self.in_channels = 30
-        self.dim = 832
+        self.dim = 512
         self.patch_size = 16
         self.num_layers = 6
         self.para_pool_expansion = 4
