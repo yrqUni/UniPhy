@@ -57,64 +57,71 @@ def check_config_fit(args, dim, layers, device):
         x = torch.randn(args.bs, args.T, args.C, args.H, args.W, device=device)
         dt = torch.ones(args.bs, args.T, device=device)
 
-        z, _ = model(x, dt)
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
 
+        torch.cuda.synchronize()
+        start_evt.record()
+
+        z, _ = model(x, dt)
         if args.decoder_type == "diffusion":
             loss = z.abs().sum() if z.is_complex() else z.sum()
         else:
-            x_ref = x.view(-1, args.C, args.H, args.W)
+            x_ref = x.reshape(-1, args.C, args.H, args.W)
             z_flat = z.reshape(-1, *z.shape[2:])
             pred_ens = model.decoder.generate_ensemble(z_flat, x_ref=x_ref)
             loss = pred_ens.sum()
 
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
 
+        end_evt.record()
+        torch.cuda.synchronize()
+        elapsed_time = start_evt.elapsed_time(end_evt)
+
+        optimizer.zero_grad(set_to_none=True)
         del model, optimizer, x, dt, z, loss
         if 'pred_ens' in locals(): del pred_ens
         torch.cuda.empty_cache()
         gc.collect()
-        return True, num_params
+        return True, num_params, elapsed_time
 
     except Exception as e:
         if "out of memory" not in str(e).lower():
-            print(f"\n[ERROR at Dim {dim}, Layers {layers}]:")
             traceback.print_exc()
         if model is not None: del model
         if optimizer is not None: del optimizer
         torch.cuda.empty_cache()
         gc.collect()
-        return False, 0
+        return False, 0, 0
 
 def main():
     if int(os.environ.get("RANK", 0)) != 0: return
     args = get_args()
     device = torch.device("cuda:0")
-    print(f"Search Config: Type={args.decoder_type}, EnsSize={args.ensemble_size if args.decoder_type=='ensemble' else 'N/A'}")
-    print(args)
-
+    
     results = []
     for layers in sorted(args.search_layers):
-        print(f"\n[Scanning] Layers={layers}")
-        best_dim = 0
-        best_params = 0
+        best_dim, best_params, best_time = 0, 0, 0
         for dim in range(args.min_search_dim, args.max_search_dim + 1, args.dim_step):
-            success, params = check_config_fit(args, dim, layers, device)
+            success, params, step_time = check_config_fit(args, dim, layers, device)
             if success:
-                best_dim = dim
-                best_params = params
-                print(f"  > Dim {dim:<5} [OK] {format_params(params)}")
+                best_dim, best_params, best_time = dim, params, step_time
+                print(f"Layers {layers} | Dim {dim:<5} [OK] {format_params(params)} | {step_time:.1f}ms")
             else:
-                print(f"  > Dim {dim:<5} [FAIL/OOM]")
+                print(f"Layers {layers} | Dim {dim:<5} [FAIL/OOM]")
                 break
-        if best_dim > 0: results.append((best_params, layers, best_dim))
-        else: break
+        if best_dim > 0:
+            results.append((best_params, layers, best_dim, best_time))
+        else:
+            break
 
-    print("\n" + "="*70)
-    print(f"{'Rank':<5} | {'Params':<15} | {'Layers':<8} | {'Max Dim':<8} | {'Type':<10}")
-    for i, (params, layers, dim) in enumerate(sorted(results, key=lambda x: x[0], reverse=True)):
-        print(f"{i+1:<5} | {format_params(params):<15} | {layers:<8} | {dim:<8} | {args.decoder_type:<10}")
+    print("\n" + "="*90)
+    print(f"{'Rank':<5} | {'Params':<12} | {'Layers':<8} | {'Max Dim':<8} | {'Step Time':<12} | {'Type':<10}")
+    print("-" * 90)
+    sorted_res = sorted(results, key=lambda x: x[0], reverse=True)
+    for i, (params, layers, dim, t) in enumerate(sorted_res):
+        print(f"{i+1:<5} | {format_params(params):<12} | {layers:<8} | {dim:<8} | {t:>9.1f} ms | {args.decoder_type:<10}")
 
 if __name__ == "__main__":
     main()
