@@ -25,7 +25,7 @@ def get_args():
     parser.add_argument("--dim_step", type=int, default=64)
     parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 8, 12, 16, 24])
     parser.add_argument("--patch_size", type=int, default=16)
-    parser.add_argument("--expansion", type=int, default=2)
+    parser.add_argument("--expansion", type=int, default=4)
     return parser.parse_args()
 
 def format_params(num):
@@ -88,7 +88,7 @@ def main():
     args = get_args()
     device = torch.device("cuda:0")
 
-    print(f"--- Scan Config (BSZ={args.bs}, H={args.H}, W={args.W}, P={args.patch_size}, Exp={args.expansion}) ---")
+    print(args)
 
     results = []
     for layers in sorted(args.search_layers):
