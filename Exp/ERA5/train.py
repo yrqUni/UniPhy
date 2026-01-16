@@ -83,7 +83,7 @@ class Args:
     def __init__(self) -> None:
         self.input_shape = (721, 1440)
         self.in_channels = 30
-        self.dim = 256
+        self.dim = 128
         self.patch_size = 16
         self.num_layers = 6
         self.para_pool_expansion = 4
@@ -99,8 +99,8 @@ class Args:
         self.epochs = 100
         self.grad_clip = 1.0
         self.grad_accum_steps = 1
-        self.log_every = 10
-        self.wandb_every = 10
+        self.log_every = 1
+        self.wandb_every = 1
         self.ckpt_step = 0.5
         self.log_path = "./uniphy_logs"
         self.ckpt_dir = "./uniphy_ckpt"
