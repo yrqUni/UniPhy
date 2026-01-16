@@ -83,7 +83,7 @@ class Args:
     def __init__(self) -> None:
         self.input_shape = (721, 1440)
         self.in_channels = 30
-        self.dim = 128
+        self.dim = 300
         self.patch_size = 16
         self.num_layers = 6
         self.para_pool_expansion = 4
@@ -91,7 +91,7 @@ class Args:
         self.decoder_type = "ensemble"
         self.ensemble_size = 4
         self.dt_ref = 6.0
-        self.train_batch_size = 2
+        self.train_batch_size = 1
         self.eval_batch_size = 1
         self.use_scheduler = True
         self.lr = 1e-5
@@ -210,7 +210,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         max_cache_size=128, rank=dist.get_rank(), gpus=dist.get_world_size()
     )
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=True, drop_last=True)
-    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, persistent_workers=True)
+    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1, persistent_workers=False)
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [
