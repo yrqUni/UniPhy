@@ -3,6 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+def get_safe_groups(channels: int, target: int = 8) -> int:
+    if channels % target == 0:
+        return target
+    for g in [4, 2, 1]:
+        if channels % g == 0:
+            return g
+    return 1
+
 class Padder(nn.Module):
     def __init__(self, patch_size):
         super().__init__()
@@ -25,106 +33,155 @@ class Padder(nn.Module):
         target_w = W - self.pad_w
         return x[..., :target_h, :target_w]
 
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+class TimeAwareResBlock(nn.Module):
+    def __init__(self, dim, dim_out, time_emb_dim, groups=8):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2))
+        
+        g1 = get_safe_groups(dim_out, groups)
+        self.block1 = nn.Sequential(
+            nn.Conv2d(dim, dim_out, 3, padding=1),
+            nn.GroupNorm(g1, dim_out),
+            nn.SiLU(),
+        )
+        
+        g2 = get_safe_groups(dim_out, groups)
+        self.block2 = nn.Sequential(
+            nn.Conv2d(dim_out, dim_out, 3, padding=1),
+            nn.GroupNorm(g2, dim_out),
+            nn.SiLU(),
+        )
+        
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+    def forward(self, x, time_emb):
+        scale_shift = self.mlp(time_emb)
+        scale_shift = scale_shift.unsqueeze(-1).unsqueeze(-1)
+        scale, shift = scale_shift.chunk(2, dim=1)
+        
+        h = self.block1(x)
+        h = h * (scale + 1) + shift
+        h = self.block2(h)
+        
+        return h + self.res_conv(x)
+
 class UniPhyEncoder(nn.Module):
-    def __init__(self, in_ch, embed_dim, patch_size=4):
+    def __init__(self, in_ch, embed_dim, patch_size=16):
         super().__init__()
         self.patch_size = patch_size
         self.padder = Padder(patch_size)
         
-        self.proj = nn.Conv2d(in_ch, embed_dim * 2, kernel_size=patch_size, stride=patch_size)
+        self.unshuffle_dim = in_ch * (patch_size ** 2)
+        self.proj = nn.Conv2d(self.unshuffle_dim, embed_dim * 2, kernel_size=1)
         
         nn.init.orthogonal_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x):
         x = self.padder.pad(x)
+        x = F.pixel_unshuffle(x, self.patch_size)
         x_emb = self.proj(x)
         x_real, x_imag = torch.chunk(x_emb, 2, dim=1)
         return torch.complex(x_real, x_imag)
 
-class TimeEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, time):
-        device = time.device
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
-
-class DiffusionResBlock(nn.Module):
-    def __init__(self, channels, cond_channels, time_emb_dim):
-        super().__init__()
-        self.norm1 = nn.GroupNorm(8, channels)
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        
-        self.time_proj = nn.Linear(time_emb_dim, channels)
-        self.cond_proj = nn.Conv2d(cond_channels, channels, 1)
-        
-        self.norm2 = nn.GroupNorm(8, channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        
-        self.act = nn.SiLU()
-
-    def forward(self, x, t_emb, condition):
-        h = self.conv1(self.act(self.norm1(x)))
-        h = h + self.time_proj(t_emb)[:, :, None, None]
-        h = h + self.cond_proj(condition)
-        h = self.conv2(self.act(self.norm2(h)))
-        return x + h
-
 class UniPhyDiffusionDecoder(nn.Module):
-    def __init__(self, out_ch, latent_dim, patch_size=4, model_channels=64):
+    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128):
         super().__init__()
         self.patch_size = patch_size
         self.padder = Padder(patch_size)
         
-        self.latent_proj = nn.ConvTranspose2d(
-            latent_dim * 2, model_channels, 
-            kernel_size=patch_size, stride=patch_size
-        )
+        noisy_in_dim = out_ch * (patch_size ** 2)
+        self.noisy_proj = nn.Conv2d(noisy_in_dim, model_channels, kernel_size=1)
         
+        self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
+        
+        time_dim = model_channels * 4
         self.time_mlp = nn.Sequential(
-            TimeEmbedding(model_channels),
-            nn.Linear(model_channels, model_channels * 4),
-            nn.SiLU(),
-            nn.Linear(model_channels * 4, model_channels)
+            SinusoidalPosEmb(model_channels),
+            nn.Linear(model_channels, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim),
         )
         
-        self.input_conv = nn.Conv2d(out_ch, model_channels, 3, padding=1)
+        self.block1 = TimeAwareResBlock(model_channels * 2, model_channels, time_dim)
+        self.block2 = TimeAwareResBlock(model_channels, model_channels, time_dim)
+        self.block3 = TimeAwareResBlock(model_channels, model_channels, time_dim)
         
-        self.res1 = DiffusionResBlock(model_channels, model_channels, model_channels)
-        self.res2 = DiffusionResBlock(model_channels, model_channels, model_channels)
-        self.res3 = DiffusionResBlock(model_channels, model_channels, model_channels)
+        self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
         
-        self.out_conv = nn.Conv2d(model_channels, out_ch, 3, padding=1)
-        
-        nn.init.uniform_(self.out_conv.weight, -1e-5, 1e-5)
-        nn.init.zeros_(self.out_conv.bias)
+        # FIX: Use small uniform init instead of zeros to allow gradient flow checks
+        nn.init.uniform_(self.final_proj.weight, -1e-5, 1e-5)
+        nn.init.zeros_(self.final_proj.bias)
 
     def forward(self, z_latent, x_noisy, t):
-        z_cat = torch.cat([z_latent.real, z_latent.imag], dim=1)
-        cond_feat = self.latent_proj(z_cat)
+        x_noisy = self.padder.pad(x_noisy)
+        x = F.pixel_unshuffle(x_noisy, self.patch_size)
+        x = self.noisy_proj(x)
         
-        target_h, target_w = x_noisy.shape[-2:]
-        cond_feat = cond_feat[..., :target_h, :target_w]
+        if z_latent.is_complex():
+            z_cat = torch.cat([z_latent.real, z_latent.imag], dim=1)
+        else:
+            z_cat = z_latent
+        
+        h_lr, w_lr = x.shape[-2:]
+        z_cat = z_cat[..., :h_lr, :w_lr]
+        
+        cond_feat = self.latent_proj(z_cat)
         
         t_emb = self.time_mlp(t)
         
-        x = self.input_conv(x_noisy)
+        h = torch.cat([x, cond_feat], dim=1)
+        h = self.block1(h, t_emb)
+        h = self.block2(h, t_emb)
+        h = self.block3(h, t_emb)
         
-        x = self.res1(x, t_emb, cond_feat)
-        x = self.res2(x, t_emb, cond_feat)
-        x = self.res3(x, t_emb, cond_feat)
+        out = self.final_proj(h)
+        out = F.pixel_shuffle(out, self.patch_size)
         
-        out = self.out_conv(x)
+        out = self.padder.unpad(out)
         return out
 
     @torch.no_grad()
     def sample(self, z_latent, shape, device, steps=20):
-        return torch.randn(shape, device=device)
+        B, C, H, W = shape
+        img = torch.randn(shape, device=device)
+        
+        betas = torch.linspace(1e-4, 0.02, 1000, device=device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        
+        times = torch.linspace(999, 0, steps, device=device).long()
+        
+        for i in range(steps):
+            t = torch.full((B,), times[i], device=device, dtype=torch.long)
+            
+            t_idx = times[i]
+            beta_t = betas[t_idx]
+            sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alphas_cumprod[t_idx])
+            sqrt_recip_alpha_t = 1.0 / torch.sqrt(alphas[t_idx])
+            
+            pred_noise = self.forward(z_latent, img, t)
+            
+            img = sqrt_recip_alpha_t * (img - beta_t / sqrt_one_minus_alpha_cumprod_t * pred_noise)
+            
+            if i < steps - 1:
+                noise = torch.randn_like(img)
+                sigma_t = torch.sqrt(beta_t)
+                img = img + sigma_t * noise
+                
+        return img
 
