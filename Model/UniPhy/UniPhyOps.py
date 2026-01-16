@@ -1,121 +1,66 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.fft
+import math
+from CliffordConv2d import CliffordConv2d
+from HelmholtzProjection import HelmholtzProjection
 from PScan import PScanTriton
 
-class LearnedPropagator(nn.Module):
-    def __init__(self, channels, h, w):
+class UniPhyLayer(nn.Module):
+    def __init__(self, emb_ch, input_shape):
         super().__init__()
-        self.channels = channels
-        self.net = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.SiLU(),
-            nn.Linear(64, channels)
-        )
-        ky = torch.fft.fftfreq(h)
-        kx = torch.fft.rfftfreq(w)
-        grid_ky, grid_kx = torch.meshgrid(ky, kx, indexing='ij')
-        self.register_buffer('k_grid', torch.stack([grid_ky, grid_kx], dim=-1))
-        k2_val = torch.sqrt(grid_ky**2 + grid_kx**2)
-        self.register_buffer('k_phys', k2_val.unsqueeze(-1)) 
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.net:
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, dt):
-        h, wf, _ = self.k_grid.shape
-        learned_phase = self.net(self.k_grid.view(-1, 2)).view(h, wf, self.channels)
-        omega = learned_phase + self.k_phys.to(learned_phase.dtype)
-        phase = omega * dt.view(-1, 1, 1, 1)
-        return torch.complex(torch.cos(phase), torch.sin(phase))
-
-class FluidInteractionNet(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.main = nn.Sequential(
-            nn.Conv2d(channels, channels * 2, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(channels * 2, channels * 2, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(channels * 2, channels, 1)
-        )
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.main:
-            if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        return self.main(x)
-
-class UniPhyFluidScan(nn.Module):
-    def __init__(self, channels, h, w):
-        super().__init__()
-        self.h, self.w, self.channels = h, w, channels
+        self.emb_ch = emb_ch
+        self.h, self.w = input_shape
+        self.fw = self.w // 2 + 1
+        
+        self.gen_proj = nn.Linear(emb_ch, emb_ch * 2)
+        self.clifford_op = CliffordConv2d(emb_ch, kernel_size=3, padding=1)
+        self.projection_op = HelmholtzProjection(self.h, self.w)
+        self.norm = nn.GroupNorm(4, emb_ch)
         self.pscan = PScanTriton.apply
-        self.propagator = LearnedPropagator(channels, h, w)
-        self.interaction = FluidInteractionNet(channels)
-        ky = torch.fft.fftfreq(h)
-        kx = torch.fft.rfftfreq(w)
-        grid_ky, grid_kx = torch.meshgrid(ky, kx, indexing='ij')
-        k2 = grid_ky**2 + grid_kx**2
-        k2[0, 0] = 1.0
-        self.register_buffer('ky', grid_ky)
-        self.register_buffer('kx', grid_kx)
-        self.register_buffer('k2', k2)
 
-    def apply_constraints(self, xf):
-        if self.channels >= 2:
-            u_f = xf[..., 0, :, :]
-            v_f = xf[..., 1, :, :]
-            div_f = (self.ky * u_f + self.kx * v_f) / self.k2
-            xf_new = xf.clone()
-            xf_new[..., 0, :, :] = u_f - self.ky * div_f
-            xf_new[..., 1, :, :] = v_f - self.kx * div_f
-            return xf_new
-        return xf
-
-    def get_interaction_force(self, x):
-        with torch.enable_grad():
-            x = x.detach().requires_grad_(True)
-            h_pot = self.interaction(x).sum()
-            force = torch.autograd.grad(h_pot, x, create_graph=True, retain_graph=True)[0]
-        return force
-
-    def forward(self, x_seq, dt):
+    def forward(self, x_seq, dt_seq):
         B, T, C, H, W = x_seq.shape
-        Wf = W // 2 + 1
-        A = self.propagator(dt)
-        A_scan = A.unsqueeze(1).expand(B, T, H, Wf, C)
-        A_scan = A_scan.permute(0, 2, 3, 1, 4).reshape(-1, T, C)
+        dt = dt_seq.view(B, T, 1, 1, 1)
+
+        x_fft = torch.fft.rfft2(x_seq, dim=(-2, -1), norm="ortho")
+
+        stats = x_seq.mean(dim=(-1, -2))
+        params = self.gen_proj(stats)
+        nu, omega = torch.chunk(params, 2, dim=-1)
         
-        x_in = x_seq.reshape(B * T, C, H, W)
-        v_inter = self.get_interaction_force(x_in)
-        v_inter = v_inter.view(B, T, C, H, W)
+        lambda_c = torch.complex(-torch.abs(nu), omega).view(B, T, C, 1, 1)
+
+        A_scan = torch.exp(lambda_c * dt)
+
+        eps = 1e-6
+        lambda_abs = torch.abs(lambda_c)
+        is_small = lambda_abs < eps
         
-        X_total = x_seq + v_inter * dt.view(B, 1, 1, 1, 1)
-        Xf = torch.fft.rfft2(X_total, dim=(-2, -1), norm="ortho")
-        Xf = self.apply_constraints(Xf)
+        safe_lambda = torch.where(is_small, torch.full_like(lambda_c, eps), lambda_c)
         
-        Xf_scan = Xf.permute(0, 3, 4, 1, 2).reshape(-1, T, C)
-        h_f_scan = self.pscan(A_scan, Xf_scan)
+        exp_lambda_dt = torch.exp(safe_lambda * dt)
+        X_term = torch.where(
+            is_small,
+            dt.to(torch.complex64),
+            (exp_lambda_dt - 1.0) / safe_lambda
+        )
         
-        h_f = h_f_scan.view(B, H, Wf, T, C).permute(0, 3, 4, 1, 2)
-        h_f = self.apply_constraints(h_f)
+        X_scan = x_fft * X_term
+
+        A_input = A_scan.expand(B, T, C, H, self.fw).to(torch.complex64)
+        X_input = X_scan.to(torch.complex64)
         
-        norm_in = torch.linalg.vector_norm(Xf, ord=2, dim=(2,3,4), keepdim=True)
-        norm_out = torch.linalg.vector_norm(h_f, ord=2, dim=(2,3,4), keepdim=True)
-        scaling = norm_in / (norm_out + 1e-6)
-        h_f = h_f * scaling
+        h_fft = self.pscan(A_input, X_input)
+
+        h_spatial = torch.fft.irfft2(h_fft, s=(H, W), dim=(-2, -1), norm="ortho")
         
-        out = torch.fft.irfft2(h_f, s=(H, W), dim=(-2, -1), norm="ortho")
-        return out
+        h_spatial_flat = h_spatial.reshape(B * T, C, H, W)
+        
+        u = h_spatial_flat + self.clifford_op(h_spatial_flat)
+        u = self.projection_op(u)
+        
+        out = self.norm(u)
+        
+        return out.view(B, T, C, H, W)
 
