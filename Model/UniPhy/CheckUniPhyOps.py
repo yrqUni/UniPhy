@@ -1,69 +1,121 @@
 import torch
 import torch.nn as nn
-from UniPhyOps import UniPhyLayer
+from UniPhyOps import HamiltonianPropagator, UniPhyBlock, UniPhyNet
 
-def calculate_divergence(seq):
-    B, T, C, H, W = seq.shape
-    u = seq[:, :, 0, :, :]
-    v = seq[:, :, 1, :, :]
-    
-    grad_u_x = torch.gradient(u, dim=-1)[0]
-    grad_v_y = torch.gradient(v, dim=-2)[0]
-    
-    div = grad_u_x + grad_v_y
-    return torch.abs(div).mean()
+def report(test_name, error, threshold=1e-4):
+    passed = error < threshold
+    status = "PASS" if passed else "FAIL"
+    color = "\033[92m" if passed else "\033[91m"
+    reset = "\033[0m"
+    print(f"[{test_name}] Max Error: {error:.2e} -> {color}{status}{reset}")
+    if not passed:
+        raise ValueError(f"{test_name} Failed!")
 
-def calculate_energy(seq):
-    return torch.sum(seq**2, dim=(2, 3, 4))
-
-def run_verification():
-    B, T, C, H, W = 2, 10, 4, 64, 64
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def check_energy_conservation():
+    print("\n--- Checking Hamiltonian Conservation (Unitary Evolution) ---")
+    B, T, D = 2, 100, 64
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    model = UniPhyLayer(emb_ch=C, input_shape=(H, W)).to(device)
+    model = HamiltonianPropagator(D, conserve_energy=True).to(device)
     
-    x = torch.randn(B, T, C, H, W, device=device)
+    h_init = torch.randn(B, 1, 1, D, dtype=torch.complex64, device=device)
+    h_init = h_init / h_init.abs() 
+    
     dt = torch.rand(B, T, device=device) * 0.1
     
-    try:
-        out = model(x, dt)
-        print(f"Forward Pass: SUCCESS")
-        print(f"Output Shape: {out.shape}")
-        assert out.shape == (B, T, C, H, W)
-    except Exception as e:
-        print(f"Forward Pass: FAILED | Error: {e}")
-        return
-
-    div_val = calculate_divergence(out)
-    print(f"Mean Divergence: {div_val.item():.2e}")
+    h_curr = h_init.clone()
+    energies = []
     
-    if div_val < 1e-5:
-        print("Divergence Check: PASSED (Solenoidal field maintained)")
-    else:
-        print("Divergence Check: WARNING (High divergence detected)")
-
-    energies = calculate_energy(out)
-    energy_ratios = energies[:, -1] / energies[:, 0]
-    
-    print(f"Energy at t=0: {energies[0, 0].item():.2f}")
-    print(f"Energy at t=T: {energies[0, -1].item():.2f}")
-    
-    is_stable = torch.all(energies < 1e5)
-    if is_stable:
-        print("Stability Check: PASSED (No numerical explosion)")
-    else:
-        print("Stability Check: FAILED (System exploded)")
-
     with torch.no_grad():
-        nn.init.zeros_(model.gen_proj.weight)
-        nn.init.zeros_(model.gen_proj.bias)
+        for t in range(T):
+            dummy_x = torch.zeros(B, 1, 1, D, device=device)
+            _, h_next = model.step_serial(dummy_x, dt[:, t], h_curr)
+            
+            energy = h_next.abs().mean()
+            energies.append(energy)
+            h_curr = h_next
+            
+    energies = torch.stack(energies)
+    initial_energy = h_init.abs().mean()
+    max_divergence = (energies - initial_energy).abs().max()
+    
+    report("Conservation (Pure Rotation)", max_divergence, threshold=1e-5)
+
+def check_parallel_serial_consistency():
+    print("\n--- Checking Parallel vs Serial Equivalence ---")
+    B, T, H, W, C = 2, 32, 8, 8, 16
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    block = UniPhyBlock(C, input_shape=(H, W)).to(device)
+    block.eval()
+    
+    x_seq = torch.randn(B, T, H, W, C, device=device)
+    dt_seq = torch.rand(B, T, device=device) * 0.1
+    
+    with torch.no_grad():
+        out_parallel, h_final_parallel = block.forward_parallel(x_seq, dt_seq)
         
-        out_pure = model(x, dt)
-        energies_pure = calculate_energy(out_pure)
+    out_serial_list = []
+    h_curr = torch.zeros(B, H, W, C, dtype=torch.complex64, device=device)
+    
+    with torch.no_grad():
+        for t in range(T):
+            x_step = x_seq[:, t]
+            dt_step = dt_seq[:, t]
+            
+            x_out, h_curr = block.step_serial(x_step, dt_step, h_curr)
+            out_serial_list.append(x_out)
+            
+    out_serial = torch.stack(out_serial_list, dim=1)
+    
+    diff_out = (out_parallel - out_serial).abs().max()
+    report("Output Tensor Consistency", diff_out, threshold=1e-4)
+    
+    diff_state = (h_final_parallel - h_curr).abs().max()
+    report("Hidden State Consistency", diff_state, threshold=1e-4)
+
+def check_chunked_inference():
+    print("\n--- Checking Chunked/Prefill Consistency ---")
+    B, T, H, W, C = 2, 64, 4, 4, 16
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    split_idx = 32
+    
+    model = UniPhyNet(in_ch=C, dim=C, input_shape=(H, W), num_layers=2).to(device)
+    model.eval()
+    
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.rand(B, T, device=device)
+    
+    with torch.no_grad():
+        out_full, _ = model.forward_parallel(x, dt)
         
-        drift = torch.abs(energies_pure[:, -1] - energies_pure[:, 0]).mean()
-        print(f"Ideal Propagation Drift: {drift.item():.2e}")
+    x1, x2 = x[:, :split_idx], x[:, split_idx:]
+    dt1, dt2 = dt[:, :split_idx], dt[:, split_idx:]
+    
+    with torch.no_grad():
+        propagator = model.layers[0].propagator
+        x_prop = x.permute(0, 1, 3, 4, 2)
+        x1_p, x2_p = x_prop[:, :split_idx], x_prop[:, split_idx:]
+        
+        out_prop_full, _ = propagator.forward_parallel(x_prop, dt)
+        
+        out_prop_1, h_split = propagator.forward_parallel(x1_p, dt1)
+        out_prop_2, _ = propagator.forward_parallel(x2_p, dt2, initial_state=h_split)
+        
+        out_prop_chunked = torch.cat([out_prop_1, out_prop_2], dim=1)
+        
+    diff_chunk = (out_prop_full - out_prop_chunked).abs().max()
+    report("Chunked State Injection", diff_chunk, threshold=1e-4)
 
 if __name__ == "__main__":
-    run_verification()
+    torch.manual_seed(42)
+    torch.set_default_dtype(torch.float32)
+    
+    try:
+        check_energy_conservation()
+        check_parallel_serial_consistency()
+        check_chunked_inference()
+        print("\nAll Checks Passed Successfully. UniPhyOps is robust.")
+    except Exception as e:
+        print(f"\nVerification Failed: {e}")
 
