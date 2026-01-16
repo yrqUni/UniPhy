@@ -182,7 +182,10 @@ def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float]:
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
-    if rank == 0: setup_logging(args)
+    if rank == 0:
+        setup_logging(args)
+        setup_wandb(rank, args)
+
     if args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -201,14 +204,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
     log_model_stats(model, rank)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-    setup_wandb(rank, args)
 
     train_ds = ERA5_Dataset(
         input_dir=args.data_root, year_range=args.year_range, is_train=True,
         sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num,
         max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size()
     )
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=False, drop_last=True)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=True, drop_last=True)
     train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
@@ -217,11 +219,14 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         {"params": [p for p in param_dict.values() if p.dim() < 2], "weight_decay": 0.0},
     ]
     opt = torch.optim.AdamW(optim_groups, lr=args.lr)
-    scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=len(train_loader)//args.grad_accum_steps, epochs=args.epochs) if args.use_scheduler else None
+    
+    steps_per_epoch = max(1, len(train_loader) // args.grad_accum_steps)
+    scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs) if args.use_scheduler else None
 
     start_ep, global_step = 0, 0
     if args.ckpt: start_ep, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
 
+    save_interval = max(1, int(len(train_loader) * args.ckpt_step))
     T_diff = 1000
     betas = torch.linspace(1e-4, 0.02, T_diff).cuda(local_rank)
     alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
@@ -229,26 +234,29 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     for ep in range(start_ep, args.epochs):
         train_sampler.set_epoch(ep)
         train_iter = tqdm(train_loader, desc=f"Ep {ep+1}") if rank == 0 else train_loader
+        
         for train_step, data in enumerate(train_iter, start=1):
             model.train()
             data = data.to(f"cuda:{local_rank}", non_blocking=True).float()
             B, T_tot, C, H, W = data.shape
+            
             indices = torch.tensor([sorted(random.sample(range(T_tot), args.sample_k)) for _ in range(B)], device=data.device)
             sampled = data[torch.arange(B, device=data.device).unsqueeze(1), indices]
             x_in, target = sampled[:, :-1], sampled[:, 1:]
             dt = (indices[:, 1:] - indices[:, :-1]).float() * args.dt_ref
-            B, T_seq, C, H, W = target.shape
+            B_seq, T_seq, C, H, W = target.shape
 
             is_accum = (train_step % args.grad_accum_steps != 0)
             sync_ctx = model.no_sync() if is_accum else contextlib.nullcontext()
+            
             with sync_ctx:
                 z_pred, _ = model(x_in, dt)
-                z_flat = z_pred.reshape(B * T_seq, *z_pred.shape[2:])
-                target_flat = target.reshape(B * T_seq, C, H, W)
+                z_flat = z_pred.reshape(B_seq * T_seq, *z_pred.shape[2:])
+                target_flat = target.reshape(B_seq * T_seq, C, H, W)
                 m_base = model.module if isinstance(model, DDP) else model
 
                 if m_base.decoder_type == "diffusion":
-                    t = torch.randint(0, T_diff, (B * T_seq,), device=data.device).long()
+                    t = torch.randint(0, T_diff, (B_seq * T_seq,), device=data.device).long()
                     noise = torch.randn_like(target_flat)
                     sqrt_at = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1)
                     sqrt_ot = torch.sqrt(1.0 - alphas_cumprod[t]).view(-1, 1, 1, 1)
@@ -256,34 +264,53 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     pred_noise = m_base.decoder(z_flat, x_noisy, t)
                     loss = F.mse_loss(pred_noise, noise)
                 else:
-                    x_ref = x_in.reshape(B * T_seq, C, H, W)
+                    x_ref = x_in.reshape(B_seq * T_seq, C, H, W)
                     pred_ens = m_base.decoder.generate_ensemble(z_flat, x_ref=x_ref)
                     loss = crps_ensemble_loss(pred_ens, target_flat)
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     opt.zero_grad(set_to_none=True)
                     continue
+                
                 (loss / args.grad_accum_steps).backward()
 
             if not is_accum:
-                if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if args.grad_clip > 0: 
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                
                 gn, _ = get_grad_stats(model)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 if scheduler: scheduler.step()
                 global_step += 1
+                
                 if rank == 0:
                     if train_step % args.log_every == 0:
                         msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | GN: {gn:.2f}"
                         if isinstance(train_iter, tqdm): train_iter.set_description(msg)
                         logging.info(msg)
+                    
                     if args.use_wandb and (train_step % args.wandb_every == 0):
-                        wandb.log({"train/loss": loss.item(), "train/lr": opt.param_groups[0]["lr"], "train/gn": gn, "train/step": global_step})
-                if train_step % int(len(train_loader)*args.ckpt_step) == 0:
-                    save_ckpt(model, opt, ep+1, train_step, loss.item(), args, scheduler)
+                        wandb.log({
+                            "train/loss": loss.item(), 
+                            "train/lr": opt.param_groups[0]["lr"], 
+                            "train/gn": gn, 
+                            "train/step": global_step
+                        })
+                    
+                    if train_step % save_interval == 0:
+                        save_ckpt(model, opt, ep+1, train_step, loss.item(), args, scheduler)
+
     cleanup_ddp()
 
 if __name__ == "__main__":
     a = Args()
-    run_ddp(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), int(os.environ["LOCAL_RANK"]), os.environ.get("MASTER_ADDR", "127.0.0.1"), os.environ.get("MASTER_PORT", "12355"), a)
+    run_ddp(
+        rank=int(os.environ["RANK"]), 
+        world_size=int(os.environ["WORLD_SIZE"]), 
+        local_rank=int(os.environ["LOCAL_RANK"]), 
+        master_addr=os.environ.get("MASTER_ADDR", "127.0.0.1"), 
+        master_port=os.environ.get("MASTER_PORT", "12355"), 
+        args=a
+    )
 
