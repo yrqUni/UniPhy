@@ -6,42 +6,90 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def spectral_fused_kernel(
-    x_ptr,
-    nu_ptr,
-    theta_ptr,
+def spectral_fwd_kernel(
+    out_r_ptr, out_i_ptr,
+    nu_ptr, theta_ptr,
     dt_ptr,
-    stride_x_b, stride_x_c, stride_x_h, stride_x_w,
+    stride_out_b, stride_out_h, stride_out_w,
     stride_nu_b, stride_nu_r, stride_nu_h, stride_nu_w,
     stride_dt,
-    B, C, H, W, RANK: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
+    RANK: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_W: tl.constexpr
 ):
-    pid = tl.program_id(0)
+    pid_b = tl.program_id(0)
+    pid_HW = tl.program_id(1)
     
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    total_elements = B * C * H * W
-    mask = offs < total_elements
+    num_w_blocks = tl.cdiv(W, BLOCK_W)
+    idx_h = pid_HW // num_w_blocks
+    idx_w_chunk = pid_HW % num_w_blocks
     
-    w_idx = offs % W
-    h_idx = (offs // W) % H
-    c_idx = (offs // (W * H)) % C
-    b_idx = offs // (W * H * C)
+    w_start = idx_w_chunk * BLOCK_W
+    offs_w = w_start + tl.arange(0, BLOCK_W)
+    mask = offs_w < W
     
-    dt = tl.load(dt_ptr + b_idx * stride_dt, mask=mask, other=0.0)
+    dt = tl.load(dt_ptr + pid_b * stride_dt)
     
-    filter_r = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    filter_i = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    acc_r = tl.zeros([BLOCK_W], dtype=tl.float32)
+    acc_i = tl.zeros([BLOCK_W], dtype=tl.float32)
     
-    nu_base = b_idx * stride_nu_b + h_idx * stride_nu_h + w_idx * stride_nu_w
-    theta_base = b_idx * stride_nu_b + h_idx * stride_nu_h + w_idx * stride_nu_w
+    nu_base = pid_b * stride_nu_b + idx_h * stride_nu_h
+    theta_base = pid_b * stride_nu_b + idx_h * stride_nu_h
     
     for r in range(RANK):
-        nu_off = nu_base + r * stride_nu_r
-        theta_off = theta_base + r * stride_nu_r
+        p_nu = nu_ptr + nu_base + r * stride_nu_r + offs_w * stride_nu_w
+        p_theta = theta_ptr + theta_base + r * stride_nu_r + offs_w * stride_nu_w
         
-        nu_val = tl.load(nu_ptr + nu_off, mask=mask, other=0.0)
-        theta_val = tl.load(theta_ptr + theta_off, mask=mask, other=0.0)
+        nu_val = tl.load(p_nu, mask=mask, other=0.0)
+        theta_val = tl.load(p_theta, mask=mask, other=0.0)
+        
+        decay = tl.exp(-nu_val * dt)
+        angle = theta_val * dt
+        
+        acc_r += decay * tl.cos(angle)
+        acc_i += decay * tl.sin(angle)
+
+    out_off = pid_b * stride_out_b + idx_h * stride_out_h + offs_w * stride_out_w
+    tl.store(out_r_ptr + out_off, acc_r, mask=mask)
+    tl.store(out_i_ptr + out_off, acc_i, mask=mask)
+
+@triton.jit
+def spectral_bwd_kernel(
+    dnu_ptr, dtheta_ptr,
+    grad_r_ptr, grad_i_ptr,
+    nu_ptr, theta_ptr,
+    dt_ptr,
+    stride_nu_b, stride_nu_r, stride_nu_h, stride_nu_w,
+    stride_grad_b, stride_grad_h, stride_grad_w,
+    stride_dt,
+    RANK: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_W: tl.constexpr
+):
+    pid_b = tl.program_id(0)
+    pid_HW = tl.program_id(1)
+    
+    num_w_blocks = tl.cdiv(W, BLOCK_W)
+    idx_h = pid_HW // num_w_blocks
+    idx_w_chunk = pid_HW % num_w_blocks
+    
+    w_start = idx_w_chunk * BLOCK_W
+    offs_w = w_start + tl.arange(0, BLOCK_W)
+    mask = offs_w < W
+    
+    dt = tl.load(dt_ptr + pid_b * stride_dt)
+    
+    grad_off = pid_b * stride_grad_b + idx_h * stride_grad_h + offs_w * stride_grad_w
+    g_r = tl.load(grad_r_ptr + grad_off, mask=mask, other=0.0)
+    g_i = tl.load(grad_i_ptr + grad_off, mask=mask, other=0.0)
+    
+    base_idx = pid_b * stride_nu_b + idx_h * stride_nu_h
+    
+    for r in range(RANK):
+        curr_offset = base_idx + r * stride_nu_r + offs_w * stride_nu_w
+        
+        nu_val = tl.load(nu_ptr + curr_offset, mask=mask, other=0.0)
+        theta_val = tl.load(theta_ptr + curr_offset, mask=mask, other=0.0)
         
         decay = tl.exp(-nu_val * dt)
         angle = theta_val * dt
@@ -49,19 +97,76 @@ def spectral_fused_kernel(
         cos_a = tl.cos(angle)
         sin_a = tl.sin(angle)
         
-        filter_r += decay * cos_a
-        filter_i += decay * sin_a
+        term_r = decay * cos_a
+        term_i = decay * sin_a
+        
+        d_term_real_dnu = -dt * term_r
+        d_term_imag_dnu = -dt * term_i
+        
+        d_term_real_dtheta = -dt * term_i
+        d_term_imag_dtheta = dt * term_r
+        
+        d_nu = g_r * d_term_real_dnu + g_i * d_term_imag_dnu
+        d_theta = g_r * d_term_real_dtheta + g_i * d_term_imag_dtheta
+        
+        tl.store(dnu_ptr + curr_offset, d_nu, mask=mask)
+        tl.store(dtheta_ptr + curr_offset, d_theta, mask=mask)
 
-    x_off = b_idx * stride_x_b + c_idx * stride_x_c + h_idx * stride_x_h + w_idx * stride_x_w
-    
-    x_r = tl.load(x_ptr + 2 * x_off, mask=mask, other=0.0)
-    x_i = tl.load(x_ptr + 2 * x_off + 1, mask=mask, other=0.0)
-    
-    out_r = x_r * filter_r - x_i * filter_i
-    out_i = x_r * filter_i + x_i * filter_r
-    
-    tl.store(x_ptr + 2 * x_off, out_r, mask=mask)
-    tl.store(x_ptr + 2 * x_off + 1, out_i, mask=mask)
+class SpectralFilterFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, nu, theta, dt, w_freq):
+        B, R, H, W_in = nu.shape
+        ctx.w_freq = w_freq
+        ctx.rank = R
+        
+        dt = dt.contiguous()
+        nu = nu.contiguous()
+        theta = theta.contiguous()
+        
+        filter_real = torch.empty((B, H, w_freq), device=nu.device, dtype=torch.float32)
+        filter_imag = torch.empty((B, H, w_freq), device=nu.device, dtype=torch.float32)
+        
+        BLOCK_W = 128
+        grid = (B, H * triton.cdiv(w_freq, BLOCK_W))
+        
+        spectral_fwd_kernel[grid](
+            filter_real, filter_imag,
+            nu, theta,
+            dt,
+            filter_real.stride(0), filter_real.stride(1), filter_real.stride(2),
+            nu.stride(0), nu.stride(1), nu.stride(2), nu.stride(3),
+            dt.stride(0),
+            RANK=R, W=w_freq, BLOCK_W=BLOCK_W
+        )
+        
+        ctx.save_for_backward(nu, theta, dt)
+        return filter_real, filter_imag
+
+    @staticmethod
+    def backward(ctx, grad_real, grad_imag):
+        nu, theta, dt = ctx.saved_tensors
+        w_freq = ctx.w_freq
+        R = ctx.rank
+        B, _, H, _ = nu.shape
+        
+        dnu = torch.empty_like(nu)
+        dtheta = torch.empty_like(theta)
+        
+        BLOCK_W = 128
+        grid = (B, H * triton.cdiv(w_freq, BLOCK_W))
+        
+        spectral_bwd_kernel[grid](
+            dnu, dtheta,
+            grad_real, grad_imag,
+            nu, theta,
+            dt,
+            nu.stride(0), nu.stride(1), nu.stride(2), nu.stride(3),
+            grad_real.stride(0), grad_real.stride(1), grad_real.stride(2),
+            dt.stride(0),
+            RANK=R, W=w_freq, BLOCK_W=BLOCK_W
+        )
+        
+        return dnu, dtheta, None, None
 
 class SpectralStep(nn.Module):
     def __init__(self, in_ch, rank=32, w_freq=64):
@@ -77,6 +182,7 @@ class SpectralStep(nn.Module):
 
     def forward(self, x, dt):
         B, C, H, W = x.shape
+        
         x_spec = torch.fft.rfft2(x, norm="ortho")
         
         params = self.estimator(x)
@@ -84,35 +190,20 @@ class SpectralStep(nn.Module):
         nu = F.softplus(nu)
         theta = torch.tanh(theta) * math.pi
         
-        target_spec = x_spec[:, :, :, :self.w_freq].contiguous()
+        if dt.dim() == 0: dt = dt.view(1).expand(B)
+        elif dt.dim() > 1: dt = dt.view(B)
+        dt = dt.contiguous()
         
-        if dt.dim() == 0:
-            dt_tensor = dt.view(1).expand(B)
-        elif dt.dim() > 1:
-            dt_tensor = dt.view(B)
-        else:
-            dt_tensor = dt
-            
-        dt_tensor = dt_tensor.contiguous()
+        filter_real, filter_imag = SpectralFilterFunction.apply(nu, theta, dt, self.w_freq)
         
-        total_elements = B * C * H * self.w_freq
-        grid = lambda meta: (triton.cdiv(total_elements, meta['BLOCK_SIZE']),)
+        target_spec = x_spec[:, :, :, :self.w_freq]
+        filter_complex = torch.complex(filter_real, filter_imag).unsqueeze(1)
         
-        target_spec_view = torch.view_as_real(target_spec)
-
-        spectral_fused_kernel[grid](
-            target_spec_view,
-            nu,
-            theta,
-            dt_tensor,
-            target_spec.stride(0), target_spec.stride(1), target_spec.stride(2), target_spec.stride(3),
-            nu.stride(0), nu.stride(1), nu.stride(2), nu.stride(3),
-            dt_tensor.stride(0),
-            B, C, H, self.w_freq, self.rank,
-            BLOCK_SIZE=512
-        )
+        out_spec = target_spec * filter_complex
         
-        x_spec[:, :, :, :self.w_freq] = target_spec
+        x_final_spec = torch.zeros_like(x_spec)
+        x_final_spec[:, :, :, :self.w_freq] = out_spec
+        x_final_spec[:, :, :, self.w_freq:] = x_spec[:, :, :, self.w_freq:]
         
-        return torch.fft.irfft2(x_spec, s=(H, W), norm="ortho")
+        return torch.fft.irfft2(x_final_spec, s=(H, W), norm="ortho")
 
