@@ -48,34 +48,24 @@ def check_latent_conservation():
     model.eval()
     
     B, T, C, H, W = 1, 50, 4, 32, 32
-    # 随机初始化
     x = torch.randn(B, T, C, H, W, device=device)
     dt = torch.rand(B, T, device=device) * 0.1
     
     with torch.no_grad():
-        # 1. Warmup: 给一个初始脉冲，建立 Hidden State
         x_init = x[:, 0].unsqueeze(1)
         z_out, initial_states = model(x_init, dt[:, 0:1])
         
-        # 2. Free Evolution: 后续输入全为 0，观察 Hidden State 是否守恒
-        # 注意：我们检查的是 Hidden State (h) 的能量，这才是哈密顿量承载的地方
-        dummy_x = torch.zeros_like(z_out[:, 0]).permute(0, 2, 3, 1) # [B, H, W, D]
+        dummy_x = torch.zeros_like(z_out[:, 0]).permute(0, 2, 3, 1) 
         
         h_energies = []
         
-        # 追踪第一层的 Hidden State (最直接反映 Propagator 行为)
         curr_h = initial_states[0] 
         
         for t in range(T):
             next_states = []
             
-            # 我们不仅跑 block，我们直接观测 block 内部 propagator 的 state 演化
-            # 为了严谨，我们还是跑完整个 block，但输入是 0
-            
-            # 使用 step_serial, 输入为 0
             _, h_next_all = model.blocks[0].step_serial(dummy_x, dt[:, t], curr_h)
             
-            # 记录能量
             energy = torch.norm(h_next_all)
             h_energies.append(energy)
             
@@ -85,13 +75,11 @@ def check_latent_conservation():
     start_energy = h_energies[0]
     end_energy = h_energies[-1]
     
-    # 允许微小的数值误差
     max_dev = (h_energies - start_energy).abs().max() / (start_energy + 1e-6)
     
     print(f"Hidden State Energy (Start): {start_energy:.4f}")
     print(f"Hidden State Energy (End):   {end_energy:.4f}")
     
-    #  - 仅作示意，实际不生成
     report("Latent Energy Stability", max_dev, threshold=0.01)
 
 def check_inference_loop():

@@ -50,9 +50,7 @@ class UniPhyTransformerBlock(nn.Module):
         x = self.norm_space(x)
         
         x_real_view = torch.view_as_real(x)
-        # [B, T, H, W, C, 2] -> [B, T, C, 2, H, W]
         x_real_view = x_real_view.permute(0, 1, 4, 5, 2, 3).contiguous()
-        # -> [B*T, 2C, H, W]
         x_real_view = x_real_view.view(B * T, C * 2, H, W)
         
         x_cliff = self.space_clifford(x_real_view)
@@ -62,9 +60,7 @@ class UniPhyTransformerBlock(nn.Module):
         
         x_space = x_cliff + x_spec
         
-        # [B*T, 2C, H, W] -> [B, T, C, 2, H, W]
         x_space = x_space.view(B, T, C, 2, H, W)
-        # -> [B, T, H, W, C, 2]
         x_space = x_space.permute(0, 1, 4, 5, 2, 3).contiguous()
         x_space = torch.view_as_complex(x_space)
         
@@ -97,9 +93,7 @@ class UniPhyTransformerBlock(nn.Module):
         x = self.norm_space(x)
         
         x_real_view = torch.view_as_real(x)
-        # [B, H, W, C, 2] -> [B, C, 2, H, W]
         x_real_view = x_real_view.permute(0, 3, 4, 1, 2).contiguous()
-        # -> [B, 2C, H, W]
         x_real_view = x_real_view.view(B, C * 2, H, W)
         
         x_cliff = self.space_clifford(x_real_view)
@@ -107,9 +101,7 @@ class UniPhyTransformerBlock(nn.Module):
         
         x_space = x_cliff + x_spec
         
-        # [B, 2C, H, W] -> [B, C, 2, H, W]
         x_space = x_space.view(B, C, 2, H, W)
-        # -> [B, H, W, C, 2]
         x_space = x_space.permute(0, 3, 4, 1, 2).contiguous()
         x_space = torch.view_as_complex(x_space)
         
