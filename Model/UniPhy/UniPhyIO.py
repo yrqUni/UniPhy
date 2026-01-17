@@ -76,16 +76,17 @@ class MassCorrector(nn.Module):
             ref_slice = ref[:, -1:, ...]
         else:
             ref_slice = ref.unsqueeze(1)
-            
+        
         ref_mass = (ref_slice[:, :, self.mass_idx:self.mass_idx+1] * self.weights).mean(dim=(-2, -1), keepdim=True)
         pred_mass = (pred[:, :, self.mass_idx:self.mass_idx+1] * self.weights).mean(dim=(-2, -1), keepdim=True)
         
         diff = pred_mass - ref_mass
         
-        correction = torch.zeros_like(pred)
-        correction[:, :, self.mass_idx:self.mass_idx+1] = diff
+        C = pred.shape[2]
         
-        return pred - correction
+        mask = (torch.arange(C, device=pred.device) == self.mass_idx).view(1, 1, C, 1, 1).to(pred.dtype)
+        
+        return pred - (diff * mask)
 
 class UniPhyEncoder(nn.Module):
     def __init__(self, in_ch, embed_dim, patch_size=16, img_height=64, img_width=64):

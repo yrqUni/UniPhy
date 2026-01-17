@@ -169,6 +169,7 @@ class SpectralStep(nn.Module):
         k_term = vx * torch.pow(self.k_x_abs, alpha_clamp) + vy * torch.pow(self.k_y_abs, alpha_clamp)
         dissipation = torch.exp(-k_term * (H * W))
         x_fft = x_fft * dissipation.unsqueeze(0).unsqueeze(0)
+        x_fft = x_fft.clone()
         x_fft[..., 0, 0] = original_dc
         out = torch.fft.ifft2(x_fft, s=(H, W), norm='ortho')
         return out
