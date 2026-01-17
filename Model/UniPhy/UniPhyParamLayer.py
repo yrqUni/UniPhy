@@ -79,7 +79,7 @@ class LieAlgebraRotation(nn.Module):
         out = F.linear(x_flat, R)
         return out.permute(0, 3, 1, 2)
 
-class UniPhyParaPool(nn.Module):
+class UniPhyParamLayer(nn.Module):
     def __init__(self, dim, expand=4):
         super().__init__()
         self.dim = dim
