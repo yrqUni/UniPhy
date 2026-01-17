@@ -28,20 +28,17 @@ class SymplecticPropagator(nn.Module):
         self.dt_ref = dt_ref
         
         self.frequencies = nn.Parameter(torch.randn(dim) * 1.0)
-        
         self.basis_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
 
     def get_orthogonal_basis(self):
         S = self.basis_generator.triu(1)
         S = S - S.t()
-        
         I = torch.eye(self.dim, device=S.device)
-        Q = torch.linalg.solve(I - S, I + S).T
+        Q = torch.linalg.solve(I - S, I + S)
         return Q
 
     def get_operators(self, dt):
         Q = self.get_orthogonal_basis()
-        
         V = Q.to(dtype=torch.cfloat)
         V_inv = V.T 
 
