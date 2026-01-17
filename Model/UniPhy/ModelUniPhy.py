@@ -90,8 +90,10 @@ class UniPhyModel(nn.Module):
         self.img_width = img_width
         self.patch_size = patch_size
         
-        h_dim = img_height // patch_size
-        w_dim = img_width // patch_size
+        pad_h = (patch_size - img_height % patch_size) % patch_size
+        pad_w = (patch_size - img_width % patch_size) % patch_size
+        h_dim = (img_height + pad_h) // patch_size
+        w_dim = (img_width + pad_w) // patch_size
         
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
         

@@ -95,8 +95,11 @@ class UniPhyEncoder(nn.Module):
         nn.init.orthogonal_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
         
-        h_dim = img_height // patch_size
-        w_dim = img_width // patch_size
+        pad_h = (patch_size - img_height % patch_size) % patch_size
+        pad_w = (patch_size - img_width % patch_size) % patch_size
+        h_dim = (img_height + pad_h) // patch_size
+        w_dim = (img_width + pad_w) // patch_size
+        
         self.pos_emb = SphericalPosEmb(embed_dim * 2, h_dim, w_dim)
 
     def forward(self, x):
