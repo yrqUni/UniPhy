@@ -3,10 +3,7 @@ import sys
 import math
 import torch.nn.functional as F
 
-try:
-    from UniPhyParaPool import UniPhyParaPool, MassConservingSwiGLU, LieAlgebraRotation, ThermodynamicVectorMLP
-except ImportError:
-    from .UniPhyParaPool import UniPhyParaPool, MassConservingSwiGLU, LieAlgebraRotation, ThermodynamicVectorMLP
+from UniPhyParamLayer import UniPhyParamLayer, MassConservingSwiGLU, LieAlgebraRotation, ThermodynamicVectorMLP
 
 def check_scalar_mass_mechanics():
     print("Checking Scalar Stream Mass Constraints...")
@@ -27,7 +24,7 @@ def check_scalar_mass_mechanics():
 def check_thermodynamic_consistency():
     print("Checking Total Energy Conservation (Thermodynamics)...")
     dim = 32
-    pool = UniPhyParaPool(dim, expand=2)
+    pool = UniPhyParamLayer(dim, expand=2)
     
     scalar_dim = dim // 4
     vector_dim = dim - scalar_dim

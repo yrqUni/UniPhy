@@ -3,10 +3,7 @@ import sys
 import math
 import torch.nn.functional as F
 
-try:
-    from UniPhyIO import Padder, MassCorrector, SphericalPosEmb, UniPhyEncoder, UniPhyEnsembleDecoder
-except ImportError:
-    from .UniPhyIO import Padder, MassCorrector, SphericalPosEmb, UniPhyEncoder, UniPhyEnsembleDecoder
+from UniPhyIO import Padder, MassCorrector, SphericalPosEmb, UniPhyEncoder, UniPhyEnsembleDecoder
 
 def check_padder_odd_shapes():
     print("Checking Padder with Odd Shapes (H=721)...")

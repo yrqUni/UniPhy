@@ -3,12 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MassConservingSwiGLU(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+    def __init__(self, dim, hidden_dim):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim)
         self.w2 = nn.Linear(dim, hidden_dim)
         self.w3 = nn.Linear(hidden_dim, dim)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, heat_gain=None):
         B, C, H, W = x.shape
@@ -18,7 +17,6 @@ class MassConservingSwiGLU(nn.Module):
         x1 = self.w1(x_in)
         x2 = self.w2(x_in)
         hidden = F.silu(x1) * x2
-        hidden = self.dropout(hidden)
         delta = self.w3(hidden)
         delta = delta.permute(0, 3, 1, 2)
         
@@ -33,7 +31,7 @@ class MassConservingSwiGLU(nn.Module):
         return out
 
 class ThermodynamicVectorMLP(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+    def __init__(self, dim, hidden_dim):
         super().__init__()
         assert dim % 2 == 0
         self.n_vectors = dim // 2
@@ -41,7 +39,6 @@ class ThermodynamicVectorMLP(nn.Module):
         self.gate_proj = nn.Linear(self.n_vectors, hidden_dim)
         self.feat_proj = nn.Linear(self.n_vectors, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, self.n_vectors)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -54,7 +51,6 @@ class ThermodynamicVectorMLP(nn.Module):
         gate = self.gate_proj(mag_flat)
         feat = self.feat_proj(mag_flat)
         hidden = F.silu(gate) * feat
-        hidden = self.dropout(hidden)
         
         raw_scales = self.out_proj(hidden)
         scales = torch.sigmoid(raw_scales) * 1.5
@@ -84,7 +80,7 @@ class LieAlgebraRotation(nn.Module):
         return out.permute(0, 3, 1, 2)
 
 class UniPhyParaPool(nn.Module):
-    def __init__(self, dim, expand=4, dropout=0.0):
+    def __init__(self, dim, expand=4):
         super().__init__()
         self.dim = dim
         self.scalar_dim = dim // 4
@@ -93,9 +89,9 @@ class UniPhyParaPool(nn.Module):
         scalar_hidden = int(self.scalar_dim * expand)
         vector_hidden = int(self.vector_dim * expand)
         
-        self.scalar_op = MassConservingSwiGLU(self.scalar_dim, scalar_hidden, dropout)
+        self.scalar_op = MassConservingSwiGLU(self.scalar_dim, scalar_hidden)
         self.vector_mixing = LieAlgebraRotation(self.vector_dim)
-        self.vector_op = ThermodynamicVectorMLP(self.vector_dim, vector_hidden, dropout)
+        self.vector_op = ThermodynamicVectorMLP(self.vector_dim, vector_hidden)
 
     def forward(self, x):
         x_scalar = x[:, :self.scalar_dim, :, :]

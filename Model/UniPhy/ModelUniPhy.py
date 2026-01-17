@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import SymplecticPropagator, PScanTriton, MetricAwareCliffordConv2d, SpectralStep
-from UniPhyParaPool import UniPhyParaPool
+from UniPhyParamLayer import UniPhyParamLayer
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4, dropout=0.0):
+    def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4):
         super().__init__()
         self.dim = dim
         
@@ -25,7 +25,7 @@ class UniPhyBlock(nn.Module):
         self.pscan = PScanTriton()
         
         self.norm_pool = nn.LayerNorm(dim * 2)
-        self.para_pool = UniPhyParaPool(dim * 2, expand=expand, dropout=dropout)
+        self.para_pool = UniPhyParamLayer(dim * 2, expand=expand)
 
     def _complex_norm(self, z, norm_layer):
         z_cat = torch.cat([z.real, z.imag], dim=-1)
@@ -94,8 +94,7 @@ class UniPhyModel(nn.Module):
                  depth=4, 
                  patch_size=16, 
                  img_height=64, 
-                 img_width=128, 
-                 dropout=0.0):
+                 img_width=128):
         super().__init__()
         
         self.img_height = img_height
@@ -110,7 +109,7 @@ class UniPhyModel(nn.Module):
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
         
         self.blocks = nn.ModuleList([
-            UniPhyBlock(embed_dim, h_dim, w_dim, dropout=dropout)
+            UniPhyBlock(embed_dim, h_dim, w_dim)
             for _ in range(depth)
         ])
         
