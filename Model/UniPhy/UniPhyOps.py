@@ -25,21 +25,17 @@ class SymplecticPropagator(nn.Module):
         super().__init__()
         assert dim % 2 == 0
         self.dim = dim
-        self.half_dim = dim // 2
         self.dt_ref = dt_ref
-        self.symmetric_kernel = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        J = torch.zeros(dim, dim)
-        I = torch.eye(self.half_dim)
-        J[:self.half_dim, self.half_dim:] = I
-        J[self.half_dim:, :self.half_dim] = -I
-        self.register_buffer('J', J)
+        self.skew_kernel = nn.Parameter(torch.randn(dim, dim) * 0.01)
 
     def get_operators(self, dt):
-        K = self.symmetric_kernel.triu() + self.symmetric_kernel.triu(1).t()
-        A = torch.matmul(self.J, K)
-        L, V = torch.linalg.eig(A)
-        V_inv = torch.linalg.inv(V)
-        
+        K = self.skew_kernel.triu(1)
+        A = K - K.t()
+        H_matrix = 1j * A
+        L_real, V = torch.linalg.eigh(H_matrix)
+        L = -1j * L_real
+        V_inv = V.conj().t()
+
         if dt.ndim == 2:
             dt_cast = dt.unsqueeze(-1)
         elif dt.ndim == 1:
