@@ -22,8 +22,11 @@ class Padder(nn.Module):
         H, W = x.shape[-2:]
         self.pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
         self.pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
-        if self.pad_h > 0 or self.pad_w > 0:
-            x = F.pad(x, (0, self.pad_w, 0, self.pad_h), mode='replicate')
+        
+        if self.pad_w > 0:
+            x = F.pad(x, (0, self.pad_w, 0, 0), mode='circular')
+        if self.pad_h > 0:
+            x = F.pad(x, (0, 0, 0, self.pad_h), mode='replicate')
         return x
 
     def unpad(self, x):

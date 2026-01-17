@@ -1,50 +1,37 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
+import torch.fft
 
 class SpectralStep(nn.Module):
-    def __init__(self, in_ch, rank=32, w_freq=64):
+    def __init__(self, dim, h, w, viscosity=1e-4):
         super().__init__()
-        self.in_ch = in_ch
-        self.rank = rank
-        self.w_freq = w_freq
-        self.estimator = nn.Sequential(
-            nn.AdaptiveAvgPool2d((None, w_freq)),
-            nn.Conv2d(in_ch, rank * 2, 1)
-        )
-        nn.init.uniform_(self.estimator[-1].weight, -0.01, 0.01)
+        self.dim = dim
+        self.viscosity = viscosity
+        self.h = h
+        self.w = w
+        
+        self.weight = nn.Parameter(torch.randn(dim, h, w, dtype=torch.cfloat) * 0.02)
+        
+        kx = torch.fft.fftfreq(w, d=1.0)
+        ky = torch.fft.fftfreq(h, d=1.0)
+        k_x, k_y = torch.meshgrid(kx, ky, indexing='xy')
+        k_sq = k_x ** 2 + k_y ** 2
+        self.register_buffer('k_sq', k_sq)
 
-    def forward(self, x, dt):
+    def forward(self, x):
         B, C, H, W = x.shape
-        x_spec = torch.fft.rfft2(x, norm="ortho")
         
-        params = self.estimator(x)
-        nu, theta = torch.chunk(params, 2, dim=1)
-        nu = F.softplus(nu)
-        theta = torch.tanh(theta) * math.pi
+        x_fft = torch.fft.fft2(x, norm='ortho')
         
-        if dt.dim() < nu.dim():
-            dt_view = dt.view(B, 1, 1, 1)
-        else:
-            dt_view = dt
-            
-        decay = torch.exp(-nu * dt_view)
-        angle = theta * dt_view
+        original_dc = x_fft[..., 0, 0].clone()
         
-        operator = torch.complex(decay * torch.cos(angle), decay * torch.sin(angle))
+        x_fft = x_fft * self.weight
         
-        operator_sum = operator.sum(dim=1, keepdim=True)
+        dissipation = torch.exp(-self.viscosity * self.k_sq * (H * W))
+        x_fft = x_fft * dissipation.unsqueeze(0).unsqueeze(0)
         
-        feat_spec = x_spec[:, :, :, :self.w_freq]
+        x_fft[..., 0, 0] = original_dc
         
-        if operator_sum.shape[2] == 1:
-             feat_spec = feat_spec * operator_sum
-        else:
-             feat_spec = feat_spec * operator_sum
-             
-        x_out_spec = x_spec.clone()
-        x_out_spec[:, :, :, :self.w_freq] = feat_spec
-        
-        return torch.fft.irfft2(x_out_spec, s=(H, W), norm="ortho")
+        out = torch.fft.ifft2(x_fft, s=(H, W), norm='ortho')
+        return out
 
