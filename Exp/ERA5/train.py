@@ -87,9 +87,9 @@ class Args:
         self.embed_dim = 300
         self.patch_size = 16
         self.depth = 6
-        self.ensemble_size = 4 
         self.dropout = 0.0
         
+        self.ensemble_size = 4 
         self.dt_ref = 6.0
         self.train_batch_size = 1
         self.eval_batch_size = 1
@@ -248,12 +248,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with sync_ctx:
                 ensemble_preds = []
-                
                 m_base = model.module if isinstance(model, DDP) else model
                 
                 for _ in range(args.ensemble_size):
                     pred = model(x_in, dt)
-                    
                     pred_flat = pred.reshape(B_seq * T_seq, C, H, W)
                     ensemble_preds.append(pred_flat)
                 
