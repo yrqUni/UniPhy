@@ -10,10 +10,13 @@ class Padder(nn.Module):
         self.pad_h = 0
         self.pad_w = 0
 
+    def set_padding(self, h, w):
+        self.pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
+        self.pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
+
     def pad(self, x):
         H, W = x.shape[-2:]
-        self.pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
-        self.pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
+        self.set_padding(H, W)
         
         if self.pad_w > 0:
             x = F.pad(x, (0, self.pad_w, 0, 0), mode='circular')
@@ -143,7 +146,7 @@ class UniPhyDiffusionDecoder(nn.Module):
             x_noisy = x_noisy.reshape(B * T, C, H, W)
             if z_latent.ndim == 5:
                 z_latent = z_latent.reshape(B * T, *z_latent.shape[2:])
-                
+        
         x_noisy = self.padder.pad(x_noisy)
         x = F.pixel_unshuffle(x_noisy, self.patch_size)
         x = self.noisy_proj(x)
@@ -198,10 +201,12 @@ class UniPhyEnsembleDecoder(nn.Module):
             B, T, C, H, W = x_ref.shape
             z_flat = z_latent.view(B * T, *z_latent.shape[2:])
         else:
-            B = x_ref.shape[0]
+            B, C, H, W = x_ref.shape
             T = 1
             z_flat = z_latent
             
+        self.padder.set_padding(H, W)
+
         if z_flat.is_complex():
             z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
         else:
@@ -220,6 +225,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         
         out = self.final_proj(h)
         out = F.pixel_shuffle(out, self.patch_size)
+        
         out = self.padder.unpad(out)
         
         if is_5d:
