@@ -109,8 +109,9 @@ def main():
     torch.cuda.set_device(device)
 
     print(f"\n{'='*100}")
-    print(f" UniPhy Max Parameter Search (Cayley + SDE)")
+    print(f" UniPhy Max Parameter Search")
     print(f" Input: {args.bs}x{args.T}x{args.C}x{args.H}x{args.W} | Patch: {args.patch_size}")
+    print(f" Args: {args}") 
     print(f"{'='*100}\n")
 
     results = []
