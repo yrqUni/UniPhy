@@ -20,8 +20,32 @@ class MetricAwareCliffordConv2d(nn.Module):
         out = out / self.metric_factor
         return out
 
+class NoiseInjector(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(dim * 2, dim, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+        self.global_scale = nn.Parameter(torch.tensor(0.01))
+
+    def forward(self, x, dt):
+        x_perm = x.permute(0, 2, 1, 3, 4)
+        
+        x_in = torch.cat([x_perm.real, x_perm.imag], dim=1)
+        
+        sigma = self.net(x_in) 
+        sigma = sigma.permute(0, 2, 1, 3, 4)
+        
+        dt_shape = dt.view(dt.shape[0], dt.shape[1], 1, 1, 1)
+        
+        noise_std = torch.randn_like(x)
+        
+        diffusion = sigma * self.global_scale * noise_std * torch.sqrt(dt_shape.clamp(min=0.0))
+        return diffusion
+
 class SymplecticPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0):
+    def __init__(self, dim, dt_ref=1.0, stochastic=True):
         super().__init__()
         assert dim % 2 == 0
         self.dim = dim
@@ -29,6 +53,12 @@ class SymplecticPropagator(nn.Module):
         
         self.frequencies = nn.Parameter(torch.randn(dim) * 1.0)
         self.basis_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        
+        self.stochastic = stochastic
+        if stochastic:
+            self.noise_injector = NoiseInjector(dim)
+        else:
+            self.noise_injector = None
 
     def get_orthogonal_basis(self):
         S = self.basis_generator.triu(1)
@@ -54,6 +84,11 @@ class SymplecticPropagator(nn.Module):
         evo_diag = torch.exp(L.view(1, 1, -1) * dt_cast)
         
         return V, V_inv, evo_diag
+
+    def inject_noise(self, x, dt):
+        if self.stochastic and self.noise_injector is not None:
+            return self.noise_injector(x, dt)
+        return torch.zeros_like(x)
 
 class SpectralStep(nn.Module):
     def __init__(self, dim, h, w, viscosity=1e-4):

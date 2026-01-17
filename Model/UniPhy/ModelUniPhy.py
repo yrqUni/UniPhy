@@ -21,7 +21,7 @@ class UniPhyBlock(nn.Module):
         self.spatial_gate = nn.Parameter(torch.ones(1) * 0.5)
 
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = SymplecticPropagator(dim, dt_ref=1.0)
+        self.prop = SymplecticPropagator(dim, dt_ref=1.0, stochastic=True)
         self.pscan = PScanTriton()
         
         self.norm_pool = nn.LayerNorm(dim * 2)
@@ -51,6 +51,7 @@ class UniPhyBlock(nn.Module):
         x = x_s.view(B, T, D, H, W) + resid
         
         resid = x
+        
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         
@@ -61,9 +62,14 @@ class UniPhyBlock(nn.Module):
         h_eigen = self.pscan(evo_diag, x_eigen)
         x_t_out = torch.matmul(h_eigen, V.T)
         
-        x = x_t_out.view(B, H, W, T, D).permute(0, 3, 4, 1, 2) + resid
+        x_drift = x_t_out.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        
+        noise = self.prop.inject_noise(x, dt)
+        
+        x = x_drift + noise + resid
         
         resid = x
+        
         x_p = x.permute(0, 1, 3, 4, 2) 
         x_p = self._complex_norm(x_p, self.norm_pool)
         
