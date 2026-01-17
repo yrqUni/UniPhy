@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+
+from PScan import PScanTriton
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
-from UniPhyOps import SymplecticPropagator, PScanTriton, MetricAwareCliffordConv2d, SpectralStep
+from UniPhyOps import SymplecticPropagator, MetricAwareCliffordConv2d, SpectralStep
 from UniPhyParaPool import UniPhyParaPool
 
 class UniPhyBlock(nn.Module):

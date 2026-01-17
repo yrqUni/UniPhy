@@ -83,7 +83,7 @@ class Args:
         self.img_width = 1440
         self.in_channels = 30
         self.out_channels = 30
-        self.embed_dim = 1024
+        self.embed_dim = 512
         self.patch_size = 16
         self.depth = 6
         
