@@ -8,16 +8,29 @@ class MetricAwareCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        
         lat_indices = torch.arange(img_height)
         lat_rad = (lat_indices / (img_height - 1)) * math.pi - (math.pi / 2)
-        metric_factor = torch.sqrt(torch.cos(lat_rad).abs() + 1e-6)
-        metric_factor = metric_factor / metric_factor.mean()
-        self.register_buffer('metric_factor', metric_factor.view(1, 1, -1, 1))
+        
+        static_metric = torch.sqrt(torch.cos(lat_rad).abs() + 1e-6)
+        static_metric = static_metric / static_metric.mean()
+        self.register_buffer('static_metric', static_metric.view(1, 1, -1, 1))
+        
+        self.metric_refiner = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels, 1),
+            nn.Sigmoid() 
+        )
 
     def forward(self, x):
-        x_scaled = x * self.metric_factor
+        dynamic_scale = self.metric_refiner(x) * 0.2 + 0.9
+        
+        effective_metric = self.static_metric * dynamic_scale
+        
+        x_scaled = x * effective_metric
         out = self.conv(x_scaled)
-        out = out / self.metric_factor
+        
+        out = out / effective_metric
         return out
 
 class NoiseInjector(nn.Module):
@@ -56,11 +69,28 @@ class ContextAwareGrowth(nn.Module):
     def forward(self, x):
         B, T, D, H, W = x.shape
         x_mag = x.abs()
-        
         global_energy = x_mag.mean(dim=(1, 3, 4))
-        
         delta_sigma = self.net(global_energy)
         return delta_sigma
+
+class TimeWarper(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.SiLU(),
+            nn.Linear(dim // 2, 1),
+            nn.Sigmoid() 
+        )
+
+    def forward(self, x, dt):
+        B, T, D, H, W = x.shape
+        x_state = x.abs().mean(dim=(3, 4)) 
+        
+        warp_factor = self.net(x_state).squeeze(-1) 
+        warp_factor = warp_factor * 1.5 + 0.5 
+        
+        return dt * warp_factor
 
 class SymplecticPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, stochastic=True):
@@ -70,10 +100,10 @@ class SymplecticPropagator(nn.Module):
         self.dt_ref = dt_ref
         
         self.frequencies = nn.Parameter(torch.randn(dim) * 1.0)
-        
         self.static_growth = nn.Parameter(torch.randn(dim) * 0.01)
         
         self.context_growth = ContextAwareGrowth(dim)
+        self.time_warper = TimeWarper(dim)
         
         self.basis_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
         
@@ -100,21 +130,23 @@ class SymplecticPropagator(nn.Module):
         if x_context is not None:
             sigma_dynamic = self.context_growth(x_context)
             sigma_total = sigma_static.unsqueeze(0) + sigma_dynamic * 0.1
+            
+            dt_eff = self.time_warper(x_context, dt)
         else:
             sigma_total = sigma_static.unsqueeze(0)
+            dt_eff = dt
             
         sigma_final = torch.tanh(sigma_total) * 0.5
-        
         omega = self.frequencies.unsqueeze(0)
         
         L = torch.complex(sigma_final, omega)
 
-        if dt.ndim == 2:
-            dt_cast = dt.unsqueeze(-1)
-        elif dt.ndim == 1:
-            dt_cast = dt.view(-1, 1, 1)
+        if dt_eff.ndim == 2:
+            dt_cast = dt_eff.unsqueeze(-1)
+        elif dt_eff.ndim == 1:
+            dt_cast = dt_eff.view(-1, 1, 1)
         else:
-            dt_cast = dt.unsqueeze(-1)
+            dt_cast = dt_eff.unsqueeze(-1)
 
         evo_diag = torch.exp(L.unsqueeze(1) * dt_cast)
         
@@ -126,25 +158,42 @@ class SymplecticPropagator(nn.Module):
         return torch.zeros_like(x)
 
 class SpectralStep(nn.Module):
-    def __init__(self, dim, h, w, viscosity=1e-4):
+    def __init__(self, dim, h, w):
         super().__init__()
         self.dim = dim
-        self.viscosity = viscosity
+        
         self.weight = nn.Parameter(torch.randn(dim, h, w, dtype=torch.cfloat) * 0.02)
+        
+        self.viscosity_x = nn.Parameter(torch.tensor(1e-4))
+        self.viscosity_y = nn.Parameter(torch.tensor(1e-4))
+        self.alpha = nn.Parameter(torch.tensor(2.0))
+        
         kx = torch.fft.fftfreq(w, d=1.0)
         ky = torch.fft.fftfreq(h, d=1.0)
         k_x, k_y = torch.meshgrid(kx, ky, indexing='xy')
-        k_sq = k_x ** 2 + k_y ** 2
-        self.register_buffer('k_sq', k_sq)
+        
+        self.register_buffer('k_x_abs', k_x.abs())
+        self.register_buffer('k_y_abs', k_y.abs())
 
     def forward(self, x):
         B, C, H, W = x.shape
         x_fft = torch.fft.fft2(x, norm='ortho')
         original_dc = x_fft[..., 0, 0].clone()
+        
         x_fft = x_fft * self.weight
-        dissipation = torch.exp(-self.viscosity * self.k_sq * (H * W))
+        
+        alpha_clamp = self.alpha.clamp(1.0, 3.0)
+        vx = self.viscosity_x.abs()
+        vy = self.viscosity_y.abs()
+        
+        k_term = vx * torch.pow(self.k_x_abs, alpha_clamp) + \
+                 vy * torch.pow(self.k_y_abs, alpha_clamp)
+                 
+        dissipation = torch.exp(-k_term * (H * W))
+        
         x_fft = x_fft * dissipation.unsqueeze(0).unsqueeze(0)
         x_fft[..., 0, 0] = original_dc
+        
         out = torch.fft.ifft2(x_fft, s=(H, W), norm='ortho')
         return out
 

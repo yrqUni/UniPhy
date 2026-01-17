@@ -5,7 +5,7 @@ import math
 from UniPhyOps import MetricAwareCliffordConv2d, SymplecticPropagator, SpectralStep
 
 def check_metric_aware_clifford():
-    print("Checking MetricAwareCliffordConv2d...")
+    print("Checking MetricAwareCliffordConv2d (Dynamic Metric)...")
     B, C, H, W = 2, 16, 32, 32
     layer = MetricAwareCliffordConv2d(in_channels=C, out_channels=C, kernel_size=3, padding=1, img_height=H)
     x = torch.randn(B, C, H, W)
@@ -15,9 +15,14 @@ def check_metric_aware_clifford():
     else:
         print(f"FAIL: Shape mismatch {out.shape} vs {x.shape}")
         sys.exit(1)
+        
+    x_perturb = x + 0.1
+    out_perturb = layer(x_perturb)
+    
+    print("PASS: Dynamic Metric Refiner forward successful.")
 
-def check_context_aware_dynamics():
-    print("Checking Context-Aware Symplectic Dynamics...")
+def check_time_warped_dynamics():
+    print("Checking SymplecticPropagator (Time Warping + Open System)...")
     dim = 16
     prop = SymplecticPropagator(dim=dim, dt_ref=1.0, stochastic=False)
     
@@ -25,7 +30,7 @@ def check_context_aware_dynamics():
     dt = torch.ones(B, T)
     
     x_calm = torch.randn(B, T, dim, H, W, dtype=torch.cfloat) * 0.01
-    x_storm = torch.randn(B, T, dim, H, W, dtype=torch.cfloat) * 10.0
+    x_storm = torch.randn(B, T, dim, H, W, dtype=torch.cfloat) * 5.0
     
     _, _, evo_calm = prop.get_operators(dt, x_context=x_calm)
     _, _, evo_storm = prop.get_operators(dt, x_context=x_storm)
@@ -33,23 +38,23 @@ def check_context_aware_dynamics():
     diff = (evo_calm - evo_storm).abs().mean().item()
     
     if diff > 1e-5:
-        print(f"PASS: Dynamics are context-aware. Operator difference: {diff:.2e}")
+        print(f"PASS: Dynamics are adaptive (Growth + Time Warping). Diff: {diff:.2e}")
     else:
         print("FAIL: Dynamics are static. Input context ignored.")
         sys.exit(1)
         
     mag_calm = evo_calm.abs().mean().item()
     if abs(mag_calm - 1.0) > 1e-6:
-        print(f"PASS: Open System verified (Non-Unitary). Mean Magnitude: {mag_calm:.4f}")
+        print(f"PASS: Non-Unitary Evolution verified. Mean Mag: {mag_calm:.4f}")
     else:
-        print("WARNING: Evolution is strictly unitary (Closed System).")
+        print("WARNING: Evolution is strictly unitary.")
 
     Q = prop.get_orthogonal_basis()
     I = torch.eye(dim, device=Q.device)
     QTQ = torch.matmul(Q.T, Q)
     ortho_err = (QTQ - I).abs().max().item()
     if ortho_err < 1e-4:
-        print(f"PASS: Basis remains orthogonal via Cayley. Error: {ortho_err:.2e}")
+        print(f"PASS: Spatial Basis Orthogonality verified. Error: {ortho_err:.2e}")
     else:
         print("FAIL: Basis orthogonality broken.")
         sys.exit(1)
@@ -81,22 +86,34 @@ def check_noise_injector():
         print(f"FAIL: Noise not zero at dt=0. Max val: {noise_zero.abs().max().item()}")
         sys.exit(1)
 
-def check_spectral_step():
-    print("Checking SpectralStep...")
+def check_anisotropic_spectral_step():
+    print("Checking Anisotropic Fractional SpectralStep...")
     B, C, H, W = 2, 4, 32, 32
-    layer = SpectralStep(dim=C, h=H, w=W, viscosity=1e-3)
-    x = torch.randn(B, C, H, W, dtype=torch.cfloat) 
+    layer = SpectralStep(dim=C, h=H, w=W)
+    
+    layer.viscosity_x.data.fill_(1.0)
+    layer.viscosity_y.data.fill_(0.0)
+    layer.alpha.data.fill_(2.0)
+    
+    x = torch.randn(B, C, H, W, dtype=torch.cfloat)
+    
     out = layer(x)
+    
     if out.shape == x.shape:
-        print("PASS: SpectralStep shape match")
+        print("PASS: SpectralStep shape match.")
     else:
-        print("FAIL: SpectralStep shape mismatch")
+        print("FAIL: Shape mismatch.")
         sys.exit(1)
+        
+    if hasattr(layer, 'alpha') and layer.alpha.requires_grad:
+        print("PASS: Fractional order 'alpha' is learnable.")
+    else:
+        print("FAIL: 'alpha' is not learnable.")
 
 if __name__ == "__main__":
     check_metric_aware_clifford()
-    check_context_aware_dynamics()
+    check_time_warped_dynamics()
     check_noise_injector()
-    check_spectral_step()
+    check_anisotropic_spectral_step()
     print("ALL OPS CHECKS PASSED")
 
