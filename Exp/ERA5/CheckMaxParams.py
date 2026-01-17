@@ -25,7 +25,7 @@ def get_args():
     parser.add_argument("--min_search_dim", type=int, default=64)
     parser.add_argument("--max_search_dim", type=int, default=2048)
     parser.add_argument("--dim_step", type=int, default=64)
-    parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 8, 12, 16, 24])
+    parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 6, 8, 12, 16, 24])
     parser.add_argument("--patch_size", type=int, default=16)
     return parser.parse_args()
 

@@ -35,7 +35,6 @@ MODEL_ARG_KEYS = [
     "patch_size",
     "img_height",
     "img_width",
-    "dropout"
 ]
 
 def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -84,10 +83,9 @@ class Args:
         self.img_width = 1440
         self.in_channels = 2
         self.out_channels = 2
-        self.embed_dim = 300
+        self.embed_dim = 1024
         self.patch_size = 16
         self.depth = 6
-        self.dropout = 0.0
         
         self.ensemble_size = 4 
         self.dt_ref = 6.0
@@ -197,7 +195,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         patch_size=args.patch_size,
         img_height=args.img_height,
         img_width=args.img_width,
-        dropout=args.dropout
     ).cuda(local_rank)
 
     log_model_stats(model, rank)
@@ -259,6 +256,10 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 target_flat = target.reshape(B_seq * T_seq, C, H, W)
                 
                 loss = crps_ensemble_loss(pred_ensemble, target_flat)
+                
+                with torch.no_grad():
+                    pred_mean = torch.mean(pred_ensemble, dim=1)
+                    l1_val = F.l1_loss(pred_mean, target_flat)
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     opt.zero_grad(set_to_none=True)
@@ -278,13 +279,14 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 if rank == 0:
                     if train_step % args.log_every == 0:
-                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | GN: {gn:.2f}"
+                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | L1: {l1_val.item():.4e} | GN: {gn:.2f}"
                         if isinstance(train_iter, tqdm): train_iter.set_description(msg)
                         logging.info(msg)
 
                     if args.use_wandb and (train_step % args.wandb_every == 0):
                         wandb.log({
                             "train/loss": loss.item(),
+                            "train/l1": l1_val.item(),
                             "train/lr": opt.param_groups[0]["lr"],
                             "train/gn": gn,
                             "train/step": global_step
