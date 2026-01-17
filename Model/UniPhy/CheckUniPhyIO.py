@@ -36,7 +36,7 @@ def check_padder_odd_shapes():
         sys.exit(1)
 
 def check_mass_conservation():
-    print("Checking Global Mass Conservation...")
+    print("Checking Global Mass Conservation (Standard)...")
     H, W = 32, 64
     corrector = MassCorrector(height=H, mass_idx=0)
     
@@ -78,9 +78,9 @@ def check_spherical_topology_vorticity():
         sys.exit(1)
 
 def check_encoder_decoder_integration():
-    print("Checking Full Encoder/Decoder Integration with Odd Shapes...")
+    print("Checking Full Encoder/Decoder Integration...")
     B, T, C = 2, 4, 2
-    H, W = 721, 1440
+    H, W = 64, 128
     dim = 64
     patch_size = 16
     

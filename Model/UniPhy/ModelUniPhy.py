@@ -2,12 +2,14 @@ import torch
 import torch.nn as nn
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import SymplecticPropagator, PScanTriton, MetricAwareCliffordConv2d, SpectralStep
-from UniPhyParamLayer import UniPhyParamLayer
+from UniPhyParaPool import UniPhyParaPool
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4):
+    def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4, dropout=0.0):
         super().__init__()
         self.dim = dim
+        self.img_height = img_height
+        self.img_width = img_width
         
         self.norm_spatial = nn.LayerNorm(dim * 2)
         
@@ -25,7 +27,7 @@ class UniPhyBlock(nn.Module):
         self.pscan = PScanTriton()
         
         self.norm_pool = nn.LayerNorm(dim * 2)
-        self.para_pool = UniPhyParamLayer(dim * 2, expand=expand)
+        self.para_pool = UniPhyParaPool(dim * 2, expand=expand)
 
     def _complex_norm(self, z, norm_layer):
         z_cat = torch.cat([z.real, z.imag], dim=-1)
@@ -55,11 +57,13 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         
-        dt_expanded = dt.repeat_interleave(H * W, dim=0)
-        V, V_inv, evo_diag = self.prop.get_operators(dt_expanded)
+        V, V_inv, evo_diag = self.prop.get_operators(dt, x_context=x)
+        
+        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).repeat(1, H, W, 1, 1)
+        evo_diag_flat = evo_diag_expanded.view(B * H * W, T, D)
         
         x_eigen = torch.matmul(x_t, V_inv.T)
-        h_eigen = self.pscan(evo_diag, x_eigen)
+        h_eigen = self.pscan(evo_diag_flat, x_eigen)
         x_t_out = torch.matmul(h_eigen, V.T)
         
         x_drift = x_t_out.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
@@ -94,7 +98,8 @@ class UniPhyModel(nn.Module):
                  depth=4, 
                  patch_size=16, 
                  img_height=64, 
-                 img_width=128):
+                 img_width=128, 
+                 dropout=0.0):
         super().__init__()
         
         self.img_height = img_height
@@ -109,7 +114,7 @@ class UniPhyModel(nn.Module):
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
         
         self.blocks = nn.ModuleList([
-            UniPhyBlock(embed_dim, h_dim, w_dim)
+            UniPhyBlock(embed_dim, h_dim, w_dim, dropout=dropout)
             for _ in range(depth)
         ])
         

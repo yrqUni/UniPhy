@@ -125,58 +125,6 @@ class UniPhyEncoder(nn.Module):
             out = out.view(B, T, D, H_p, W_p)
         return out
 
-class UniPhyDiffusionDecoder(nn.Module):
-    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, img_height=64):
-        super().__init__()
-        self.patch_size = patch_size
-        self.padder = Padder(patch_size)
-        self.mass_corrector = MassCorrector(img_height)
-        
-        noisy_in_dim = out_ch * (patch_size ** 2)
-        self.noisy_proj = nn.Conv2d(noisy_in_dim, model_channels, kernel_size=1)
-        self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
-        
-        self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
-        nn.init.zeros_(self.final_proj.bias)
-
-    def forward(self, z_latent, x_noisy, t):
-        is_5d = x_noisy.ndim == 5
-        if is_5d:
-            B, T, C, H, W = x_noisy.shape
-            x_noisy = x_noisy.reshape(B * T, C, H, W)
-            if z_latent.ndim == 5:
-                z_latent = z_latent.reshape(B * T, *z_latent.shape[2:])
-        
-        x_noisy = self.padder.pad(x_noisy)
-        x = F.pixel_unshuffle(x_noisy, self.patch_size)
-        x = self.noisy_proj(x)
-        
-        if z_latent.is_complex():
-            z_cat = torch.cat([z_latent.real, z_latent.imag], dim=1)
-        else:
-            z_cat = z_latent
-            
-        h_lr, w_lr = x.shape[-2:]
-        z_cat = z_cat[..., :h_lr, :w_lr]
-        
-        cond = self.latent_proj(z_cat)
-        h = x + cond 
-        
-        out = self.final_proj(h)
-        out = F.pixel_shuffle(out, self.patch_size)
-        out = self.padder.unpad(out)
-        
-        if is_5d:
-            _, C_o, H_o, W_o = out.shape
-            out = out.view(B, T, C_o, H_o, W_o)
-            
-        return out
-
-    @torch.no_grad()
-    def sample(self, z_latent, shape, device, steps=20):
-        img = torch.randn(shape, device=device)
-        return img 
-
 class UniPhyEnsembleDecoder(nn.Module):
     def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10, img_height=64):
         super().__init__()

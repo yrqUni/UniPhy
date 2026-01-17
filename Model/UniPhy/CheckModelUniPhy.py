@@ -5,7 +5,7 @@ import math
 from ModelUniPhy import UniPhyModel
 
 def check_model_pipeline():
-    print("\n=== Checking UniPhy Model SDE Pipeline ===")
+    print("\n=== Checking UniPhy Model SDE Pipeline (Context-Aware) ===")
     
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -14,12 +14,21 @@ def check_model_pipeline():
         print("WARNING: Running on CPU")
 
     B, T, C, H, W = 1, 5, 2, 32, 64
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=32, depth=2, img_height=H, img_width=W).to(device)
+    
+    model = UniPhyModel(
+        in_channels=C, 
+        out_channels=C, 
+        embed_dim=32, 
+        depth=2, 
+        img_height=H, 
+        img_width=W,
+        dropout=0.0
+    ).to(device)
     
     x = torch.randn(B, T, C, H, W, device=device)
     dt = torch.rand(B, T, device=device)
     
-    print("[1] Forward Pass (Stochastic)...")
+    print("[1] Forward Pass (Stochastic & Context-Aware)...")
     out1 = model(x, dt)
     out2 = model(x, dt)
     
@@ -38,7 +47,7 @@ def check_model_pipeline():
     loss = out1.sum()
     try:
         loss.backward()
-        print("PASS: Backward pass successful (Cayley transform fixed gradient issue).")
+        print("PASS: Backward pass successful.")
     except Exception as e:
         print(f"FAIL: Backward pass failed. Error: {e}")
         sys.exit(1)
@@ -53,7 +62,11 @@ def check_model_pipeline():
     output_mass = (out1[:, :, 0:1] * weights).mean()
     
     drift = (input_mass - output_mass).abs().item()
-    print(f"PASS: Mass drift {drift:.2e}")
+    if drift < 1e-5:
+        print(f"PASS: Mass drift {drift:.2e}")
+    else:
+        print(f"FAIL: Mass Conservation Violated. Drift: {drift:.2e}")
+        sys.exit(1)
 
     print("\n=== ALL SYSTEM CHECKS PASSED ===")
 
