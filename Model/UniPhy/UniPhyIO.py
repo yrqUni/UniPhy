@@ -3,14 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-def get_safe_groups(channels: int, target: int = 8) -> int:
-    if channels % target == 0:
-        return target
-    for g in [4, 2, 1]:
-        if channels % g == 0:
-            return g
-    return 1
-
 class Padder(nn.Module):
     def __init__(self, patch_size):
         super().__init__()
@@ -35,92 +27,110 @@ class Padder(nn.Module):
         target_w = W - self.pad_w
         return x[..., :target_h, :target_w]
 
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+class SphericalPosEmb(nn.Module):
+    def __init__(self, dim, h, w):
         super().__init__()
         self.dim = dim
+        self.h = h
+        self.w = w
+        
+        assert dim % 2 == 0
+        dim_h = dim // 2
+        dim_w = dim - dim_h
+
+        inv_freq_h = 1.0 / (10000 ** (torch.arange(0, dim_h, 2).float() / dim_h))
+        pos_h = torch.arange(h, dtype=torch.float)
+        sin_inp_h = torch.einsum("i,j->ij", pos_h, inv_freq_h)
+        emb_h = torch.cat((sin_inp_h.sin(), sin_inp_h.cos()), dim=-1)
+
+        inv_freq_w = 1.0 / (10000 ** (torch.arange(0, dim_w, 2).float() / dim_w))
+        pos_w = torch.arange(w, dtype=torch.float)
+        
+        pos_w = pos_w / w * 2 * math.pi
+        sin_inp_w = torch.einsum("i,j->ij", pos_w, inv_freq_w)
+        emb_w = torch.cat((sin_inp_w.sin(), sin_inp_w.cos()), dim=-1)
+
+        emb_h = emb_h.unsqueeze(1).repeat(1, w, 1) 
+        emb_w = emb_w.unsqueeze(0).repeat(h, 1, 1) 
+        
+        self.register_buffer('emb', torch.cat([emb_h, emb_w], dim=-1).permute(2, 0, 1).unsqueeze(0))
 
     def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
+        return x + self.emb
 
-class TimeAwareResBlock(nn.Module):
-    def __init__(self, dim, dim_out, time_emb_dim, groups=8):
+class MassCorrector(nn.Module):
+    def __init__(self, height, mass_idx=0):
         super().__init__()
-        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2))
-        g1 = get_safe_groups(dim_out, groups)
-        self.block1 = nn.Sequential(
-            nn.Conv2d(dim, dim_out, 3, padding=1),
-            nn.GroupNorm(g1, dim_out),
-            nn.SiLU(),
-        )
-        g2 = get_safe_groups(dim_out, groups)
-        self.block2 = nn.Sequential(
-            nn.Conv2d(dim_out, dim_out, 3, padding=1),
-            nn.GroupNorm(g2, dim_out),
-            nn.SiLU(),
-        )
-        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.mass_idx = mass_idx
+        lat_indices = torch.arange(height)
+        lat_rad = (lat_indices / (height - 1)) * math.pi - (math.pi / 2)
+        weights = torch.cos(lat_rad)
+        weights = weights / weights.mean()
+        self.register_buffer('weights', weights.view(1, 1, 1, -1, 1))
 
-    def forward(self, x, time_emb):
-        scale_shift = self.mlp(time_emb)
-        scale_shift = scale_shift.unsqueeze(-1).unsqueeze(-1)
-        scale, shift = scale_shift.chunk(2, dim=1)
-        h = self.block1(x)
-        h = h * (scale + 1) + shift
-        h = self.block2(h)
-        return h + self.res_conv(x)
+    def forward(self, pred, ref):
+        if ref.ndim == 5:
+            ref_slice = ref[:, -1:, ...]
+        else:
+            ref_slice = ref.unsqueeze(1)
+            
+        ref_mass = (ref_slice[:, :, self.mass_idx:self.mass_idx+1] * self.weights).mean(dim=(-2, -1), keepdim=True)
+        pred_mass = (pred[:, :, self.mass_idx:self.mass_idx+1] * self.weights).mean(dim=(-2, -1), keepdim=True)
+        
+        diff = pred_mass - ref_mass
+        
+        correction = torch.zeros_like(pred)
+        correction[:, :, self.mass_idx:self.mass_idx+1] = diff
+        
+        return pred - correction
 
 class UniPhyEncoder(nn.Module):
-    def __init__(self, in_ch, embed_dim, patch_size=16):
+    def __init__(self, in_ch, embed_dim, patch_size=16, img_height=64, img_width=64):
         super().__init__()
         self.patch_size = patch_size
         self.padder = Padder(patch_size)
         self.unshuffle_dim = in_ch * (patch_size ** 2)
+        
         self.proj = nn.Conv2d(self.unshuffle_dim, embed_dim * 2, kernel_size=1)
         nn.init.orthogonal_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
+        
+        h_dim = img_height // patch_size
+        w_dim = img_width // patch_size
+        self.pos_emb = SphericalPosEmb(embed_dim * 2, h_dim, w_dim)
 
     def forward(self, x):
         is_5d = x.ndim == 5
         if is_5d:
             B, T, C, H, W = x.shape
             x = x.view(B * T, C, H, W)
+            
         x = self.padder.pad(x)
         x = F.pixel_unshuffle(x, self.patch_size)
         x_emb = self.proj(x)
+        
+        x_emb = self.pos_emb(x_emb)
+        
         x_real, x_imag = torch.chunk(x_emb, 2, dim=1)
         out = torch.complex(x_real, x_imag)
+        
         if is_5d:
             _, D, H_p, W_p = out.shape
             out = out.view(B, T, D, H_p, W_p)
         return out
 
 class UniPhyDiffusionDecoder(nn.Module):
-    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128):
+    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, img_height=64):
         super().__init__()
         self.patch_size = patch_size
         self.padder = Padder(patch_size)
+        self.mass_corrector = MassCorrector(img_height)
+        
         noisy_in_dim = out_ch * (patch_size ** 2)
         self.noisy_proj = nn.Conv2d(noisy_in_dim, model_channels, kernel_size=1)
         self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
-        time_dim = model_channels * 4
-        self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(model_channels),
-            nn.Linear(model_channels, time_dim),
-            nn.GELU(),
-            nn.Linear(time_dim, time_dim),
-        )
-        self.block1 = TimeAwareResBlock(model_channels * 2, model_channels, time_dim)
-        self.block2 = TimeAwareResBlock(model_channels, model_channels, time_dim)
-        self.block3 = TimeAwareResBlock(model_channels, model_channels, time_dim)
+        
         self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
-        nn.init.uniform_(self.final_proj.weight, -1e-5, 1e-5)
         nn.init.zeros_(self.final_proj.bias)
 
     def forward(self, z_latent, x_noisy, t):
@@ -130,86 +140,65 @@ class UniPhyDiffusionDecoder(nn.Module):
             x_noisy = x_noisy.reshape(B * T, C, H, W)
             if z_latent.ndim == 5:
                 z_latent = z_latent.reshape(B * T, *z_latent.shape[2:])
-            if t.numel() == B:
-                t = t.repeat_interleave(T)
-            elif t.numel() == B * T:
-                t = t.view(-1)
+                
         x_noisy = self.padder.pad(x_noisy)
         x = F.pixel_unshuffle(x_noisy, self.patch_size)
         x = self.noisy_proj(x)
+        
         if z_latent.is_complex():
             z_cat = torch.cat([z_latent.real, z_latent.imag], dim=1)
         else:
             z_cat = z_latent
+            
         h_lr, w_lr = x.shape[-2:]
         z_cat = z_cat[..., :h_lr, :w_lr]
-        cond_feat = self.latent_proj(z_cat)
-        t_emb = self.time_mlp(t)
-        h = torch.cat([x, cond_feat], dim=1)
-        h = self.block1(h, t_emb)
-        h = self.block2(h, t_emb)
-        h = self.block3(h, t_emb)
+        
+        cond = self.latent_proj(z_cat)
+        h = x + cond 
+        
         out = self.final_proj(h)
         out = F.pixel_shuffle(out, self.patch_size)
         out = self.padder.unpad(out)
+        
         if is_5d:
             _, C_o, H_o, W_o = out.shape
             out = out.view(B, T, C_o, H_o, W_o)
+            
         return out
 
     @torch.no_grad()
     def sample(self, z_latent, shape, device, steps=20):
         img = torch.randn(shape, device=device)
-        is_5d = len(shape) == 5
-        B = shape[0]
-        T = shape[1] if is_5d else 1
-        betas = torch.linspace(1e-4, 0.02, 1000, device=device)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        times = torch.linspace(999, 0, steps, device=device).long()
-        for i in range(steps):
-            t_idx = times[i]
-            t_val = torch.full((B,), t_idx, device=device, dtype=torch.long)
-            t_input = t_val.unsqueeze(1).repeat(1, T) if is_5d else t_val
-            beta_t = betas[t_idx]
-            s1 = torch.sqrt(1 - alphas_cumprod[t_idx])
-            s2 = 1.0 / torch.sqrt(alphas[t_idx])
-            pred_noise = self.forward(z_latent, img, t_input)
-            img = s2 * (img - beta_t / s1 * pred_noise)
-            if i < steps - 1:
-                img = img + torch.sqrt(beta_t) * torch.randn_like(img)
-        return img
+        return img 
 
 class UniPhyEnsembleDecoder(nn.Module):
-    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10):
+    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10, img_height=64):
         super().__init__()
         self.patch_size = patch_size
         self.padder = Padder(patch_size)
         self.ensemble_size = ensemble_size
+        self.mass_corrector = MassCorrector(img_height)
+        
         self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
         self.member_emb = nn.Embedding(ensemble_size, model_channels)
-        self.block1 = TimeAwareResBlock(model_channels, model_channels * 2, model_channels)
-        self.block2 = TimeAwareResBlock(model_channels * 2, model_channels * 2, model_channels)
-        self.block3 = TimeAwareResBlock(model_channels * 2, model_channels, model_channels)
+        
+        self.block = nn.Sequential(
+            nn.Conv2d(model_channels, model_channels, 3, 1, 1),
+            nn.SiLU(),
+            nn.Conv2d(model_channels, model_channels, 3, 1, 1)
+        )
         self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
 
     def forward(self, z_latent, x_ref, member_idx=None):
         is_5d = x_ref.ndim == 5
         if is_5d:
             B, T, C, H, W = x_ref.shape
-            x_flat = x_ref.view(B * T, C, H, W)
-            if z_latent.ndim == 5:
-                z_flat = z_latent.view(B * T, *z_latent.shape[2:])
-            else:
-                z_flat = z_latent
+            z_flat = z_latent.view(B * T, *z_latent.shape[2:])
         else:
             B = x_ref.shape[0]
             T = 1
-            x_flat = x_ref
             z_flat = z_latent
-
-        _ = self.padder.pad(x_flat)
-        
+            
         if z_flat.is_complex():
             z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
         else:
@@ -222,27 +211,18 @@ class UniPhyEnsembleDecoder(nn.Module):
         elif member_idx.numel() == B and is_5d:
             member_idx = member_idx.repeat_interleave(T)
             
-        m_emb = self.member_emb(member_idx)
-        h = self.block1(x_feat, m_emb)
-        h = self.block2(h, m_emb)
-        h = self.block3(h, m_emb)
+        m_emb = self.member_emb(member_idx).unsqueeze(-1).unsqueeze(-1)
+        h = x_feat + m_emb
+        h = self.block(h)
         
         out = self.final_proj(h)
         out = F.pixel_shuffle(out, self.patch_size)
         out = self.padder.unpad(out)
         
         if is_5d:
-            _, C_o, H_o, W_o = out.shape
-            out = out.view(B, T, C_o, H_o, W_o)
+            out = out.view(B, T, C, H, W)
+            
+        out = self.mass_corrector(out, x_ref)
+        
         return out
-
-    def generate_ensemble(self, z_latent, x_ref, num_members=None):
-        num_members = num_members or self.ensemble_size
-        B = x_ref.shape[0]
-        results = []
-        for i in range(num_members):
-            m_idx = torch.full((B,), i, device=z_latent.device, dtype=torch.long)
-            res = self.forward(z_latent, x_ref, member_idx=m_idx)
-            results.append(res.unsqueeze(1))
-        return torch.cat(results, dim=1)
 

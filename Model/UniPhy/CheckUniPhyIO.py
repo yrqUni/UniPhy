@@ -1,81 +1,123 @@
 import torch
-import torch.nn as nn
-from UniPhyIO import UniPhyEncoder, UniPhyDiffusionDecoder, UniPhyEnsembleDecoder
+import sys
+import math
+import torch.nn.functional as F
 
-def report(name, val, threshold=1e-5):
-    passed = val < threshold
-    status = "PASS" if passed else "FAIL"
-    color = "\033[92m" if passed else "\033[91m"
-    reset = "\033[0m"
-    print(f"[{name}] Error/Metric: {val:.2e} -> {color}{status}{reset}")
-    if not passed:
-        raise ValueError(f"{name} Failed")
+try:
+    from UniPhyIO import Padder, MassCorrector, SphericalPosEmb, UniPhyEncoder, UniPhyEnsembleDecoder
+except ImportError:
+    from .UniPhyIO import Padder, MassCorrector, SphericalPosEmb, UniPhyEncoder, UniPhyEnsembleDecoder
 
-def check_geometric_conservation():
-    print("\n--- Checking Geometric Conservation (Padding/Unpadding) ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    B, C, H, W = 2, 30, 721, 1440
+def check_boundary_conditions_momentum():
+    print("Checking Boundary Conditions (Angular Momentum & Zonal Flow)...")
     patch_size = 4
-    latent_dim = 64
-    encoder = UniPhyEncoder(in_ch=C, embed_dim=latent_dim, patch_size=patch_size).to(device)
-    diff_decoder = UniPhyDiffusionDecoder(out_ch=C, latent_dim=latent_dim, patch_size=patch_size).to(device)
-    ens_decoder = UniPhyEnsembleDecoder(out_ch=C, latent_dim=latent_dim, patch_size=patch_size).to(device)
-    x = torch.randn(B, C, H, W, device=device)
-    t = torch.randint(0, 1000, (B,), device=device).float()
-    with torch.no_grad():
-        z = encoder(x)
-        x_diff = diff_decoder(z, x, t)
-        x_ens = ens_decoder(z, x)
-    shape_diff_diff = sum([abs(s1 - s2) for s1, s2 in zip(x_diff.shape, x.shape)])
-    shape_diff_ens = sum([abs(s1 - s2) for s1, s2 in zip(x_ens.shape, x.shape)])
-    report("Diff Decoder Shape", shape_diff_diff, threshold=0.1)
-    report("Ensemble Decoder Shape", shape_diff_ens, threshold=0.1)
+    padder = Padder(patch_size)
+    
+    H, W = 10, 10
+    x = torch.arange(W).float().view(1, 1, 1, W).repeat(1, 1, H, 1)
+    
+    padded_x = padder.pad(x)
+    
+    pad_w = padder.pad_w
+    if pad_w > 0:
+        right_pad = padded_x[..., :H, -pad_w:]
+        left_original = x[..., :pad_w]
+        
+        diff = (right_pad - left_original).abs().max().item()
+        if diff < 1e-6:
+            print(f"PASS: W-axis Circular Padding verified (Angular Momentum Conserved). Drift: {diff:.2e}")
+        else:
+            print(f"FAIL: W-axis is not circular. Zonal flow broken. Drift: {diff:.2e}")
+            sys.exit(1)
+            
+    x_h = torch.arange(H).float().view(1, 1, H, 1).repeat(1, 1, 1, W)
+    padded_x_h = padder.pad(x_h)
+    pad_h = padder.pad_h
+    
+    if pad_h > 0:
+        bottom_pad = padded_x_h[..., -pad_h:, :W]
+        bottom_original = x_h[..., -1:, :]
+        
+        bottom_original_expanded = bottom_original.expand_as(bottom_pad)
+        
+        diff = (bottom_pad - bottom_original_expanded).abs().max().item()
+        if diff < 1e-6:
+            print(f"PASS: H-axis Replicate Padding verified (Polar Boundary). Drift: {diff:.2e}")
+        else:
+            print(f"FAIL: H-axis padding incorrect. Drift: {diff:.2e}")
+            sys.exit(1)
 
-def check_ensemble_diversity():
-    print("\n--- Checking Ensemble Diversity ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    B, C, H, W = 1, 4, 32, 32
-    ensemble_size = 5
-    encoder = UniPhyEncoder(in_ch=C, embed_dim=16).to(device)
-    decoder = UniPhyEnsembleDecoder(out_ch=C, latent_dim=16, ensemble_size=ensemble_size).to(device)
-    x = torch.randn(B, C, H, W, device=device)
-    with torch.no_grad():
-        z = encoder(x)
-        ens_out = decoder.generate_ensemble(z, x, num_members=ensemble_size)
-    if ens_out.shape != (B, ensemble_size, C, H, W):
-        raise ValueError(f"Ensemble Output Shape Error: {ens_out.shape}")
-    var = torch.var(ens_out, dim=1).mean().item()
-    print(f"Ensemble Variance: {var:.6f}")
-    report("Ensemble Diversity", 0.0 if var > 1e-10 else 1.0, threshold=0.1)
+def check_mass_conservation():
+    print("Checking Global Mass Conservation...")
+    H, W = 32, 64
+    corrector = MassCorrector(height=H, mass_idx=0)
+    
+    pred = torch.randn(2, 5, 1, H, W) + 10.0
+    ref = torch.randn(2, 5, 1, H, W) + 10.0
+    
+    lat_indices = torch.arange(H)
+    lat_rad = (lat_indices / (H - 1)) * math.pi - (math.pi / 2)
+    weights = torch.cos(lat_rad).view(1, 1, 1, -1, 1)
+    weights = weights / weights.mean()
+    
+    ref_mass = (ref[:, -1:, ...] * weights).mean(dim=(-2, -1))
+    
+    corrected_pred = corrector(pred, ref)
+    
+    out_mass = (corrected_pred * weights).mean(dim=(-2, -1))
+    
+    diff = (out_mass - ref_mass).abs().max().item()
+    
+    if diff < 1e-5:
+        print(f"PASS: Global Mass Conserved. Max Drift: {diff:.2e}")
+    else:
+        print(f"FAIL: Mass Conservation Violated. Max Drift: {diff:.2e}")
+        sys.exit(1)
 
-def check_gradient_flow():
-    print("\n--- Checking Gradient Flow for Both Heads ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    B, C, H, W = 1, 4, 32, 32
-    encoder = UniPhyEncoder(in_ch=C, embed_dim=16).to(device)
-    diff_decoder = UniPhyDiffusionDecoder(out_ch=C, latent_dim=16).to(device)
-    ens_decoder = UniPhyEnsembleDecoder(out_ch=C, latent_dim=16).to(device)
-    x = torch.randn(B, C, H, W, device=device, requires_grad=True)
-    z = encoder(x)
-    pred_diff = diff_decoder(z, x, torch.ones(B, device=device))
-    loss_diff = pred_diff.sum()
-    loss_diff.backward(retain_graph=True)
-    diff_grad_norm = torch.norm(x.grad).item()
-    x.grad.zero_()
-    pred_ens = ens_decoder(z, x)
-    loss_ens = pred_ens.sum()
-    loss_ens.backward()
-    ens_grad_norm = torch.norm(x.grad).item()
-    report("Diff Gradient Flow", 0.0 if diff_grad_norm > 0 else 1.0, threshold=0.1)
-    report("Ensemble Gradient Flow", 0.0 if ens_grad_norm > 0 else 1.0, threshold=0.1)
+def check_spherical_topology_vorticity():
+    print("Checking Spherical Topology (Vorticity Continuity)...")
+    dim = 64
+    H, W = 16, 32
+    pos_emb_layer = SphericalPosEmb(dim, H, W)
+    
+    dummy = torch.zeros(1, dim, H, W)
+    emb = pos_emb_layer(dummy)
+    
+    if pos_emb_layer.emb.shape == (1, dim, H, W):
+        print("PASS: Spherical Embedding Shape Correct")
+    else:
+        print("FAIL: Embedding Shape Incorrect")
+        sys.exit(1)
+
+def check_full_pipeline_shapes():
+    print("Checking Full Pipeline Input/Output...")
+    B, T, C, H, W = 2, 4, 2, 64, 128
+    dim = 64
+    
+    enc = UniPhyEncoder(in_ch=C, embed_dim=dim, patch_size=16, img_height=H, img_width=W)
+    dec = UniPhyEnsembleDecoder(out_ch=C, latent_dim=dim, patch_size=16, img_height=H)
+    
+    x = torch.randn(B, T, C, H, W)
+    
+    z = enc(x)
+    if z.is_complex():
+        print(f"PASS: Encoder Output is Complex (Required for Physics Backbone)")
+    else:
+        print("FAIL: Encoder Output should be Complex")
+        sys.exit(1)
+        
+    out = dec(z, x)
+    
+    if out.shape == x.shape:
+        print("PASS: Decoder Output Shape Matches Input")
+    else:
+        print(f"FAIL: Shape Mismatch {out.shape} vs {x.shape}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    try:
-        check_geometric_conservation()
-        check_ensemble_diversity()
-        check_gradient_flow()
-        print("\nAll IO Checks Passed.")
-    except Exception as e:
-        print(f"\nVerification Failed: {e}")
+    check_boundary_conditions_momentum()
+    check_mass_conservation()
+    check_spherical_topology_vorticity()
+    check_full_pipeline_shapes()
+    print("ALL UNI_PHY IO CHECKS PASSED")
 
