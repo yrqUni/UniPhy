@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
-from UniPhyOps import HamiltonianPropagator, PScanTriton, CliffordConv2d, SpectralStep
+from UniPhyOps import SymplecticPropagator, PScanTriton, MetricAwareCliffordConv2d, SpectralStep
 from UniPhyParaPool import UniPhyParaPool
 
 class UniPhyBlock(nn.Module):
@@ -10,12 +10,18 @@ class UniPhyBlock(nn.Module):
         self.dim = dim
         
         self.norm_spatial = nn.LayerNorm(dim * 2)
-        self.spatial_cliff = CliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size//2)
+        
+        self.spatial_cliff = MetricAwareCliffordConv2d(
+            dim * 2, dim * 2, 
+            kernel_size=kernel_size, 
+            padding=kernel_size//2,
+            img_height=img_height
+        )
         self.spatial_spec = SpectralStep(dim, img_height, img_width)
         self.spatial_gate = nn.Parameter(torch.ones(1) * 0.5)
 
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = HamiltonianPropagator(dim, dt_ref=1.0)
+        self.prop = SymplecticPropagator(dim, dt_ref=1.0)
         self.pscan = PScanTriton()
         
         self.norm_pool = nn.LayerNorm(dim * 2)

@@ -10,10 +10,9 @@ class MassConservingSwiGLU(nn.Module):
         self.w3 = nn.Linear(hidden_dim, dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, heat_gain=None):
         B, C, H, W = x.shape
         resid = x
-        
         x_in = x.permute(0, 2, 3, 1)
         
         x1 = self.w1(x_in)
@@ -21,15 +20,19 @@ class MassConservingSwiGLU(nn.Module):
         hidden = F.silu(x1) * x2
         hidden = self.dropout(hidden)
         delta = self.w3(hidden)
-        
         delta = delta.permute(0, 3, 1, 2)
         
         delta_mean = delta.mean(dim=(2, 3), keepdim=True)
         delta = delta - delta_mean
+        
+        out = resid + delta
+        
+        if heat_gain is not None:
+            out[:, 0:1, :, :] = out[:, 0:1, :, :] + heat_gain
             
-        return resid + delta
+        return out
 
-class HighCapacityVectorMLP(nn.Module):
+class ThermodynamicVectorMLP(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.0):
         super().__init__()
         assert dim % 2 == 0
@@ -43,8 +46,9 @@ class HighCapacityVectorMLP(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         vectors = x.view(B, self.n_vectors, 2, H, W)
-        magnitudes = torch.norm(vectors, dim=2)
         
+        ke_in = torch.sum(vectors ** 2, dim=2)
+        magnitudes = torch.sqrt(ke_in + 1e-8)
         mag_flat = magnitudes.permute(0, 2, 3, 1)
         
         gate = self.gate_proj(mag_flat)
@@ -52,13 +56,17 @@ class HighCapacityVectorMLP(nn.Module):
         hidden = F.silu(gate) * feat
         hidden = self.dropout(hidden)
         
-        scales = self.out_proj(hidden)
-        scales = torch.sigmoid(scales) * 2.0
+        raw_scales = self.out_proj(hidden)
+        scales = torch.sigmoid(raw_scales) * 1.5
         
         scales = scales.permute(0, 3, 1, 2).unsqueeze(2)
         
         out_vectors = vectors * scales
-        return out_vectors.view(B, C, H, W)
+        
+        ke_out = torch.sum(out_vectors ** 2, dim=2)
+        energy_dissipation = (ke_in - ke_out).sum(dim=1, keepdim=True)
+        
+        return out_vectors.view(B, C, H, W), energy_dissipation
 
 class LieAlgebraRotation(nn.Module):
     def __init__(self, dim):
@@ -68,12 +76,9 @@ class LieAlgebraRotation(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        
         A = self.skew_generator.triu(diagonal=1)
         A = A - A.t()
-        
         R = torch.linalg.matrix_exp(A)
-        
         x_flat = x.permute(0, 2, 3, 1)
         out = F.linear(x_flat, R)
         return out.permute(0, 3, 1, 2)
@@ -89,18 +94,17 @@ class UniPhyParaPool(nn.Module):
         vector_hidden = int(self.vector_dim * expand)
         
         self.scalar_op = MassConservingSwiGLU(self.scalar_dim, scalar_hidden, dropout)
-        
         self.vector_mixing = LieAlgebraRotation(self.vector_dim)
-        self.vector_op = HighCapacityVectorMLP(self.vector_dim, vector_hidden, dropout)
+        self.vector_op = ThermodynamicVectorMLP(self.vector_dim, vector_hidden, dropout)
 
     def forward(self, x):
         x_scalar = x[:, :self.scalar_dim, :, :]
         x_vector = x[:, self.scalar_dim:, :, :]
         
-        out_scalar = self.scalar_op(x_scalar)
-        
         x_vector_rot = self.vector_mixing(x_vector)
-        out_vector = self.vector_op(x_vector_rot)
+        out_vector, energy_delta = self.vector_op(x_vector_rot)
+        
+        out_scalar = self.scalar_op(x_scalar, heat_gain=energy_delta)
         
         out = torch.cat([out_scalar, out_vector], dim=1)
         return out

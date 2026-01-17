@@ -44,20 +44,20 @@ def check_end_to_end_conservation():
     x_grad = torch.arange(W, device=device).float().view(1, 1, 1, 1, W).expand(B, T, C, H, W) / W
     with torch.no_grad():
         z = model.encoder(x_grad)
-        pass 
         
     print("PASS: Topology constraints integrated via UniPhyIO.")
 
-    print("[3] Verifying Enstrophy Stability...")
-    x_high_energy = torch.randn(B, T, C, H, W, device=device) * 10.0
+    print("[3] Verifying Symplectic Stability (Long Horizon)...")
+    x_high_energy = torch.randn(B, T * 4, C, H, W, device=device) * 5.0
+    dt_long = torch.rand(B, T * 4, device=device)
     with torch.no_grad():
-        out_high = model(x_high_energy, dt)
+        out_high = model(x_high_energy, dt_long)
     
     if torch.isnan(out_high).any() or torch.isinf(out_high).any():
-        print("FAIL: Model output contains NaN/Inf (Enstrophy Explosion)")
+        print("FAIL: Model output contains NaN/Inf (Explosion)")
         sys.exit(1)
     else:
-        print("PASS: Numerical Stability maintained.")
+        print("PASS: Numerical Stability maintained over long horizon.")
 
     print("\n=== ALL SYSTEM CHECKS PASSED ===")
 
