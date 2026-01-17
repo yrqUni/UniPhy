@@ -110,7 +110,7 @@ class Args:
         self.eval_sample_num = 1
         self.use_tf32 = True
         self.use_wandb = True
-        self.wandb_project = "ERA5_SDE"
+        self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
         self.wandb_run_name = self.ckpt
         self.wandb_mode = "online"
