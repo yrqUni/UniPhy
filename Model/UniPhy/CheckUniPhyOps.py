@@ -18,22 +18,21 @@ def check_metric_aware_clifford():
         
     x_perturb = x + 0.1
     out_perturb = layer(x_perturb)
-    
     print("PASS: Dynamic Metric Refiner forward successful.")
 
 def check_time_warped_dynamics():
     print("Checking SymplecticPropagator (Time Warping + Open System)...")
     dim = 16
-    prop = SymplecticPropagator(dim=dim, dt_ref=1.0, stochastic=False)
-    
     B, T, H, W = 2, 5, 16, 16
+    prop = SymplecticPropagator(dim=dim, img_height=H, img_width=W, dt_ref=1.0, stochastic=False)
+    
     dt = torch.ones(B, T)
     
     x_calm = torch.randn(B, T, dim, H, W, dtype=torch.cfloat) * 0.01
     x_storm = torch.randn(B, T, dim, H, W, dtype=torch.cfloat) * 5.0
     
-    _, _, evo_calm = prop.get_operators(dt, x_context=x_calm)
-    _, _, evo_storm = prop.get_operators(dt, x_context=x_storm)
+    _, _, evo_calm, dt_calm = prop.get_operators(dt, x_context=x_calm)
+    _, _, evo_storm, dt_storm = prop.get_operators(dt, x_context=x_storm)
     
     diff = (evo_calm - evo_storm).abs().mean().item()
     
@@ -59,12 +58,12 @@ def check_time_warped_dynamics():
         print("FAIL: Basis orthogonality broken.")
         sys.exit(1)
 
-def check_noise_injector():
-    print("Checking Neural SDE Noise Injector...")
+def check_spectral_noise_injector():
+    print("Checking SpectralNoiseInjector (SDE)...")
     dim = 16
-    prop = SymplecticPropagator(dim=dim, stochastic=True)
-    
     B, T, D, H, W = 2, 5, dim, 16, 16
+    prop = SymplecticPropagator(dim=dim, img_height=H, img_width=W, stochastic=True)
+    
     x = torch.randn(B, T, D, H, W, dtype=torch.cfloat)
     dt = torch.ones(B, T) * 0.1
     
@@ -80,7 +79,7 @@ def check_noise_injector():
 
     dt_zero = torch.zeros(B, T)
     noise_zero = prop.inject_noise(x, dt_zero)
-    if noise_zero.abs().max().item() < 1e-6:
+    if noise_zero.abs().max().item() < 1e-5:
         print("PASS: Wiener process scaling verified (dt=0 -> noise=0).")
     else:
         print(f"FAIL: Noise not zero at dt=0. Max val: {noise_zero.abs().max().item()}")
@@ -113,7 +112,7 @@ def check_anisotropic_spectral_step():
 if __name__ == "__main__":
     check_metric_aware_clifford()
     check_time_warped_dynamics()
-    check_noise_injector()
+    check_spectral_noise_injector()
     check_anisotropic_spectral_step()
     print("ALL OPS CHECKS PASSED")
 

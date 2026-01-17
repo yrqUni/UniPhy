@@ -8,14 +8,11 @@ class MetricAwareCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
-        
         lat_indices = torch.arange(img_height)
         lat_rad = (lat_indices / (img_height - 1)) * math.pi - (math.pi / 2)
-        
         static_metric = torch.sqrt(torch.cos(lat_rad).abs() + 1e-6)
         static_metric = static_metric / static_metric.mean()
         self.register_buffer('static_metric', static_metric.view(1, 1, -1, 1))
-        
         self.metric_refiner = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, in_channels, 1),
@@ -24,35 +21,42 @@ class MetricAwareCliffordConv2d(nn.Module):
 
     def forward(self, x):
         dynamic_scale = self.metric_refiner(x) * 0.2 + 0.9
-        
         effective_metric = self.static_metric * dynamic_scale
-        
         x_scaled = x * effective_metric
         out = self.conv(x_scaled)
-        
         out = out / effective_metric
         return out
 
-class NoiseInjector(nn.Module):
-    def __init__(self, dim):
+class SpectralNoiseInjector(nn.Module):
+    def __init__(self, dim, h, w):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(dim * 2, dim, kernel_size=1, bias=True),
-            nn.Sigmoid()
+        self.dim = dim
+        self.h = h
+        self.w = w
+        ky = torch.fft.fftfreq(h, d=1.0)
+        kx = torch.fft.fftfreq(w, d=1.0)
+        k_x, k_y = torch.meshgrid(kx, ky, indexing='xy')
+        k_sq = k_x**2 + k_y**2
+        initial_scale = 1.0 / (k_sq + 1.0)
+        self.spectral_scale = nn.Parameter(initial_scale.unsqueeze(0).repeat(dim, 1, 1))
+        self.controller = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.Sigmoid() 
         )
-        self.global_scale = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, x, dt):
-        x_perm = x.permute(0, 2, 1, 3, 4)
-        x_in = torch.cat([x_perm.real, x_perm.imag], dim=1)
+        B, T, D, H, W = x.shape
+        x_energy = x.abs().mean(dim=(3, 4))
+        noise_gain = self.controller(x_energy).view(B, T, D, 1, 1)
+        noise_fft = torch.randn(B, T, D, H, W, dtype=torch.cfloat, device=x.device)
+        scale = self.spectral_scale.unsqueeze(0).unsqueeze(0)
+        noise_colored_fft = noise_fft * scale
+        noise_colored = torch.fft.ifft2(noise_colored_fft, s=(H, W), norm='ortho')
         
-        sigma = self.net(x_in)
-        sigma = sigma.permute(0, 2, 1, 3, 4)
-        
-        dt_shape = dt.view(dt.shape[0], dt.shape[1], 1, 1, 1)
-        noise_std = torch.randn_like(x)
-        
-        diffusion = sigma * self.global_scale * noise_std * torch.sqrt(dt_shape.clamp(min=0.0))
+        dt_shape = dt.view(B, T, 1, 1, 1)
+        diffusion = noise_colored * noise_gain * torch.sqrt(dt_shape.clamp(min=1e-10)) * (dt_shape > 0).float()
         return diffusion
 
 class ContextAwareGrowth(nn.Module):
@@ -67,9 +71,8 @@ class ContextAwareGrowth(nn.Module):
         )
 
     def forward(self, x):
-        B, T, D, H, W = x.shape
         x_mag = x.abs()
-        global_energy = x_mag.mean(dim=(1, 3, 4))
+        global_energy = x_mag.mean(dim=(3, 4))
         delta_sigma = self.net(global_energy)
         return delta_sigma
 
@@ -84,32 +87,25 @@ class TimeWarper(nn.Module):
         )
 
     def forward(self, x, dt):
-        B, T, D, H, W = x.shape
         x_state = x.abs().mean(dim=(3, 4)) 
-        
         warp_factor = self.net(x_state).squeeze(-1) 
         warp_factor = warp_factor * 1.5 + 0.5 
-        
         return dt * warp_factor
 
 class SymplecticPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0, stochastic=True):
+    def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
         super().__init__()
         assert dim % 2 == 0
         self.dim = dim
         self.dt_ref = dt_ref
-        
         self.frequencies = nn.Parameter(torch.randn(dim) * 1.0)
         self.static_growth = nn.Parameter(torch.randn(dim) * 0.01)
-        
         self.context_growth = ContextAwareGrowth(dim)
         self.time_warper = TimeWarper(dim)
-        
         self.basis_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        
         self.stochastic = stochastic
         if stochastic:
-            self.noise_injector = NoiseInjector(dim)
+            self.noise_injector = SpectralNoiseInjector(dim, img_height, img_width)
         else:
             self.noise_injector = None
 
@@ -124,54 +120,42 @@ class SymplecticPropagator(nn.Module):
         Q = self.get_orthogonal_basis()
         V = Q.to(dtype=torch.cfloat)
         V_inv = V.T 
-
         sigma_static = self.static_growth
-        
         if x_context is not None:
             sigma_dynamic = self.context_growth(x_context)
-            sigma_total = sigma_static.unsqueeze(0) + sigma_dynamic * 0.1
-            
+            sigma_total = sigma_static.view(1, 1, -1) + sigma_dynamic * 0.1
             dt_eff = self.time_warper(x_context, dt)
         else:
-            sigma_total = sigma_static.unsqueeze(0)
+            sigma_total = sigma_static.view(1, 1, -1)
             dt_eff = dt
-            
         sigma_final = torch.tanh(sigma_total) * 0.5
-        omega = self.frequencies.unsqueeze(0)
-        
+        omega = self.frequencies.view(1, 1, -1)
         L = torch.complex(sigma_final, omega)
-
         if dt_eff.ndim == 2:
             dt_cast = dt_eff.unsqueeze(-1)
         elif dt_eff.ndim == 1:
             dt_cast = dt_eff.view(-1, 1, 1)
         else:
             dt_cast = dt_eff.unsqueeze(-1)
+        evo_diag = torch.exp(L * dt_cast)
+        return V, V_inv, evo_diag, dt_eff
 
-        evo_diag = torch.exp(L.unsqueeze(1) * dt_cast)
-        
-        return V, V_inv, evo_diag
-
-    def inject_noise(self, x, dt):
+    def inject_noise(self, x, dt_eff):
         if self.stochastic and self.noise_injector is not None:
-            return self.noise_injector(x, dt)
+            return self.noise_injector(x, dt_eff)
         return torch.zeros_like(x)
 
 class SpectralStep(nn.Module):
     def __init__(self, dim, h, w):
         super().__init__()
         self.dim = dim
-        
         self.weight = nn.Parameter(torch.randn(dim, h, w, dtype=torch.cfloat) * 0.02)
-        
         self.viscosity_x = nn.Parameter(torch.tensor(1e-4))
         self.viscosity_y = nn.Parameter(torch.tensor(1e-4))
         self.alpha = nn.Parameter(torch.tensor(2.0))
-        
         kx = torch.fft.fftfreq(w, d=1.0)
         ky = torch.fft.fftfreq(h, d=1.0)
         k_x, k_y = torch.meshgrid(kx, ky, indexing='xy')
-        
         self.register_buffer('k_x_abs', k_x.abs())
         self.register_buffer('k_y_abs', k_y.abs())
 
@@ -179,21 +163,14 @@ class SpectralStep(nn.Module):
         B, C, H, W = x.shape
         x_fft = torch.fft.fft2(x, norm='ortho')
         original_dc = x_fft[..., 0, 0].clone()
-        
         x_fft = x_fft * self.weight
-        
         alpha_clamp = self.alpha.clamp(1.0, 3.0)
         vx = self.viscosity_x.abs()
         vy = self.viscosity_y.abs()
-        
-        k_term = vx * torch.pow(self.k_x_abs, alpha_clamp) + \
-                 vy * torch.pow(self.k_y_abs, alpha_clamp)
-                 
+        k_term = vx * torch.pow(self.k_x_abs, alpha_clamp) + vy * torch.pow(self.k_y_abs, alpha_clamp)
         dissipation = torch.exp(-k_term * (H * W))
-        
         x_fft = x_fft * dissipation.unsqueeze(0).unsqueeze(0)
         x_fft[..., 0, 0] = original_dc
-        
         out = torch.fft.ifft2(x_fft, s=(H, W), norm='ortho')
         return out
 
