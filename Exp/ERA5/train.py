@@ -28,15 +28,14 @@ from ModelUniPhy import UniPhyModel
 warnings.filterwarnings("ignore")
 
 MODEL_ARG_KEYS = [
-    "input_shape",
     "in_channels",
-    "dim",
+    "out_channels",
+    "embed_dim",
+    "depth",
     "patch_size",
-    "num_layers",
-    "para_pool_expansion",
-    "conserve_energy",
-    "decoder_type",
-    "ensemble_size"
+    "img_height",
+    "img_width",
+    "dropout"
 ]
 
 def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -81,20 +80,21 @@ def log_model_stats(model: torch.nn.Module, rank: int) -> None:
 
 class Args:
     def __init__(self) -> None:
-        self.input_shape = (721, 1440)
-        self.in_channels = 30
-        self.dim = 300
+        self.img_height = 721
+        self.img_width = 1440
+        self.in_channels = 2
+        self.out_channels = 2
+        self.embed_dim = 300
         self.patch_size = 16
-        self.num_layers = 6
-        self.para_pool_expansion = 4
-        self.conserve_energy = True
-        self.decoder_type = "ensemble"
-        self.ensemble_size = 4
+        self.depth = 6
+        self.ensemble_size = 4 
+        self.dropout = 0.0
+        
         self.dt_ref = 6.0
         self.train_batch_size = 1
         self.eval_batch_size = 1
         self.use_scheduler = True
-        self.lr = 1e-5
+        self.lr = 1e-4 
         self.weight_decay = 0.05
         self.epochs = 100
         self.grad_clip = 1.0
@@ -107,12 +107,12 @@ class Args:
         self.ckpt = ""
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 20
-        self.sample_k = 8
+        self.train_data_n_frames = 8
+        self.sample_k = 4
         self.eval_sample_num = 1
         self.use_tf32 = True
         self.use_wandb = True
-        self.wandb_project = "ERA5"
+        self.wandb_project = "ERA5_SDE"
         self.wandb_entity = "UniPhy"
         self.wandb_run_name = self.ckpt
         self.wandb_mode = "online"
@@ -190,15 +190,14 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         torch.backends.cudnn.allow_tf32 = True
 
     model = UniPhyModel(
-        input_shape=args.input_shape,
         in_channels=args.in_channels,
-        dim=args.dim,
+        out_channels=args.out_channels,
+        embed_dim=args.embed_dim,
+        depth=args.depth,
         patch_size=args.patch_size,
-        num_layers=args.num_layers,
-        para_pool_expansion=args.para_pool_expansion,
-        conserve_energy=args.conserve_energy,
-        decoder_type=args.decoder_type,
-        ensemble_size=args.ensemble_size
+        img_height=args.img_height,
+        img_width=args.img_width,
+        dropout=args.dropout
     ).cuda(local_rank)
 
     log_model_stats(model, rank)
@@ -210,7 +209,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size()
     )
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=False, drop_last=True)
-    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1, persistent_workers=False)
+    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [
@@ -218,7 +217,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         {"params": [p for p in param_dict.values() if p.dim() < 2], "weight_decay": 0.0},
     ]
     opt = torch.optim.AdamW(optim_groups, lr=args.lr)
-    
+
     steps_per_epoch = max(1, len(train_loader) // args.grad_accum_steps)
     scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs) if args.use_scheduler else None
 
@@ -226,77 +225,73 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if args.ckpt: start_ep, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
 
     save_interval = max(1, int(len(train_loader) * args.ckpt_step))
-    T_diff = 1000
-    betas = torch.linspace(1e-4, 0.02, T_diff).cuda(local_rank)
-    alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
 
     for ep in range(start_ep, args.epochs):
         train_sampler.set_epoch(ep)
         train_iter = tqdm(train_loader, desc=f"Ep {ep+1}") if rank == 0 else train_loader
-        
+
         for train_step, data in enumerate(train_iter, start=1):
             model.train()
             data = data.to(f"cuda:{local_rank}", non_blocking=True).float()
             B, T_tot, C, H, W = data.shape
-            
+
             indices = torch.tensor([sorted(random.sample(range(T_tot), args.sample_k)) for _ in range(B)], device=data.device)
             sampled = data[torch.arange(B, device=data.device).unsqueeze(1), indices]
             x_in, target = sampled[:, :-1], sampled[:, 1:]
+            
             dt = (indices[:, 1:] - indices[:, :-1]).float() * args.dt_ref
+            
             B_seq, T_seq, C, H, W = target.shape
-
+            
             is_accum = (train_step % args.grad_accum_steps != 0)
             sync_ctx = model.no_sync() if is_accum else contextlib.nullcontext()
-            
-            with sync_ctx:
-                z_pred, _ = model(x_in, dt)
-                z_flat = z_pred.reshape(B_seq * T_seq, *z_pred.shape[2:])
-                target_flat = target.reshape(B_seq * T_seq, C, H, W)
-                m_base = model.module if isinstance(model, DDP) else model
 
-                if m_base.decoder_type == "diffusion":
-                    t = torch.randint(0, T_diff, (B_seq * T_seq,), device=data.device).long()
-                    noise = torch.randn_like(target_flat)
-                    sqrt_at = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1)
-                    sqrt_ot = torch.sqrt(1.0 - alphas_cumprod[t]).view(-1, 1, 1, 1)
-                    x_noisy = sqrt_at * target_flat + sqrt_ot * noise
-                    pred_noise = m_base.decoder(z_flat, x_noisy, t)
-                    loss = F.mse_loss(pred_noise, noise)
-                else:
-                    x_ref = x_in.reshape(B_seq * T_seq, C, H, W)
-                    pred_ens = m_base.decoder.generate_ensemble(z_flat, x_ref=x_ref)
-                    loss = crps_ensemble_loss(pred_ens, target_flat)
+            with sync_ctx:
+                ensemble_preds = []
+                
+                m_base = model.module if isinstance(model, DDP) else model
+                
+                for _ in range(args.ensemble_size):
+                    pred = model(x_in, dt)
+                    
+                    pred_flat = pred.reshape(B_seq * T_seq, C, H, W)
+                    ensemble_preds.append(pred_flat)
+                
+                pred_ensemble = torch.stack(ensemble_preds, dim=1)
+                target_flat = target.reshape(B_seq * T_seq, C, H, W)
+                
+                loss = crps_ensemble_loss(pred_ensemble, target_flat)
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     opt.zero_grad(set_to_none=True)
                     continue
-                
+
                 (loss / args.grad_accum_steps).backward()
 
             if not is_accum:
-                if args.grad_clip > 0: 
+                if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                
+
                 gn, _ = get_grad_stats(model)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 if scheduler: scheduler.step()
                 global_step += 1
-                
+
                 if rank == 0:
                     if train_step % args.log_every == 0:
                         msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | GN: {gn:.2f}"
                         if isinstance(train_iter, tqdm): train_iter.set_description(msg)
                         logging.info(msg)
-                    
+
                     if args.use_wandb and (train_step % args.wandb_every == 0):
                         wandb.log({
-                            "train/loss": loss.item(), 
-                            "train/lr": opt.param_groups[0]["lr"], 
-                            "train/gn": gn, 
+                            "train/loss": loss.item(),
+                            "train/lr": opt.param_groups[0]["lr"],
+                            "train/gn": gn,
                             "train/step": global_step
                         })
-                    
+
                     if train_step % save_interval == 0:
                         save_ckpt(model, opt, ep+1, train_step, loss.item(), args, scheduler)
 
@@ -305,11 +300,11 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 if __name__ == "__main__":
     a = Args()
     run_ddp(
-        rank=int(os.environ["RANK"]), 
-        world_size=int(os.environ["WORLD_SIZE"]), 
-        local_rank=int(os.environ["LOCAL_RANK"]), 
-        master_addr=os.environ.get("MASTER_ADDR", "127.0.0.1"), 
-        master_port=os.environ.get("MASTER_PORT", "12355"), 
+        rank=int(os.environ["RANK"]),
+        world_size=int(os.environ["WORLD_SIZE"]),
+        local_rank=int(os.environ["LOCAL_RANK"]),
+        master_addr=os.environ.get("MASTER_ADDR", "127.0.0.1"),
+        master_port=os.environ.get("MASTER_PORT", "12355"),
         args=a
     )
 
