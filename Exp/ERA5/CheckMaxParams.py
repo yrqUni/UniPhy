@@ -20,7 +20,7 @@ def get_args():
     parser.add_argument("--bs", type=int, default=1)
     parser.add_argument("--H", type=int, default=721)
     parser.add_argument("--W", type=int, default=1440)
-    parser.add_argument("--C", type=int, default=2)
+    parser.add_argument("--C", type=int, default=30)
     parser.add_argument("--T", type=int, default=8)
     parser.add_argument("--min_search_dim", type=int, default=64)
     parser.add_argument("--max_search_dim", type=int, default=2048)
