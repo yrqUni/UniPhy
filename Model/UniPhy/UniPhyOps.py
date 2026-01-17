@@ -26,15 +26,26 @@ class SymplecticPropagator(nn.Module):
         assert dim % 2 == 0
         self.dim = dim
         self.dt_ref = dt_ref
-        self.skew_kernel = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        
+        self.frequencies = nn.Parameter(torch.randn(dim) * 1.0)
+        
+        self.basis_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
+
+    def get_orthogonal_basis(self):
+        S = self.basis_generator.triu(1)
+        S = S - S.t()
+        
+        I = torch.eye(self.dim, device=S.device)
+        Q = torch.linalg.solve(I - S, I + S).T
+        return Q
 
     def get_operators(self, dt):
-        K = self.skew_kernel.triu(1)
-        A = K - K.t()
-        H_matrix = 1j * A
-        L_real, V = torch.linalg.eigh(H_matrix)
-        L = -1j * L_real
-        V_inv = V.conj().t()
+        Q = self.get_orthogonal_basis()
+        
+        V = Q.to(dtype=torch.cfloat)
+        V_inv = V.T 
+
+        L = 1j * self.frequencies
 
         if dt.ndim == 2:
             dt_cast = dt.unsqueeze(-1)
@@ -44,6 +55,7 @@ class SymplecticPropagator(nn.Module):
             dt_cast = dt.unsqueeze(-1)
 
         evo_diag = torch.exp(L.view(1, 1, -1) * dt_cast)
+        
         return V, V_inv, evo_diag
 
 class SpectralStep(nn.Module):
