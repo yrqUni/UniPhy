@@ -198,7 +198,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     ).cuda(local_rank)
 
     log_model_stats(model, rank)
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
 
     train_ds = ERA5_Dataset(
         input_dir=args.data_root, year_range=args.year_range, is_train=True,
