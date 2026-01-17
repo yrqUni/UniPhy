@@ -1,181 +1,113 @@
 import torch
 import torch.nn as nn
-from UniPhyOps import HamiltonianPropagator
+from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
+from UniPhyOps import HamiltonianPropagator, PScanTriton, CliffordConv2d, SpectralStep
 from UniPhyParaPool import UniPhyParaPool
-from CliffordConv2d import CliffordConv2d
-from SpectralStepTriton import SpectralStep
-from UniPhyIO import UniPhyEncoder, UniPhyDiffusionDecoder, UniPhyEnsembleDecoder
 
-class ComplexLayerNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim * 2, eps=eps)
-
-    def forward(self, x):
-        x_real = torch.view_as_real(x)
-        shape = x_real.shape
-        x_flat = x_real.flatten(start_dim=-2)
-        x_norm = self.norm(x_flat)
-        return torch.view_as_complex(x_norm.view(shape))
-
-class UniPhyTransformerBlock(nn.Module):
-    def __init__(self, dim, input_shape, expansion_factor=4):
+class UniPhyBlock(nn.Module):
+    def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4, dropout=0.0):
         super().__init__()
         self.dim = dim
-        self.H, self.W = input_shape
-        self.norm_time = ComplexLayerNorm(dim)
-        self.time_mixer = HamiltonianPropagator(dim * 2, conserve_energy=True)
-        self.norm_space = ComplexLayerNorm(dim)
-        self.space_clifford = CliffordConv2d(dim * 2, kernel_size=3, padding=1)
-        self.space_spectral = SpectralStep(dim * 2, rank=32, w_freq=self.W // 2 + 1)
-        self.norm_feat = ComplexLayerNorm(dim)
-        self.feature_mixer = UniPhyParaPool(dim, expansion_factor=expansion_factor)
+        
+        self.norm_spatial = nn.LayerNorm(dim * 2)
+        self.spatial_cliff = CliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size//2)
+        self.spatial_spec = SpectralStep(dim, img_height, img_width)
+        self.spatial_gate = nn.Parameter(torch.ones(1) * 0.5)
 
-    def forward_parallel(self, x, dt, initial_state=None):
-        residual = x
-        x = self.norm_time(x)
-        B, T, H, W, C = x.shape
-        x_real_flat = torch.view_as_real(x).flatten(start_dim=-2)
-        x_out_real, h_final = self.time_mixer.forward_parallel(x_real_flat, dt, initial_state)
-        x = torch.view_as_complex(x_out_real.view(B, T, H, W, C, 2))
-        x = x + residual
-        residual = x
-        x = self.norm_space(x)
-        x_real_view = torch.view_as_real(x)
-        x_real_view = x_real_view.permute(0, 1, 4, 5, 2, 3).contiguous()
-        x_real_view = x_real_view.view(B * T, C * 2, H, W)
-        x_cliff = self.space_clifford(x_real_view)
-        dt_flat = dt.view(-1).contiguous()
-        x_spec = self.space_spectral(x_real_view, dt_flat)
-        x_space = x_cliff + x_spec
-        x_space = x_space.view(B, T, C, 2, H, W)
-        x_space = x_space.permute(0, 1, 4, 5, 2, 3).contiguous()
-        x_space = torch.view_as_complex(x_space)
-        x = x_space + residual
-        residual = x
-        x = self.norm_feat(x)
-        B, T, H, W, C = x.shape
-        x_flat = x.view(B * T * H * W, C)[:, :, None, None]
-        x_feat = self.feature_mixer(x_flat)
-        x_feat = x_feat.view(B, T, H, W, C)
-        x = x_feat + residual
-        return x, h_final
+        self.norm_temporal = nn.LayerNorm(dim * 2)
+        self.prop = HamiltonianPropagator(dim, dt_ref=1.0)
+        self.pscan = PScanTriton()
+        
+        self.norm_pool = nn.LayerNorm(dim * 2)
+        self.para_pool = UniPhyParaPool(dim * 2, expand=expand, dropout=dropout)
 
-    def step_serial(self, x, dt, h_prev):
-        residual = x
-        x = self.norm_time(x)
-        B, H, W, C = x.shape
-        x_real_flat = torch.view_as_real(x).flatten(start_dim=-2)
-        x_out_real, h_next = self.time_mixer.step_serial(x_real_flat, dt, h_prev)
-        x = torch.view_as_complex(x_out_real.view(B, H, W, C, 2))
-        x = x + residual
-        residual = x
-        x = self.norm_space(x)
-        x_real_view = torch.view_as_real(x)
-        x_real_view = x_real_view.permute(0, 3, 4, 1, 2).contiguous()
-        x_real_view = x_real_view.view(B, C * 2, H, W)
-        x_cliff = self.space_clifford(x_real_view)
-        x_spec = self.space_spectral(x_real_view, dt)
-        x_space = x_cliff + x_spec
-        x_space = x_space.view(B, C, 2, H, W)
-        x_space = x_space.permute(0, 3, 4, 1, 2).contiguous()
-        x_space = torch.view_as_complex(x_space)
-        x = x_space + residual
-        residual = x
-        x = self.norm_feat(x)
-        x_flat = x.view(B * H * W, C)[:, :, None, None]
-        x_feat = self.feature_mixer(x_flat)
-        x_feat = x_feat.view(B, H, W, C)
-        x = x_feat + residual
-        return x, h_next
+    def _complex_norm(self, z, norm_layer):
+        z_cat = torch.cat([z.real, z.imag], dim=-1)
+        z_norm = norm_layer(z_cat)
+        r, i = torch.chunk(z_norm, 2, dim=-1)
+        return torch.complex(r, i)
 
-class UniPhyModel(nn.Module):
-    def __init__(self,
-                 input_shape=(721, 1440),
-                 in_channels=30,
-                 dim=64,
-                 patch_size=4,
-                 num_layers=8,
-                 para_pool_expansion=4,
-                 conserve_energy=True,
-                 decoder_type='diffusion',
-                 ensemble_size=10):
-        super().__init__()
-        self.H_raw, self.W_raw = input_shape
-        self.pad_h = (patch_size - self.H_raw % patch_size) % patch_size
-        self.pad_w = (patch_size - self.W_raw % patch_size) % patch_size
-        self.H_latent = (self.H_raw + self.pad_h) // patch_size
-        self.W_latent = (self.W_raw + self.pad_w) // patch_size
-        self.decoder_type = decoder_type.lower()
-        self.in_channels = in_channels
-
-        self.encoder = UniPhyEncoder(in_channels, dim, patch_size=patch_size)
-        self.blocks = nn.ModuleList([
-            UniPhyTransformerBlock(
-                dim=dim,
-                input_shape=(self.H_latent, self.W_latent),
-                expansion_factor=para_pool_expansion
-            ) for _ in range(num_layers)
-        ])
-
-        if self.decoder_type == 'diffusion':
-            self.decoder = UniPhyDiffusionDecoder(
-                out_ch=in_channels,
-                latent_dim=dim,
-                patch_size=patch_size,
-                model_channels=dim
-            )
-        elif self.decoder_type == 'ensemble':
-            self.decoder = UniPhyEnsembleDecoder(
-                out_ch=in_channels,
-                latent_dim=dim,
-                patch_size=patch_size,
-                model_channels=dim,
-                ensemble_size=ensemble_size
-            )
-        else:
-            raise ValueError(f"Unknown decoder type: {decoder_type}")
-
-        self.norm_final = ComplexLayerNorm(dim)
+    def _spatial_op(self, x):
+        x_real_imag = torch.cat([x.real, x.imag], dim=1)
+        out_cliff = self.spatial_cliff(x_real_imag)
+        r, i = torch.chunk(out_cliff, 2, dim=1)
+        out_cliff_c = torch.complex(r, i)
+        out_spec = self.spatial_spec(x)
+        return self.spatial_gate * out_cliff_c + (1.0 - self.spatial_gate) * out_spec
 
     def forward(self, x, dt):
-        B, T, C, H, W = x.shape
-        x_flat = x.contiguous().view(B * T, C, H, W)
-        z = self.encoder(x_flat)
-        _, D, Hl, Wl = z.shape
-        z = z.view(B, T, D, Hl, Wl).permute(0, 1, 3, 4, 2)
-        final_states = []
-        for block in self.blocks:
-            z, h_final = block.forward_parallel(z, dt)
-            final_states.append(h_final)
-        z = self.norm_final(z)
-        z = z.permute(0, 1, 4, 2, 3)
-        return z, final_states
-
-    @torch.no_grad()
-    def inference(self, context_x, context_dt, future_steps, future_dt, diffusion_steps=20, num_ensemble=None):
-        B, T, C, H, W = context_x.shape
-        z_ctx, current_states = self.forward(context_x, context_dt)
-        curr_z = z_ctx[:, -1].permute(0, 2, 3, 1)
+        B, T, D, H, W = x.shape
+        resid = x
         
-        predictions = []
-        dt_val = torch.full((B,), future_dt, device=context_x.device) if isinstance(future_dt, float) else future_dt
+        x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
+        x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
+        x_s = self._spatial_op(x_s)
+        x = x_s.view(B, T, D, H, W) + resid
+        
+        resid = x
+        x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
+        x_t = self._complex_norm(x_t, self.norm_temporal)
+        
+        dt_expanded = dt.repeat_interleave(H * W, dim=0)
+        V, V_inv, evo_diag = self.prop.get_operators(dt_expanded)
+        
+        x_eigen = torch.matmul(x_t, V_inv.T)
+        h_eigen = self.pscan(evo_diag, x_eigen)
+        x_t_out = torch.matmul(h_eigen, V.T)
+        
+        x = x_t_out.view(B, H, W, T, D).permute(0, 3, 4, 1, 2) + resid
+        
+        resid = x
+        x_p = x.permute(0, 1, 3, 4, 2) 
+        x_p = self._complex_norm(x_p, self.norm_pool)
+        
+        x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
+        
+        B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
+        x_p_in = x_p_flat.view(B_p * T_p, H_p, W_p, C_p).permute(0, 3, 1, 2)
+        
+        x_pool_out = self.para_pool(x_p_in)
+        
+        x_pool_out = x_pool_out.permute(0, 2, 3, 1).view(B_p, T_p, H_p, W_p, C_p)
+        r, i = torch.chunk(x_pool_out, 2, dim=-1)
+        x = torch.complex(r, i).permute(0, 1, 4, 2, 3) + resid
+        
+        return x
 
-        for _ in range(future_steps):
-            next_states = []
-            for i, block in enumerate(self.blocks):
-                curr_z, h_next = block.step_serial(curr_z, dt_val, current_states[i])
-                next_states.append(h_next)
-            current_states = next_states
-            z_out = self.norm_final(curr_z)
-            z_out_perm = z_out.permute(0, 3, 1, 2)
+class UniPhyModel(nn.Module):
+    def __init__(self, 
+                 in_channels=2, 
+                 out_channels=2, 
+                 embed_dim=64, 
+                 depth=4, 
+                 patch_size=16, 
+                 img_height=64, 
+                 img_width=128, 
+                 dropout=0.0):
+        super().__init__()
+        
+        self.img_height = img_height
+        self.img_width = img_width
+        self.patch_size = patch_size
+        
+        h_dim = img_height // patch_size
+        w_dim = img_width // patch_size
+        
+        self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
+        
+        self.blocks = nn.ModuleList([
+            UniPhyBlock(embed_dim, h_dim, w_dim, dropout=dropout)
+            for _ in range(depth)
+        ])
+        
+        self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
 
-            if self.decoder_type == 'diffusion':
-                x_sample = self.decoder.sample(z_out_perm, (B, C, H, W), context_x.device, steps=diffusion_steps)
-            else:
-                x_sample = self.decoder.generate_ensemble(z_out_perm, context_x[:, -1], num_members=num_ensemble)
+    def forward(self, x, dt):
+        z = self.encoder(x)
+        
+        for block in self.blocks:
+            z = block(z, dt)
             
-            predictions.append(x_sample)
-
-        return torch.stack(predictions, dim=1)
+        out = self.decoder(z, x)
+        return out
 
