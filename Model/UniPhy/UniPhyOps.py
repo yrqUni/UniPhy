@@ -31,18 +31,36 @@ class NoiseInjector(nn.Module):
 
     def forward(self, x, dt):
         x_perm = x.permute(0, 2, 1, 3, 4)
-        
         x_in = torch.cat([x_perm.real, x_perm.imag], dim=1)
         
-        sigma = self.net(x_in) 
+        sigma = self.net(x_in)
         sigma = sigma.permute(0, 2, 1, 3, 4)
         
         dt_shape = dt.view(dt.shape[0], dt.shape[1], 1, 1, 1)
-        
         noise_std = torch.randn_like(x)
         
         diffusion = sigma * self.global_scale * noise_std * torch.sqrt(dt_shape.clamp(min=0.0))
         return diffusion
+
+class ContextAwareGrowth(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.Tanh() 
+        )
+
+    def forward(self, x):
+        B, T, D, H, W = x.shape
+        x_mag = x.abs()
+        
+        global_energy = x_mag.mean(dim=(1, 3, 4))
+        
+        delta_sigma = self.net(global_energy)
+        return delta_sigma
 
 class SymplecticPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, stochastic=True):
@@ -52,6 +70,11 @@ class SymplecticPropagator(nn.Module):
         self.dt_ref = dt_ref
         
         self.frequencies = nn.Parameter(torch.randn(dim) * 1.0)
+        
+        self.static_growth = nn.Parameter(torch.randn(dim) * 0.01)
+        
+        self.context_growth = ContextAwareGrowth(dim)
+        
         self.basis_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
         
         self.stochastic = stochastic
@@ -67,12 +90,24 @@ class SymplecticPropagator(nn.Module):
         Q = torch.linalg.solve(I - S, I + S)
         return Q
 
-    def get_operators(self, dt):
+    def get_operators(self, dt, x_context=None):
         Q = self.get_orthogonal_basis()
         V = Q.to(dtype=torch.cfloat)
         V_inv = V.T 
 
-        L = 1j * self.frequencies
+        sigma_static = self.static_growth
+        
+        if x_context is not None:
+            sigma_dynamic = self.context_growth(x_context)
+            sigma_total = sigma_static.unsqueeze(0) + sigma_dynamic * 0.1
+        else:
+            sigma_total = sigma_static.unsqueeze(0)
+            
+        sigma_final = torch.tanh(sigma_total) * 0.5
+        
+        omega = self.frequencies.unsqueeze(0)
+        
+        L = torch.complex(sigma_final, omega)
 
         if dt.ndim == 2:
             dt_cast = dt.unsqueeze(-1)
@@ -81,7 +116,7 @@ class SymplecticPropagator(nn.Module):
         else:
             dt_cast = dt.unsqueeze(-1)
 
-        evo_diag = torch.exp(L.view(1, 1, -1) * dt_cast)
+        evo_diag = torch.exp(L.unsqueeze(1) * dt_cast)
         
         return V, V_inv, evo_diag
 
