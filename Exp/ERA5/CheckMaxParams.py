@@ -53,8 +53,7 @@ def check_config_fit(args, dim, layers, device):
             depth=layers,
             patch_size=args.patch_size,
             img_height=args.H,
-            img_width=args.W,
-            dropout=0.0
+            img_width=args.W
         ).to(device)
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
