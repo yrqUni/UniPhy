@@ -9,6 +9,7 @@ from UniPhyOps import StablePropagator, RiemannianCliffordConv2d, SpectralStep
 from UniPhyParaPool import UniPhyParaPool, FluxConservingSwiGLU, SymplecticExchange
 from UniPhyIO import GlobalConservationConstraint
 from PScan import PScanTriton
+from ModelUniPhy import UniPhyModel
 
 def check_symplectic_conservation():
     print("--- Checking Symplectic Exchange Conservation ---")
@@ -77,8 +78,6 @@ def check_flux_conservation():
     out = layer(x)
     mean_out = out.mean()
     
-    resid_mean = mean_in 
-    
     diff = abs(mean_out - mean_in).item()
     print(f"Mean Input: {mean_in:.6f}")
     print(f"Mean Output: {mean_out:.6f}")
@@ -106,8 +105,8 @@ def check_riemannian_metric():
     else:
         print("[FAIL] Metric contains non-positive values.")
 
-def check_pscan_equivalence():
-    print("\n--- Checking PScan vs Sequential Equivalence ---")
+def check_pscan_unit_test():
+    print("\n--- Checking PScan vs Sequential Equivalence (Unit Test) ---")
     device = torch.device("cuda")
     pscan = PScanTriton().to(device)
     
@@ -160,6 +159,112 @@ def check_global_constraint():
     else:
         print("[FAIL] Global constraint failed.")
 
+def manual_sequential_forward(model, x, dt):
+    B, T, C, H, W = x.shape
+    
+    z = model.encoder(x)
+    
+    for block in model.blocks:
+        resid = z
+        
+        B_z, T_z, D_z, H_z, W_z = z.shape
+        z_s = z.view(B_z * T_z, D_z, H_z, W_z).permute(0, 2, 3, 1)
+        z_s = block._complex_norm(z_s, block.norm_spatial).permute(0, 3, 1, 2)
+        z_s = block._spatial_op(z_s)
+        z = z_s.view(B_z, T_z, D_z, H_z, W_z) + resid
+        
+        resid = z
+        
+        z_t = z.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
+        z_t = block._complex_norm(z_t, block.norm_temporal)
+        
+        V, V_inv, evo_diag, dt_eff = block.prop.get_operators(dt, x_context=z)
+        
+        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).repeat(1, H_z, W_z, 1, 1)
+        evo_diag_flat = evo_diag_expanded.view(B_z * H_z * W_z, T_z, D_z)
+        
+        x_eigen = torch.matmul(z_t, V_inv.T)
+        
+        h_eigen_list = []
+        h_state = torch.zeros(B_z * H_z * W_z, D_z, dtype=x_eigen.dtype, device=x_eigen.device)
+        
+        for t in range(T_z):
+            A_t = evo_diag_flat[:, t, :]
+            u_t = x_eigen[:, t, :]
+            h_state = A_t * h_state + u_t
+            h_eigen_list.append(h_state)
+            
+        h_eigen = torch.stack(h_eigen_list, dim=1)
+        
+        x_t_out = torch.matmul(h_eigen, V.T)
+        
+        x_drift = x_t_out.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
+        noise = block.prop.inject_noise(z, dt_eff)
+        
+        z = x_drift + noise + resid
+        
+        resid = z
+        
+        x_p = z.permute(0, 1, 3, 4, 2)
+        x_p = block._complex_norm(x_p, block.norm_pool)
+        
+        x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
+        B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
+        x_p_in = x_p_flat.view(B_p * T_p, H_p, W_p, C_p).permute(0, 3, 1, 2)
+        
+        x_pool_out = block.para_pool(x_p_in)
+        
+        x_pool_out = x_pool_out.permute(0, 2, 3, 1).view(B_p, T_p, H_p, W_p, C_p)
+        r, i = torch.chunk(x_pool_out, 2, dim=-1)
+        z = torch.complex(r, i).permute(0, 1, 4, 2, 3) + resid
+        
+    out = model.decoder(z, x)
+    return out
+
+def check_model_equivalence():
+    print("\n--- Checking Parallel vs Sequential Equivalence (Whole Model) ---")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == 'cpu':
+        print("[WARNING] Triton PScan requires CUDA. Check might fail or skip PScan.")
+    
+    B, T, C, H, W = 1, 8, 2, 32, 32
+    model = UniPhyModel(
+        in_channels=C, 
+        out_channels=C, 
+        embed_dim=16, 
+        depth=2, 
+        patch_size=16, 
+        img_height=H, 
+        img_width=W
+    ).to(device)
+    
+    model.eval()
+    
+    for block in model.blocks:
+        block.prop.stochastic = False
+    
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.tensor(0.5, device=device)
+    
+    with torch.no_grad():
+        try:
+            out_parallel = model(x, dt)
+        except Exception as e:
+            print(f"[FAIL] Parallel execution failed: {e}")
+            return
+
+        out_sequential = manual_sequential_forward(model, x, dt)
+        
+        diff = (out_parallel - out_sequential).abs().max().item()
+        
+        print(f"Max Absolute Difference: {diff:.9f}")
+        
+        if diff < 1e-4:
+            print("[PASS] Model logic is equivalent in both modes.")
+        else:
+            print("[FAIL] Divergence detected between parallel and sequential modes.")
+
 if __name__ == "__main__":
     check_symplectic_conservation()
     check_propagator_stability()
@@ -167,7 +272,8 @@ if __name__ == "__main__":
     check_riemannian_metric()
     check_global_constraint()
     if torch.cuda.is_available():
-        check_pscan_equivalence()
+        check_pscan_unit_test()
+        check_model_equivalence()
     else:
-        print("\n[INFO] Skipping PScan check (CUDA required)")
+        print("\n[INFO] Skipping PScan checks (CUDA required)")
 

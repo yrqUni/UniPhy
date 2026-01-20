@@ -109,7 +109,7 @@ class UniPhyModel(nn.Module):
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
         
         self.blocks = nn.ModuleList([
-            UniPhyBlock(embed_dim, h_dim, w_dim, dropout=dropout, img_height=h_dim, img_width=w_dim) 
+            UniPhyBlock(embed_dim, h_dim, w_dim, dropout=dropout) 
             for _ in range(depth)
         ])
         
