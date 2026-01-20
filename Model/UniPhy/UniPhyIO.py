@@ -3,12 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-class Padder(nn.Module):
-    def __init__(self, patch_size):
+class FlexiblePadder(nn.Module):
+    def __init__(self, patch_size, mode='replicate'):
         super().__init__()
         self.patch_size = patch_size
         self.pad_h = 0
         self.pad_w = 0
+        self.mode = mode
 
     def set_padding(self, h, w):
         self.pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
@@ -18,10 +19,8 @@ class Padder(nn.Module):
         H, W = x.shape[-2:]
         self.set_padding(H, W)
         
-        if self.pad_w > 0:
-            x = F.pad(x, (0, self.pad_w, 0, 0), mode='circular')
-        if self.pad_h > 0:
-            x = F.pad(x, (0, 0, 0, self.pad_h), mode='replicate')
+        if self.pad_w > 0 or self.pad_h > 0:
+            x = F.pad(x, (0, self.pad_w, 0, self.pad_h), mode=self.mode)
         return x
 
     def unpad(self, x):
@@ -30,7 +29,7 @@ class Padder(nn.Module):
         target_w = W - self.pad_w
         return x[..., :target_h, :target_w]
 
-class SphericalPosEmb(nn.Module):
+class SpectralPosEmb(nn.Module):
     def __init__(self, dim, h, w):
         super().__init__()
         self.dim = dim
@@ -48,8 +47,6 @@ class SphericalPosEmb(nn.Module):
 
         inv_freq_w = 1.0 / (10000 ** (torch.arange(0, dim_w, 2).float() / dim_w))
         pos_w = torch.arange(w, dtype=torch.float)
-        
-        pos_w = pos_w / w * 2 * math.pi
         sin_inp_w = torch.einsum("i,j->ij", pos_w, inv_freq_w)
         emb_w = torch.cat((sin_inp_w.sin(), sin_inp_w.cos()), dim=-1)
 
@@ -61,15 +58,10 @@ class SphericalPosEmb(nn.Module):
     def forward(self, x):
         return x + self.emb
 
-class MassCorrector(nn.Module):
-    def __init__(self, height, mass_idx=0):
+class GlobalConservationConstraint(nn.Module):
+    def __init__(self, conserved_indices=[0]):
         super().__init__()
-        self.mass_idx = mass_idx
-        lat_indices = torch.arange(height)
-        lat_rad = (lat_indices / (height - 1)) * math.pi - (math.pi / 2)
-        weights = torch.cos(lat_rad)
-        weights = weights / weights.mean()
-        self.register_buffer('weights', weights.view(1, 1, 1, -1, 1))
+        self.conserved_indices = conserved_indices
 
     def forward(self, pred, ref):
         if ref.ndim == 5:
@@ -77,14 +69,17 @@ class MassCorrector(nn.Module):
         else:
             ref_slice = ref.unsqueeze(1)
         
-        ref_mass = (ref_slice[:, :, self.mass_idx:self.mass_idx+1] * self.weights).mean(dim=(-2, -1), keepdim=True)
-        pred_mass = (pred[:, :, self.mass_idx:self.mass_idx+1] * self.weights).mean(dim=(-2, -1), keepdim=True)
+        B, T, C, H, W = pred.shape
         
-        diff = pred_mass - ref_mass
+        ref_integral = ref_slice.mean(dim=(-2, -1), keepdim=True)
+        pred_integral = pred.mean(dim=(-2, -1), keepdim=True)
         
-        C = pred.shape[2]
+        diff = pred_integral - ref_integral
         
-        mask = (torch.arange(C, device=pred.device) == self.mass_idx).view(1, 1, C, 1, 1).to(pred.dtype)
+        mask = torch.zeros(1, 1, C, 1, 1, device=pred.device, dtype=pred.dtype)
+        for idx in self.conserved_indices:
+            if idx < C:
+                mask[:, :, idx, :, :] = 1.0
         
         return pred - (diff * mask)
 
@@ -92,7 +87,7 @@ class UniPhyEncoder(nn.Module):
     def __init__(self, in_ch, embed_dim, patch_size=16, img_height=64, img_width=64):
         super().__init__()
         self.patch_size = patch_size
-        self.padder = Padder(patch_size)
+        self.padder = FlexiblePadder(patch_size, mode='replicate')
         self.unshuffle_dim = in_ch * (patch_size ** 2)
         
         self.proj = nn.Conv2d(self.unshuffle_dim, embed_dim * 2, kernel_size=1)
@@ -104,7 +99,7 @@ class UniPhyEncoder(nn.Module):
         h_dim = (img_height + pad_h) // patch_size
         w_dim = (img_width + pad_w) // patch_size
         
-        self.pos_emb = SphericalPosEmb(embed_dim * 2, h_dim, w_dim)
+        self.pos_emb = SpectralPosEmb(embed_dim * 2, h_dim, w_dim)
 
     def forward(self, x):
         is_5d = x.ndim == 5
@@ -130,9 +125,9 @@ class UniPhyEnsembleDecoder(nn.Module):
     def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10, img_height=64):
         super().__init__()
         self.patch_size = patch_size
-        self.padder = Padder(patch_size)
+        self.padder = FlexiblePadder(patch_size, mode='replicate')
         self.ensemble_size = ensemble_size
-        self.mass_corrector = MassCorrector(img_height)
+        self.conservation_constraint = GlobalConservationConstraint(conserved_indices=[0])
         
         self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
         self.member_emb = nn.Embedding(ensemble_size, model_channels)
@@ -180,7 +175,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         if is_5d:
             out = out.view(B, T, C, H, W)
             
-        out = self.mass_corrector(out, x_ref)
+        out = self.conservation_constraint(out, x_ref)
         
         return out
 
