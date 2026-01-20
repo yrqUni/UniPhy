@@ -109,6 +109,76 @@ class TimeWarper(nn.Module):
         warp_factor = torch.exp(warp_log * 0.5)
         return dt * warp_factor
 
+class GENERICPropagator(nn.Module):
+    def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
+        super().__init__()
+        assert dim % 2 == 0
+        self.dim = dim
+        self.dt_ref = dt_ref
+        self.stochastic = stochastic
+
+        self.w_L = nn.Parameter(torch.randn(dim, dim) * 0.02)
+        self.w_M = nn.Parameter(torch.randn(dim, dim) * 0.02)
+
+        self.context_gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, 2)
+        )
+
+        if stochastic:
+            self.noise_injector = SpectralNoiseInjector(dim, img_height, img_width)
+        else:
+            self.noise_injector = None
+
+    def get_orthogonal_basis(self):
+        S = 0.5 * (self.w_L - self.w_L.t())
+        return torch.matrix_exp(S)
+
+    def get_operators(self, dt, x_context=None):
+        device = self.w_L.device
+        D = self.dim
+
+        L_base = 0.5 * (self.w_L - self.w_L.transpose(-1, -2))
+        M_base = - (self.w_M @ self.w_M.transpose(-1, -2))
+
+        if x_context is not None:
+            B, T = x_context.shape[0], x_context.shape[1]
+            ctx = x_context.mean(dim=(3, 4))
+            if ctx.is_complex():
+                ctx = ctx.real
+            gate = self.context_gate(ctx)
+            a_L = F.softplus(gate[..., 0:1]).view(B, T, 1, 1)
+            a_M = F.softplus(gate[..., 1:2]).view(B, T, 1, 1)
+            G = a_L * L_base.view(1, 1, D, D) + a_M * M_base.view(1, 1, D, D)
+            
+            if dt.dim() == 0:
+                dt_eff = dt.expand(B, T, 1)
+            elif dt.dim() == 1:
+                dt_eff = dt.view(-1, 1, 1).expand(B, T, 1)
+            else:
+                dt_eff = dt.view(B, T, 1)
+        else:
+            B, T = 1, 1
+            G = (L_base + M_base).view(1, 1, D, D)
+            dt_eff = dt.view(1, 1, 1) if torch.is_tensor(dt) else torch.full((1, 1, 1), dt, device=device)
+
+        V = self.get_orthogonal_basis().to(torch.cfloat)
+        V_inv = V.conj().T
+        
+        G_complex = G.to(torch.cfloat)
+        H = torch.matmul(V_inv.view(1, 1, D, D), torch.matmul(G_complex, V.view(1, 1, D, D)))
+        G_diag = torch.diagonal(H, dim1=-2, dim2=-1)
+        
+        evo_diag = torch.exp(G_diag * (dt_eff / self.dt_ref))
+
+        return V, V_inv, evo_diag, dt_eff
+
+    def inject_noise(self, x, dt_eff):
+        if self.stochastic and self.noise_injector is not None:
+            return self.noise_injector(x, dt_eff)
+        return torch.zeros_like(x)
+    
 class StablePropagator(nn.Module):
     def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
         super().__init__()

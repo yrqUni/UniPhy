@@ -16,7 +16,7 @@ def train():
     opt_uni = optim.AdamW(model_uni.parameters(), lr=2e-4, weight_decay=1e-5)
     
     print("Training on dt=1.0 wave propagation (Fixing Dissipation)...")
-    for epoch in range(601):
+    for epoch in range(2048):
         for u_t, u_tp1 in loader:
             u_t, u_tp1 = u_t.to(device), u_tp1.to(device)
             dt_t = torch.ones(u_t.shape[0], 1, device=device) * 1.0

@@ -15,7 +15,7 @@ def train():
     opt_cnn = optim.Adam(model_cnn.parameters(), lr=1e-3)
     opt_geo = optim.Adam(model_geo.parameters(), lr=1e-3)
     
-    for epoch in range(100):
+    for epoch in range(1000):
         for x, y, topo in loader:
             x, y, topo = x.to(device), y.to(device), topo.to(device)
             
