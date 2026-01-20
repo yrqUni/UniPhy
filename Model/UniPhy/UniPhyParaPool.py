@@ -10,7 +10,6 @@ class FluxConservingSwiGLU(nn.Module):
         self.w3 = nn.Linear(hidden_dim, dim)
 
     def forward(self, x):
-        resid = x
         x_in = x.permute(0, 2, 3, 1)
         
         x1 = self.w1(x_in)
@@ -23,8 +22,7 @@ class FluxConservingSwiGLU(nn.Module):
         delta_mean = delta.mean(dim=(2, 3), keepdim=True)
         delta = delta - delta_mean
         
-        out = resid + delta
-        return out
+        return delta
 
 class EquivariantVectorMLP(nn.Module):
     def __init__(self, dim, hidden_dim):
@@ -49,7 +47,7 @@ class EquivariantVectorMLP(nn.Module):
         hidden = F.silu(gate) * feat
         
         raw_scales = self.out_proj(hidden)
-        scales = torch.sigmoid(raw_scales) * 2.0 
+        scales = torch.tanh(raw_scales)
         
         scales = scales.permute(0, 3, 1, 2).unsqueeze(2)
         
@@ -78,8 +76,6 @@ class SymplecticExchange(nn.Module):
         self.s_dim = scalar_dim
         self.v_dim = vector_dim
         
-        # [修复] 输入维度改为 1 (能量是标量)
-        # hidden_dim 设为 vector_dim // 2，但在极小维度时至少保证为 2，以免 bottleneck 太窄
         ctrl_hidden = max(vector_dim // 2, 2)
         
         self.coupling_controller = nn.Sequential(
@@ -131,11 +127,11 @@ class UniPhyParaPool(nn.Module):
         
         x_vector_rot = self.vector_mixing(x_vector)
         
-        out_vector = self.vector_op(x_vector_rot)
-        out_scalar = self.scalar_op(x_scalar)
+        delta_vector = self.vector_op(x_vector_rot)
+        delta_scalar = self.scalar_op(x_scalar)
         
-        out_scalar, out_vector = self.symplectic_exchange(out_scalar, out_vector)
+        delta_scalar, delta_vector = self.symplectic_exchange(delta_scalar, delta_vector)
         
-        out = torch.cat([out_scalar, out_vector], dim=1)
+        out = torch.cat([delta_scalar, delta_vector], dim=1)
         return out
 
