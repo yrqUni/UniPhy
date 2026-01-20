@@ -63,8 +63,8 @@ class UniPhyBlock(nn.Module):
         
         V, V_inv, evo_diag, dt_eff = self.prop.get_operators(dt, x_context=x)
         
-        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).repeat(1, H, W, 1, 1)
-        evo_diag_flat = evo_diag_expanded.view(B * H * W, T, D)
+        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, D)
+        evo_diag_flat = evo_diag_expanded.reshape(B * H * W, T, D)
         
         x_eigen = torch.matmul(x_t, V_inv.T)
         h_eigen = self.pscan(evo_diag_flat, x_eigen)
