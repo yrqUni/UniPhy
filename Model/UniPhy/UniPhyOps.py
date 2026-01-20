@@ -14,6 +14,15 @@ class RiemannianCliffordConv2d(nn.Module):
             nn.Conv2d(in_channels, in_channels, 1),
             nn.Tanh()
         )
+        
+        self.viscosity_gate = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        laplacian = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
+        self.register_buffer('laplacian_kernel', laplacian.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
+        self.groups = in_channels
 
     def forward(self, x):
         base_log = self.log_metric_param
@@ -23,7 +32,11 @@ class RiemannianCliffordConv2d(nn.Module):
         scale = torch.exp(effective_log_metric)
         inv_scale = torch.exp(-effective_log_metric)
         
-        x_scaled = x * scale
+        diffusion_term = F.conv2d(x, self.laplacian_kernel, padding=1, groups=self.groups)
+        local_viscosity = self.viscosity_gate(x) * inv_scale
+        x_diffused = x + diffusion_term * local_viscosity * 0.01
+        
+        x_scaled = x_diffused * scale
         out = self.conv(x_scaled)
         out = out * inv_scale
         return out
@@ -60,7 +73,8 @@ class SpectralNoiseInjector(nn.Module):
         noise_colored = torch.fft.ifft2(noise_colored_fft, s=(H, W), norm='ortho')
         
         dt_shape = dt.view(B, T, 1, 1, 1)
-        diffusion = noise_colored * noise_gain * torch.sqrt(dt_shape.clamp(min=1e-8))
+        smooth_dt = F.softplus(dt_shape) + 1e-6
+        diffusion = noise_colored * noise_gain * torch.sqrt(smooth_dt)
         return diffusion
 
 class LyapunovController(nn.Module):
@@ -86,13 +100,13 @@ class TimeWarper(nn.Module):
             nn.Linear(dim, dim // 2),
             nn.SiLU(),
             nn.Linear(dim // 2, 1),
-            nn.Sigmoid() 
+            nn.Tanh() 
         )
 
     def forward(self, x, dt):
         x_state = x.abs().mean(dim=(3, 4)) 
-        warp_factor = self.net(x_state).squeeze(-1) 
-        warp_factor = warp_factor + 0.5 
+        warp_log = self.net(x_state).squeeze(-1) 
+        warp_factor = torch.exp(warp_log * 0.5)
         return dt * warp_factor
 
 class StablePropagator(nn.Module):
@@ -107,7 +121,7 @@ class StablePropagator(nn.Module):
         
         self.stability_control = LyapunovController(dim)
         self.time_warper = TimeWarper(dim)
-        self.basis_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.skew_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
         
         self.stochastic = stochastic
         if stochastic:
@@ -116,10 +130,9 @@ class StablePropagator(nn.Module):
             self.noise_injector = None
 
     def get_orthogonal_basis(self):
-        S = self.basis_generator.triu(1)
+        S = self.skew_generator.triu(1)
         S = S - S.t()
-        I = torch.eye(self.dim, device=S.device)
-        Q = torch.linalg.solve(I - S, I + S)
+        Q = torch.matrix_exp(S)
         return Q
 
     def get_operators(self, dt, x_context=None):
@@ -138,7 +151,7 @@ class StablePropagator(nn.Module):
             sigma_total = sigma_static.view(1, 1, -1)
             dt_eff = dt
             
-        sigma_final = torch.tanh(sigma_total) * 0.02
+        sigma_final = -F.softplus(-sigma_total)
         omega = self.frequencies.view(1, 1, -1)
         L = torch.complex(sigma_final, omega)
         
