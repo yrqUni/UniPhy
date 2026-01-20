@@ -100,8 +100,8 @@ class Args:
         self.log_every = 1
         self.wandb_every = 1
         self.ckpt_step = 0.5
-        self.log_path = "./uniphy_logs"
-        self.ckpt_dir = "./uniphy_ckpt"
+        self.log_path = "./uniphy/logs"
+        self.ckpt_dir = "./uniphy/ckpt"
         self.ckpt = ""
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]

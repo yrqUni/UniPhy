@@ -95,7 +95,7 @@ def check_riemannian_metric():
     x = torch.randn(2, 16, 32, 32)
     _ = layer(x)
     
-    base_metric = torch.nn.functional.softplus(layer.metric_param) + 1e-6
+    base_metric = torch.exp(layer.log_metric_param)
     min_metric = base_metric.min().item()
     
     print(f"Min Metric Value: {min_metric:.6e}")

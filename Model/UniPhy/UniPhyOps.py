@@ -8,7 +8,7 @@ class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height, img_width):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
-        self.metric_param = nn.Parameter(torch.zeros(1, 1, img_height, img_width))
+        self.log_metric_param = nn.Parameter(torch.zeros(1, 1, img_height, img_width))
         self.metric_refiner = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_channels, in_channels, 1),
@@ -16,13 +16,16 @@ class RiemannianCliffordConv2d(nn.Module):
         )
 
     def forward(self, x):
-        base_metric = F.softplus(self.metric_param) + 1e-6
-        dynamic_scale = self.metric_refiner(x) * 0.1 + 1.0
-        effective_metric = base_metric * dynamic_scale
+        base_log = self.log_metric_param
+        dynamic_log = self.metric_refiner(x) * 0.1
+        effective_log_metric = base_log + dynamic_log
         
-        x_scaled = x * effective_metric
+        scale = torch.exp(effective_log_metric)
+        inv_scale = torch.exp(-effective_log_metric)
+        
+        x_scaled = x * scale
         out = self.conv(x_scaled)
-        out = out / (effective_metric + 1e-6)
+        out = out * inv_scale
         return out
 
 class SpectralNoiseInjector(nn.Module):
@@ -191,7 +194,4 @@ class SpectralStep(nn.Module):
         
         out = torch.fft.ifft2(x_fft, s=(H, W), norm='ortho')
         return out
-
-SymplecticPropagator = StablePropagator
-MetricAwareCliffordConv2d = RiemannianCliffordConv2d
 
