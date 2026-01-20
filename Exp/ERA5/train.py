@@ -91,8 +91,8 @@ class Args:
         self.dt_ref = 6.0
         self.train_batch_size = 1
         self.eval_batch_size = 1
-        self.use_scheduler = True
-        self.lr = 1e-4 
+        self.use_scheduler = False
+        self.lr = 1e-5
         self.weight_decay = 0.05
         self.epochs = 100
         self.grad_clip = 1.0
