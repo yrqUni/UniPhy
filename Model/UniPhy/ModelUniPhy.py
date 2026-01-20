@@ -28,7 +28,6 @@ class UniPhyBlock(nn.Module):
         self.prop = StablePropagator(dim, img_height, img_width, dt_ref=1.0, stochastic=True)
         self.pscan = PScanTriton()
 
-        self.norm_pool = nn.LayerNorm(dim * 2)
         self.para_pool = UniPhyParaPool(dim * 2, expand=expand)
 
     def _complex_norm(self, z, norm_layer):
@@ -79,11 +78,9 @@ class UniPhyBlock(nn.Module):
         resid = x
         
         x_p = x.permute(0, 1, 3, 4, 2) 
-        x_p = self._complex_norm(x_p, self.norm_pool)
-        
         x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
-        B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
         
+        B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
         x_p_in = x_p_flat.view(B_p * T_p, H_p, W_p, C_p).permute(0, 3, 1, 2)
         
         x_pool_out = self.para_pool(x_p_in)

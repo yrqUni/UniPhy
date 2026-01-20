@@ -9,6 +9,9 @@ class FluxConservingSwiGLU(nn.Module):
         self.w2 = nn.Linear(dim, hidden_dim)
         self.w3 = nn.Linear(hidden_dim, dim)
 
+        nn.init.zeros_(self.w3.weight)
+        nn.init.zeros_(self.w3.bias)
+
     def forward(self, x):
         x_in = x.permute(0, 2, 3, 1)
         
@@ -34,6 +37,9 @@ class EquivariantVectorMLP(nn.Module):
         self.feat_proj = nn.Linear(self.n_vectors, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, self.n_vectors)
 
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
     def forward(self, x):
         B, C, H, W = x.shape
         vectors = x.view(B, self.n_vectors, 2, H, W)
@@ -47,7 +53,7 @@ class EquivariantVectorMLP(nn.Module):
         hidden = F.silu(gate) * feat
         
         raw_scales = self.out_proj(hidden)
-        scales = torch.tanh(raw_scales)
+        scales = torch.tanh(raw_scales) 
         
         scales = scales.permute(0, 3, 1, 2).unsqueeze(2)
         
@@ -84,13 +90,16 @@ class SymplecticExchange(nn.Module):
             nn.Linear(ctrl_hidden, 1),
             nn.Tanh()
         )
+        
+        nn.init.zeros_(self.coupling_controller[2].weight)
+        nn.init.zeros_(self.coupling_controller[2].bias)
 
     def forward(self, scalar, vector):
         vector_energy = (vector ** 2).mean(dim=1, keepdim=True)
         theta = self.coupling_controller(vector_energy.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         
-        s_norm = torch.norm(scalar, dim=1, keepdim=True)
-        v_norm = torch.norm(vector, dim=1, keepdim=True)
+        s_norm = torch.sqrt(torch.sum(scalar ** 2, dim=1, keepdim=True) + 1e-8)
+        v_norm = torch.sqrt(torch.sum(vector ** 2, dim=1, keepdim=True) + 1e-8)
         
         total_amp = torch.sqrt(s_norm**2 + v_norm**2 + 1e-8)
         current_angle = torch.atan2(v_norm, s_norm)
@@ -112,6 +121,8 @@ class UniPhyParaPool(nn.Module):
         self.scalar_dim = dim // 4
         self.vector_dim = dim - self.scalar_dim
         
+        self.norm = nn.LayerNorm(dim)
+        
         scalar_hidden = int(self.scalar_dim * expand)
         vector_hidden = int(self.vector_dim * expand)
         
@@ -122,6 +133,10 @@ class UniPhyParaPool(nn.Module):
         self.symplectic_exchange = SymplecticExchange(self.scalar_dim, self.vector_dim)
 
     def forward(self, x):
+        x_in = x.permute(0, 2, 3, 1)
+        x_in = self.norm(x_in)
+        x = x_in.permute(0, 3, 1, 2)
+        
         x_scalar = x[:, :self.scalar_dim, :, :]
         x_vector = x[:, self.scalar_dim:, :, :]
         

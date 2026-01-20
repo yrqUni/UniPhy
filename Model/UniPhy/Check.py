@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import sys
 import os
 
@@ -158,6 +159,83 @@ def check_global_constraint():
     else:
         print("[FAIL] Global constraint failed.")
 
+def check_source_sink_stability():
+    print("\n--- Checking Source/Sink Feedback Stability (Zero-Init) ---")
+    dim = 64
+    H, W = 32, 32
+    steps = 100
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = UniPhyParaPool(dim, expand=4).to(device)
+    
+    model.eval()
+    
+    x = torch.randn(1, dim, H, W, device=device)
+    x = x / x.std()
+    
+    energies = []
+    
+    print(f"Initial Energy: {x.std().item():.4f}")
+    
+    with torch.no_grad():
+        for t in range(steps):
+            delta = model(x)
+            x = x + delta
+            
+            curr_energy = x.std().item()
+            curr_max = x.abs().max().item()
+            energies.append(curr_energy)
+            
+            if curr_max > 1e4:
+                print(f"[FAIL] System exploded at step {t}")
+                return
+
+    growth_ratio = energies[-1] / energies[0]
+    print(f"Final Energy Growth Ratio (100 steps): {growth_ratio:.4f}x")
+    
+    if growth_ratio < 1.1:
+        print("[PASS] Zero-Init effective. Model starts as identity mapping.")
+    elif growth_ratio > 50.0:
+        print("[FAIL] Energy growth is too fast.")
+    else:
+        print("[PASS] Energy growth is within physical limits.")
+
+def check_damping_learnability():
+    print("\n--- Checking Damping Capability (Sink Mechanism) ---")
+    dim = 64
+    H, W = 16, 16
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = UniPhyParaPool(dim, expand=4).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    
+    x_fixed = torch.randn(1, dim, H, W, device=device)
+    x_fixed = x_fixed / x_fixed.std()
+    
+    initial_energy = x_fixed.std().item()
+    print(f"Goal: Learn to suppress energy. Initial: {initial_energy:.4f}")
+    
+    for step in range(100):
+        optimizer.zero_grad()
+        delta = model(x_fixed)
+        x_next = x_fixed + delta
+        loss = (x_next ** 2).mean()
+        loss.backward()
+        optimizer.step()
+    
+    with torch.no_grad():
+        delta_final = model(x_fixed)
+        final_energy = (x_fixed + delta_final).std().item()
+        cos_sim = torch.nn.functional.cosine_similarity(delta_final.flatten(), x_fixed.flatten(), dim=0)
+        
+    print(f"Final Energy: {final_energy:.4f} (from {initial_energy:.4f})")
+    print(f"Cosine Sim (Delta vs Input): {cos_sim.item():.4f}")
+    
+    if final_energy < initial_energy * 0.2 and cos_sim < -0.9:
+        print("[PASS] Model successfully learned to act as a Sink.")
+    else:
+        print("[FAIL] Model failed to learn damping.")
+
 def manual_sequential_forward(model, x, dt):
     B, T, C, H, W = x.shape
     
@@ -198,7 +276,6 @@ def manual_sequential_forward(model, x, dt):
         x_t_out = torch.matmul(h_eigen, V.T)
         
         x_drift = x_t_out.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
-        
         noise = block.prop.inject_noise(z, dt_eff)
         
         z = x_drift + noise + resid
@@ -206,7 +283,6 @@ def manual_sequential_forward(model, x, dt):
         resid = z
         
         x_p = z.permute(0, 1, 3, 4, 2)
-        x_p = block._complex_norm(x_p, block.norm_pool)
         
         x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
         B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
@@ -272,8 +348,10 @@ if __name__ == "__main__":
     check_riemannian_metric()
     check_global_constraint()
     if torch.cuda.is_available():
+        check_source_sink_stability()
+        check_damping_learnability()
         check_pscan_unit_test()
         check_model_equivalence()
     else:
-        print("\n[INFO] Skipping PScan checks (CUDA required)")
+        print("\n[INFO] Skipping checks requiring CUDA")
 
