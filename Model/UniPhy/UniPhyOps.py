@@ -40,17 +40,46 @@ class RiemannianCliffordConv2d(nn.Module):
         self.groups = in_channels
 
     def forward(self, x):
+        is_5d = (x.ndim == 5)
+        if is_5d:
+            B, T, C, H, W = x.shape
+            x = x.reshape(B * T, C, H, W)
+
+        if x.is_complex():
+            x_real = x.real
+            x_imag = x.imag
+            x_mag = x.abs()
+        else:
+            x_real = x
+            x_imag = None
+            x_mag = x
+
         base_log = self.log_metric_param
-        dynamic_log = self.metric_refiner(x) * 0.1
+        dynamic_log = self.metric_refiner(x_mag) * 0.1
         effective_log_metric = base_log + dynamic_log
         scale = torch.exp(effective_log_metric)
         inv_scale = torch.exp(-effective_log_metric)
-        diffusion_term = F.conv2d(x, self.laplacian_kernel, padding=1, groups=self.groups)
-        local_viscosity = self.viscosity_gate(x) * inv_scale
-        x_diffused = x + diffusion_term * local_viscosity * 0.01
-        x_scaled = x_diffused * scale
-        out = self.conv(x_scaled)
-        out = out * inv_scale
+        
+        local_viscosity = self.viscosity_gate(x_mag) * inv_scale
+
+        def apply_physics(feat):
+            diffusion_term = F.conv2d(feat, self.laplacian_kernel, padding=1, groups=self.groups)
+            x_diffused = feat + diffusion_term * local_viscosity * 0.01
+            x_scaled = x_diffused * scale
+            out = self.conv(x_scaled)
+            out = out * inv_scale
+            return out
+
+        out_real = apply_physics(x_real)
+        if x_imag is not None:
+            out_imag = apply_physics(x_imag)
+            out = torch.complex(out_real, out_imag)
+        else:
+            out = out_real
+            
+        if is_5d:
+            out = out.view(B, T, *out.shape[1:])
+            
         return out
 
 class SpectralNoiseInjector(nn.Module):
@@ -103,90 +132,126 @@ class LyapunovController(nn.Module):
 
     def forward(self, x):
         x_mag = x.abs()
-        global_energy = x_mag.mean(dim=(3, 4))
+        global_energy = x_mag.mean(dim=(-2, -1))
         control_signal = self.net(global_energy)
         return control_signal
 
-class TimeWarper(nn.Module):
-    def __init__(self, dim):
+class CFLTimeWarper(nn.Module):
+    def __init__(self, dim, dx=1.0, max_velocity=10.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, dim // 4, kernel_size=3, padding=1),
+        self.dx = dx
+        self.max_velocity = max_velocity
+        self.cfl_estimator = nn.Sequential(
+            nn.Conv2d(dim * 2, dim // 4, 3, 1, 1),
             nn.SiLU(),
-            nn.Conv2d(dim // 4, 1, kernel_size=3, padding=1),
-            nn.Tanh() 
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(dim // 4, 1),
+            nn.Sigmoid()
         )
 
-    def forward(self, x, dt):
-        local_energy = x.abs().mean(dim=(1, 2), keepdim=True).squeeze(1)
+    def forward(self, x, dt_ref):
+        if x.is_complex():
+            x_mag = x.abs()
+        else:
+            x_mag = torch.norm(x, dim=2)
+
+        v_proxy = x_mag.mean(dim=(3, 4), keepdim=True) + 1e-6
+        dt_max = self.dx / (v_proxy * self.max_velocity)
         
-        warp_log = self.net(local_energy) 
-        warp_factor = torch.exp(warp_log * 2.0)
+        B, T, C, H, W = x.shape
+        x_in = x.reshape(B * T, C, H, W)
+        if x_in.is_complex():
+            x_in = torch.cat([x_in.real, x_in.imag], dim=1)
         
-        if isinstance(dt, torch.Tensor):
-             if dt.ndim == 1:
-                 dt = dt.view(-1, 1, 1, 1)
-             elif dt.ndim == 0:
-                 dt = dt.view(1, 1, 1, 1)
-        return dt * warp_factor
+        alpha = self.cfl_estimator(x_in).view(B, T, 1, 1, 1)
+        dt_constrained = alpha * torch.minimum(dt_ref, dt_max)
+        
+        return dt_constrained
     
 class MetriplecticPropagator(nn.Module):
     def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
         super().__init__()
-        assert dim % 2 == 0
         self.dim = dim
-        self.dt_ref = dt_ref
-        self.L_generator = nn.Parameter(torch.randn(dim) * 0.01)
-        self.dissipation_base = nn.Parameter(torch.randn(dim) * 0.0)
+        self.H = img_height
+        self.W = img_width
+        self.time_warper = CFLTimeWarper(dim)
+        self.L_generator = nn.Parameter(torch.randn(dim, 1, 1) * 0.01)
+        self.dissipation_base = nn.Parameter(torch.randn(dim, 1, 1) * 0.0)
         self.stability_control = LyapunovController(dim, out_dim=dim * 3)
-        self.time_warper = TimeWarper(dim)
+        self.viscosity = nn.Parameter(torch.tensor(1e-3))
+        
+        ky = torch.fft.fftfreq(self.H, d=1.0)
+        kx = torch.fft.rfftfreq(self.W, d=1.0)
+        k_x, k_y = torch.meshgrid(kx, ky, indexing='xy')
+        self.register_buffer('k_squared', (k_x**2 + k_y**2).unsqueeze(0))
+
         self.stochastic = stochastic
         if stochastic:
             self.noise_injector = SpectralNoiseInjector(dim, img_height, img_width)
         else:
             self.noise_injector = None
 
-    def get_operators(self, dt, x_context=None):
-        omega_base = self.L_generator
-        gamma_base = -F.softplus(self.dissipation_base)
-
-        if x_context is not None:
-            control = self.stability_control(x_context)
-            d_omega = control[..., :self.dim] * 0.1
-            d_gamma = control[..., self.dim : 2*self.dim]
-            valve_raw = control[..., 2*self.dim:]
-            
-            omega_t = omega_base + d_omega
-            gamma_t = -F.softplus(self.dissipation_base + d_gamma)
-            B_valve = torch.sigmoid(valve_raw) * 2.0
-            
-            dt_eff = self.time_warper(x_context, dt)
-        else:
-            omega_t = omega_base
-            gamma_t = gamma_base
-            B_valve = torch.ones_like(omega_base)
-            dt_eff = dt
-
-        L_eigen = torch.complex(gamma_t, omega_t)
+    def get_operators(self, dt, x_context):
+        dt_eff = self.time_warper(x_context, dt)
         
-        if dt_eff.ndim == 2: 
-            dt_cast = dt_eff.unsqueeze(-1)
-        elif dt_eff.ndim == 1: 
-            dt_cast = dt_eff.view(-1, 1, 1)
-        elif dt_eff.ndim == 4: 
-            dt_cast = dt_eff.permute(0, 2, 3, 1).unsqueeze(-1)
-            if L_eigen.ndim == 3:
-                L_eigen = L_eigen.unsqueeze(1).unsqueeze(1)
-        else: 
-            dt_cast = dt_eff.unsqueeze(-1)
-
-        A_evo = torch.exp(L_eigen * dt_cast)
-        return None, B_valve, A_evo, dt_eff
+        control = self.stability_control(x_context)
+        d_omega = control[..., :self.dim] * 0.1
+        valve_raw = control[..., 2*self.dim:]
+        
+        d_omega_expanded = d_omega.unsqueeze(-1).unsqueeze(-1)
+        omega_t = self.L_generator + d_omega_expanded
+        
+        B_valve = torch.sigmoid(valve_raw) * 2.0
+        
+        gamma_base = -F.softplus(self.dissipation_base)
+        nu_eff = F.softplus(self.viscosity)
+        
+        gamma_k = gamma_base - nu_eff * self.k_squared
+        
+        gamma_term = gamma_k.unsqueeze(0).unsqueeze(0) * dt_eff
+        omega_term = omega_t * dt_eff
+        
+        A_decay = torch.exp(gamma_term)
+        
+        half_angle = 1j * omega_term * 0.5
+        A_rot = (1 + half_angle) / (1 - half_angle)
+        
+        A_evo_spectral = A_decay * A_rot
+        
+        return None, B_valve, A_evo_spectral, dt_eff
 
     def inject_noise(self, x, dt_eff):
         if self.stochastic and self.noise_injector is not None:
             return self.noise_injector(x, dt_eff)
         return torch.zeros_like(x)
+
+    def forward_spectral(self, z_in, dt, pscan_module=None):
+        _, B_op, A_op, dt_eff = self.get_operators(dt, z_in)
+        
+        if z_in.is_complex():
+            u_in = torch.cat([z_in.real, z_in.imag], dim=0)
+            
+            if A_op.shape[0] == z_in.shape[0]:
+                A_op = torch.cat([A_op, A_op], dim=0)
+            
+            if B_op.shape[0] == z_in.shape[0]:
+                B_op = torch.cat([B_op, B_op], dim=0)
+        else:
+            u_in = z_in
+
+        z_fft = torch.fft.rfft2(u_in, norm='ortho')
+
+        if B_op.ndim == 3:
+             u_fft = z_fft * B_op.unsqueeze(-1).unsqueeze(-1)
+        else:
+             u_fft = z_fft
+
+        B, T, C, H, W_f = z_fft.shape
+        u_flat = u_fft.permute(0, 3, 4, 1, 2).reshape(B*H*W_f, T, C)
+        A_flat = A_op.permute(0, 3, 4, 1, 2).reshape(B*H*W_f, T, C)
+        
+        return u_flat, A_flat, dt_eff, (B, T, C, H, W_f)
 
 class SpectralStep(nn.Module):
     def __init__(self, dim, h, w):
@@ -209,6 +274,11 @@ class SpectralStep(nn.Module):
         self.register_buffer('k_y_abs', k_y.abs())
 
     def forward(self, x):
+        is_5d = (x.ndim == 5)
+        if is_5d:
+            B, T, C, H, W = x.shape
+            x = x.reshape(B * T, C, H, W)
+            
         is_complex = x.is_complex()
         if is_complex:
             x_in = torch.cat([x.real, x.imag], dim=0)
@@ -241,7 +311,12 @@ class SpectralStep(nn.Module):
             
         if is_complex:
             out_r, out_i = torch.chunk(out_real, 2, dim=0)
-            return torch.complex(out_r, out_i)
+            out = torch.complex(out_r, out_i)
         else:
-            return out_real
+            out = out_real
+
+        if is_5d:
+            out = out.view(B, T, *out.shape[1:])
+            
+        return out
 
