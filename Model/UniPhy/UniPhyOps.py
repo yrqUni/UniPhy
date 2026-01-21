@@ -78,13 +78,15 @@ class SpectralNoiseInjector(nn.Module):
         return diffusion
 
 class LyapunovController(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, out_dim=None):
         super().__init__()
+        target_dim = out_dim if out_dim is not None else dim
+
         self.net = nn.Sequential(
             nn.Linear(dim, dim // 2),
             nn.SiLU(),
-            nn.Linear(dim // 2, dim),
-            nn.Tanh() 
+            nn.Linear(dim // 2, target_dim),
+            nn.Tanh()
         )
 
     def forward(self, x):
