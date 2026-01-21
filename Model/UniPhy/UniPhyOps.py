@@ -121,7 +121,7 @@ class MetriplecticPropagator(nn.Module):
         self.L_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
         self.M_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
 
-        self.stability_control = LyapunovController(dim)
+        self.stability_control = LyapunovController(dim, out_dim=dim * 2)
         self.time_warper = TimeWarper(dim)
 
         self.stochastic = stochastic
