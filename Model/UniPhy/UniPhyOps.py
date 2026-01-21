@@ -111,6 +111,23 @@ class TimeWarper(nn.Module):
         warp_factor = torch.exp(warp_log * 0.5)
         return dt * warp_factor
 
+class LyapunovController(nn.Module):
+    def __init__(self, dim, out_dim=None):
+        super().__init__()
+        target_dim = out_dim if out_dim is not None else dim
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.SiLU(),
+            nn.Linear(dim // 2, target_dim),
+            nn.Tanh() 
+        )
+
+    def forward(self, x):
+        x_mag = x.abs()
+        global_energy = x_mag.mean(dim=(3, 4))
+        control_signal = self.net(global_energy)
+        return control_signal
+
 class MetriplecticPropagator(nn.Module):
     def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
         super().__init__()
@@ -118,10 +135,11 @@ class MetriplecticPropagator(nn.Module):
         self.dim = dim
         self.dt_ref = dt_ref
 
-        self.L_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.M_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.L_generator = nn.Parameter(torch.randn(dim) * 0.01)
+        self.dissipation_base = nn.Parameter(torch.randn(dim) * 0.0)
 
-        self.stability_control = LyapunovController(dim, out_dim=dim * 2)
+        self.stability_control = LyapunovController(dim, out_dim=dim * 3)
+        
         self.time_warper = TimeWarper(dim)
 
         self.stochastic = stochastic
@@ -131,42 +149,47 @@ class MetriplecticPropagator(nn.Module):
             self.noise_injector = None
 
     def get_operators(self, dt, x_context=None):
-        omega = self.L_generator.diagonal()
-        gamma_static = self.M_generator.diagonal()
+        omega_base = self.L_generator
+        gamma_base = -F.softplus(self.dissipation_base)
 
         if x_context is not None:
             control = self.stability_control(x_context)
-            d_omega = control[..., :self.dim] * 0.1
-            d_gamma = control[..., self.dim:] * 0.1
             
-            omega_t = omega + d_omega
-            gamma_t = gamma_static + d_gamma
+            d_omega = control[..., :self.dim] * 0.1
+            d_gamma_raw = control[..., self.dim : 2*self.dim]
+            input_gain_raw = control[..., 2*self.dim:]
+            
+            omega_t = omega_base + d_omega
+            gamma_t = -F.softplus(self.dissipation_base + d_gamma_raw)
+            input_gain = torch.sigmoid(input_gain_raw) * 2.0
+            
             dt_eff = self.time_warper(x_context, dt)
         else:
-            omega_t = omega
-            gamma_t = gamma_static
+            omega_t = omega_base
+            gamma_t = gamma_base
+            input_gain = torch.ones_like(omega_base)
             dt_eff = dt
 
         L_eigen = torch.complex(gamma_t, omega_t)
 
-        if dt_eff.ndim == 2:
+        if dt_eff.ndim == 2: 
             dt_cast = dt_eff.unsqueeze(-1)
-        elif dt_eff.ndim == 1:
+        elif dt_eff.ndim == 1: 
             dt_cast = dt_eff.view(-1, 1, 1)
-        else:
+        else: 
             dt_cast = dt_eff.unsqueeze(-1)
 
         evo_diag = torch.exp(L_eigen * dt_cast)
 
         Q = torch.eye(self.dim, device=dt.device, dtype=torch.cfloat)
         
-        return Q, Q, evo_diag, dt_eff
+        return Q, Q, evo_diag, dt_eff, input_gain
 
     def inject_noise(self, x, dt_eff):
         if self.stochastic and self.noise_injector is not None:
             return self.noise_injector(x, dt_eff)
         return torch.zeros_like(x)
-    
+
 class StablePropagator(nn.Module):
     def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
         super().__init__()

@@ -6,11 +6,11 @@ import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from UniPhyOps import StablePropagator, RiemannianCliffordConv2d, SpectralStep
+from UniPhyOps import MetriplecticPropagator, RiemannianCliffordConv2d, SpectralStep
 from UniPhyParaPool import UniPhyParaPool, FluxConservingSwiGLU, SymplecticExchange
 from UniPhyIO import GlobalConservationConstraint
 from PScan import PScanTriton
-from ModelUniPhy import UniPhyModel
+from ModelUniPhy import UniPhyModel, UniPhyBlock
 
 def check_symplectic_conservation():
     print("--- Checking Symplectic Exchange Conservation ---")
@@ -41,10 +41,10 @@ def check_symplectic_conservation():
 def check_propagator_stability():
     print("\n--- Checking Propagator Stability & Unitarity ---")
     dim = 16
-    prop = StablePropagator(dim, 32, 32, stochastic=False)
+    prop = MetriplecticPropagator(dim, 32, 32, stochastic=False)
     
-    Q = prop.get_orthogonal_basis()
-    I = torch.eye(dim, device=Q.device)
+    Q = torch.eye(dim, dtype=torch.cfloat)
+    I = torch.eye(dim)
     Q_check = torch.matmul(Q.H, Q).real
     
     ortho_error = (Q_check - I).abs().max().item()
@@ -56,7 +56,7 @@ def check_propagator_stability():
         print("[FAIL] Basis is not orthogonal.")
         
     dt = torch.tensor(1.0)
-    _, _, evo_diag, _ = prop.get_operators(dt)
+    _, _, evo_diag, _, _ = prop.get_operators(dt)
     
     max_amp = evo_diag.abs().max().item()
     min_amp = evo_diag.abs().min().item()
@@ -245,37 +245,56 @@ def manual_sequential_forward(model, x, dt):
         resid = z
         
         B_z, T_z, D_z, H_z, W_z = z.shape
-        z_s = z.view(B_z * T_z, D_z, H_z, W_z).permute(0, 2, 3, 1)
-        z_s = block._complex_norm(z_s, block.norm_spatial).permute(0, 3, 1, 2)
-        z_s = block._spatial_op(z_s)
+        z_flat = z.view(B_z * T_z, D_z, H_z, W_z)
+        
+        z_perm = z_flat.permute(0, 2, 3, 1)
+        z_cat = torch.cat([z_perm.real, z_perm.imag], dim=-1)
+        z_norm = block.norm_spatial(z_cat)
+        r, i = torch.chunk(z_norm, 2, dim=-1)
+        z_norm_c = torch.complex(r, i).permute(0, 3, 1, 2)
+        
+        z_cat_conv = torch.cat([z_norm_c.real, z_norm_c.imag], dim=1)
+        out_cliff = block.spatial_cliff(z_cat_conv)
+        r_c, i_c = torch.chunk(out_cliff, 2, dim=1)
+        out_cliff_c = torch.complex(r_c, i_c)
+        
+        out_spec = block.spatial_spec(z_norm_c)
+        
+        z_s = block.spatial_gate * out_cliff_c + (1.0 - block.spatial_gate) * out_spec
         z = z_s.view(B_z, T_z, D_z, H_z, W_z) + resid
         
         resid = z
         
-        z_t = z.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
-        z_t = block._complex_norm(z_t, block.norm_temporal)
+        z_perm = z.permute(0, 1, 3, 4, 2)
+        z_cat = torch.cat([z_perm.real, z_perm.imag], dim=-1)
+        z_norm = block.norm_temporal(z_cat)
+        r, i = torch.chunk(z_norm, 2, dim=-1)
+        z_norm_c = torch.complex(r, i).permute(0, 1, 4, 2, 3)
         
-        V, V_inv, evo_diag, dt_eff = block.prop.get_operators(dt, x_context=z)
+        V, V_inv, evo_diag, dt_eff, input_gain = block.prop.get_operators(dt, x_context=z_norm_c)
+        
+        if input_gain.ndim == 3:
+            input_gain = input_gain.unsqueeze(-1).unsqueeze(-1)
+        
+        z_forced = z_norm_c * input_gain
         
         evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).expand(B_z, H_z, W_z, T_z, D_z)
         evo_diag_flat = evo_diag_expanded.reshape(B_z * H_z * W_z, T_z, D_z)
         
-        x_eigen = torch.matmul(z_t, V_inv.T)
+        z_t = z_forced.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
         
         h_eigen_list = []
-        h_state = torch.zeros(B_z * H_z * W_z, D_z, dtype=x_eigen.dtype, device=x_eigen.device)
+        h_state = torch.zeros(B_z * H_z * W_z, D_z, dtype=z_t.dtype, device=z_t.device)
         
         for t in range(T_z):
             A_t = evo_diag_flat[:, t, :]
-            u_t = x_eigen[:, t, :]
+            u_t = z_t[:, t, :]
             h_state = A_t * h_state + u_t
             h_eigen_list.append(h_state)
             
         h_eigen = torch.stack(h_eigen_list, dim=1)
         
-        x_t_out = torch.matmul(h_eigen, V.T)
-        
-        x_drift = x_t_out.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
+        x_drift = h_eigen.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
         noise = block.prop.inject_noise(z, dt_eff)
         
         z = x_drift + noise + resid
@@ -283,7 +302,6 @@ def manual_sequential_forward(model, x, dt):
         resid = z
         
         x_p = z.permute(0, 1, 3, 4, 2)
-        
         x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
         B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
         x_p_in = x_p_flat.view(B_p * T_p, H_p, W_p, C_p).permute(0, 3, 1, 2)
@@ -328,6 +346,8 @@ def check_model_equivalence():
             out_parallel = model(x, dt)
         except Exception as e:
             print(f"[FAIL] Parallel execution failed: {e}")
+            import traceback
+            traceback.print_exc()
             return
 
         out_sequential = manual_sequential_forward(model, x, dt)

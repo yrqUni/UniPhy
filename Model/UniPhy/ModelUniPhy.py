@@ -47,37 +47,55 @@ class UniPhyBlock(nn.Module):
         return self.spatial_gate * out_cliff_c + (1.0 - self.spatial_gate) * out_spec
 
     def forward(self, x, dt):
-        B, T, D, H, W = x.shape
-        resid = x
+        B, T, C, H, W = x.shape
+        residual = x
         
-        x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
-        x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
-        x_s = self._spatial_op(x_s)
-        x = x_s.view(B, T, D, H, W) + resid
+        x_flat = x.view(B * T, C, H, W)
+        x_perm = x_flat.permute(0, 2, 3, 1)
+        x_cat = torch.cat([x_perm.real, x_perm.imag], dim=-1)
+        x_norm = self.norm_spatial(x_cat)
+        r, i = torch.chunk(x_norm, 2, dim=-1)
+        x_norm_c = torch.complex(r, i).permute(0, 3, 1, 2)
         
-        resid = x
+        x_cat_conv = torch.cat([x_norm_c.real, x_norm_c.imag], dim=1)
+        out_cliff = self.spatial_cliff(x_cat_conv)
+        r_c, i_c = torch.chunk(out_cliff, 2, dim=1)
+        out_cliff_c = torch.complex(r_c, i_c)
         
-        x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
-        x_t = self._complex_norm(x_t, self.norm_temporal)
+        out_spec = self.spatial_spec(x_norm_c)
         
-        V, V_inv, evo_diag, dt_eff = self.prop.get_operators(dt, x_context=x)
+        z = self.spatial_gate * out_cliff_c + (1.0 - self.spatial_gate) * out_spec
+        z = z.view(B, T, C, H, W) + residual
         
-        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, D)
-        evo_diag_flat = evo_diag_expanded.reshape(B * H * W, T, D)
+        residual = z
         
-        x_eigen = torch.matmul(x_t, V_inv.T)
-        h_eigen = self.pscan(evo_diag_flat, x_eigen)
-        x_t_out = torch.matmul(h_eigen, V.T)
+        z_perm = z.permute(0, 1, 3, 4, 2)
+        z_cat = torch.cat([z_perm.real, z_perm.imag], dim=-1)
+        z_norm = self.norm_temporal(z_cat)
+        r, i = torch.chunk(z_norm, 2, dim=-1)
+        z_norm_c = torch.complex(r, i).permute(0, 1, 4, 2, 3)
         
-        x_drift = x_t_out.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        V, V_inv, evo_diag, dt_eff, input_gain = self.prop.get_operators(dt, x_context=z_norm_c)
         
-        noise = self.prop.inject_noise(x, dt_eff)
+        if input_gain.ndim == 3:
+            input_gain = input_gain.unsqueeze(-1).unsqueeze(-1)
+        z_forced = z_norm_c * input_gain
+
+        z_t = z_forced.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
         
-        x = x_drift + noise + resid
+        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, C)
+        evo_diag_flat = evo_diag_expanded.reshape(B * H * W, T, C)
         
-        resid = x
+        h_eigen = self.pscan(evo_diag_flat, z_t)
         
-        x_p = x.permute(0, 1, 3, 4, 2) 
+        x_drift = h_eigen.view(B, H, W, T, C).permute(0, 3, 4, 1, 2)
+        
+        noise = self.prop.inject_noise(z, dt_eff)
+        x = x_drift + noise + residual
+        
+        residual = x
+        
+        x_p = x.permute(0, 1, 3, 4, 2)
         x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
         
         B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
@@ -87,7 +105,7 @@ class UniPhyBlock(nn.Module):
         
         x_pool_out = x_pool_out.permute(0, 2, 3, 1).view(B_p, T_p, H_p, W_p, C_p)
         r, i = torch.chunk(x_pool_out, 2, dim=-1)
-        x = torch.complex(r, i).permute(0, 1, 4, 2, 3) + resid
+        x = torch.complex(r, i).permute(0, 1, 4, 2, 3) + residual
         
         return x
 

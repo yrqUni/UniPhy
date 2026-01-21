@@ -46,6 +46,17 @@ def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> tor
     spread = torch.mean(pred_sorted * (2 * indices - M - 1), dim=1) / M
     return (mae - spread).mean()
 
+def thermodynamic_regularization(model: torch.nn.Module) -> torch.Tensor:
+    loss_reg = torch.tensor(0.0, device=next(model.parameters()).device)
+    found = False
+    for name, module in model.named_modules():
+        if hasattr(module, "M_generator"):
+            found = True
+            m_diag = module.M_generator.diagonal()
+            loss_reg = loss_reg + torch.relu(m_diag).mean()
+    
+    return loss_reg if found else torch.tensor(0.0, device=next(model.parameters()).device)
+
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -95,7 +106,7 @@ class Args:
         self.lr = 1e-5
         self.weight_decay = 0.05
         self.epochs = 100
-        self.grad_clip = 0.0
+        self.grad_clip = 1.0
         self.grad_accum_steps = 1
         self.log_every = 1
         self.wandb_every = 1
@@ -255,7 +266,11 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 pred_ensemble = torch.stack(ensemble_preds, dim=1)
                 target_flat = target.reshape(B_seq * T_seq, C, H, W)
                 
-                loss = crps_ensemble_loss(pred_ensemble, target_flat)
+                loss_crps = crps_ensemble_loss(pred_ensemble, target_flat)
+                
+                loss_phy = thermodynamic_regularization(m_base)
+                
+                loss = loss_crps + 0.01 * loss_phy
                 
                 with torch.no_grad():
                     pred_mean = torch.mean(pred_ensemble, dim=1)
@@ -279,13 +294,15 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 if rank == 0:
                     if train_step % args.log_every == 0:
-                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | L1: {l1_val.item():.4e} | GN: {gn:.2f}"
+                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | Phy: {loss_phy.item():.4e} | L1: {l1_val.item():.4e} | GN: {gn:.2f}"
                         if isinstance(train_iter, tqdm): train_iter.set_description(msg)
                         logging.info(msg)
 
                     if args.use_wandb and (train_step % args.wandb_every == 0):
                         wandb.log({
                             "train/loss": loss.item(),
+                            "train/loss_crps": loss_crps.item(),
+                            "train/loss_phy": loss_phy.item(),
                             "train/l1": l1_val.item(),
                             "train/lr": opt.param_groups[0]["lr"],
                             "train/gn": gn,
