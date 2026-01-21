@@ -324,11 +324,11 @@ def check_model_equivalence():
     dt = torch.tensor(0.5, device=device)
     
     with torch.no_grad():
-        # try:
-        out_parallel = model(x, dt)
-        # except Exception as e:
-        #     print(f"[FAIL] Parallel execution failed: {e}")
-        #     return
+        try:
+            out_parallel = model(x, dt)
+        except Exception as e:
+            print(f"[FAIL] Parallel execution failed: {e}")
+            return
 
         out_sequential = manual_sequential_forward(model, x, dt)
         
