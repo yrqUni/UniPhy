@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from PScan import PScanTriton
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
-from UniPhyOps import GENERICPropagator, RiemannianCliffordConv2d, SpectralStep
+from UniPhyOps import MetriplecticPropagator, RiemannianCliffordConv2d, SpectralStep
 from UniPhyParaPool import UniPhyParaPool
 
 class UniPhyBlock(nn.Module):
@@ -25,7 +25,7 @@ class UniPhyBlock(nn.Module):
         self.spatial_gate = nn.Parameter(torch.ones(1) * 0.5)
 
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = GENERICPropagator(dim, img_height, img_width, dt_ref=1.0, stochastic=True)
+        self.prop = MetriplecticPropagator(dim, img_height, img_width, dt_ref=1.0, stochastic=True)
         self.pscan = PScanTriton()
 
         self.para_pool = UniPhyParaPool(dim * 2, expand=expand)

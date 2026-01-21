@@ -95,7 +95,7 @@ class Args:
         self.lr = 1e-5
         self.weight_decay = 0.05
         self.epochs = 100
-        self.grad_clip = 1.0
+        self.grad_clip = 0.0
         self.grad_accum_steps = 1
         self.log_every = 1
         self.wandb_every = 1
