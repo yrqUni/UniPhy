@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import sys
+import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,11 +31,12 @@ warnings.filterwarnings("ignore")
 MODEL_ARG_KEYS = [
     "in_channels",
     "out_channels",
-    "embed_dim",
+    "dim",
     "depth",
     "patch_size",
     "img_height",
     "img_width",
+    "ensemble_size"
 ]
 
 def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -47,15 +49,7 @@ def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> tor
     return (mae - spread).mean()
 
 def thermodynamic_regularization(model: torch.nn.Module) -> torch.Tensor:
-    loss_reg = torch.tensor(0.0, device=next(model.parameters()).device)
-    found = False
-    for name, module in model.named_modules():
-        if hasattr(module, "M_generator"):
-            found = True
-            m_diag = module.M_generator.diagonal()
-            loss_reg = loss_reg + torch.relu(m_diag).mean()
-    
-    return loss_reg if found else torch.tensor(0.0, device=next(model.parameters()).device)
+    return torch.tensor(0.0, device=next(model.parameters()).device)
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
@@ -146,9 +140,12 @@ def setup_wandb(rank: int, args: Args) -> None:
     wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run_name, config=vars(args))
 
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
-    return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
+    d = {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
+    if hasattr(args_obj, 'embed_dim'):
+        d['dim'] = args_obj.embed_dim
+    return d
 
-def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
+def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, global_step: int, loss: float, args: Args, scheduler: Optional[Any] = None) -> None:
     if dist.get_rank() != 0: return
     os.makedirs(args.ckpt_dir, exist_ok=True)
     state = {
@@ -156,6 +153,7 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
         "optimizer": opt.state_dict(),
         "epoch": epoch,
         "step": step,
+        "global_step": global_step,
         "loss": loss,
         "args": dict(vars(args)),
         "model_args": extract_model_args(args),
@@ -168,25 +166,27 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
         files.sort(key=os.path.getmtime)
         for f in files[:-5]: os.remove(f)
 
-def load_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, ckpt_path: str, scheduler: Optional[Any] = None, map_location: str = "cpu") -> Tuple[int, int]:
-    if not os.path.isfile(ckpt_path): return 0, 0
+def load_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, ckpt_path: str, scheduler: Optional[Any] = None, map_location: str = "cpu") -> Tuple[int, int, int]:
+    if not os.path.isfile(ckpt_path): return 0, 0, 0
     checkpoint = torch.load(ckpt_path, map_location=map_location)
     sd = checkpoint["model"]
     new_sd = {k.replace("module.", ""): v for k, v in sd.items()}
     model.load_state_dict(new_sd, strict=False)
     opt.load_state_dict(checkpoint["optimizer"])
     if scheduler and "scheduler" in checkpoint: scheduler.load_state_dict(checkpoint["scheduler"])
-    return checkpoint.get("epoch", 0), checkpoint.get("step", 0)
+    return checkpoint.get("epoch", 0), checkpoint.get("step", 0), checkpoint.get("global_step", 0)
 
-def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float]:
+def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, float]:
     total_norm_sq = 0.0
     max_abs = 0.0
+    total_param_norm_sq = 0.0
     for p in model.parameters():
+        total_param_norm_sq += p.data.norm(2).item() ** 2
         if p.grad is None: continue
         g = p.grad.data
         total_norm_sq += g.norm(2).item() ** 2
         max_abs = max(max_abs, g.abs().max().item())
-    return float(total_norm_sq**0.5), float(max_abs)
+    return float(total_norm_sq**0.5), float(max_abs), float(total_param_norm_sq**0.5)
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
@@ -201,11 +201,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     model = UniPhyModel(
         in_channels=args.in_channels,
         out_channels=args.out_channels,
-        embed_dim=args.embed_dim,
+        dim=args.embed_dim,
         depth=args.depth,
         patch_size=args.patch_size,
         img_height=args.img_height,
         img_width=args.img_width,
+        ensemble_size=args.ensemble_size
     ).cuda(local_rank)
 
     log_model_stats(model, rank)
@@ -229,10 +230,17 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     steps_per_epoch = max(1, len(train_loader) // args.grad_accum_steps)
     scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs) if args.use_scheduler else None
 
-    start_ep, global_step = 0, 0
-    if args.ckpt: start_ep, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
+    start_ep, start_local_step, global_step = 0, 0, 0
+    if args.ckpt:
+        start_ep, start_local_step, loaded_global_step = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
+        if loaded_global_step > 0:
+            global_step = loaded_global_step
+        else:
+            global_step = start_ep * steps_per_epoch
 
     save_interval = max(1, int(len(train_loader) * args.ckpt_step))
+    samples_seen = 0
+    start_time = time.time()
 
     for ep in range(start_ep, args.epochs):
         train_sampler.set_epoch(ep)
@@ -282,11 +290,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 (loss / args.grad_accum_steps).backward()
 
+            samples_seen += B * world_size
+
             if not is_accum:
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-                gn, _ = get_grad_stats(model)
+                gn, max_g, param_norm = get_grad_stats(model)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 if scheduler: scheduler.step()
@@ -294,23 +304,32 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 if rank == 0:
                     if train_step % args.log_every == 0:
-                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | Phy: {loss_phy.item():.4e} | L1: {l1_val.item():.4e} | GN: {gn:.2f}"
+                        elapsed = time.time() - start_time
+                        throughput = samples_seen / elapsed if elapsed > 0 else 0
+                        
+                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | Phy: {loss_phy.item():.4e} | L1: {l1_val.item():.4e} | GN: {gn:.2f} | PNorm: {param_norm:.2f} | {throughput:.2f} samples/s"
                         if isinstance(train_iter, tqdm): train_iter.set_description(msg)
                         logging.info(msg)
+                        
+                        start_time = time.time()
+                        samples_seen = 0
 
                     if args.use_wandb and (train_step % args.wandb_every == 0):
                         wandb.log({
+                            "train/epoch": ep + 1,
                             "train/loss": loss.item(),
                             "train/loss_crps": loss_crps.item(),
                             "train/loss_phy": loss_phy.item(),
                             "train/l1": l1_val.item(),
                             "train/lr": opt.param_groups[0]["lr"],
-                            "train/gn": gn,
+                            "train/grad_norm": gn,
+                            "train/grad_max": max_g,
+                            "train/param_norm": param_norm,
                             "train/step": global_step
                         })
 
                     if train_step % save_interval == 0:
-                        save_ckpt(model, opt, ep+1, train_step, loss.item(), args, scheduler)
+                        save_ckpt(model, opt, ep+1, train_step, global_step, loss.item(), args, scheduler)
 
     cleanup_ddp()
 
