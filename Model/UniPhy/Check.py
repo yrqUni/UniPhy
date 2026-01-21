@@ -6,60 +6,33 @@ import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from UniPhyOps import MetriplecticPropagator, RiemannianCliffordConv2d, SpectralStep
-from UniPhyParaPool import UniPhyParaPool, FluxConservingSwiGLU, SymplecticExchange
+from UniPhyOps import MetriplecticPropagator, RiemannianCliffordConv2d, SpectralStep, GatedChannelMixer
 from UniPhyIO import GlobalConservationConstraint
 from PScan import PScanTriton
 from ModelUniPhy import UniPhyModel, UniPhyBlock
 
-def check_symplectic_conservation():
-    print("--- Checking Symplectic Exchange Conservation ---")
-    B, C, H, W = 2, 4, 32, 32
-    scalar_dim = C
-    vector_dim = C
-    layer = SymplecticExchange(scalar_dim, vector_dim)
-    
-    s = torch.randn(B, scalar_dim, H, W)
-    v = torch.randn(B, vector_dim, H, W)
-    
-    energy_in = torch.sqrt((s**2).sum() + (v**2).sum())
-    
-    s_out, v_out = layer(s, v)
-    
-    energy_out = torch.sqrt((s_out**2).sum() + (v_out**2).sum())
-    
-    diff = abs(energy_in - energy_out).item()
-    print(f"Energy In: {energy_in:.6f}")
-    print(f"Energy Out: {energy_out:.6f}")
-    print(f"Difference: {diff:.6e}")
-    
-    if diff < 1e-4:
-        print("[PASS] Symplectic conservation holds.")
-    else:
-        print("[FAIL] Energy leakage detected.")
-
 def check_propagator_stability():
-    print("\n--- Checking Propagator Stability & Unitarity ---")
+    print("\n--- Checking Propagator Stability & SSM Logic ---")
     dim = 16
     prop = MetriplecticPropagator(dim, 32, 32, stochastic=False)
     
-    Q = torch.eye(dim, dtype=torch.cfloat)
-    I = torch.eye(dim)
-    Q_check = torch.matmul(Q.H, Q).real
-    
-    ortho_error = (Q_check - I).abs().max().item()
-    print(f"Orthogonality Error (Q^H Q - I): {ortho_error:.6e}")
-    
-    if ortho_error < 1e-5:
-        print("[PASS] Basis is orthogonal.")
-    else:
-        print("[FAIL] Basis is not orthogonal.")
-        
     dt = torch.tensor(1.0)
-    _, _, evo_diag, _, _ = prop.get_operators(dt)
+    C_op, B_op, A_op, dt_eff = prop.get_operators(dt)
     
-    max_amp = evo_diag.abs().max().item()
-    min_amp = evo_diag.abs().min().item()
+    if C_op is None:
+        print("[PASS] C_op is None (Identity Output).")
+    else:
+        print(f"[INFO] C_op shape: {C_op.shape}")
+        
+    if B_op is not None:
+        print(f"[PASS] B_op (Input Valve) generated with shape: {B_op.shape}")
+        if B_op.max() > 2.1:
+            print("[WARN] Valve gain unusually high.")
+        else:
+            print("[PASS] Valve gain within expected range.")
+            
+    max_amp = A_op.abs().max().item()
+    min_amp = A_op.abs().min().item()
     
     print(f"Evolution Eigenvalues Max Amp: {max_amp:.6f}")
     print(f"Evolution Eigenvalues Min Amp: {min_amp:.6f}")
@@ -68,25 +41,6 @@ def check_propagator_stability():
         print("[PASS] Evolution is stable (non-exploding).")
     else:
         print("[FAIL] Evolution eigenvalues imply explosion.")
-
-def check_flux_conservation():
-    print("\n--- Checking Flux Conservation ---")
-    dim = 16
-    layer = FluxConservingSwiGLU(dim, dim * 2)
-    x = torch.randn(2, dim, 32, 32) + 5.0 
-    
-    out = layer(x)
-    mean_out = out.mean()
-    
-    diff = abs(mean_out).item()
-    print(f"Input Mean: {x.mean():.6f}")
-    print(f"Output Mean (Delta): {mean_out:.6f}")
-    print(f"Difference from Zero: {diff:.6e}")
-    
-    if diff < 1e-5:
-        print("[PASS] Global flux update is zero-mean (conserved).")
-    else:
-        print("[FAIL] Significant mean drift detected.")
 
 def check_riemannian_metric():
     print("\n--- Checking Riemannian Metric Positivity ---")
@@ -159,82 +113,33 @@ def check_global_constraint():
     else:
         print("[FAIL] Global constraint failed.")
 
-def check_source_sink_stability():
-    print("\n--- Checking Source/Sink Feedback Stability (Zero-Init) ---")
-    dim = 64
-    H, W = 32, 32
-    steps = 100
+def check_model_stability_simulation():
+    print("\n--- Checking Whole Model Long-term Stability ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = UniPhyParaPool(dim, expand=4).to(device)
-    
+    if device.type == 'cpu':
+        print("[INFO] Skipping simulation on CPU.")
+        return
+
+    B, T, C, H, W = 1, 10, 2, 16, 16
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W).to(device)
     model.eval()
     
-    x = torch.randn(1, dim, H, W, device=device)
-    x = x / x.std()
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.tensor(0.1, device=device)
     
-    energies = []
-    
-    print(f"Initial Energy: {x.std().item():.4f}")
-    
-    with torch.no_grad():
-        for t in range(steps):
-            delta = model(x)
-            x = x + delta
-            
-            curr_energy = x.std().item()
-            curr_max = x.abs().max().item()
-            energies.append(curr_energy)
-            
-            if curr_max > 1e4:
-                print(f"[FAIL] System exploded at step {t}")
-                return
-
-    growth_ratio = energies[-1] / energies[0]
-    print(f"Final Energy Growth Ratio (100 steps): {growth_ratio:.4f}x")
-    
-    if growth_ratio < 1.1:
-        print("[PASS] Zero-Init effective. Model starts as identity mapping.")
-    elif growth_ratio > 50.0:
-        print("[FAIL] Energy growth is too fast.")
-    else:
-        print("[PASS] Energy growth is within physical limits.")
-
-def check_damping_learnability():
-    print("\n--- Checking Damping Capability (Sink Mechanism) ---")
-    dim = 64
-    H, W = 16, 16
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = UniPhyParaPool(dim, expand=4).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    
-    x_fixed = torch.randn(1, dim, H, W, device=device)
-    x_fixed = x_fixed / x_fixed.std()
-    
-    initial_energy = x_fixed.std().item()
-    print(f"Goal: Learn to suppress energy. Initial: {initial_energy:.4f}")
-    
-    for step in range(100):
-        optimizer.zero_grad()
-        delta = model(x_fixed)
-        x_next = x_fixed + delta
-        loss = (x_next ** 2).mean()
-        loss.backward()
-        optimizer.step()
-    
-    with torch.no_grad():
-        delta_final = model(x_fixed)
-        final_energy = (x_fixed + delta_final).std().item()
-        cos_sim = torch.nn.functional.cosine_similarity(delta_final.flatten(), x_fixed.flatten(), dim=0)
+    try:
+        with torch.no_grad():
+            out = model(x, dt)
         
-    print(f"Final Energy: {final_energy:.4f} (from {initial_energy:.4f})")
-    print(f"Cosine Sim (Delta vs Input): {cos_sim.item():.4f}")
-    
-    if final_energy < initial_energy * 0.2 and cos_sim < -0.9:
-        print("[PASS] Model successfully learned to act as a Sink.")
-    else:
-        print("[FAIL] Model failed to learn damping.")
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            print("[FAIL] Model output contains NaN or Inf.")
+        else:
+            print("[PASS] Model forward pass is numerically stable.")
+            
+    except Exception as e:
+        print(f"[FAIL] Simulation error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def manual_sequential_forward(model, x, dt):
     B, T, C, H, W = x.shape
@@ -242,7 +147,7 @@ def manual_sequential_forward(model, x, dt):
     z = model.encoder(x)
     
     for block in model.blocks:
-        resid = z
+        residual = z
         
         B_z, T_z, D_z, H_z, W_z = z.shape
         z_flat = z.view(B_z * T_z, D_z, H_z, W_z)
@@ -261,56 +166,90 @@ def manual_sequential_forward(model, x, dt):
         out_spec = block.spatial_spec(z_norm_c)
         
         z_s = block.spatial_gate * out_cliff_c + (1.0 - block.spatial_gate) * out_spec
-        z = z_s.view(B_z, T_z, D_z, H_z, W_z) + resid
+        z = z_s.view(B_z, T_z, D_z, H_z, W_z) + residual
         
-        resid = z
+        residual = z
         
         z_perm = z.permute(0, 1, 3, 4, 2)
         z_cat = torch.cat([z_perm.real, z_perm.imag], dim=-1)
         z_norm = block.norm_temporal(z_cat)
         r, i = torch.chunk(z_norm, 2, dim=-1)
-        z_norm_c = torch.complex(r, i).permute(0, 1, 4, 2, 3)
+        z_in = torch.complex(r, i).permute(0, 1, 4, 2, 3)
         
-        V, V_inv, evo_diag, dt_eff, input_gain = block.prop.get_operators(dt, x_context=z_norm_c)
+        C_op, B_op, A_op, dt_eff = block.prop.get_operators(dt, x_context=z_in)
         
-        if input_gain.ndim == 3:
-            input_gain = input_gain.unsqueeze(-1).unsqueeze(-1)
-        
-        z_forced = z_norm_c * input_gain
-        
-        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).expand(B_z, H_z, W_z, T_z, D_z)
-        evo_diag_flat = evo_diag_expanded.reshape(B_z * H_z * W_z, T_z, D_z)
-        
-        z_t = z_forced.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
+        if B_op is None:
+            u = z_in
+        elif B_op.ndim >= 2 and B_op.shape[-1] == D_z and B_op.shape[-2] == D_z:
+             z_flat_t = z_in.permute(0, 3, 4, 1, 2).reshape(B_z*H_z*W_z, T_z, D_z)
+             if not B_op.is_complex():
+                 B_op = B_op.to(dtype=z_in.dtype)
+             u_flat = torch.matmul(z_flat_t, B_op.transpose(-1, -2)) 
+             u = u_flat.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
+        else:
+             if B_op.ndim == 3: 
+                 B_op_cast = B_op.unsqueeze(-1).unsqueeze(-1)
+             elif B_op.ndim == z_in.ndim:
+                 B_op_cast = B_op
+             else:
+                 B_op_cast = B_op
+                 
+             if not B_op_cast.is_complex() and z_in.is_complex():
+                 B_op_cast = B_op_cast.to(dtype=z_in.dtype)
+                 
+             u = z_in * B_op_cast
+
+        if A_op.ndim == 5:
+            A_expanded = A_op.expand(B_z, H_z, W_z, T_z, D_z)
+        elif A_op.ndim == 3:
+            A_expanded = A_op.unsqueeze(1).unsqueeze(1).expand(B_z, H_z, W_z, T_z, D_z)
+        else:
+            A_expanded = A_op.view(B_z, 1, 1, -1, D_z).expand(B_z, H_z, W_z, T_z, D_z)
+            
+        A_flat = A_expanded.reshape(B_z * H_z * W_z, T_z, D_z)
+        u_t = u.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
         
         h_eigen_list = []
-        h_state = torch.zeros(B_z * H_z * W_z, D_z, dtype=z_t.dtype, device=z_t.device)
+        h_state = torch.zeros(B_z * H_z * W_z, D_z, dtype=u_t.dtype, device=u_t.device)
         
         for t in range(T_z):
-            A_t = evo_diag_flat[:, t, :]
-            u_t = z_t[:, t, :]
-            h_state = A_t * h_state + u_t
+            A_val = A_flat[:, t, :]
+            u_val = u_t[:, t, :] 
+            h_state = A_val * h_state + u_val
             h_eigen_list.append(h_state)
             
-        h_eigen = torch.stack(h_eigen_list, dim=1)
+        h = torch.stack(h_eigen_list, dim=1)
         
-        x_drift = h_eigen.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
+        if C_op is None:
+            y = h
+        else:
+            if not C_op.is_complex():
+                 C_op = C_op.to(dtype=y.dtype)
+            y = torch.matmul(h, C_op.transpose(-1, -2))
+            
+        x_drift = y.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
         noise = block.prop.inject_noise(z, dt_eff)
         
-        z = x_drift + noise + resid
+        z = x_drift + noise + residual
         
-        resid = z
+        residual = z
         
-        x_p = z.permute(0, 1, 3, 4, 2)
-        x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
-        B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
-        x_p_in = x_p_flat.view(B_p * T_p, H_p, W_p, C_p).permute(0, 3, 1, 2)
+        if z.shape[2] == block.dim * 2 or z.shape[2] == block.dim:
+             z_in = z.permute(0, 1, 3, 4, 2)
+        else:
+             z_in = z
+             
+        z_cat = torch.cat([z_in.real, z_in.imag], dim=-1)
+        z_norm = block.mlp_norm(z_cat)
+        z_mlp = block.mlp(z_norm)
         
-        x_pool_out = block.para_pool(x_p_in)
+        z_r, z_i = torch.chunk(z_mlp, 2, dim=-1)
+        z_out = torch.complex(z_r, z_i)
         
-        x_pool_out = x_pool_out.permute(0, 2, 3, 1).view(B_p, T_p, H_p, W_p, C_p)
-        r, i = torch.chunk(x_pool_out, 2, dim=-1)
-        z = torch.complex(r, i).permute(0, 1, 4, 2, 3) + resid
+        if z_out.ndim == 5 and z_out.shape[1] == T_z and z_out.shape[2] == H_z:
+             z_out = z_out.permute(0, 1, 4, 2, 3)
+             
+        z = z + z_out
         
     out = model.decoder(z, x)
     return out
@@ -362,14 +301,11 @@ def check_model_equivalence():
             print("[FAIL] Divergence detected between parallel and sequential modes.")
 
 if __name__ == "__main__":
-    check_symplectic_conservation()
     check_propagator_stability()
-    check_flux_conservation()
     check_riemannian_metric()
     check_global_constraint()
     if torch.cuda.is_available():
-        check_source_sink_stability()
-        check_damping_learnability()
+        check_model_stability_simulation()
         check_pscan_unit_test()
         check_model_equivalence()
     else:

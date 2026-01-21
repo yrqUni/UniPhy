@@ -3,8 +3,7 @@ import torch.nn as nn
 
 from PScan import PScanTriton
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
-from UniPhyOps import MetriplecticPropagator, RiemannianCliffordConv2d, SpectralStep
-from UniPhyParaPool import UniPhyParaPool
+from UniPhyOps import MetriplecticPropagator, RiemannianCliffordConv2d, SpectralStep, GatedChannelMixer
 
 class UniPhyBlock(nn.Module):
     def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4, dropout=0.0):
@@ -28,23 +27,8 @@ class UniPhyBlock(nn.Module):
         self.prop = MetriplecticPropagator(dim, img_height, img_width, dt_ref=1.0, stochastic=True)
         self.pscan = PScanTriton()
 
-        self.para_pool = UniPhyParaPool(dim * 2, expand=expand)
-
-    def _complex_norm(self, z, norm_layer):
-        z_cat = torch.cat([z.real, z.imag], dim=-1)
-        z_norm = norm_layer(z_cat)
-        r, i = torch.chunk(z_norm, 2, dim=-1)
-        return torch.complex(r, i)
-
-    def _spatial_op(self, x):
-        x_real_imag = torch.cat([x.real, x.imag], dim=1)
-        out_cliff = self.spatial_cliff(x_real_imag)
-        r, i = torch.chunk(out_cliff, 2, dim=1)
-        out_cliff_c = torch.complex(r, i)
-        
-        out_spec = self.spatial_spec(x)
-        
-        return self.spatial_gate * out_cliff_c + (1.0 - self.spatial_gate) * out_spec
+        self.mlp_norm = nn.LayerNorm(dim * 2)
+        self.mlp = GatedChannelMixer(dim * 2, expand=expand, dropout=dropout)
 
     def forward(self, x, dt):
         B, T, C, H, W = x.shape
@@ -61,7 +45,6 @@ class UniPhyBlock(nn.Module):
         out_cliff = self.spatial_cliff(x_cat_conv)
         r_c, i_c = torch.chunk(out_cliff, 2, dim=1)
         out_cliff_c = torch.complex(r_c, i_c)
-        
         out_spec = self.spatial_spec(x_norm_c)
         
         z = self.spatial_gate * out_cliff_c + (1.0 - self.spatial_gate) * out_spec
@@ -73,40 +56,73 @@ class UniPhyBlock(nn.Module):
         z_cat = torch.cat([z_perm.real, z_perm.imag], dim=-1)
         z_norm = self.norm_temporal(z_cat)
         r, i = torch.chunk(z_norm, 2, dim=-1)
-        z_norm_c = torch.complex(r, i).permute(0, 1, 4, 2, 3)
+        z_in = torch.complex(r, i).permute(0, 1, 4, 2, 3)
         
-        V, V_inv, evo_diag, dt_eff, input_gain = self.prop.get_operators(dt, x_context=z_norm_c)
+        C_op, B_op, A_op, dt_eff = self.prop.get_operators(dt, x_context=z_in)
         
-        if input_gain.ndim == 3:
-            input_gain = input_gain.unsqueeze(-1).unsqueeze(-1)
-        z_forced = z_norm_c * input_gain
+        if B_op is None:
+            u = z_in
+        elif B_op.ndim >= 2 and B_op.shape[-1] == C and B_op.shape[-2] == C:
+             z_flat = z_in.permute(0, 3, 4, 1, 2).reshape(B*H*W, T, C)
+             if not B_op.is_complex():
+                 B_op = B_op.to(dtype=z_in.dtype)
+             u_flat = torch.matmul(z_flat, B_op.transpose(-1, -2)) 
+             u = u_flat.view(B, H, W, T, C).permute(0, 3, 4, 1, 2)
+        else:
+             if B_op.ndim == 3:
+                 B_op_cast = B_op.unsqueeze(-1).unsqueeze(-1)
+             elif B_op.ndim == z_in.ndim:
+                 B_op_cast = B_op
+             else:
+                 B_op_cast = B_op
+                 
+             if not B_op_cast.is_complex() and z_in.is_complex():
+                 B_op_cast = B_op_cast.to(dtype=z_in.dtype)
+                 
+             u = z_in * B_op_cast
 
-        z_t = z_forced.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
+        u_t = u.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
         
-        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, C)
-        evo_diag_flat = evo_diag_expanded.reshape(B * H * W, T, C)
+        if A_op.ndim == 5:
+            A_expanded = A_op.expand(B, H, W, T, C)
+        elif A_op.ndim == 3:
+            A_expanded = A_op.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, C)
+        else:
+            A_expanded = A_op.view(B, 1, 1, -1, C).expand(B, H, W, T, C)
+            
+        A_flat = A_expanded.reshape(B * H * W, T, C)
+        h = self.pscan(A_flat, u_t)
         
-        h_eigen = self.pscan(evo_diag_flat, z_t)
-        
-        x_drift = h_eigen.view(B, H, W, T, C).permute(0, 3, 4, 1, 2)
-        
+        if C_op is None:
+            y = h
+        else:
+            if not C_op.is_complex():
+                 C_op = C_op.to(dtype=y.dtype)
+            y = torch.matmul(h, C_op.transpose(-1, -2))
+            
+        x_drift = y.view(B, H, W, T, C).permute(0, 3, 4, 1, 2)
         noise = self.prop.inject_noise(z, dt_eff)
+        
         x = x_drift + noise + residual
         
         residual = x
         
-        x_p = x.permute(0, 1, 3, 4, 2)
-        x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
+        if x.shape[2] == self.dim * 2 or x.shape[2] == self.dim:
+             x_in = x.permute(0, 1, 3, 4, 2)
+        else:
+             x_in = x
+             
+        x_cat = torch.cat([x_in.real, x_in.imag], dim=-1)
+        x_norm = self.mlp_norm(x_cat)
+        x_mlp = self.mlp(x_norm)
         
-        B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
-        x_p_in = x_p_flat.view(B_p * T_p, H_p, W_p, C_p).permute(0, 3, 1, 2)
+        x_r, x_i = torch.chunk(x_mlp, 2, dim=-1)
+        x_out = torch.complex(x_r, x_i)
         
-        x_pool_out = self.para_pool(x_p_in)
-        
-        x_pool_out = x_pool_out.permute(0, 2, 3, 1).view(B_p, T_p, H_p, W_p, C_p)
-        r, i = torch.chunk(x_pool_out, 2, dim=-1)
-        x = torch.complex(r, i).permute(0, 1, 4, 2, 3) + residual
-        
+        if x_out.ndim == 5 and x_out.shape[1] == T and x_out.shape[2] == H:
+             x_out = x_out.permute(0, 1, 4, 2, 3)
+             
+        x = x + x_out
         return x
 
 class UniPhyModel(nn.Module):
@@ -122,12 +138,10 @@ class UniPhyModel(nn.Module):
         w_dim = (img_width + pad_w) // patch_size
         
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        
         self.blocks = nn.ModuleList([
             UniPhyBlock(embed_dim, h_dim, w_dim, dropout=dropout) 
             for _ in range(depth)
         ])
-        
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
 
     def forward(self, x, dt):
