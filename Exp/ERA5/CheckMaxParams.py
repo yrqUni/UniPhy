@@ -27,7 +27,6 @@ def get_args():
     parser.add_argument("--dim_step", type=int, default=64)
     parser.add_argument("--search_layers", type=int, nargs='+', default=[4, 6, 8, 12, 16, 24])
     parser.add_argument("--patch_size", type=int, default=16)
-    parser.add_argument("--ensemble_size", type=int, default=1)
     return parser.parse_args()
 
 def format_count(num):
@@ -50,12 +49,11 @@ def check_config_fit(args, dim, layers, device):
         model = UniPhyModel(
             in_channels=args.C,
             out_channels=args.C,
-            dim=dim,
+            embed_dim=dim,
             depth=layers,
             patch_size=args.patch_size,
             img_height=args.H,
             img_width=args.W,
-            ensemble_size=args.ensemble_size
         ).to(device)
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -18,17 +18,6 @@ def scan_combine(ar, ai, xr, xi, br, bi, yr, yi):
     new_xi = bx_i + yi
     return new_ar, new_ai, new_xr, new_xi
 
-def get_autotune_configs():
-    return [
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ]
-
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=['L'],
-)
 @triton.jit
 def pscan_kernel(
     A_ptr, X_ptr, Y_ptr, 
@@ -77,12 +66,7 @@ class _PScanFunction(torch.autograd.Function):
         Y_real = torch.empty_like(X_real)
         
         BLOCK_SIZE = max(16, next_power_of_2(L))
-        
-        pscan_kernel[(A_flat.shape[0],)](
-            A_real, X_real, Y_real, 
-            A_real.stride(0), A_real.stride(1), 
-            L, BLOCK_SIZE, False
-        )
+        pscan_kernel[(A_flat.shape[0],)](A_real, X_real, Y_real, A_real.stride(0), A_real.stride(1), L, BLOCK_SIZE, False)
         
         Y = torch.view_as_complex(Y_real).view(*A_in.shape).transpose(1, -1)
         ctx.save_for_backward(A, Y)
@@ -102,12 +86,7 @@ class _PScanFunction(torch.autograd.Function):
         Y_real = torch.empty_like(X_real)
         
         BLOCK_SIZE = max(16, next_power_of_2(L))
-        
-        pscan_kernel[(A_flat.shape[0],)](
-            A_real, X_real, Y_real, 
-            A_real.stride(0), A_real.stride(1), 
-            L, BLOCK_SIZE, True
-        )
+        pscan_kernel[(A_flat.shape[0],)](A_real, X_real, Y_real, A_real.stride(0), A_real.stride(1), L, BLOCK_SIZE, True)
         
         dX = torch.view_as_complex(Y_real).view(*A_in.shape).transpose(1, -1)
         

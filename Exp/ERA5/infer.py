@@ -7,6 +7,7 @@ import imageio
 from types import SimpleNamespace
 from tqdm import tqdm
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../Model/UniPhy")))
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
@@ -95,13 +96,12 @@ def main():
     model = UniPhyModel(
         in_channels=args.in_channels,
         out_channels=args.out_channels,
-        dim=args.embed_dim,
+        embed_dim=args.embed_dim,
         depth=args.depth,
         patch_size=args.patch_size,
         img_height=args.img_height,
         img_width=args.img_width,
-        dropout=args.dropout,
-        ensemble_size=args.ensemble_size
+        dropout=args.dropout
     ).to(device)
 
     if os.path.exists(args.checkpoint_path):

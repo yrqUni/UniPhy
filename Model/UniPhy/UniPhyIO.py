@@ -83,7 +83,7 @@ class GlobalConservationConstraint(nn.Module):
         
         return pred - (diff * mask)
 
-class UniPhyInputEmbedding(nn.Module):
+class UniPhyEncoder(nn.Module):
     def __init__(self, in_ch, embed_dim, patch_size=16, img_height=64, img_width=64):
         super().__init__()
         self.patch_size = patch_size
@@ -122,7 +122,7 @@ class UniPhyInputEmbedding(nn.Module):
         return out
 
 class UniPhyEnsembleDecoder(nn.Module):
-    def __init__(self, latent_dim, out_ch, ensemble_size=10, patch_size=16, model_channels=128, img_height=64):
+    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10, img_height=64):
         super().__init__()
         self.patch_size = patch_size
         self.padder = FlexiblePadder(patch_size, mode='replicate')
@@ -142,9 +142,8 @@ class UniPhyEnsembleDecoder(nn.Module):
     def forward(self, z_latent, x_ref, member_idx=None):
         is_5d = x_ref.ndim == 5
         if is_5d:
-            B, _, C, H, W = x_ref.shape
-            T = z_latent.shape[1]
-            z_flat = z_latent.reshape(B * T, *z_latent.shape[2:])
+            B, T, C, H, W = x_ref.shape
+            z_flat = z_latent.view(B * T, *z_latent.shape[2:])
         else:
             B, C, H, W = x_ref.shape
             T = 1
