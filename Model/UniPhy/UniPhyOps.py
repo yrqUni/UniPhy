@@ -112,6 +112,8 @@ class SpectralNoiseInjector(nn.Module):
         
         if isinstance(dt, torch.Tensor) and dt.ndim == 4:
             dt_cast = dt.unsqueeze(1)
+        elif isinstance(dt, torch.Tensor) and dt.ndim == 5:
+            dt_cast = dt
         else:
             dt_cast = dt
 
@@ -165,6 +167,13 @@ class CFLTimeWarper(nn.Module):
             x_in = torch.cat([x_in.real, x_in.imag], dim=1)
         
         alpha = self.cfl_estimator(x_in).view(B, T, 1, 1, 1)
+        
+        if isinstance(dt_ref, torch.Tensor):
+            if dt_ref.ndim == 2 and dt_ref.shape[:2] == (B, T):
+                 dt_ref = dt_ref.view(B, T, 1, 1, 1)
+            elif dt_ref.ndim == 0:
+                 dt_ref = dt_ref.view(1, 1, 1, 1, 1)
+
         dt_constrained = alpha * torch.minimum(dt_ref, dt_max)
         
         return dt_constrained
@@ -235,14 +244,14 @@ class MetriplecticPropagator(nn.Module):
             if A_op.shape[0] == z_in.shape[0]:
                 A_op = torch.cat([A_op, A_op], dim=0)
             
-            if B_op.shape[0] == z_in.shape[0]:
+            if B_op is not None and B_op.shape[0] == z_in.shape[0]:
                 B_op = torch.cat([B_op, B_op], dim=0)
         else:
             u_in = z_in
 
         z_fft = torch.fft.rfft2(u_in, norm='ortho')
 
-        if B_op.ndim == 3:
+        if B_op is not None and B_op.ndim == 3:
              u_fft = z_fft * B_op.unsqueeze(-1).unsqueeze(-1)
         else:
              u_fft = z_fft
