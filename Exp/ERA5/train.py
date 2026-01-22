@@ -116,7 +116,7 @@ class Args:
         self.grad_clip = 0.0
         self.grad_accum_steps = 1
         self.log_every = 1
-        self.wandb_every = 10
+        self.wandb_every = 1
         self.image_log_every = 500
         self.ckpt_step = 0.5
         self.log_path = "./uniphy/logs"
