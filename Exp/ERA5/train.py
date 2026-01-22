@@ -276,22 +276,19 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         year_range=args.year_range,
         is_train=True,
         sample_len=args.train_data_n_frames,
-        eval_sample=args.eval_sample_num
-    )
+        look_ahead=2)
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_ds,
         shuffle=False, 
-        drop_last=True
-    )
+        drop_last=True)
     train_loader = DataLoader(
         train_ds,
         sampler=train_sampler,
         batch_size=args.train_batch_size,
-        num_workers=1,
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=2,
-        persistent_workers=True
-    )
+        persistent_workers=True)
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [
