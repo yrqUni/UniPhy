@@ -65,7 +65,8 @@ class ComplexPLUTransform(nn.Module):
         L, U = self._mat()
         L_inv = torch.linalg.solve_triangular(L, torch.eye(self.dim, device=x.device, dtype=L.dtype), upper=False)
         U_inv = torch.linalg.solve_triangular(U, torch.eye(self.dim, device=x.device, dtype=U.dtype), upper=True)
-        return torch.matmul(x[..., self.inv_perm_idx], (U_inv @ L_inv).T)
+        mat_inv = U_inv @ L_inv
+        return torch.matmul(x[..., self.inv_perm_idx].to(mat_inv.dtype), mat_inv.T)
 
     def decode(self, x):
         L, U = self._mat()
@@ -102,14 +103,14 @@ class TemporalPropagator(nn.Module):
         phi1 = torch.where(mask, 1.0 + 0.5 * Z, torch.expm1(Z) / torch.where(mask, torch.ones_like(Z), Z))
         return torch.exp(Z), phi1 * (dt_eff.unsqueeze(-1) * self.dt_ref)
 
-    def generate_stochastic_term(self, target_shape, dt):
+    def generate_stochastic_term(self, target_shape, dt, dtype):
         if not self.training or self.noise_scale <= 0:
-            return torch.zeros(target_shape, device=self.ld.device, dtype=torch.cfloat)
+            return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         l_re = -torch.exp(self.ld)
         var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1)) / (2 * l_re)
-        std = torch.sqrt(torch.abs(var))
-        noise = torch.randn(target_shape, device=self.ld.device, dtype=torch.cfloat)
+        std = torch.sqrt(torch.abs(var)).to(dtype)
+        noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
     def forward(self, h_prev, x_input, dt):
@@ -118,6 +119,6 @@ class TemporalPropagator(nn.Module):
         op_decay, op_forcing = self.get_transition_operators(dt)
         source = self._get_source_law(h_tilde)
         h_tilde_next = h_tilde * op_decay + (x_tilde + source) * op_forcing
-        h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt)
+        h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
         return self.basis.decode(h_tilde_next)
     
