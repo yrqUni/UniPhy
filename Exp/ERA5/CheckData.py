@@ -1,81 +1,47 @@
 import os
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, DistributedSampler
+import time
+from torch.utils.data import DataLoader
 from ERA5 import ERA5_Dataset
+from rich.console import Console
+from rich.table import Table
 
-def check_dataset_consistency():
+console = Console()
+
+def test_speed(num_workers):
     input_dir = '/nfs/ERA5_data/data_norm'
-    sample_len = 8
     batch_size = 2
-    
-    dataset = ERA5_Dataset(
-        input_dir=input_dir,
-        year_range=[2000, 2001],
-        is_train=True,
-        sample_len=sample_len
-    )
-    
-    print(f"Dataset Length: {len(dataset)}")
-    
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
-    )
-    
-    for i, batch in enumerate(loader):
-        print(f"Batch {i} shape: {batch.shape}")
-        
-        if torch.isnan(batch).any():
-            print("Error: NaN detected")
-        
-        if i == 0:
-            first_sample = batch[0]
-            second_sample = batch[1]
-            diff = (first_sample[1:] - second_sample[:-1]).abs().sum()
-            print(f"Sequential overlap diff: {diff.item()}")
-            
-        if i >= 5:
-            break
+    steps = 40
 
-def check_ddp_sampling():
-    if not torch.cuda.is_available():
-        return
-        
-    world_size = 2
-    input_dir = '/nfs/ERA5_data/data_norm'
-    
-    dataset = ERA5_Dataset(
-        input_dir=input_dir,
-        year_range=[2000, 2002],
-        sample_len=4
+    dataset = ERA5_Dataset(input_dir=input_dir, year_range=[2000, 2000], sample_len=8)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, num_workers=num_workers,
+        pin_memory=True, persistent_workers=True
     )
+
+    latencies = []
+    it = iter(loader)
+    next(it) 
     
-    indices_rank0 = []
-    sampler0 = DistributedSampler(dataset, num_replicas=world_size, rank=0, shuffle=False, drop_last=True)
-    for idx in sampler0:
-        indices_rank0.append(idx)
-        
-    indices_rank1 = []
-    sampler1 = DistributedSampler(dataset, num_replicas=world_size, rank=1, shuffle=False, drop_last=True)
-    for idx in sampler1:
-        indices_rank1.append(idx)
-        
-    intersection = set(indices_rank0).intersection(set(indices_rank1))
-    print(f"Rank 0 indices count: {len(indices_rank0)}")
-    print(f"Rank 1 indices count: {len(indices_rank1)}")
-    print(f"Overlapping indices: {len(intersection)}")
+    for _ in range(steps):
+        t0 = time.perf_counter()
+        next(it)
+        latencies.append(time.perf_counter() - t0)
     
-    if len(intersection) == 0:
-        print("DDP Sampler check passed")
-    else:
-        print("DDP Sampler check failed")
+    avg_lat = np.mean(latencies)
+    fps = batch_size / avg_lat
+    return avg_lat, fps
 
 if __name__ == "__main__":
-    check_dataset_consistency()
-    check_ddp_sampling()
+    table = Table(title="Dataloader Optimization Test", header_style="bold magenta")
+    table.add_column("Workers", justify="center")
+    table.add_column("Latency (ms)", justify="right")
+    table.add_column("Throughput (samples/s)", justify="right")
+
+    for w in [2, 4, 8]:
+        lat, fps = test_speed(w)
+        table.add_row(str(w), f"{lat*1000:.1f}", f"{fps:.2f}")
+    
+    console.print(table)
 

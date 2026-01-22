@@ -3,6 +3,7 @@ import datetime
 import glob
 import logging
 import os
+import gc
 import random
 import sys
 import warnings
@@ -286,7 +287,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         train_ds,
         sampler=train_sampler,
         batch_size=args.train_batch_size,
-        num_workers=8,
+        num_workers=4,
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=True
