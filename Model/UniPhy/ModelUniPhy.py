@@ -43,7 +43,11 @@ class UniPhyBlock(nn.Module):
         resid = x
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
-        dt_expanded = torch.as_tensor(dt_step, device=x.device).view(B, 1, 1, 1).expand(B, H, W, 1).reshape(B * H * W, 1)
+        dt_t = torch.as_tensor(dt_step, device=x.device, dtype=x.real.dtype)
+        if dt_t.numel() == B:
+            dt_expanded = dt_t.view(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
+        else:
+            dt_expanded = dt_t.reshape(-1, 1)
         h_next = self.prop.forward(h_prev, x_t, dt_expanded)
         x_drift = h_next.real.view(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
         x = x_drift + resid

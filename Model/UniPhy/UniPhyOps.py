@@ -100,7 +100,7 @@ class TemporalPropagator(nn.Module):
         Lambda = self._get_effective_lambda()
         Z = Lambda * dt_eff.unsqueeze(-1)
         mask = torch.abs(Z) < 1e-4
-        phi1 = torch.where(mask, 1.0 + 0.5 * Z, torch.expm1(Z) / torch.where(mask, torch.ones_like(Z), Z))
+        phi1 = torch.where(mask, 1.0 + 0.5 * Z + (Z**2)/6.0, torch.expm1(Z) / torch.where(mask, torch.ones_like(Z), Z))
         return torch.exp(Z), phi1 * (dt_eff.unsqueeze(-1) * self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):

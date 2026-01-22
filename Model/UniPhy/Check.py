@@ -98,10 +98,9 @@ def check_full_model_consistency():
         B_z, T_z, D_z, H_z, W_z = z.shape
         h_curr = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.cdouble)
         z_seq_list = []
-        dt_expanded = dt.view(B, 1, 1, T).expand(B, H_z, W_z, T).reshape(B_z * H_z * W_z, T)
         for t in range(T_z):
             x_step = z[:, t]
-            dt_step = dt_expanded[:, t]
+            dt_step = dt[:, t]
             z_next, h_next = block.forward_step(x_step, h_curr, dt_step)
             z_seq_list.append(z_next)
             h_curr = h_next
