@@ -95,7 +95,7 @@ class Args:
         self.lr = 1e-5
         self.weight_decay = 0.05
         self.epochs = 100
-        self.grad_clip = 1.0
+        self.grad_clip = 0.0
         self.grad_accum_steps = 1
         self.log_every = 1
         self.wandb_every = 10
@@ -106,10 +106,10 @@ class Args:
         self.ckpt = ""
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 8
-        self.sample_k = 4
+        self.train_data_n_frames = 27
+        self.sample_k = 9
         self.eval_sample_num = 1
-        self.use_tf32 = True
+        self.use_tf32 = False
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
@@ -132,7 +132,8 @@ def setup_logging(args: Args) -> None:
 
 def setup_wandb(rank: int, args: Args) -> None:
     if rank != 0 or not bool(getattr(args, "use_wandb", False)): return
-    wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run_name, config=vars(args))
+    wandb_settings = wandb.Settings(_disable_stats=True, _disable_meta=True)
+    wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run_name, config=vars(args), settings=wandb_settings)
 
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
     return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
@@ -211,19 +212,19 @@ def log_vis_images(pred: torch.Tensor, target: torch.Tensor, step: int, rank: in
     target_img = target[idx, t_idx, c_idx].detach().cpu().numpy()
     diff_img = np.abs(pred_img - target_img)
     
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5), constrained_layout=True)
     
     im0 = axes[0].imshow(target_img, cmap='RdBu_r')
     axes[0].set_title(f"Target (T={t_idx})")
-    plt.colorbar(im0, ax=axes[0])
+    fig.colorbar(im0, ax=axes[0], fraction=0.025, pad=0.02)
     
     im1 = axes[1].imshow(pred_img, cmap='RdBu_r')
     axes[1].set_title(f"Prediction (T={t_idx})")
-    plt.colorbar(im1, ax=axes[1])
+    fig.colorbar(im1, ax=axes[1], fraction=0.025, pad=0.02)
     
     im2 = axes[2].imshow(diff_img, cmap='viridis')
     axes[2].set_title(f"Abs Diff (T={t_idx})")
-    plt.colorbar(im2, ax=axes[2])
+    fig.colorbar(im2, ax=axes[2], fraction=0.025, pad=0.02)
     
     wandb.log({"val/visualization": wandb.Image(fig), "train/step": step})
     plt.close(fig)
@@ -359,6 +360,9 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                     if train_step % save_interval == 0:
                         save_ckpt(model, opt, ep+1, train_step, loss.item(), args, scheduler)
+
+    if rank == 0 and args.use_wandb:
+        wandb.finish()
 
     cleanup_ddp()
 
