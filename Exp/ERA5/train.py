@@ -130,10 +130,25 @@ def setup_logging(args: Args) -> None:
     log_filename = os.path.join(args.log_path, f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     logging.basicConfig(filename=log_filename, level=logging.INFO, format="%(asctime)s - %(message)s")
 
-def setup_wandb(rank: int, args: Args) -> None:
+def setup_wandb(rank, args):
     if rank != 0 or not bool(getattr(args, "use_wandb", False)): return
-    wandb_settings = wandb.Settings(_disable_stats=True, _disable_meta=True)
-    wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run_name, config=vars(args), settings=wandb_settings)
+    
+    wandb_settings = wandb.Settings(
+        start_method="spawn",
+        _disable_stats=True,
+        _disable_meta=True,
+        init_timeout=300,
+        _internal_check_process_timeout=300
+    )
+    
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        config=vars(args),
+        settings=wandb_settings,
+        force=True
+    )
 
 def extract_model_args(args_obj: Any) -> Dict[str, Any]:
     return {k: getattr(args_obj, k) for k in MODEL_ARG_KEYS if hasattr(args_obj, k)}
