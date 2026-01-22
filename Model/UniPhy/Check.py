@@ -5,8 +5,8 @@ import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
-from UniPhyParaPool import UniPhyParaPool
+from UniPhyOps import TemporalPropagator
+from UniPhyFFN import UniPhyFeedForwardNetwork
 from ModelUniPhy import UniPhyModel
 
 def check_plu_invertibility():
@@ -22,7 +22,7 @@ def check_plu_invertibility():
 def check_parapool_conservation():
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pool = UniPhyParaPool(dim).to(device)
+    pool = UniPhyFeedForwardNetwork(dim).to(device)
     x = torch.randn(4, dim, 16, 16, device=device, dtype=torch.cdouble)
     delta = pool(x)
     mean_val = delta.mean(dim=(-2, -1)).abs().max().item()
