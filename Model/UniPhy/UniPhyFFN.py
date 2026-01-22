@@ -15,15 +15,11 @@ class ComplexFFN(nn.Module):
     def forward(self, z):
         dtype = self.w1_re.weight.dtype
         re, im = z.real.to(dtype), z.imag.to(dtype)
-        
         h_re = self.w1_re(re) - self.w1_im(im)
         h_im = self.w1_re(im) + self.w1_im(re)
-        
         h_re, h_im = F.silu(h_re), F.silu(h_im)
-        
         out_re = self.w2_re(h_re) - self.w2_im(h_im)
         out_im = self.w2_re(h_im) + self.w2_im(h_re)
-        
         return torch.complex(out_re, out_im)
 
 class UniPhyFeedForwardNetwork(nn.Module):

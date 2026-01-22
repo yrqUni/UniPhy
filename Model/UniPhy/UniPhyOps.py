@@ -86,18 +86,18 @@ class TemporalPropagator(nn.Module):
         self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_im = nn.Parameter(torch.randn(dim) * 0.01)
 
-    def _get_spectrum(self):
-        return torch.complex(-torch.exp(self.ld), self.lf)
+    def _get_effective_lambda(self):
+        l_phys = torch.complex(-torch.exp(self.ld), self.lf)
+        l_law = torch.complex(self.law_re, self.law_im)
+        return l_phys + l_law
 
-    def _get_source_law(self, h):
-        bias = torch.complex(self.src_re, self.src_im)
-        weight = torch.complex(self.law_re, self.law_im)
-        return h * weight + bias
+    def _get_source_bias(self):
+        return torch.complex(self.src_re, self.src_im)
 
     def get_transition_operators(self, dt):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         dt_eff = dt / self.dt_ref
-        Lambda = self._get_spectrum()
+        Lambda = self._get_effective_lambda()
         Z = Lambda * dt_eff.unsqueeze(-1)
         mask = torch.abs(Z) < 1e-4
         phi1 = torch.where(mask, 1.0 + 0.5 * Z, torch.expm1(Z) / torch.where(mask, torch.ones_like(Z), Z))
@@ -107,7 +107,7 @@ class TemporalPropagator(nn.Module):
         if not self.training or self.noise_scale <= 0:
             return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        l_re = -torch.exp(self.ld)
+        l_re = self._get_effective_lambda().real
         var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1)) / (2 * l_re)
         std = torch.sqrt(torch.abs(var)).to(dtype)
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
@@ -117,8 +117,8 @@ class TemporalPropagator(nn.Module):
         h_tilde = self.basis.encode(h_prev)
         x_tilde = self.basis.encode(x_input)
         op_decay, op_forcing = self.get_transition_operators(dt)
-        source = self._get_source_law(h_tilde)
-        h_tilde_next = h_tilde * op_decay + (x_tilde + source) * op_forcing
+        bias = self._get_source_bias()
+        h_tilde_next = h_tilde * op_decay + (x_tilde + bias) * op_forcing
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
         return self.basis.decode(h_tilde_next)
     
