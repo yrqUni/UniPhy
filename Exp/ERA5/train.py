@@ -279,7 +279,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     )
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_ds,
-        shuffle=True, 
+        shuffle=False, 
         drop_last=True
     )
     train_loader = DataLoader(
