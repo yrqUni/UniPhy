@@ -25,11 +25,11 @@ from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, T
 from rich.panel import Panel
 from rich.table import Table
 
-sys.path.append("/nfs/UniPhy/ModelUniPhy")
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
-from ModelUniPhy import UniPhy
+from ModelUniPhy import UniPhyModel
 
 warnings.filterwarnings("ignore")
 console = Console()
@@ -321,7 +321,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    model = UniPhy(args).cuda(local_rank)
+    model = UniPhyModel(args).cuda(local_rank)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     register_lru_gate_hooks(model)
 
