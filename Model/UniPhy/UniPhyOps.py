@@ -21,15 +21,15 @@ class RiemannianCliffordConv2d(nn.Module):
         self.groups = in_channels
 
     def forward(self, x):
-        base_log = self.log_metric_param
+        dtype = self.conv.weight.dtype
+        x = x.to(dtype)
+        base_log = self.log_metric_param.to(dtype)
         dynamic_log = self.metric_refiner(x) * 0.1
         effective_log_metric = base_log + dynamic_log
         scale = torch.exp(effective_log_metric)
         inv_scale = torch.exp(-effective_log_metric)
-        
-        kernel = self.laplacian_kernel.to(x.dtype)
+        kernel = self.laplacian_kernel.to(dtype)
         diffusion_term = F.conv2d(x, kernel, padding=1, groups=self.groups)
-        
         local_viscosity = self.viscosity_gate(x) * inv_scale
         x_diffused = x + diffusion_term * local_viscosity * 0.01
         x_scaled = x_diffused * scale
