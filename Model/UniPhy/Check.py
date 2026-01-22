@@ -5,7 +5,9 @@ import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from UniPhyOps import AnalyticSpectralPropagator
+from UniPhyOps import AnalyticSpectralPropagator, RiemannianCliffordConv2d
+from UniPhyParaPool import UniPhyParaPool, FluxConservingSwiGLU, SymplecticExchange
+from UniPhyIO import GlobalConservationConstraint
 from ModelUniPhy import UniPhyModel
 
 def check_plu_invertibility():
@@ -138,28 +140,47 @@ def check_variable_dt_broadcasting():
     else:
         print("[FAIL] Broadcasting logic error.")
 
-def check_full_model_adaptive_forward():
-    print("\n--- Checking Full Model Adaptive Forward ---")
+def check_pscan_adaptive_equivalence():
+    print("\n--- Checking PScan Adaptive dt Equivalence ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    if device.type == 'cpu':
+        print("[SKIP] PScan requires CUDA.")
+        return
+
     B, T, C, H, W = 1, 10, 2, 16, 16
-    model = UniPhyModel(in_channels=C, out_channels=C, img_height=H, img_width=W, depth=2).to(device).double()
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W).to(device).double()
     model.eval()
     
-    x = torch.randn(B, T, C, H, W, device=device)
+    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
+    dt_adaptive = torch.rand(B, T, device=device, dtype=torch.float64) + 0.1
     
-    dt_adaptive = torch.rand(B, T, device=device) * 2.0 + 0.1
+    with torch.no_grad():
+        out_parallel = model(x, dt_adaptive)
+        
+    z = model.encoder(x)
+    block = model.blocks[0]
     
-    try:
-        with torch.no_grad():
-            out = model(x, dt_adaptive)
-        print(f"Output Shape: {out.shape}")
-        if out.shape == x.shape:
-            print("[PASS] Full model accepts adaptive dt map.")
-        else:
-            print("[FAIL] Output shape mismatch.")
-    except Exception as e:
-        print(f"[FAIL] Forward execution error: {e}")
+    z_seq_list = []
+    B_z, T_z, D_z, H_z, W_z = z.shape
+    h_curr = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.complex128)
+    
+    for t in range(T_z):
+        x_step = z[:, t] 
+        dt_step = dt_adaptive[:, t] 
+        z_next, h_next = block.forward_step(x_step, h_curr, dt_step)
+        z_seq_list.append(z_next)
+        h_curr = h_next
+        
+    z_seq = torch.stack(z_seq_list, dim=1)
+    out_seq = model.decoder(z_seq, x)
+    
+    diff = (out_parallel - out_seq).abs().max().item()
+    print(f"PScan vs Sequential Error (Adaptive dt): {diff:.2e}")
+    
+    if diff < 1e-10:
+        print("[PASS] PScan correctly handles adaptive time steps.")
+    else:
+        print("[FAIL] PScan logic divergence.")
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
@@ -170,5 +191,5 @@ if __name__ == "__main__":
     check_forced_response_integral()
     check_adaptive_step_invariance()
     check_variable_dt_broadcasting()
-    check_full_model_adaptive_forward()
+    check_pscan_adaptive_equivalence()
 
