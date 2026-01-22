@@ -25,7 +25,7 @@ from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, T
 from rich.panel import Panel
 from rich.table import Table
 
-sys.path.append("/nfs/UniPhy/Model/UniPhy")
+sys.path.append("/nfs/UniPhy/ModelUniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
 from ERA5 import ERA5_Dataset
