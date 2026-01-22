@@ -6,8 +6,6 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from UniPhyOps import AnalyticSpectralPropagator, RiemannianCliffordConv2d
-from UniPhyParaPool import UniPhyParaPool, FluxConservingSwiGLU, SymplecticExchange
-from UniPhyIO import GlobalConservationConstraint
 from ModelUniPhy import UniPhyModel
 
 def check_plu_invertibility():
@@ -31,7 +29,8 @@ def check_semigroup_property():
     print("\n--- Checking Semigroup Property (Free Evolution) ---")
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim).to(device)
+    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
+    prop.eval()
     
     h0 = torch.randn(1, dim, device=device, dtype=torch.cfloat)
     x0 = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
@@ -57,7 +56,8 @@ def check_forced_response_integral():
     print("\n--- Checking Forced Response Integral ---")
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim).to(device)
+    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
+    prop.eval()
     
     h0 = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
     x_const = torch.randn(1, dim, device=device, dtype=torch.cfloat)
@@ -83,7 +83,8 @@ def check_adaptive_step_invariance():
     print("\n--- Checking Adaptive Step Invariance ---")
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim).to(device)
+    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
+    prop.eval()
     
     h0 = torch.randn(1, dim, device=device, dtype=torch.cfloat)
     x0 = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
@@ -118,7 +119,8 @@ def check_variable_dt_broadcasting():
     print("\n--- Checking Variable dt Broadcasting ---")
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim).to(device)
+    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
+    prop.eval()
     
     h = torch.randn(2, dim, device=device, dtype=torch.cfloat)
     x = torch.zeros(2, dim, device=device, dtype=torch.cfloat)
@@ -140,13 +142,38 @@ def check_variable_dt_broadcasting():
     else:
         print("[FAIL] Broadcasting logic error.")
 
+def check_stochasticity():
+    print("\n--- Checking Stochastic Noise Injection ---")
+    dim = 64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop = AnalyticSpectralPropagator(dim, noise_scale=0.1).to(device)
+    
+    h = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
+    x = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
+    dt = torch.tensor(1.0, device=device)
+    
+    prop.train()
+    out1 = prop(h, x, dt)
+    out2 = prop(h, x, dt)
+    
+    diff_train = (out1 - out2).abs().max().item()
+    print(f"Difference in Train Mode (Noise ON): {diff_train:.2e}")
+    
+    prop.eval()
+    out3 = prop(h, x, dt)
+    out4 = prop(h, x, dt)
+    diff_eval = (out3 - out4).abs().max().item()
+    print(f"Difference in Eval Mode (Noise OFF): {diff_eval:.2e}")
+    
+    if diff_train > 1e-6 and diff_eval < 1e-12:
+        print("[PASS] Stochasticity injection is working correctly.")
+    else:
+        print("[FAIL] Stochasticity check failed.")
+
 def check_pscan_adaptive_equivalence():
     print("\n--- Checking PScan Adaptive dt Equivalence ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == 'cpu':
-        print("[SKIP] PScan requires CUDA.")
-        return
-
+    
     B, T, C, H, W = 1, 10, 2, 16, 16
     model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W).to(device).double()
     model.eval()
@@ -191,6 +218,7 @@ if __name__ == "__main__":
     check_forced_response_integral()
     check_adaptive_step_invariance()
     check_variable_dt_broadcasting()
+    check_stochasticity()
     if torch.cuda.is_available():
         check_pscan_adaptive_equivalence()
 

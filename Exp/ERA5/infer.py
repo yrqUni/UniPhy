@@ -9,7 +9,6 @@ import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
-import xarray as xr
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -96,9 +95,20 @@ def main():
         year_range=args.year_range, 
         is_train=False,
         sample_len=args.cond_frames + args.pred_frames, 
-        eval_sample=1
+        eval_sample=1,
+        max_cache_size=8,
+        rank=0,
+        gpus=1
     )
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    test_loader = DataLoader(
+        test_ds, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=1,
+        pin_memory=True,
+        prefetch_factor=1,
+        persistent_workers=False
+    )
     
     lat_weights = get_lat_weights(model_args["img_height"], model_args["img_width"], device)
     

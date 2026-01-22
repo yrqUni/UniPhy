@@ -111,9 +111,9 @@ class Args:
         self.eval_sample_num = 1
         self.use_tf32 = True
         self.use_wandb = True
-        self.wandb_project = "ERA5"
+        self.wandb_project = "ERA5_UniPhy_Flow"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = self.ckpt
+        self.wandb_run_name = "AdaptiveFlow_Run"
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
@@ -257,7 +257,15 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size()
     )
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=False, drop_last=True)
-    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1, persistent_workers=False)
+    train_loader = DataLoader(
+        train_ds, 
+        sampler=train_sampler, 
+        batch_size=args.train_batch_size, 
+        num_workers=1, 
+        pin_memory=True, 
+        prefetch_factor=1, 
+        persistent_workers=False
+    )
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [

@@ -25,7 +25,7 @@ class UniPhyBlock(nn.Module):
         self.spatial_gate = nn.Parameter(torch.ones(1) * 0.5)
 
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = AnalyticSpectralPropagator(dim, dt_ref=1.0)
+        self.prop = AnalyticSpectralPropagator(dim, dt_ref=1.0, noise_scale=0.01)
         
         self.pscan = PScanTriton()
         
@@ -72,6 +72,10 @@ class UniPhyBlock(nn.Module):
         x_eigen = self.prop.basis.encode(x_t)
         
         h_next = h_prev.unsqueeze(1) * op_decay + x_eigen * op_forcing
+        
+        noise = self.prop.generate_stochastic_term(h_next.shape, dt_step, h_prev.device)
+        h_next = h_next + noise
+        
         h_next = h_next.squeeze(1)
         
         x_out_complex = self.prop.basis.decode(h_next.unsqueeze(1))
@@ -125,6 +129,9 @@ class UniPhyBlock(nn.Module):
         x_eigen = self.prop.basis.encode(x_t)
         
         u_t = x_eigen * op_forcing
+        
+        noise = self.prop.generate_stochastic_term(u_t.shape, dt, x.device)
+        u_t = u_t + noise
         
         h_eigen = self.pscan(op_decay, u_t)
         

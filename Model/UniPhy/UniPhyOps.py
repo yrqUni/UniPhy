@@ -83,10 +83,11 @@ class ComplexPLUTransform(nn.Module):
         return x_out
 
 class AnalyticSpectralPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0):
+    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
+        self.noise_scale = noise_scale
         self.basis = ComplexPLUTransform(dim)
         self.lambda_log_decay = nn.Parameter(torch.randn(dim) * 0.5 - 2.0) 
         self.lambda_freq = nn.Parameter(torch.randn(dim) * 1.0)
@@ -118,11 +119,33 @@ class AnalyticSpectralPropagator(nn.Module):
         op_forcing = self._safe_phi_1(Z) * dt_eff * self.dt_ref
         return op_decay, op_forcing
 
+    def generate_stochastic_term(self, shape, dt, device):
+        if not self.training or self.noise_scale <= 0:
+            return torch.zeros(shape, device=device, dtype=torch.cfloat)
+        
+        if isinstance(dt, torch.Tensor):
+            std = torch.sqrt(dt.abs() / self.dt_ref) * self.noise_scale
+            if std.ndim == 2:
+                std = std.view(shape[0], shape[1], 1)
+            elif std.ndim == 1:
+                std = std.view(-1, 1, 1)
+        else:
+            std = (dt / self.dt_ref)**0.5 * self.noise_scale
+            
+        noise = torch.randn(shape, device=device, dtype=torch.cfloat) * std
+        return noise
+
     def forward(self, h_prev, x_input, dt):
         h_tilde = self.basis.encode(h_prev)
         x_tilde = self.basis.encode(x_input)
+        
         op_decay, op_forcing = self.get_transition_operators(dt)
+        
         h_tilde_next = h_tilde * op_decay + x_tilde * op_forcing
+        
+        noise = self.generate_stochastic_term(h_tilde_next.shape, dt, h_prev.device)
+        h_tilde_next = h_tilde_next + noise
+        
         h_next = self.basis.decode(h_tilde_next)
         return h_next
 
