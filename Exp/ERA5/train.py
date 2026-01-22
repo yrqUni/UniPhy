@@ -287,7 +287,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         train_ds,
         sampler=train_sampler,
         batch_size=args.train_batch_size,
-        num_workers=4,
+        num_workers=1,
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=True

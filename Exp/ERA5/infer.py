@@ -102,7 +102,7 @@ def main():
             test_ds,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=1,
             pin_memory=True,
             prefetch_factor=2,
             persistent_workers=True
