@@ -27,7 +27,7 @@ class UniPhyBlock(nn.Module):
         
         self.pscan = PScanTriton()
         
-        self.f f n = UniPhyFeedForwardNetwork(dim, expand=expand)
+        self.ffn = UniPhyFeedForwardNetwork(dim, expand=expand)
         self.last_h_state = None
 
     def _complex_norm(self, z, norm_layer):
