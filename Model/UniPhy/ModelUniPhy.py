@@ -3,8 +3,8 @@ import torch.nn as nn
 
 from PScan import PScanTriton 
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
-from UniPhyOps import AnalyticSpectralPropagator, RiemannianCliffordConv2d, SpectralStep
-from UniPhyParaPool import UniPhyParaPool
+from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
+from UniPhyFFN import UniPhyFeedForwardNetwork
 
 class UniPhyBlock(nn.Module):
     def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4):
@@ -21,15 +21,13 @@ class UniPhyBlock(nn.Module):
             img_height=img_height,
             img_width=img_width 
         )
-        self.spatial_spec = SpectralStep(dim, img_height, img_width)
-        self.spatial_gate = nn.Parameter(torch.ones(1) * 0.5)
 
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = AnalyticSpectralPropagator(dim, dt_ref=1.0, noise_scale=0.01)
+        self.prop = TemporalPropagator(dim, dt_ref=1.0, noise_scale=0.01)
         
         self.pscan = PScanTriton()
         
-        self.para_pool = UniPhyParaPool(dim * 2, expand=expand)
+        self.f f n = UniPhyFeedForwardNetwork(dim, expand=expand)
         self.last_h_state = None
 
     def _complex_norm(self, z, norm_layer):
@@ -42,9 +40,7 @@ class UniPhyBlock(nn.Module):
         x_real_imag = torch.cat([x.real, x.imag], dim=1)
         out_cliff = self.spatial_cliff(x_real_imag)
         r, i = torch.chunk(out_cliff, 2, dim=1)
-        out_cliff_c = torch.complex(r, i)
-        out_spec = self.spatial_spec(x)
-        return self.spatial_gate * out_cliff_c + (1.0 - self.spatial_gate) * out_spec
+        return torch.complex(r, i)
 
     def forward_step(self, x_step, h_prev, dt_step):
         B, D, H, W = x_step.shape
@@ -59,37 +55,15 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         
-        op_decay, op_forcing = self.prop.get_transition_operators(dt_step)
+        dt_expanded = torch.as_tensor(dt_step, device=x.device).view(-1, 1).expand(B, 1).unsqueeze(1).expand(B, H, W, 1).reshape(B * H * W, 1)
         
-        target_shape = (B * H * W, 1, D)
-        if op_decay.shape[0] == B:
-             op_decay = op_decay.unsqueeze(1).unsqueeze(1).expand(B, H, W, D).reshape(*target_shape)
-             op_forcing = op_forcing.unsqueeze(1).unsqueeze(1).expand(B, H, W, D).reshape(*target_shape)
-        else:
-             op_decay = op_decay.view(1, 1, D).expand(*target_shape)
-             op_forcing = op_forcing.view(1, 1, D).expand(*target_shape)
-
-        x_eigen = self.prop.basis.encode(x_t)
+        h_next = self.prop.forward(h_prev, x_t, dt_expanded)
         
-        h_next = h_prev.unsqueeze(1) * op_decay + x_eigen * op_forcing
-        
-        noise = self.prop.generate_stochastic_term(h_next.shape, dt_step, h_prev.device)
-        h_next = h_next + noise
-        
-        h_next = h_next.squeeze(1)
-        
-        x_out_complex = self.prop.basis.decode(h_next.unsqueeze(1))
+        x_out_complex = h_next.unsqueeze(1)
         x_drift = x_out_complex.real.view(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
         
         x = x_drift + resid
-        resid = x
-        
-        x_p = x.permute(0, 2, 3, 1)
-        x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
-        x_pool_out = self.para_pool(x_p_flat.permute(0, 3, 1, 2))
-        x_pool_out = x_pool_out.permute(0, 2, 3, 1)
-        r, i = torch.chunk(x_pool_out, 2, dim=-1)
-        x = torch.complex(r, i).permute(0, 3, 1, 2) + resid
+        x = x + self.ffn(x)
         
         return x, h_next
 
@@ -107,51 +81,30 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         
-        op_decay, op_forcing = self.prop.get_transition_operators(dt)
+        dt_tensor = torch.as_tensor(dt, device=x.device)
+        dt_expanded = dt_tensor.view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
         
-        target_shape = (B * H * W, T, D)
+        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded)
         
-        if op_decay.shape[0] == B * T: 
-            op_decay = op_decay.view(B, T, D).unsqueeze(1).unsqueeze(1)
-            op_decay = op_decay.expand(B, H, W, T, D).reshape(*target_shape)
-            
-            op_forcing = op_forcing.view(B, T, D).unsqueeze(1).unsqueeze(1)
-            op_forcing = op_forcing.expand(B, H, W, T, D).reshape(*target_shape)
-            
-        elif op_decay.ndim == 3 and op_decay.shape[0] == B:
-            op_decay = op_decay.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, D).reshape(*target_shape)
-            op_forcing = op_forcing.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, D).reshape(*target_shape)
-            
-        else:
-            op_decay = op_decay.view(1, 1, D).expand(*target_shape)
-            op_forcing = op_forcing.view(1, 1, D).expand(*target_shape)
-            
         x_eigen = self.prop.basis.encode(x_t)
         
-        u_t = x_eigen * op_forcing
+        source = self.prop._get_source_law(x_eigen)
+        u_t = (x_eigen + source) * op_forcing
         
-        noise = self.prop.generate_stochastic_term(u_t.shape, dt, x.device)
+        noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded)
         u_t = u_t + noise
         
         h_eigen = self.pscan(op_decay, u_t)
-        
-        self.last_h_state = h_eigen[:, -1, :] 
+        self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
         
         x_t_out_complex = self.prop.basis.decode(h_eigen)
-        
         x_drift = x_t_out_complex.real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
         
-        resid = x
-        
-        x_p = x.permute(0, 1, 3, 4, 2) 
-        x_p_flat = torch.cat([x_p.real, x_p.imag], dim=-1)
-        B_p, T_p, H_p, W_p, C_p = x_p_flat.shape
-        x_p_in = x_p_flat.view(B_p * T_p, H_p, W_p, C_p).permute(0, 3, 1, 2)
-        x_pool_out = self.para_pool(x_p_in)
-        x_pool_out = x_pool_out.permute(0, 2, 3, 1).view(B_p, T_p, H_p, W_p, C_p)
-        r, i = torch.chunk(x_pool_out, 2, dim=-1)
-        x = torch.complex(r, i).permute(0, 1, 4, 2, 3) + resid
+        B_p, T_p, D_p, H_p, W_p = x.shape
+        x_in = x.view(B_p * T_p, D_p, H_p, W_p)
+        delta_p = self.ffn(x_in)
+        x = x + delta_p.view(B_p, T_p, D_p, H_p, W_p)
         
         return x
 
@@ -168,12 +121,10 @@ class UniPhyModel(nn.Module):
         w_dim = (img_width + pad_w) // patch_size
         
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        
         self.blocks = nn.ModuleList([
             UniPhyBlock(embed_dim, h_dim, w_dim) 
             for _ in range(depth)
         ])
-        
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
 
     def forward(self, x, dt):
@@ -184,7 +135,6 @@ class UniPhyModel(nn.Module):
         return out
         
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
-        B, L, C, H, W = x_cond.shape
         z = self.encoder(x_cond)
         
         states = []
@@ -215,4 +165,4 @@ class UniPhyModel(nn.Module):
             predictions.append(pred_pixel)
             
         return torch.stack(predictions, dim=1)
-
+    

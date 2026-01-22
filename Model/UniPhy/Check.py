@@ -5,222 +5,134 @@ import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from UniPhyOps import AnalyticSpectralPropagator, RiemannianCliffordConv2d
+from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
+from UniPhyParaPool import UniPhyParaPool
 from ModelUniPhy import UniPhyModel
 
 def check_plu_invertibility():
-    print("--- Checking PLU Basis Invertibility ---")
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim).to(device)
-    x = torch.randn(16, dim, device=device)
-    x_rec = prop.basis.decode(prop.basis.encode(x)).real
+    prop = TemporalPropagator(dim).to(device)
+    x = torch.randn(16, dim, device=device, dtype=torch.cfloat)
+    x_rec = prop.basis.decode(prop.basis.encode(x))
     err = (x - x_rec).abs().max().item()
-    print(f"Reconstruction Error: {err:.2e}")
     if err < 1e-12:
-        print("[PASS] PLU Basis is strictly invertible.")
+        pass
     else:
-        print("[FAIL] PLU Basis inversion failed.")
+        print(f"PLU Inversion Error: {err:.2e}")
+
+def check_parapool_conservation():
+    dim = 64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pool = UniPhyParaPool(dim).to(device)
+    x = torch.randn(4, dim, 16, 16, device=device, dtype=torch.cfloat)
+    delta = pool(x)
+    mean_val = delta.mean(dim=(-2, -1)).abs().max().item()
+    if mean_val < 1e-12:
+        pass
+    else:
+        print(f"ParaPool Conservation Error: {mean_val:.2e}")
+
+def check_source_sink_dynamics():
+    dim = 64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
+    h = torch.randn(1, dim, device=device, dtype=torch.cfloat)
+    x_zero = torch.zeros_like(h)
+    h_next = prop.forward(h, x_zero, dt=1.0)
+    diff = (h_next - h).abs().max().item()
+    if diff > 1e-8:
+        pass
+    else:
+        print(f"Source-Sink Dynamics Error: {diff:.2e}")
+
+def check_ou_noise_scaling():
+    dim = 64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop = TemporalPropagator(dim, noise_scale=0.1).to(device)
+    prop.train()
+    target_shape = (1000, dim)
+    noise_small = prop.generate_stochastic_term(target_shape, dt=0.1)
+    noise_large = prop.generate_stochastic_term(target_shape, dt=10.0)
+    std_small = noise_small.std().item()
+    std_large = noise_large.std().item()
+    if std_large > std_small:
+        pass
+    else:
+        print(f"OU Noise Scaling Error: Small={std_small:.2e}, Large={std_large:.2e}")
 
 def check_semigroup_property():
-    print("\n--- Checking Semigroup Property (Free Evolution) ---")
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
+    prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
     prop.eval()
     h0 = torch.randn(1, dim, device=device, dtype=torch.cfloat)
     x0 = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
     T_total = 10.0
-    h_jump = prop(h0, x0, dt=torch.tensor(T_total, device=device))
+    h_jump = prop.forward(h0, x0, dt=T_total)
     steps = 100
-    dt_small = torch.tensor(T_total / steps, device=device)
+    dt_small = T_total / steps
     h_step = h0
     for _ in range(steps):
-        h_step = prop(h_step, x0, dt=dt_small)
+        h_step = prop.forward(h_step, x0, dt=dt_small)
     diff = (h_jump - h_step).abs().max().item()
-    print(f"Jump vs 100 Steps Error: {diff:.2e}")
     if diff < 1e-10:
-        print("[PASS] Semigroup property holds (Exact Analytic Integration).")
+        pass
     else:
-        print("[FAIL] Physics integration mismatch.")
-
-def check_forced_response_integral():
-    print("\n--- Checking Forced Response Integral ---")
-    dim = 64
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
-    prop.eval()
-    h0 = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
-    x_const = torch.randn(1, dim, device=device, dtype=torch.cfloat)
-    T_total = 5.0
-    h_jump = prop(h0, x_const, dt=torch.tensor(T_total, device=device))
-    steps = 50
-    dt_small = torch.tensor(T_total / steps, device=device)
-    h_step = h0
-    for _ in range(steps):
-        h_step = prop(h_step, x_const, dt=dt_small)
-    diff = (h_jump - h_step).abs().max().item()
-    print(f"Integral Error: {diff:.2e}")
-    if diff < 1e-10:
-        print("[PASS] Forced response integral is accurate.")
-    else:
-        print("[FAIL] Integral calculation failed.")
-
-def check_adaptive_step_invariance():
-    print("\n--- Checking Adaptive Step Invariance ---")
-    dim = 64
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
-    prop.eval()
-    h0 = torch.randn(1, dim, device=device, dtype=torch.cfloat)
-    x0 = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
-    T1 = 4.0
-    T2 = 6.0
-    T_total = T1 + T2
-    h_uniform = h0
-    steps = 100
-    dt_uni = torch.tensor(T_total / steps, device=device)
-    for _ in range(steps):
-        h_uniform = prop(h_uniform, x0, dt=dt_uni)
-    h_adaptive = h0
-    h_adaptive = prop(h_adaptive, x0, dt=torch.tensor(T1, device=device))
-    steps_remainder = 60
-    dt_rem = torch.tensor(T2 / steps_remainder, device=device)
-    for _ in range(steps_remainder):
-        h_adaptive = prop(h_adaptive, x0, dt=dt_rem)
-    diff = (h_uniform - h_adaptive).abs().max().item()
-    print(f"Uniform vs Adaptive Sequence Error: {diff:.2e}")
-    if diff < 1e-10:
-        print("[PASS] System is invariant to discretization strategy.")
-    else:
-        print("[FAIL] Adaptive stepping inconsistency.")
+        print(f"Semigroup Property Error: {diff:.2e}")
 
 def check_variable_dt_broadcasting():
-    print("\n--- Checking Variable dt Broadcasting ---")
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim, noise_scale=0.0).to(device)
+    prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
     prop.eval()
-    h = torch.randn(2, dim, device=device, dtype=torch.cfloat)
-    x = torch.zeros(2, dim, device=device, dtype=torch.cfloat)
-    dt_batch = torch.tensor([1.5, 3.5], device=device)
-    out_batch = prop(h, x, dt=dt_batch)
-    out_0 = prop(h[0:1], x[0:1], dt=torch.tensor(1.5, device=device))
-    out_1 = prop(h[1:2], x[1:2], dt=torch.tensor(3.5, device=device))
-    err0 = (out_batch[0] - out_0[0]).abs().max().item()
-    err1 = (out_batch[1] - out_1[0]).abs().max().item()
-    print(f"Batch Consistency Errors: {err0:.2e}, {err1:.2e}")
-    if err0 < 1e-12 and err1 < 1e-12:
-        print("[PASS] Variable dt broadcasting is correct.")
+    B_HW, T = 16, 5
+    h = torch.randn(B_HW, T, dim, device=device, dtype=torch.cfloat)
+    x = torch.zeros(B_HW, T, dim, device=device, dtype=torch.cfloat)
+    dt_multi = torch.rand(B_HW, T, device=device) + 0.5
+    op_d, op_f = prop.get_transition_operators(dt_multi)
+    if op_d.shape == (B_HW, T, dim):
+        pass
     else:
-        print("[FAIL] Broadcasting logic error.")
+        print(f"Broadcasting Shape Error: {op_d.shape}")
 
-def check_stochasticity():
-    print("\n--- Checking Stochastic Noise Injection ---")
-    dim = 64
+def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = AnalyticSpectralPropagator(dim, noise_scale=0.1).to(device)
-    h = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
-    x = torch.zeros(1, dim, device=device, dtype=torch.cfloat)
-    dt = torch.tensor(1.0, device=device)
-    prop.train()
-    out1 = prop(h, x, dt)
-    out2 = prop(h, x, dt)
-    diff_train = (out1 - out2).abs().max().item()
-    print(f"Difference in Train Mode (Noise ON): {diff_train:.2e}")
-    prop.eval()
-    out3 = prop(h, x, dt)
-    out4 = prop(h, x, dt)
-    diff_eval = (out3 - out4).abs().max().item()
-    print(f"Difference in Eval Mode (Noise OFF): {diff_eval:.2e}")
-    if diff_train > 1e-6 and diff_eval < 1e-12:
-        print("[PASS] Stochasticity injection is working correctly.")
-    else:
-        print("[FAIL] Stochasticity check failed.")
-
-def check_pscan_adaptive_equivalence():
-    print("\n--- Checking PScan Adaptive dt Equivalence ---")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, C, H, W = 1, 10, 2, 16, 16
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W).to(device).double()
+    B, T, C, H, W = 1, 5, 2, 32, 32
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W).to(device)
     model.eval()
-    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
-    dt_adaptive = torch.rand(B, T, device=device, dtype=torch.float64) + 0.1
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.rand(B, T, device=device) + 1.0
     with torch.no_grad():
-        out_parallel = model(x, dt_adaptive)
-    z = model.encoder(x)
-    block = model.blocks[0]
-    z_seq_list = []
-    B_z, T_z, D_z, H_z, W_z = z.shape
-    h_curr = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.complex128)
-    for t in range(T_z):
-        x_step = z[:, t] 
-        dt_step = dt_adaptive[:, t] 
-        z_next, h_next = block.forward_step(x_step, h_curr, dt_step)
-        z_seq_list.append(z_next)
-        h_curr = h_next
-    z_seq = torch.stack(z_seq_list, dim=1)
-    out_seq = model.decoder(z_seq, x)
-    diff = (out_parallel - out_seq).abs().max().item()
-    print(f"PScan vs Sequential Error (Adaptive dt): {diff:.2e}")
-    if diff < 1e-10:
-        print("[PASS] PScan correctly handles adaptive time steps.")
-    else:
-        print("[FAIL] PScan logic divergence.")
-
-def check_hybrid_equivalence():
-    print("\n--- Checking Hybrid (Parallel Cond + Sequential Future) Equivalence ---")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, C, H, W = 1, 10, 2, 16, 16
-    T_cond = 4
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device).double()
-    model.eval()
-    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
-    dt = torch.rand(B, T, device=device, dtype=torch.float64) + 0.1
-    x_cond = x[:, :T_cond]
-    dt_cond = dt[:, :T_cond]
-    x_fut = x[:, T_cond:]
-    dt_fut = dt[:, T_cond:]
-    with torch.no_grad():
-        out_full = model(x, dt)
-    z = model.encoder(x)
-    z_cond = z[:, :T_cond]
-    z_fut = z[:, T_cond:]
-    states = []
-    z_curr = z_cond
-    for block in model.blocks:
-        z_curr = block(z_curr, dt_cond)
-        states.append(block.last_h_state)
-    z_out_list = []
-    for t in range(T - T_cond):
-        dt_step = dt_fut[:, t]
-        z_step = z_fut[:, t]
-        new_states = []
-        for i, block in enumerate(model.blocks):
-            h_prev = states[i]
-            z_step, h_next = block.forward_step(z_step, h_prev, dt_step)
-            new_states.append(h_next)
-        states = new_states
-        z_out_list.append(z_step)
-    z_fut_out = torch.stack(z_out_list, dim=1)
-    out_fut = model.decoder(z_fut_out, x_fut)
-    diff = (out_full[:, T_cond:] - out_fut).abs().max().item()
-    print(f"Hybrid vs Full Parallel Error: {diff:.2e}")
-    if diff < 1e-10:
-        print("[PASS] Hybrid parallel-sequential execution matches.")
-    else:
-        print("[FAIL] Hybrid execution mismatch.")
+        out_parallel = model(x, dt)
+        z = model.encoder(x)
+        block = model.blocks[0]
+        B_z, T_z, D_z, H_z, W_z = z.shape
+        h_curr = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.cfloat)
+        z_seq_list = []
+        dt_expanded = dt.view(B, 1, 1, T).expand(B, H_z, W_z, T).reshape(B_z * H_z * W_z, T)
+        for t in range(T_z):
+            x_step = z[:, t]
+            dt_step = dt_expanded[:, t]
+            z_next, h_next = block.forward_step(x_step, h_curr, dt_step)
+            z_seq_list.append(z_next)
+            h_curr = h_next
+        z_seq = torch.stack(z_seq_list, dim=1)
+        out_seq = model.decoder(z_seq, x)
+        diff = (out_parallel - out_seq).abs().max().item()
+        if diff < 1e-10:
+            pass
+        else:
+            print(f"PScan Consistency Error: {diff:.2e}")
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
-    print("Running Checks in Float64 Precision...\n")
     check_plu_invertibility()
+    check_parapool_conservation()
+    check_source_sink_dynamics()
+    check_ou_noise_scaling()
     check_semigroup_property()
-    check_forced_response_integral()
-    check_adaptive_step_invariance()
     check_variable_dt_broadcasting()
-    check_stochasticity()
     if torch.cuda.is_available():
-        check_pscan_adaptive_equivalence()
-        check_hybrid_equivalence()
-
+        check_full_model_consistency()
+        

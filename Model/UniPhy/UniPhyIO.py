@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 class FlexiblePadder(nn.Module):
     def __init__(self, patch_size, mode='replicate'):

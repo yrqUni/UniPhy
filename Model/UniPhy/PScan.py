@@ -1,10 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.fft
 import triton
 import triton.language as tl
-import math
 
 @triton.jit
 def complex_mul(ar, ai, br, bi):
