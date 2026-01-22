@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
-import math
 
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height, img_width):
@@ -14,12 +13,10 @@ class RiemannianCliffordConv2d(nn.Module):
             nn.Conv2d(in_channels, in_channels, 1),
             nn.Tanh()
         )
-        
         self.viscosity_gate = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 1),
             nn.Sigmoid()
         )
-        
         laplacian = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
         self.register_buffer('laplacian_kernel', laplacian.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
         self.groups = in_channels
@@ -28,228 +25,110 @@ class RiemannianCliffordConv2d(nn.Module):
         base_log = self.log_metric_param
         dynamic_log = self.metric_refiner(x) * 0.1
         effective_log_metric = base_log + dynamic_log
-        
         scale = torch.exp(effective_log_metric)
         inv_scale = torch.exp(-effective_log_metric)
-        
         diffusion_term = F.conv2d(x, self.laplacian_kernel, padding=1, groups=self.groups)
         local_viscosity = self.viscosity_gate(x) * inv_scale
         x_diffused = x + diffusion_term * local_viscosity * 0.01
-        
         x_scaled = x_diffused * scale
         out = self.conv(x_scaled)
         out = out * inv_scale
         return out
 
-class SpectralNoiseInjector(nn.Module):
-    def __init__(self, dim, h, w):
-        super().__init__()
-        self.dim = dim
-        self.h = h
-        self.w = w
-        
-        ky = torch.fft.fftfreq(h, d=1.0)
-        kx = torch.fft.fftfreq(w, d=1.0)
-        k_x, k_y = torch.meshgrid(kx, ky, indexing='xy')
-        k_sq = k_x**2 + k_y**2
-        initial_scale = 1.0 / (k_sq + 1.0)
-        self.register_buffer('spectral_decay', initial_scale.unsqueeze(0).repeat(dim, 1, 1))
-        
-        self.controller = nn.Sequential(
-            nn.Linear(dim, dim // 2),
-            nn.SiLU(),
-            nn.Linear(dim // 2, dim),
-            nn.Sigmoid() 
-        )
-
-    def forward(self, x, dt):
-        B, T, D, H, W = x.shape
-        x_energy = x.abs().mean(dim=(3, 4))
-        noise_gain = self.controller(x_energy).view(B, T, D, 1, 1)
-        
-        noise_fft = torch.randn(B, T, D, H, W, dtype=torch.cfloat, device=x.device)
-        scale = self.spectral_decay.unsqueeze(0).unsqueeze(0)
-        noise_colored_fft = noise_fft * scale
-        noise_colored = torch.fft.ifft2(noise_colored_fft, s=(H, W), norm='ortho')
-        
-        dt_shape = dt.view(B, T, 1, 1, 1)
-        smooth_dt = F.softplus(dt_shape) + 1e-6
-        diffusion = noise_colored * noise_gain * torch.sqrt(smooth_dt)
-        return diffusion
-
-class LyapunovController(nn.Module):
+class ComplexPLUTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim // 2),
-            nn.SiLU(),
-            nn.Linear(dim // 2, dim),
-            nn.Tanh() 
-        )
+        self.dim = dim
+        perm_idx = torch.randperm(dim)
+        self.register_buffer('perm_idx', perm_idx)
+        self.register_buffer('inv_perm_idx', torch.argsort(perm_idx))
+        self.l_lower_real = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.l_lower_imag = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.u_upper_real = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.u_upper_imag = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.u_log_s = nn.Parameter(torch.zeros(dim)) 
+        self.u_phase = nn.Parameter(torch.zeros(dim))
+        self.register_buffer('mask_lower', torch.tril(torch.ones(dim, dim), diagonal=-1))
+        self.register_buffer('mask_upper', torch.triu(torch.ones(dim, dim), diagonal=1))
 
-    def forward(self, x):
-        x_mag = x.abs()
-        global_energy = x_mag.mean(dim=(3, 4))
-        control_signal = self.net(global_energy)
-        return control_signal
+    def _assemble_matrices(self):
+        L_real = self.l_lower_real * self.mask_lower + torch.eye(self.dim, device=self.l_lower_real.device, dtype=self.l_lower_real.dtype)
+        L_imag = self.l_lower_imag * self.mask_lower
+        L = torch.complex(L_real, L_imag)
+        diag_mod = torch.exp(self.u_log_s)
+        diag = torch.complex(diag_mod * torch.cos(self.u_phase), diag_mod * torch.sin(self.u_phase))
+        U_rest = torch.complex(self.u_upper_real, self.u_upper_imag) * self.mask_upper
+        U = U_rest + torch.diag_embed(diag)
+        return L, U
 
-class TimeWarper(nn.Module):
-    def __init__(self, dim):
+    def encode(self, x):
+        L, U = self._assemble_matrices()
+        L_inv = torch.linalg.solve_triangular(L, torch.eye(self.dim, device=x.device, dtype=L.dtype), upper=False)
+        U_inv = torch.linalg.solve_triangular(U, torch.eye(self.dim, device=x.device, dtype=U.dtype), upper=True)
+        x_perm = x[..., self.inv_perm_idx]
+        mat_inv = U_inv @ L_inv
+        x_eigen = torch.matmul(x_perm.to(mat_inv.dtype), mat_inv.T)
+        return x_eigen
+
+    def decode(self, x_eigen):
+        L, U = self._assemble_matrices()
+        x_step1 = torch.matmul(x_eigen, U.T)
+        x_step2 = torch.matmul(x_step1, L.T)
+        x_out = x_step2[..., self.perm_idx]
+        return x_out
+
+class AnalyticSpectralPropagator(nn.Module):
+    def __init__(self, dim, dt_ref=1.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim // 2),
-            nn.SiLU(),
-            nn.Linear(dim // 2, 1),
-            nn.Tanh() 
-        )
-
-    def forward(self, x, dt):
-        x_state = x.abs().mean(dim=(3, 4)) 
-        warp_log = self.net(x_state).squeeze(-1) 
-        warp_factor = torch.exp(warp_log * 0.5)
-        return dt * warp_factor
-
-class GENERICPropagator(nn.Module):
-    def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
-        super().__init__()
-        assert dim % 2 == 0
         self.dim = dim
         self.dt_ref = dt_ref
-        self.stochastic = stochastic
+        self.basis = ComplexPLUTransform(dim)
+        self.lambda_log_decay = nn.Parameter(torch.randn(dim) * 0.5 - 2.0) 
+        self.lambda_freq = nn.Parameter(torch.randn(dim) * 1.0)
 
-        self.w_L = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.w_M = nn.Parameter(torch.randn(dim, dim) * 0.02)
+    def _get_spectrum(self):
+        real = -torch.exp(self.lambda_log_decay)
+        imag = self.lambda_freq
+        return torch.complex(real, imag)
 
-        self.context_gate = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, 2)
-        )
+    def _safe_phi_1(self, z):
+        small_mask = torch.abs(z) < 1e-4
+        z_safe = z.clone()
+        z_safe[small_mask] = 1.0 
+        res_normal = torch.expm1(z_safe) / z_safe
+        res_small = 1.0 + z * 0.5 + (z * z) / 6.0
+        return torch.where(small_mask, res_small, res_normal)
 
-        if stochastic:
-            self.noise_injector = SpectralNoiseInjector(dim, img_height, img_width)
+    def get_transition_operators(self, dt):
+        Lambda = self._get_spectrum()
+        if isinstance(dt, torch.Tensor):
+            if dt.ndim == 0: dt = dt.view(1)
+            dt_eff = dt.view(-1, 1) / self.dt_ref
+        elif isinstance(dt, float):
+            dt_eff = torch.tensor(dt, device=Lambda.device, dtype=Lambda.real.dtype).view(1, 1) / self.dt_ref
         else:
-            self.noise_injector = None
+             dt_eff = torch.tensor(dt, device=Lambda.device, dtype=Lambda.real.dtype).view(-1, 1) / self.dt_ref
+        Z = Lambda.unsqueeze(0) * dt_eff
+        op_decay = torch.exp(Z)
+        op_forcing = self._safe_phi_1(Z) * dt_eff * self.dt_ref
+        return op_decay, op_forcing
 
-    def get_orthogonal_basis(self):
-        S = 0.5 * (self.w_L - self.w_L.t())
-        return torch.matrix_exp(S)
-
-    def get_operators(self, dt, x_context=None):
-        device = self.w_L.device
-        D = self.dim
-
-        L_base = 0.5 * (self.w_L - self.w_L.transpose(-1, -2))
-        M_base = - (self.w_M @ self.w_M.transpose(-1, -2))
-
-        if x_context is not None:
-            B, T = x_context.shape[0], x_context.shape[1]
-            ctx = x_context.mean(dim=(3, 4))
-            if ctx.is_complex():
-                ctx = ctx.real
-            gate = self.context_gate(ctx)
-            a_L = F.softplus(gate[..., 0:1]).view(B, T, 1, 1)
-            a_M = F.softplus(gate[..., 1:2]).view(B, T, 1, 1)
-            G = a_L * L_base.view(1, 1, D, D) + a_M * M_base.view(1, 1, D, D)
-            
-            if dt.dim() == 0:
-                dt_eff = dt.expand(B, T, 1)
-            elif dt.dim() == 1:
-                dt_eff = dt.view(-1, 1, 1).expand(B, T, 1)
-            else:
-                dt_eff = dt.view(B, T, 1)
-        else:
-            B, T = 1, 1
-            G = (L_base + M_base).view(1, 1, D, D)
-            dt_eff = dt.view(1, 1, 1) if torch.is_tensor(dt) else torch.full((1, 1, 1), dt, device=device)
-
-        V = self.get_orthogonal_basis().to(torch.cfloat)
-        V_inv = V.conj().T
-        
-        G_complex = G.to(torch.cfloat)
-        H = torch.matmul(V_inv.view(1, 1, D, D), torch.matmul(G_complex, V.view(1, 1, D, D)))
-        G_diag = torch.diagonal(H, dim1=-2, dim2=-1)
-        
-        evo_diag = torch.exp(G_diag * (dt_eff / self.dt_ref))
-
-        return V, V_inv, evo_diag, dt_eff
-
-    def inject_noise(self, x, dt_eff):
-        if self.stochastic and self.noise_injector is not None:
-            return self.noise_injector(x, dt_eff)
-        return torch.zeros_like(x)
-    
-class StablePropagator(nn.Module):
-    def __init__(self, dim, img_height, img_width, dt_ref=1.0, stochastic=True):
-        super().__init__()
-        assert dim % 2 == 0
-        self.dim = dim
-        self.dt_ref = dt_ref
-        
-        self.frequencies = nn.Parameter(torch.randn(dim) * 1.0)
-        self.static_growth = nn.Parameter(torch.randn(dim) * 0.001 - 0.005)
-        
-        self.stability_control = LyapunovController(dim)
-        self.time_warper = TimeWarper(dim)
-        self.skew_generator = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        
-        self.stochastic = stochastic
-        if stochastic:
-            self.noise_injector = SpectralNoiseInjector(dim, img_height, img_width)
-        else:
-            self.noise_injector = None
-
-    def get_orthogonal_basis(self):
-        S = self.skew_generator.triu(1)
-        S = S - S.t()
-        Q = torch.matrix_exp(S)
-        return Q
-
-    def get_operators(self, dt, x_context=None):
-        Q = self.get_orthogonal_basis()
-        V = Q.to(dtype=torch.cfloat)
-        V_inv = V.T 
-        
-        sigma_static = self.static_growth
-        
-        if x_context is not None:
-            control_signal = self.stability_control(x_context)
-            sigma_dynamic = control_signal * 0.01 
-            sigma_total = sigma_static.view(1, 1, -1) + sigma_dynamic
-            dt_eff = self.time_warper(x_context, dt)
-        else:
-            sigma_total = sigma_static.view(1, 1, -1)
-            dt_eff = dt
-            
-        sigma_final = -F.softplus(-sigma_total)
-        omega = self.frequencies.view(1, 1, -1)
-        L = torch.complex(sigma_final, omega)
-        
-        if dt_eff.ndim == 2:
-            dt_cast = dt_eff.unsqueeze(-1)
-        elif dt_eff.ndim == 1:
-            dt_cast = dt_eff.view(-1, 1, 1)
-        else:
-            dt_cast = dt_eff.unsqueeze(-1)
-            
-        evo_diag = torch.exp(L * dt_cast)
-        return V, V_inv, evo_diag, dt_eff
-
-    def inject_noise(self, x, dt_eff):
-        if self.stochastic and self.noise_injector is not None:
-            return self.noise_injector(x, dt_eff)
-        return torch.zeros_like(x)
+    def forward(self, h_prev, x_input, dt):
+        h_tilde = self.basis.encode(h_prev)
+        x_tilde = self.basis.encode(x_input)
+        op_decay, op_forcing = self.get_transition_operators(dt)
+        h_tilde_next = h_tilde * op_decay + x_tilde * op_forcing
+        h_next = self.basis.decode(h_tilde_next)
+        return h_next
 
 class SpectralStep(nn.Module):
     def __init__(self, dim, h, w):
         super().__init__()
         self.dim = dim
         self.weight = nn.Parameter(torch.randn(dim, h, w, dtype=torch.cfloat) * 0.02)
-        
         self.viscosity_x = nn.Parameter(torch.tensor(1e-4))
         self.viscosity_y = nn.Parameter(torch.tensor(1e-4))
         self.alpha = nn.Parameter(torch.tensor(2.0))
-        
         kx = torch.fft.fftfreq(w, d=1.0)
         ky = torch.fft.fftfreq(h, d=1.0)
         k_x, k_y = torch.meshgrid(kx, ky, indexing='xy')
@@ -259,22 +138,16 @@ class SpectralStep(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         x_fft = torch.fft.fft2(x, norm='ortho')
-        
         original_dc = x_fft[..., 0, 0].clone()
         x_fft = x_fft * self.weight
-        
         alpha_clamp = self.alpha.clamp(1.0, 3.0)
         vx = self.viscosity_x.abs()
         vy = self.viscosity_y.abs()
-        
         k_term = vx * torch.pow(self.k_x_abs, alpha_clamp) + vy * torch.pow(self.k_y_abs, alpha_clamp)
         dissipation = torch.exp(-k_term * (H * W))
-        
         x_fft = x_fft * dissipation.unsqueeze(0).unsqueeze(0)
-        
         x_fft = x_fft.clone()
         x_fft[..., 0, 0] = original_dc
-        
         out = torch.fft.ifft2(x_fft, s=(H, W), norm='ortho')
         return out
 

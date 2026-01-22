@@ -100,8 +100,8 @@ class Args:
         self.log_every = 1
         self.wandb_every = 1
         self.ckpt_step = 0.5
-        self.log_path = "./uniphy/logs"
-        self.ckpt_dir = "./uniphy/ckpt"
+        self.log_path = "./uniphy/StablePropagator/logs"
+        self.ckpt_dir = "./uniphy/StablePropagator/ckpt"
         self.ckpt = ""
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
@@ -112,7 +112,7 @@ class Args:
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = self.ckpt
+        self.wandb_run_name = "StablePropagator" 
         self.wandb_mode = "online"
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:

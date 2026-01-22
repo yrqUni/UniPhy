@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 
-from PScan import PScanTriton
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
-from UniPhyOps import GENERICPropagator, RiemannianCliffordConv2d, SpectralStep
+from UniPhyOps import AnalyticSpectralPropagator, RiemannianCliffordConv2d, SpectralStep
 from UniPhyParaPool import UniPhyParaPool
 
 class UniPhyBlock(nn.Module):
@@ -25,9 +24,8 @@ class UniPhyBlock(nn.Module):
         self.spatial_gate = nn.Parameter(torch.ones(1) * 0.5)
 
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = GENERICPropagator(dim, img_height, img_width, dt_ref=1.0, stochastic=True)
-        self.pscan = PScanTriton()
-
+        self.prop = AnalyticSpectralPropagator(dim, dt_ref=1.0)
+        
         self.para_pool = UniPhyParaPool(dim * 2, expand=expand)
 
     def _complex_norm(self, z, norm_layer):
@@ -41,9 +39,7 @@ class UniPhyBlock(nn.Module):
         out_cliff = self.spatial_cliff(x_real_imag)
         r, i = torch.chunk(out_cliff, 2, dim=1)
         out_cliff_c = torch.complex(r, i)
-        
         out_spec = self.spatial_spec(x)
-        
         return self.spatial_gate * out_cliff_c + (1.0 - self.spatial_gate) * out_spec
 
     def forward(self, x, dt):
@@ -60,20 +56,48 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         
-        V, V_inv, evo_diag, dt_eff = self.prop.get_operators(dt, x_context=x)
+        op_decay, op_forcing = self.prop.get_transition_operators(dt)
         
-        evo_diag_expanded = evo_diag.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, D)
-        evo_diag_flat = evo_diag_expanded.reshape(B * H * W, T, D)
+        target_shape = (B * H * W, T, D)
         
-        x_eigen = torch.matmul(x_t, V_inv.T)
-        h_eigen = self.pscan(evo_diag_flat, x_eigen)
-        x_t_out = torch.matmul(h_eigen, V.T)
+        if op_decay.shape[0] == B * T: 
+            op_decay = op_decay.view(B, T, D).unsqueeze(1).unsqueeze(1)
+            op_decay = op_decay.expand(B, H, W, T, D).reshape(*target_shape)
+            op_forcing = op_forcing.view(B, T, D).unsqueeze(1).unsqueeze(1)
+            op_forcing = op_forcing.expand(B, H, W, T, D).reshape(*target_shape)
+            
+        elif op_decay.ndim == 3 and op_decay.shape[0] == B:
+            op_decay = op_decay.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, D).reshape(*target_shape)
+            op_forcing = op_forcing.unsqueeze(1).unsqueeze(1).expand(B, H, W, T, D).reshape(*target_shape)
+            
+        elif op_decay.ndim == 2 and op_decay.shape[0] == B:
+            op_decay = op_decay.view(B, 1, 1, 1, D).expand(B, H, W, T, D).reshape(*target_shape)
+            op_forcing = op_forcing.view(B, 1, 1, 1, D).expand(B, H, W, T, D).reshape(*target_shape)
+            
+        else:
+            op_decay = op_decay.view(1, 1, D).expand(*target_shape)
+            op_forcing = op_forcing.view(1, 1, D).expand(*target_shape)
+            
+        x_eigen = self.prop.basis.encode(x_t)
         
-        x_drift = x_t_out.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        h_list = []
+        h_state = torch.zeros(B * H * W, D, dtype=x_eigen.dtype, device=x.device)
         
-        noise = self.prop.inject_noise(x, dt_eff)
+        for t in range(T):
+            d_t = op_decay[:, t, :]
+            f_t = op_forcing[:, t, :]
+            u_t = x_eigen[:, t, :]
+            
+            h_state = h_state * d_t + u_t * f_t
+            h_list.append(h_state)
+            
+        h_eigen = torch.stack(h_list, dim=1)
         
-        x = x_drift + noise + resid
+        x_t_out_complex = self.prop.basis.decode(h_eigen)
+        
+        x_drift = x_t_out_complex.real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        
+        x = x_drift + resid
         
         resid = x
         
