@@ -191,5 +191,6 @@ if __name__ == "__main__":
     check_forced_response_integral()
     check_adaptive_step_invariance()
     check_variable_dt_broadcasting()
-    check_pscan_adaptive_equivalence()
+    if torch.cuda.is_available():
+        check_pscan_adaptive_equivalence()
 

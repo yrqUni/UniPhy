@@ -60,14 +60,17 @@ class UniPhyBlock(nn.Module):
         x_t = self._complex_norm(x_t, self.norm_temporal)
         
         op_decay, op_forcing = self.prop.get_transition_operators(dt_step)
+        
+        target_shape = (B * H * W, 1, D)
         if op_decay.shape[0] == B:
-             op_decay = op_decay.unsqueeze(1).unsqueeze(1).expand(B, H, W, D).reshape(B*H*W, 1, D)
-             op_forcing = op_forcing.unsqueeze(1).unsqueeze(1).expand(B, H, W, D).reshape(B*H*W, 1, D)
+             op_decay = op_decay.unsqueeze(1).unsqueeze(1).expand(B, H, W, D).reshape(*target_shape)
+             op_forcing = op_forcing.unsqueeze(1).unsqueeze(1).expand(B, H, W, D).reshape(*target_shape)
         else:
-             op_decay = op_decay.view(1, 1, D).expand(B*H*W, 1, D)
-             op_forcing = op_forcing.view(1, 1, D).expand(B*H*W, 1, D)
+             op_decay = op_decay.view(1, 1, D).expand(*target_shape)
+             op_forcing = op_forcing.view(1, 1, D).expand(*target_shape)
 
         x_eigen = self.prop.basis.encode(x_t)
+        
         h_next = h_prev.unsqueeze(1) * op_decay + x_eigen * op_forcing
         h_next = h_next.squeeze(1)
         

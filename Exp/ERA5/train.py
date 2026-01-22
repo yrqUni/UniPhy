@@ -1,13 +1,12 @@
 import contextlib
 import datetime
-import gc
 import glob
 import logging
 import os
 import random
 import sys
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +14,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 import wandb
+import matplotlib.pyplot as plt
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -98,10 +98,11 @@ class Args:
         self.grad_clip = 1.0
         self.grad_accum_steps = 1
         self.log_every = 1
-        self.wandb_every = 1
+        self.wandb_every = 10
+        self.image_log_every = 500
         self.ckpt_step = 0.5
-        self.log_path = "./uniphy/StablePropagator/logs"
-        self.ckpt_dir = "./uniphy/StablePropagator/ckpt"
+        self.log_path = "./uniphy/logs"
+        self.ckpt_dir = "./uniphy/ckpt"
         self.ckpt = ""
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
@@ -110,10 +111,9 @@ class Args:
         self.eval_sample_num = 1
         self.use_tf32 = True
         self.use_wandb = True
-        self.wandb_project = "ERA5"
+        self.wandb_project = "ERA5_UniPhy_Flow"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = "StablePropagator" 
-        self.wandb_mode = "online"
+        self.wandb_run_name = "AdaptiveFlow_Run"
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
@@ -153,29 +153,80 @@ def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, st
     ckpt_path = os.path.join(args.ckpt_dir, f"e{epoch}_s{step}_l{loss:.4f}.pth")
     torch.save(state, ckpt_path)
     files = glob.glob(os.path.join(args.ckpt_dir, "*.pth"))
+    files.sort(key=os.path.getmtime)
     if len(files) > 5:
-        files.sort(key=os.path.getmtime)
         for f in files[:-5]: os.remove(f)
 
 def load_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, ckpt_path: str, scheduler: Optional[Any] = None, map_location: str = "cpu") -> Tuple[int, int]:
-    if not os.path.isfile(ckpt_path): return 0, 0
+    if not os.path.isfile(ckpt_path): 
+        print(f"\n[INFO] No checkpoint found at {ckpt_path}. Starting from scratch.\n")
+        return 0, 0
+    
     checkpoint = torch.load(ckpt_path, map_location=map_location)
     sd = checkpoint["model"]
     new_sd = {k.replace("module.", ""): v for k, v in sd.items()}
     model.load_state_dict(new_sd, strict=False)
     opt.load_state_dict(checkpoint["optimizer"])
     if scheduler and "scheduler" in checkpoint: scheduler.load_state_dict(checkpoint["scheduler"])
-    return checkpoint.get("epoch", 0), checkpoint.get("step", 0)
+    
+    ep = checkpoint.get("epoch", 0)
+    st = checkpoint.get("step", 0)
+    ls = checkpoint.get("loss", 0.0)
+    
+    if dist.get_rank() == 0:
+        print(f"\n{'#'*60}")
+        print(f" RESUMING TRAINING")
+        print(f" Source: {ckpt_path}")
+        print(f" Epoch:  {ep}")
+        print(f" Step:   {st}")
+        print(f" Loss:   {ls:.6f}")
+        print(f"{'#'*60}\n")
+        
+    return ep, st
 
-def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float]:
+def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, float]:
     total_norm_sq = 0.0
     max_abs = 0.0
+    param_norm_sq = 0.0
+    
     for p in model.parameters():
+        param_norm_sq += p.data.norm(2).item() ** 2
         if p.grad is None: continue
         g = p.grad.data
         total_norm_sq += g.norm(2).item() ** 2
         max_abs = max(max_abs, g.abs().max().item())
-    return float(total_norm_sq**0.5), float(max_abs)
+        
+    return float(total_norm_sq**0.5), float(max_abs), float(param_norm_sq**0.5)
+
+def log_vis_images(pred: torch.Tensor, target: torch.Tensor, step: int, rank: int) -> None:
+    if rank != 0: return
+    
+    B, T, C, H, W = pred.shape
+    
+    idx = 0
+    t_idx = T - 1
+    c_idx = 0
+    
+    pred_img = pred[idx, t_idx, c_idx].detach().cpu().numpy()
+    target_img = target[idx, t_idx, c_idx].detach().cpu().numpy()
+    diff_img = np.abs(pred_img - target_img)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    im0 = axes[0].imshow(target_img, cmap='RdBu_r')
+    axes[0].set_title(f"Target (T={t_idx})")
+    plt.colorbar(im0, ax=axes[0])
+    
+    im1 = axes[1].imshow(pred_img, cmap='RdBu_r')
+    axes[1].set_title(f"Prediction (T={t_idx})")
+    plt.colorbar(im1, ax=axes[1])
+    
+    im2 = axes[2].imshow(diff_img, cmap='viridis')
+    axes[2].set_title(f"Abs Diff (T={t_idx})")
+    plt.colorbar(im2, ax=axes[2])
+    
+    wandb.log({"val/visualization": wandb.Image(fig), "train/step": step})
+    plt.close(fig)
 
 def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, master_port: str, args: Args) -> None:
     setup_ddp(rank, world_size, master_addr, master_port, local_rank)
@@ -194,7 +245,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         depth=args.depth,
         patch_size=args.patch_size,
         img_height=args.img_height,
-        img_width=args.img_width,
+        img_width=args.img_width
     ).cuda(local_rank)
 
     log_model_stats(model, rank)
@@ -206,7 +257,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size()
     )
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=False, drop_last=True)
-    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=1, pin_memory=True, prefetch_factor=1, persistent_workers=False)
+    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4, pin_memory=True, prefetch_factor=2)
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [
@@ -219,7 +270,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     scheduler = lr_scheduler.OneCycleLR(opt, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs) if args.use_scheduler else None
 
     start_ep, global_step = 0, 0
-    if args.ckpt: start_ep, _ = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
+    if args.ckpt: 
+        start_ep, global_step = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
 
     save_interval = max(1, int(len(train_loader) * args.ckpt_step))
 
@@ -245,7 +297,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
             with sync_ctx:
                 ensemble_preds = []
-                m_base = model.module if isinstance(model, DDP) else model
                 
                 for _ in range(args.ensemble_size):
                     pred = model(x_in, dt)
@@ -271,7 +322,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-                gn, _ = get_grad_stats(model)
+                gn, max_g, pn = get_grad_stats(model)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
                 if scheduler: scheduler.step()
@@ -279,18 +330,24 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
                 if rank == 0:
                     if train_step % args.log_every == 0:
-                        msg = f"Ep {ep+1} | Loss: {loss.item():.4e} | L1: {l1_val.item():.4e} | GN: {gn:.2f}"
+                        msg = f"Ep {ep+1} | L: {loss.item():.4e} | L1: {l1_val.item():.4e} | GN: {gn:.2f}"
                         if isinstance(train_iter, tqdm): train_iter.set_description(msg)
                         logging.info(msg)
 
-                    if args.use_wandb and (train_step % args.wandb_every == 0):
-                        wandb.log({
-                            "train/loss": loss.item(),
-                            "train/l1": l1_val.item(),
-                            "train/lr": opt.param_groups[0]["lr"],
-                            "train/gn": gn,
-                            "train/step": global_step
-                        })
+                    if args.use_wandb:
+                        if train_step % args.wandb_every == 0:
+                            wandb.log({
+                                "train/loss": loss.item(),
+                                "train/l1": l1_val.item(),
+                                "train/lr": opt.param_groups[0]["lr"],
+                                "train/grad_norm": gn,
+                                "train/param_norm": pn,
+                                "train/step": global_step
+                            })
+                        
+                        if train_step % args.image_log_every == 0:
+                            pred_viz = pred_mean.view(B_seq, T_seq, C, H, W)
+                            log_vis_images(pred_viz, target, global_step, rank)
 
                     if train_step % save_interval == 0:
                         save_ckpt(model, opt, ep+1, train_step, loss.item(), args, scheduler)

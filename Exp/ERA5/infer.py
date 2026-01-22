@@ -1,176 +1,141 @@
+import argparse
+import datetime
+import logging
 import os
+import random
 import sys
-import torch
+import warnings
+
 import numpy as np
-import matplotlib.pyplot as plt
-import imageio
-from types import SimpleNamespace
+import torch
+import torch.nn.functional as F
+import xarray as xr
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../Model/UniPhy")))
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
-from ModelUniPhy import UniPhyModel
 from ERA5 import ERA5_Dataset
+from ModelUniPhy import UniPhyModel
 
-def get_args():
-    return SimpleNamespace(
-        input_shape=(721, 1440),
-        in_channels=2,
-        out_channels=2,
-        embed_dim=300,
-        patch_size=16,
-        depth=6,
-        img_height=721,
-        img_width=1440,
-        dropout=0.0,
-        ensemble_size=8,
-        dt_ref=6.0,
-        data_root="/nfs/ERA5_data/data_norm",
-        year_range=[2017, 2021],
-        ctx_len=1,
-        pred_len=4,
-        checkpoint_path="./uniphy_ckpt/latest.pth",
-        save_path="result.gif",
-        use_tf32=True
-    )
+warnings.filterwarnings("ignore")
 
-def render_frame(t, gt, pred_mean, pred_std, sample1, sample2):
-    fig, axes = plt.subplots(2, 3, figsize=(24, 12))
-    cmap = 'jet'
-    v_min, v_max = gt.min(), gt.max()
+def set_random_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-    ax = axes[0, 0]
-    im = ax.imshow(gt, cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title(f"Ground Truth (t={t+1})")
-    plt.colorbar(im, ax=ax)
-    ax.axis('off')
+def compute_metrics(pred, target, lat_weight):
+    if lat_weight is not None:
+        if lat_weight.device != pred.device:
+            lat_weight = lat_weight.to(pred.device)
+    
+    error = pred - target
+    mse = (error ** 2)
+    
+    if lat_weight is not None:
+        mse = mse * lat_weight
+        rmse = torch.sqrt(mse.mean(dim=(0, 2, 3))).mean().item()
+    else:
+        rmse = torch.sqrt(mse.mean()).item()
+        
+    return rmse
 
-    ax = axes[0, 1]
-    im = ax.imshow(pred_mean, cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("Ensemble Mean")
-    plt.colorbar(im, ax=ax)
-    ax.axis('off')
-
-    ax = axes[0, 2]
-    im = ax.imshow(np.abs(gt - pred_mean), cmap='inferno')
-    ax.set_title("Absolute Error")
-    plt.colorbar(im, ax=ax)
-    ax.axis('off')
-
-    ax = axes[1, 0]
-    im = ax.imshow(sample1, cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("SDE Member 1")
-    plt.colorbar(im, ax=ax)
-    ax.axis('off')
-
-    ax = axes[1, 1]
-    im = ax.imshow(sample2, cmap=cmap, vmin=v_min, vmax=v_max)
-    ax.set_title("SDE Member 2")
-    plt.colorbar(im, ax=ax)
-    ax.axis('off')
-
-    ax = axes[1, 2]
-    im = ax.imshow(pred_std, cmap='viridis')
-    ax.set_title("Uncertainty (Std Dev)")
-    plt.colorbar(im, ax=ax)
-    ax.axis('off')
-
-    plt.tight_layout()
-    fig.canvas.draw()
-    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
-    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close(fig)
-    return image
+def get_lat_weights(H, W, device):
+    lat = torch.linspace(-90, 90, H, device=device)
+    weights = torch.cos(torch.deg2rad(lat))
+    weights = weights / weights.mean()
+    return weights.view(1, 1, H, 1)
 
 def main():
-    plt.switch_backend('Agg')
-    args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--data_root", type=str, default="/nfs/ERA5_data/data_norm")
+    parser.add_argument("--save_dir", type=str, default="./uniphy/results")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--year_range", type=int, nargs='+', default=[2021, 2021])
+    parser.add_argument("--cond_frames", type=int, default=2)
+    parser.add_argument("--pred_frames", type=int, default=8)
+    parser.add_argument("--dt_ref", type=float, default=6.0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--num_ensemble", type=int, default=1)
+    args = parser.parse_args()
 
-    if args.use_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
+    set_random_seed(1017)
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    device = torch.device(args.device)
+    
+    checkpoint = torch.load(args.ckpt, map_location="cpu")
+    model_args = checkpoint["model_args"]
+    
     model = UniPhyModel(
-        in_channels=args.in_channels,
-        out_channels=args.out_channels,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        patch_size=args.patch_size,
-        img_height=args.img_height,
-        img_width=args.img_width,
-        dropout=args.dropout
+        in_channels=model_args["in_channels"],
+        out_channels=model_args["out_channels"],
+        embed_dim=model_args["embed_dim"],
+        depth=model_args["depth"],
+        patch_size=model_args["patch_size"],
+        img_height=model_args["img_height"],
+        img_width=model_args["img_width"]
     ).to(device)
-
-    if os.path.exists(args.checkpoint_path):
-        ckpt = torch.load(args.checkpoint_path, map_location=device)
-        sd = ckpt.get('model', ckpt)
-        nsd = {k.replace("module.", ""): v for k, v in sd.items()}
-        model.load_state_dict(nsd, strict=False)
-        print("Checkpoint loaded successfully.")
-    else:
-        print(f"Warning: Checkpoint {args.checkpoint_path} not found. Using random weights.")
-
+    
+    sd = checkpoint["model"]
+    new_sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(new_sd, strict=True)
     model.eval()
+    
+    print(f"Loaded model from {args.ckpt}")
 
-    t_total = args.ctx_len + args.pred_len
-    try:
-        ds = ERA5_Dataset(
-            input_dir=args.data_root, year_range=args.year_range, is_train=False,
-            sample_len=t_total, eval_sample=1, max_cache_size=1, rank=0, gpus=1
-        )
-        loader = torch.utils.data.DataLoader(ds, batch_size=1)
-        full_seq = next(iter(loader))
-    except Exception as e:
-        print(f"Data loading failed: {e}. Using random data.")
-        full_seq = torch.randn(1, t_total, args.in_channels, args.img_height, args.img_width)
-
-    full_seq = full_seq.to(device).float()
-    initial_state = full_seq[:, args.ctx_len-1 : args.ctx_len]
-    gt_future = full_seq[:, args.ctx_len:]
-
-    ensemble_trajectories = []
-
-    for m in tqdm(range(args.ensemble_size), desc="Ensemble Members"):
-        current_state = initial_state.clone()
-        trajectory = []
-
-        for t in range(args.pred_len):
-            dt = torch.full((1, 1), args.dt_ref, device=device)
-            with torch.no_grad():
-                next_state = model(current_state, dt)
-            trajectory.append(next_state.cpu().numpy())
-            current_state = next_state
-
-        trajectory = np.concatenate(trajectory, axis=1)
-        ensemble_trajectories.append(trajectory)
-
-    ensemble_stack = np.concatenate(ensemble_trajectories, axis=0)
-
-    p_mean = np.mean(ensemble_stack, axis=0)
-    p_std = np.std(ensemble_stack, axis=0)
-    gt_np = gt_future.cpu().numpy()[0]
-
-    sample1 = ensemble_stack[0]
-    sample2 = ensemble_stack[min(1, args.ensemble_size-1)]
-
-    frames = []
-    c_idx = 0
-
-    for t in range(args.pred_len):
-        frame = render_frame(
-            t,
-            gt=gt_np[t, c_idx],
-            pred_mean=p_mean[t, c_idx],
-            pred_std=p_std[t, c_idx],
-            sample1=sample1[t, c_idx],
-            sample2=sample2[t, c_idx]
-        )
-        frames.append(frame)
-
-    imageio.mimsave(args.save_path, frames, fps=2)
+    test_ds = ERA5_Dataset(
+        input_dir=args.data_root, 
+        year_range=args.year_range, 
+        is_train=False,
+        sample_len=args.cond_frames + args.pred_frames, 
+        eval_sample=1
+    )
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    
+    lat_weights = get_lat_weights(model_args["img_height"], model_args["img_width"], device)
+    
+    all_rmses = []
+    
+    with torch.no_grad():
+        for i, data in tqdm(enumerate(test_loader), total=len(test_loader)):
+            data = data.to(device).float()
+            
+            x_cond = data[:, :args.cond_frames]
+            x_target = data[:, args.cond_frames:]
+            
+            dt_cond = torch.ones(x_cond.shape[0], args.cond_frames, device=device) * args.dt_ref
+            dt_future = torch.ones(x_cond.shape[0], args.pred_frames, device=device) * args.dt_ref
+            
+            if args.num_ensemble > 1:
+                ensemble_preds = []
+                for _ in range(args.num_ensemble):
+                    pred = model.forecast(x_cond, dt_cond, args.pred_frames, dt_future)
+                    ensemble_preds.append(pred)
+                pred_final = torch.stack(ensemble_preds, dim=0).mean(dim=0)
+            else:
+                pred_final = model.forecast(x_cond, dt_cond, args.pred_frames, dt_future)
+            
+            rmse = compute_metrics(pred_final, x_target, lat_weights)
+            all_rmses.append(rmse)
+            
+            if i % 100 == 0:
+                print(f"Step {i}: RMSE = {rmse:.4f}")
+                
+    mean_rmse = np.mean(all_rmses)
+    print(f"\nFinal Test RMSE: {mean_rmse:.4f}")
+    
+    result_path = os.path.join(args.save_dir, "metric_summary.txt")
+    with open(result_path, "w") as f:
+        f.write(f"Checkpoint: {args.ckpt}\n")
+        f.write(f"Mean RMSE: {mean_rmse:.4f}\n")
 
 if __name__ == "__main__":
     main()

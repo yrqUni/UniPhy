@@ -27,7 +27,10 @@ class RiemannianCliffordConv2d(nn.Module):
         effective_log_metric = base_log + dynamic_log
         scale = torch.exp(effective_log_metric)
         inv_scale = torch.exp(-effective_log_metric)
-        diffusion_term = F.conv2d(x, self.laplacian_kernel, padding=1, groups=self.groups)
+        
+        kernel = self.laplacian_kernel.to(x.dtype)
+        diffusion_term = F.conv2d(x, kernel, padding=1, groups=self.groups)
+        
         local_viscosity = self.viscosity_gate(x) * inv_scale
         x_diffused = x + diffusion_term * local_viscosity * 0.01
         x_scaled = x_diffused * scale
@@ -52,7 +55,9 @@ class ComplexPLUTransform(nn.Module):
         self.register_buffer('mask_upper', torch.triu(torch.ones(dim, dim), diagonal=1))
 
     def _assemble_matrices(self):
-        L_real = self.l_lower_real * self.mask_lower + torch.eye(self.dim, device=self.l_lower_real.device, dtype=self.l_lower_real.dtype)
+        dtype = self.l_lower_real.dtype
+        device = self.l_lower_real.device
+        L_real = self.l_lower_real * self.mask_lower + torch.eye(self.dim, device=device, dtype=dtype)
         L_imag = self.l_lower_imag * self.mask_lower
         L = torch.complex(L_real, L_imag)
         diag_mod = torch.exp(self.u_log_s)
