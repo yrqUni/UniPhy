@@ -29,6 +29,7 @@ def get_autotune_configs():
     configs=get_autotune_configs(),
     key=['L'],
 )
+
 @triton.jit
 def pscan_kernel(
     A_ptr, X_ptr, Y_ptr, 
