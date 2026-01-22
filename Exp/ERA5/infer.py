@@ -91,25 +91,23 @@ def main():
     print(f"Loaded model from {args.ckpt}")
 
     test_ds = ERA5_Dataset(
-        input_dir=args.data_root, 
-        year_range=args.year_range, 
-        is_train=False,
-        sample_len=args.cond_frames + args.pred_frames, 
-        eval_sample=1,
-        max_cache_size=8,
-        rank=0,
-        gpus=1
-    )
-    test_loader = DataLoader(
-        test_ds, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
-        num_workers=1,
-        pin_memory=True,
-        prefetch_factor=1,
-        persistent_workers=False
-    )
+            input_dir=args.data_root,
+            year_range=args.year_range,
+            is_train=False,
+            sample_len=args.cond_frames + args.pred_frames,
+            eval_sample=args.eval_sample_num
+            )
     
+    test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+            )
+
     lat_weights = get_lat_weights(model_args["img_height"], model_args["img_width"], device)
     
     all_rmses = []

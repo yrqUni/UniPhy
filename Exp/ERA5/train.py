@@ -253,17 +253,23 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
 
     train_ds = ERA5_Dataset(
-        input_dir=args.data_root, year_range=args.year_range, is_train=True,
-        sample_len=args.train_data_n_frames, eval_sample=args.eval_sample_num,
-        max_cache_size=8, rank=dist.get_rank(), gpus=dist.get_world_size()
-    )
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=False, drop_last=True)
+            input_dir=args.data_root, 
+            year_range=args.year_range, 
+            is_train=True,
+            sample_len=args.train_data_n_frames, 
+            eval_sample=args.eval_sample_num)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_ds, 
+            shuffle=False, 
+            drop_last=True)
     train_loader = DataLoader(
         train_ds, 
         sampler=train_sampler, 
         batch_size=args.train_batch_size, 
-        num_workers=0, 
-        pin_memory=True 
+        num_workers=8, 
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
     )
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
