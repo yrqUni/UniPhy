@@ -96,12 +96,12 @@ class TemporalPropagator(nn.Module):
 
     def get_transition_operators(self, dt):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        dt_eff = dt / self.dt_ref
+        dt_eff = (dt / self.dt_ref).unsqueeze(-1)
         Lambda = self._get_effective_lambda()
-        Z = Lambda * dt_eff.unsqueeze(-1)
+        Z = Lambda * dt_eff
         mask = torch.abs(Z) < 1e-4
         phi1 = torch.where(mask, 1.0 + 0.5 * Z + (Z**2)/6.0, torch.expm1(Z) / torch.where(mask, torch.ones_like(Z), Z))
-        return torch.exp(Z), phi1 * (dt_eff.unsqueeze(-1) * self.dt_ref)
+        return torch.exp(Z), phi1 * (dt_eff * self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):
         if not self.training or self.noise_scale <= 0:
@@ -115,7 +115,9 @@ class TemporalPropagator(nn.Module):
 
     def forward(self, h_prev, x_input, dt):
         h_tilde = self.basis.encode(h_prev)
+        if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
         x_tilde = self.basis.encode(x_input)
+        if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
         op_decay, op_forcing = self.get_transition_operators(dt)
         bias = self._get_source_bias()
         h_tilde_next = h_tilde * op_decay + (x_tilde + bias) * op_forcing

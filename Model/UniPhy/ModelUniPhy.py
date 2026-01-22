@@ -79,7 +79,7 @@ class UniPhyBlock(nn.Module):
         delta_p = self.ffn(x_in)
         x = x + delta_p.view(B, T, D, H, W)
         return x
-
+    
 class UniPhyModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, embed_dim=64, depth=4, patch_size=16, img_height=64, img_width=128):
         super().__init__()
