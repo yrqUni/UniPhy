@@ -83,8 +83,8 @@ class Args:
         self.img_width = 1440
         self.in_channels = 30
         self.out_channels = 30
-        self.embed_dim = 512
-        self.patch_size = 16
+        self.embed_dim = 480
+        self.patch_size = 32
         self.depth = 6
         
         self.ensemble_size = 4 
@@ -106,7 +106,7 @@ class Args:
         self.ckpt = ""
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 27
+        self.train_data_n_frames = 16
         self.sample_k = 9
         self.eval_sample_num = 1
         self.use_tf32 = False
@@ -262,10 +262,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         train_ds, 
         sampler=train_sampler, 
         batch_size=args.train_batch_size, 
-        num_workers=1, 
-        pin_memory=True, 
-        prefetch_factor=1, 
-        persistent_workers=False
+        num_workers=0, 
+        pin_memory=True 
     )
 
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
