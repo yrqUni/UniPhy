@@ -125,10 +125,23 @@ class AnalyticSpectralPropagator(nn.Module):
         
         if isinstance(dt, torch.Tensor):
             std = torch.sqrt(dt.abs() / self.dt_ref) * self.noise_scale
+            
             if std.ndim == 2:
-                std = std.view(shape[0], shape[1], 1)
+                B, T = std.shape
+                N = shape[0]
+                if N % B == 0:
+                    HW = N // B
+                    std = std.unsqueeze(1).expand(B, HW, T).reshape(N, T, 1)
+                else:
+                    std = std.view(-1, 1, 1)
+            
             elif std.ndim == 1:
                 std = std.view(-1, 1, 1)
+                if std.shape[0] != shape[0]:
+                     if shape[0] % std.shape[0] == 0:
+                         factor = shape[0] // std.shape[0]
+                         std = std.repeat_interleave(factor, dim=0)
+
         else:
             std = (dt / self.dt_ref)**0.5 * self.noise_scale
             
