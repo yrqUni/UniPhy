@@ -64,7 +64,10 @@ class RiemannianCliffordConv2d(nn.Module):
     def forward(self, x):
         dtype = self.conv.weight.dtype
         x = x.to(dtype)
+        B, C, H, W = x.shape
         base_log = self.log_metric_param.to(dtype)
+        if base_log.shape[-2:] != (H, W):
+            base_log = F.interpolate(base_log, size=(H, W), mode='bilinear', align_corners=False)
         dynamic_log = self.metric_refiner(x) * self.metric_scale
         effective_log_metric = base_log + dynamic_log
         scale = torch.exp(effective_log_metric)
@@ -75,11 +78,11 @@ class RiemannianCliffordConv2d(nn.Module):
         x_diffused = x + diffusion_term * local_viscosity * self.viscosity_scale * self.diffusion_scale
         x_scaled = x_diffused * scale
         out = self.conv(x_scaled)
-        if out.shape[1] == inv_scale.shape[1]:
-            out = out * inv_scale
+        if out.shape[1] != inv_scale.shape[1]:
+            inv_scale_out = inv_scale.expand(-1, out.shape[1], -1, -1)
         else:
-            out = out * inv_scale.mean(dim=1, keepdim=True)
-        return out
+            inv_scale_out = inv_scale
+        return out * inv_scale_out
 
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
@@ -98,6 +101,7 @@ class TemporalPropagator(nn.Module):
         nn.init.zeros_(self.lambda_net.bias)
         self.input_gate = nn.Linear(dim, dim)
         nn.init.xavier_normal_(self.input_gate.weight)
+        nn.init.zeros_(self.input_gate.bias)
         self.src_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.src_im = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
@@ -188,3 +192,4 @@ class TemporalPropagator(nn.Module):
         u_t = u_t + self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
         h_tilde_next = h_tilde * op_decay + u_t
         return self.basis.decode(h_tilde_next)
+        
