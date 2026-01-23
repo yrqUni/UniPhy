@@ -87,11 +87,15 @@ def main():
     model.eval()
     print(f"Loaded model from {args.ckpt}")
 
+    total_frames = args.cond_frames + args.pred_frames
     test_ds = ERA5_Dataset(
             input_dir=args.data_root,
             year_range=args.year_range,
-            sample_len=args.cond_frames + args.pred_frames,
-            look_ahead=2
+            window_size=total_frames,
+            sample_k=total_frames,
+            look_ahead=2,
+            is_train=False,
+            dt_ref=args.dt_ref
             )
     
     if args.eval_sample_num > 0 and args.eval_sample_num < len(test_ds):
@@ -116,7 +120,7 @@ def main():
     print(f"Start Inference on {len(test_loader)} batches...")
 
     with torch.no_grad():
-        for i, data in tqdm(enumerate(test_loader), total=len(test_loader)):
+        for i, (data, dt) in tqdm(enumerate(test_loader), total=len(test_loader)):
             data = data.to(device).float()
             
             x_cond = data[:, :args.cond_frames]

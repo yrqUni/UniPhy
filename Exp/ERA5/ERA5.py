@@ -2,19 +2,21 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import mmap
 import shutil
 from collections import OrderedDict
-import torch.distributed as dist
 import threading
 import time
+import random
 
 class ERA5_Dataset(Dataset):
-    def __init__(self, input_dir, year_range, sample_len=8, look_ahead=2):
+    def __init__(self, input_dir, year_range, window_size=16, sample_k=4, look_ahead=2, is_train=True, dt_ref=6.0):
         self.input_root = input_dir
-        self.sample_len = sample_len
-        self.shm_root = "/dev/shm/era5_cache"
+        self.window_size = window_size
+        self.sample_k = sample_k
         self.look_ahead = look_ahead
+        self.is_train = is_train
+        self.dt_ref = dt_ref
+        self.shm_root = "/dev/shm/era5_cache"
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         
         self.all_info = []
@@ -73,7 +75,7 @@ class ERA5_Dataset(Dataset):
             time.sleep(5)
 
     def __len__(self):
-        return self.total_frames - self.sample_len + 1
+        return max(0, self.total_frames - self.window_size + 1)
 
     def _get_data_ptr(self, file_idx):
         info = self.all_info[file_idx]
@@ -91,25 +93,39 @@ class ERA5_Dataset(Dataset):
             self._mmap_cache.popitem(last=False)
         return data
 
+    def _get_single_frame(self, global_idx):
+        f_idx = np.searchsorted(self.file_frame_offsets, global_idx, side='right') - 1
+        off = global_idx - self.file_frame_offsets[f_idx]
+        return self._get_data_ptr(f_idx)[off]
+
     def __getitem__(self, idx):
-        f_idx = np.searchsorted(self.file_frame_offsets, idx, side='right') - 1
-        off = idx - self.file_frame_offsets[f_idx]
-        
-        if off + self.sample_len <= self.file_shapes[f_idx][0]:
-            res = self._get_data_ptr(f_idx)[off : off + self.sample_len]
+        if self.is_train:
+            offsets = sorted(random.sample(range(self.window_size), self.sample_k))
         else:
-            frames = []
-            needed = self.sample_len
-            c_ptr, c_f = idx, f_idx
-            while needed > 0:
-                s, l = self.file_frame_offsets[c_f], self.file_shapes[c_f][0]
-                o = c_ptr - s
-                take = min(l - o, needed)
-                frames.append(self._get_data_ptr(c_f)[o : o + take])
-                needed -= take
-                c_ptr += take
-                c_f += 1
-            res = np.concatenate(frames, axis=0)
+            offsets = list(range(self.sample_k))
             
-        return torch.from_numpy(res.copy())
+        frames = []
+        start_global = idx + offsets[0]
+        f_idx = np.searchsorted(self.file_frame_offsets, start_global, side='right') - 1
+        
+        current_file_data = self._get_data_ptr(f_idx)
+        file_start_global = self.file_frame_offsets[f_idx]
+        file_len = self.file_shapes[f_idx][0]
+        
+        for off in offsets:
+            curr_global = idx + off
+            local_off = curr_global - file_start_global
+            
+            if 0 <= local_off < file_len:
+                frames.append(torch.from_numpy(current_file_data[local_off].copy()))
+            else:
+                frame_data = self._get_single_frame(curr_global)
+                frames.append(torch.from_numpy(frame_data.copy()))
+        
+        data = torch.stack(frames, dim=0)
+        
+        offsets_tensor = torch.tensor(offsets, dtype=torch.float32)
+        dt = (offsets_tensor[1:] - offsets_tensor[:-1]) * self.dt_ref
+        
+        return data, dt
     

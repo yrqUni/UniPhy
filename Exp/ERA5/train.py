@@ -22,6 +22,8 @@ from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, T
 from rich.panel import Panel
 from rich.table import Table
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
@@ -104,7 +106,7 @@ class Args:
         self.num_experts = 4
         self.patch_size = 32
         self.depth = 6
-        self.ensemble_size = 4
+        self.ensemble_size = 2
         self.dt_ref = 6.0
         self.train_batch_size = 1
         self.eval_batch_size = 1
@@ -124,6 +126,7 @@ class Args:
         self.year_range = [2000, 2021]
         self.train_data_n_frames = 16
         self.sample_k = 9
+        self.eval_sample_num = 1
         self.use_tf32 = False
         self.use_wandb = True
         self.wandb_project = "ERA5"
@@ -240,8 +243,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     train_ds = ERA5_Dataset(
         input_dir=args.data_root,
         year_range=args.year_range,
-        sample_len=args.train_data_n_frames,
-        look_ahead=2)
+        window_size=args.train_data_n_frames,
+        sample_k=args.sample_k,
+        look_ahead=2,
+        is_train=True,
+        dt_ref=args.dt_ref
+    )
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_ds,
         shuffle=False, 
@@ -278,15 +285,15 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
             disable=(rank != 0)
         ) as progress:
             task = progress.add_task(f"Epoch {ep+1}", total=len(train_loader))
-            for train_step, data in enumerate(train_loader, start=1):
+            for train_step, (data, dt) in enumerate(train_loader, start=1):
                 model.train()
                 data = data.to(f"cuda:{local_rank}", non_blocking=True).float()
-                B, T_tot, C, H, W = data.shape
-                indices = torch.tensor([sorted(random.sample(range(T_tot), args.sample_k)) for _ in range(B)], device=data.device)
-                sampled = data[torch.arange(B, device=data.device).unsqueeze(1), indices]
-                x_in, target = sampled[:, :-1], sampled[:, 1:]
-                dt = (indices[:, 1:] - indices[:, :-1]).float() * args.dt_ref
+                dt = dt.to(f"cuda:{local_rank}", non_blocking=True)
+                
+                x_in = data[:, :-1]
+                target = data[:, 1:]
                 B_seq, T_seq, C, H, W = target.shape
+                
                 is_accum = (train_step % args.grad_accum_steps != 0)
                 sync_ctx = model.no_sync() if is_accum else contextlib.nullcontext()
                 with sync_ctx:
@@ -295,6 +302,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         pred = model(x_in, dt)
                         pred_flat = pred.reshape(B_seq * T_seq, C, H, W)
                         ensemble_preds.append(pred_flat)
+                        del pred
                     pred_ensemble = torch.stack(ensemble_preds, dim=1)
                     target_flat = target.reshape(B_seq * T_seq, C, H, W)
                     loss = crps_ensemble_loss(pred_ensemble, target_flat)
@@ -305,6 +313,9 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         opt.zero_grad(set_to_none=True)
                         continue
                     (loss / args.grad_accum_steps).backward()
+                
+                del pred_ensemble, ensemble_preds, loss
+                
                 if not is_accum:
                     if args.grad_clip > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -314,18 +325,16 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     if scheduler: scheduler.step()
                     global_step += 1
                     with torch.no_grad():
-                        l_t = loss.detach(); dist.all_reduce(l_t, op=dist.ReduceOp.SUM)
-                        avg_l = (l_t / world_size).item()
                         l1_t = l1_val.detach(); dist.all_reduce(l1_t, op=dist.ReduceOp.SUM)
                         avg_l1 = (l1_t / world_size).item()
                     if rank == 0:
                         progress.advance(task)
                         if train_step % args.log_every == 0:
-                            logger.info(f"Step {global_step} | L: {avg_l:.4e} | L1: {avg_l1:.4e} | GN: {gn:.2f}")
+                            logger.info(f"Ep {ep+1} | Step {global_step} | L1: {avg_l1:.4e} | GN: {gn:.2f} | LR: {opt.param_groups[0]['lr']:.2e}")
                         if args.use_wandb:
                             if global_step % args.wandb_every == 0:
                                 wandb.log({
-                                    "train/loss": avg_l,
+                                    "train/epoch": ep + 1,
                                     "train/l1": avg_l1,
                                     "train/lr": opt.param_groups[0]["lr"],
                                     "train/grad_norm": gn,
@@ -333,7 +342,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                                     "train/step": global_step
                                 })
                     if train_step % save_interval == 0:
-                        save_ckpt(model, opt, ep+1, train_step, avg_l if 'avg_l' in locals() else loss.item(), args, scheduler)
+                        save_ckpt(model, opt, ep+1, train_step, avg_l1, args, scheduler)
                 if train_step % 100 == 0:
                     gc.collect()
         dist.barrier()
@@ -352,3 +361,4 @@ if __name__ == "__main__":
         master_port=os.environ.get("MASTER_PORT", "12355"),
         args=a
     )
+    
