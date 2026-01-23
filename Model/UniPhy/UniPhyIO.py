@@ -173,15 +173,11 @@ class UniPhyEnsembleDecoder(nn.Module):
         out = self.final_proj(h)
         out = F.pixel_shuffle(out, self.patch_size)
         out = self.padder.unpad(out)
-        
         if x_ref is None:
              C = out.shape[1]
-
         if is_5d:
             out = out.view(B, T, C, H, W)
-            
         if x_ref is not None:
             out = self.conservation_constraint(out, x_ref)
-            
         return out
     
