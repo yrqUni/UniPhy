@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
 from PScan import PScanTriton 
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
@@ -92,7 +91,10 @@ class UniPhyModel(nn.Module):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, img_height//patch_size, img_width//patch_size) for _ in range(depth)])
+        pad_h = (patch_size - img_height % patch_size) % patch_size
+        pad_w = (patch_size - img_width % patch_size) % patch_size
+        feat_h, feat_w = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
+        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, feat_h, feat_w) for _ in range(depth)])
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
         self.fusion_weights = nn.Parameter(torch.ones(depth, dtype=torch.float32))
         self.ic_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
