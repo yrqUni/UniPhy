@@ -147,7 +147,7 @@ def setup_wandb(rank, cfg):
         name=cfg['logging']['wandb_run_name'],
         config=cfg,
         settings=wandb_settings,
-        force=True
+        resume="allow"
     )
 
 def save_ckpt(model: torch.nn.Module, opt: torch.optim.Optimizer, epoch: int, step: int, metric: float, cfg: dict, scheduler: Optional[Any] = None) -> None:
@@ -247,7 +247,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     scheduler = lr_scheduler.OneCycleLR(opt, max_lr=float(cfg['train']['lr']), steps_per_epoch=steps_per_epoch, epochs=epochs) if cfg['train']['use_scheduler'] else None
 
     start_ep, global_step = 0, 0
-    if cfg['logging']['ckpt']: # You can pass ckpt path in yaml if needed
+    if cfg['logging']['ckpt']:
         start_ep, global_step = load_ckpt(model, opt, cfg['logging']['ckpt'], scheduler, map_location=f"cuda:{local_rank}")
 
     save_interval = max(1, int(len(train_loader) * cfg['logging']['ckpt_step']))
