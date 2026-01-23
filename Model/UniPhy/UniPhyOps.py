@@ -79,11 +79,15 @@ class RiemannianCliffordConv2d(nn.Module):
         return out
 
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0):
+    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
-        self.raw_noise_param = nn.Parameter(torch.tensor(-2.0))
+        
+        if noise_scale < 1e-9: init_val = -10.0
+        else: init_val = float(np.log(np.exp(noise_scale) - 1.0))
+        self.raw_noise_param = nn.Parameter(torch.tensor(init_val))
+        
         self.basis = ComplexSVDTransform(dim)
         self.ld = nn.Parameter(torch.empty(dim))
         self.lf = nn.Parameter(torch.empty(dim))
@@ -139,8 +143,9 @@ class TemporalPropagator(nn.Module):
 
     def get_transition_operators(self, dt, x=None):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        if dt.ndim == 2: dt_expanded = dt.unsqueeze(-1)
-        else: dt_expanded = dt.reshape(-1, 1, 1)
+        if dt.ndim == 1: dt_expanded = dt.view(-1, 1, 1)
+        elif dt.ndim == 2: dt_expanded = dt.unsqueeze(-1)
+        else: dt_expanded = dt
         dt_scaled = dt_expanded * self.dt_scales
         dt_eff = dt_scaled / self.dt_ref
         Lambda = self._get_effective_lambda(x)
@@ -153,8 +158,9 @@ class TemporalPropagator(nn.Module):
     def generate_stochastic_term(self, target_shape, dt, dtype):
         noise_scale = F.softplus(self.raw_noise_param) + 1e-6
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        if dt.ndim == 2: dt_expanded = dt.unsqueeze(-1)
-        else: dt_expanded = dt.reshape(-1, 1, 1)
+        if dt.ndim == 1: dt_expanded = dt.view(-1, 1, 1)
+        elif dt.ndim == 2: dt_expanded = dt.unsqueeze(-1)
+        else: dt_expanded = dt
         dt_scaled = dt_expanded * self.dt_scales
         dt_eff = dt_scaled / self.dt_ref
         l_re = self._get_effective_lambda(None).real
@@ -175,20 +181,13 @@ class TemporalPropagator(nn.Module):
         if x_target is not None and dt_remaining is not None:
             h_target = self.basis.encode(x_target)
             if h_target.ndim == 2: h_target = h_target.unsqueeze(1)
-            dt_rem_tensor = torch.as_tensor(dt_remaining, device=dt.device, dtype=dt.dtype)
-            if dt_rem_tensor.ndim == 2: dt_rem_tensor = dt_rem_tensor.unsqueeze(-1)
-            else: dt_rem_tensor = dt_rem_tensor.reshape(-1, 1, 1)
-            dt_tensor = torch.as_tensor(dt, device=dt.device, dtype=dt.dtype)
-            if dt_tensor.ndim == 2: dt_tensor = dt_tensor.unsqueeze(-1)
-            else: dt_tensor = dt_tensor.reshape(-1, 1, 1)
-            bridge_strength = dt_tensor / (dt_rem_tensor + 1e-6)
-            bridge_strength = torch.clamp(bridge_strength, 0.0, 1.0)
+            dt_rem_tensor = torch.as_tensor(dt_remaining, device=dt.device, dtype=dt.dtype).view(-1, 1, 1)
+            dt_tensor = torch.as_tensor(dt, device=dt.device, dtype=dt.dtype).view(-1, 1, 1)
+            bridge_strength = torch.clamp(dt_tensor / (dt_rem_tensor + 1e-6), 0.0, 1.0)
             x_tilde = x_tilde + (h_target - h_tilde) * bridge_strength
         op_decay, op_phi1 = self.get_transition_operators(dt, x_tilde)
-        bias = self._get_source_bias()
-        x_forcing = x_tilde + bias
-        u_t = x_forcing * op_phi1
-        noise = self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
-        h_tilde_next = h_tilde * op_decay + u_t + noise
+        u_t = (x_tilde + self._get_source_bias()) * op_phi1
+        u_t = u_t + self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
+        h_tilde_next = h_tilde * op_decay + u_t
         return self.basis.decode(h_tilde_next)
     
