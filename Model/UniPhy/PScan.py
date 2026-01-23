@@ -124,4 +124,3 @@ class _PScanFunction(torch.autograd.Function):
 class PScanTriton(nn.Module):
     def forward(self, A, X):
         return _PScanFunction.apply(A, X)
-

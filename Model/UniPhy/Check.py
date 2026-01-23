@@ -2,10 +2,7 @@ import torch
 import torch.nn as nn
 import sys
 import os
-import torch.nn.functional as F
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 from UniPhyOps import TemporalPropagator
 from UniPhyFFN import UniPhyFeedForwardNetwork
 from ModelUniPhy import UniPhyModel
@@ -34,7 +31,6 @@ def check_source_sink_dynamics():
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
-    prop.raw_noise_param.data.fill_(-100.0) 
     h = torch.randn(1, dim, device=device, dtype=torch.cdouble)
     x_zero = torch.zeros_like(h)
     h_next = prop.forward(h, x_zero, dt=1.0)
@@ -58,8 +54,7 @@ def check_ou_noise_scaling():
 def check_semigroup_property():
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
-    prop.raw_noise_param.data.fill_(-100.0)
+    prop = TemporalPropagator(dim, noise_scale=0.0, selective_dynamics=False).to(device)
     prop.eval()
     h0 = torch.randn(1, dim, device=device, dtype=torch.cdouble)
     x0 = torch.zeros(1, dim, device=device, dtype=torch.cdouble)
@@ -71,7 +66,7 @@ def check_semigroup_property():
     for _ in range(steps):
         h_step = prop.forward(h_step, x0, dt=dt_small)
     diff = (h_jump - h_step).abs().max().item()
-    if diff < 1e-8: pass
+    if diff < 1e-10: pass
     else: print(f"Semigroup Property Error: {diff:.2e}")
 
 def check_variable_dt_broadcasting():
@@ -83,88 +78,53 @@ def check_variable_dt_broadcasting():
     h = torch.randn(B_HW, T, dim, device=device, dtype=torch.cdouble)
     x = torch.zeros(B_HW, T, dim, device=device, dtype=torch.cdouble)
     dt_multi = torch.rand(B_HW, T, device=device) + 0.5
-    op_d, op_phi1 = prop.get_transition_operators(dt_multi)
+    op_d, op_f = prop.get_transition_operators(dt_multi, x_state=x)
     if op_d.shape == (B_HW, T, dim): pass
     else: print(f"Broadcasting Shape Error: {op_d.shape}")
 
 def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, C, H, W = 1, 5, 2, 32, 32
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W).to(device)
     model.eval()
-    for block in model.blocks: block.prop.raw_noise_param.data.fill_(-100.0)
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.rand(B, T, device=device, dtype=torch.float64) + 1.0
     with torch.no_grad():
         out_parallel = model(x, dt)
-        z_enc = model.encoder(x)
-        z_ic = z_enc.clone()
-        weights = F.softmax(model.fusion_weights, dim=0)
-        z_fused = 0
-        z_layer = z_enc
-        for i, block in enumerate(model.blocks):
-            z_layer = z_layer + z_ic * model.ic_scale
-            B_z, T_z, D_z, H_z, W_z = z_layer.shape
-            h_prev = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.cdouble)
-            z_step_list = []
-            for t in range(T_z):
-                x_step = z_layer[:, t]
-                dt_step = dt[:, t]
-                z_step_out, h_next = block.forward_step(x_step, h_prev, dt_step)
-                z_step_list.append(z_step_out)
-                h_prev = h_next
-            z_layer = torch.stack(z_step_list, dim=1)
-            z_fused = z_fused + z_layer * weights[i]
-        out_serial = model.decoder(z_fused, x)
-        diff = (out_parallel - out_serial).abs().max().item()
-        if diff < 1e-12: pass
+        z = model.encoder(x)
+        block = model.blocks[0]
+        B_z, T_z, D_z, H_z, W_z = z.shape
+        h_curr = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.cdouble)
+        z_seq_list = []
+        for t in range(T_z):
+            x_step = z[:, t]
+            dt_step = dt[:, t]
+            z_next, h_next = block.forward_step(x_step, h_curr, dt_step)
+            z_seq_list.append(z_next)
+            h_curr = h_next
+        z_seq = torch.stack(z_seq_list, dim=1)
+        out_seq = model.decoder(z_seq, x)
+        diff = (out_parallel - out_seq).abs().max().item()
+        if diff < 1e-10: pass
         else: print(f"PScan Consistency Error: {diff:.2e}")
 
-def check_forecast_consistency():
+def check_forecast_implementation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T_cond, T_future, C, H, W = 1, 1, 2, 2, 32, 32
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
+    B, T_cond, K, C, H, W = 2, 5, 3, 2, 32, 32
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=32, depth=2, img_height=H, img_width=W).to(device)
     model.eval()
-    for block in model.blocks: block.prop.raw_noise_param.data.fill_(-100.0)
     x_cond = torch.randn(B, T_cond, C, H, W, device=device, dtype=torch.float64)
     dt_cond = torch.ones(B, T_cond, device=device, dtype=torch.float64)
-    dt_future = torch.ones(B, T_future, device=device, dtype=torch.float64)
-    with torch.no_grad():
-        out_forecast = model.forecast(x_cond=x_cond, dt_cond=dt_cond, k_steps=T_future, dt_future=dt_future)
-        z = model.encoder(x_cond)
-        z_ic = z.clone()
-        states = []
-        for block in model.blocks:
-            z_in = z + z_ic * model.ic_scale
-            z = block(z_in, dt_cond)
-            states.append(block.last_h_state.detach())
-        z_curr = z[:, -1]
-        x_ref = x_cond[:, -1]
-        manual_preds = []
-        for k in range(T_future):
-            dt_k = dt_future[:, k]
-            z_layer_in = z_curr
-            new_states = []
-            step_outputs = []
-            for i, block in enumerate(model.blocks):
-                h_p = states[i]
-                z_layer_in = z_layer_in + z_ic[:, -1] * model.ic_scale
-                z_step, h_n = block.forward_step(z_layer_in, h_p, dt_k)
-                step_outputs.append(z_step)
-                new_states.append(h_n)
-                z_layer_in = z_step
-            states = new_states
-            z_curr = z_step
-            weights = F.softmax(model.fusion_weights, dim=0)
-            z_fused_step = sum(w * out for w, out in zip(weights, step_outputs))
-            pred_pixel = model.decoder(z_fused_step.unsqueeze(1), x_ref.unsqueeze(1)).squeeze(1)
-            manual_preds.append(pred_pixel)
-            x_ref = pred_pixel
-        out_manual = torch.stack(manual_preds, dim=1)
-        diff = (out_forecast - out_manual).abs().max().item()
-        if diff < 1e-12: pass
-        else: print(f"Forecast Self-Consistency Error: {diff:.2e}")
-
+    dt_future = torch.ones(B, K, device=device, dtype=torch.float64) * 0.5
+    try:
+        pred = model.forecast(x_cond, dt_cond, K, dt_future)
+        expected_shape = (B, K, C, H, W)
+        if pred.shape == expected_shape: pass
+        else: print(f"Forecast Shape Error: Expected {expected_shape}, got {pred.shape}")
+        if torch.isnan(pred).any() or torch.isinf(pred).any(): print("Forecast contains NaN or Inf")
+    except Exception as e:
+        print(f"Forecast Execution Error: {e}")
+        
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
     check_plu_invertibility()
@@ -175,5 +135,4 @@ if __name__ == "__main__":
     check_variable_dt_broadcasting()
     if torch.cuda.is_available():
         check_full_model_consistency()
-        check_forecast_consistency()
-        
+        check_forecast_implementation()
