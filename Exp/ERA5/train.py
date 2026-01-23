@@ -338,12 +338,13 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             start_time = time.time()
                             logger.info(
                                 f"Ep [param]{ep+1:03d}[/] | Step [param]{global_step:06d}[/] | "
-                                f"[metric]CRPS[/]: [value]{avg_crps:.4f}[/] | [metric]RMSE[/]: [value]{avg_rmse:.4f}[/] | "
+                                f"[metric]CRPS[/]: [value]{avg_crps:.4f}[/] | [metric]MAE[/]: [value]{avg_l1:.4f}[/] | "
+                                f"[metric]RMSE[/]: [value]{avg_rmse:.4f}[/] | "
                                 f"[metric]Spread[/]: [value]{avg_spread:.4f}[/] | [metric]GN[/]: [value]{gn:.2f}[/]"
                             )
                             
                             file_msg = (f"Ep {ep+1:03d} | Step {global_step:06d} | CRPS {avg_crps:.4f} | "
-                                      f"RMSE {avg_rmse:.4f} | Spread {avg_spread:.4f} | GN {gn:.2f}")
+                                      f"MAE {avg_l1:.4f} | RMSE {avg_rmse:.4f} | Spread {avg_spread:.4f} | GN {gn:.2f}")
                             logging.getLogger().handlers[1].handle(logging.LogRecord(
                                 name="file", level=logging.INFO, pathname="", lineno=0,
                                 msg=file_msg, args=(), exc_info=None))
