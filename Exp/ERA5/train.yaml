@@ -12,8 +12,8 @@ model:
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
   year_range: [2000, 2021]
-  window_size: 24
-  sample_k: 8
+  window_size: 20
+  sample_k: 5
   look_ahead: 2
   dt_ref: 6.0
 

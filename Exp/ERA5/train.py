@@ -262,6 +262,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     start_time = time.time()
     ensemble_size = cfg['train']['ensemble_size']
     grad_clip = cfg['train']['grad_clip']
+    
     use_amp = cfg['train'].get('use_amp', True)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
