@@ -6,6 +6,7 @@ import os
 import gc
 import random
 import sys
+import time
 import warnings
 from typing import Any, Dict, Optional, Tuple
 import numpy as np
@@ -124,14 +125,14 @@ class Args:
         self.ckpt = ""
         self.data_root = "/nfs/ERA5_data/data_norm"
         self.year_range = [2000, 2021]
-        self.train_data_n_frames = 24
-        self.sample_k = 8
+        self.train_data_n_frames = 20
+        self.sample_k = 5
         self.eval_sample_num = 1
         self.use_tf32 = True
         self.use_wandb = True
         self.wandb_project = "ERA5"
         self.wandb_entity = "UniPhy"
-        self.wandb_run_name = ""
+        self.wandb_run_name = "UniPhy-A800-Base-K8"
 
 def setup_ddp(rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int) -> None:
     os.environ["MASTER_ADDR"] = master_addr
@@ -273,6 +274,8 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     if args.ckpt:
         start_ep, global_step = load_ckpt(model, opt, args.ckpt, scheduler, map_location=f"cuda:{local_rank}")
     save_interval = max(1, int(len(train_loader) * args.ckpt_step))
+    
+    start_time = time.time()
     for ep in range(start_ep, args.epochs):
         train_sampler.set_epoch(ep)
         with Progress(
@@ -305,16 +308,21 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         del pred
                     pred_ensemble = torch.stack(ensemble_preds, dim=1)
                     target_flat = target.reshape(B_seq * T_seq, C, H, W)
+                    
                     loss = crps_ensemble_loss(pred_ensemble, target_flat)
+                    
                     with torch.no_grad():
                         pred_mean = torch.mean(pred_ensemble, dim=1)
                         l1_val = F.l1_loss(pred_mean, target_flat)
+                        mse_val = F.mse_loss(pred_mean, target_flat)
+                        spread_val = torch.std(pred_ensemble, dim=1).mean()
+
                     if torch.isnan(loss) or torch.isinf(loss):
                         opt.zero_grad(set_to_none=True)
                         continue
                     (loss / args.grad_accum_steps).backward()
                 
-                del pred_ensemble, ensemble_preds, loss
+                del pred_ensemble, ensemble_preds
                 
                 if not is_accum:
                     if args.grad_clip > 0:
@@ -324,25 +332,40 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     opt.zero_grad(set_to_none=True)
                     if scheduler: scheduler.step()
                     global_step += 1
+                    
                     with torch.no_grad():
-                        l1_t = l1_val.detach(); dist.all_reduce(l1_t, op=dist.ReduceOp.SUM)
-                        avg_l1 = (l1_t / world_size).item()
+                        metrics_tensor = torch.tensor([loss.item(), l1_val.item(), mse_val.item(), spread_val.item()], device=local_rank)
+                        dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+                        metrics_tensor /= world_size
+                        avg_crps, avg_l1, avg_mse, avg_spread = metrics_tensor.tolist()
+                        avg_rmse = avg_mse ** 0.5
+
                     if rank == 0:
                         progress.advance(task)
                         if train_step % args.log_every == 0:
-                            logger.info(f"Ep {ep+1} | Step {global_step} | L1: {avg_l1:.4e} | GN: {gn:.2f} | LR: {opt.param_groups[0]['lr']:.2e}")
+                            elapsed = time.time() - start_time
+                            start_time = time.time()
+                            logger.info(f"Ep {ep+1} | Step {global_step} | CRPS: {avg_crps:.4f} | RMSE: {avg_rmse:.4f} | Spread: {avg_spread:.4f} | GN: {gn:.2f}")
+                        
                         if args.use_wandb:
                             if global_step % args.wandb_every == 0:
                                 wandb.log({
-                                    "train/epoch": ep + 1,
+                                    "train/crps": avg_crps,
                                     "train/l1": avg_l1,
+                                    "train/rmse": avg_rmse,
+                                    "train/spread": avg_spread,
+                                    "train/spread_rmse_ratio": avg_spread / (avg_rmse + 1e-6),
                                     "train/lr": opt.param_groups[0]["lr"],
                                     "train/grad_norm": gn,
                                     "train/param_norm": pn,
-                                    "train/step": global_step
+                                    "train/epoch": ep + 1,
+                                    "train/step": global_step,
+                                    "perf/step_time": elapsed / args.log_every
                                 })
                     if train_step % save_interval == 0:
-                        save_ckpt(model, opt, ep+1, train_step, avg_l1, args, scheduler)
+                        save_ckpt(model, opt, ep+1, train_step, avg_crps, args, scheduler)
+                
+                del loss
                 if train_step % 100 == 0:
                     gc.collect()
         dist.barrier()
@@ -361,4 +384,3 @@ if __name__ == "__main__":
         master_port=os.environ.get("MASTER_PORT", "12355"),
         args=a
     )
-    
