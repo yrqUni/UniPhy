@@ -28,14 +28,17 @@ class RiemannianCliffordConv2d(nn.Module):
     def forward(self, x):
         dtype = self.conv.weight.dtype
         x = x.to(dtype)
-        base_log = self.log_metric_param.to(dtype)
+        base_log = torch.clamp(self.log_metric_param.to(dtype), -5, 5)
         dynamic_log = self.metric_refiner(x) * self.metric_scale
-        effective_log_metric = torch.clamp(base_log + dynamic_log, min=-5, max=5)
+        effective_log_metric = base_log + dynamic_log
+        
         scale = torch.exp(effective_log_metric)
         inv_scale = torch.exp(-effective_log_metric)
+        
         kernel = self.laplacian_kernel.to(dtype)
         diffusion_term = F.conv2d(x, kernel, padding=1, groups=self.groups)
         local_viscosity = self.viscosity_gate(x) * inv_scale
+        
         x_diffused = x + diffusion_term * local_viscosity * self.viscosity_scale * self.diffusion_scale
         x_scaled = x_diffused * scale
         out = self.conv(x_scaled)
@@ -53,24 +56,31 @@ class ComplexSVDTransform(nn.Module):
         self.log_sigma = nn.Parameter(torch.zeros(dim))
 
     def _cayley_transform(self, raw_re, raw_im):        
+        raw_re = torch.clamp(raw_re, -50.0, 50.0)
+        raw_im = torch.clamp(raw_im, -50.0, 50.0)
+        
         A_re = (raw_re - raw_re.T) * 0.5
         A_im = (raw_im + raw_im.T) * 0.5
         A = torch.complex(A_re, A_im)
+        
         A_64 = A.to(torch.complex128)
         I_64 = torch.eye(self.dim, device=raw_re.device, dtype=torch.complex128)
-        U_64 = torch.linalg.solve(I_64 - A_64, I_64 + A_64)
+        
+        eps = 1e-9
+        U_64 = torch.linalg.solve(I_64 * (1.0 + eps) - A_64, I_64 + A_64)
+    
         return U_64.to(A.dtype)
 
     def _get_basis(self):
         U = self._cayley_transform(self.u_raw_re, self.u_raw_im)
         V = self._cayley_transform(self.v_raw_re, self.v_raw_im)
-        S = torch.exp(torch.clamp(self.log_sigma, min=-10, max=10)).type_as(U)
+        S = torch.exp(torch.clamp(self.log_sigma, -10, 10)).type_as(U)
         S_mat = torch.diag_embed(S + 0j) 
         return U, S_mat, V
 
     def encode(self, x):
         U, S_mat, V = self._get_basis()
-        S_inv_val = torch.exp(-torch.clamp(self.log_sigma, min=-10, max=10)).type_as(U)
+        S_inv_val = torch.exp(-torch.clamp(self.log_sigma, -10, 10)).type_as(U)
         S_inv = torch.diag_embed(S_inv_val + 0j)
         M_inv = V @ S_inv @ U.conj().T
         return torch.matmul(x.to(M_inv.dtype), M_inv.T)
@@ -81,52 +91,45 @@ class ComplexSVDTransform(nn.Module):
         return torch.matmul(x.to(M.dtype), M.T)
     
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01, selective_dynamics=True, n_groups=1):
+    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01, selective_dynamics=True):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
         self.noise_scale = noise_scale
         self.selective_dynamics = selective_dynamics
-        self.n_groups = n_groups
         self.basis = ComplexSVDTransform(dim)
+        
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
         self.lf = nn.Parameter(torch.randn(dim) * 1.0)
         self.src_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.src_im = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_im = nn.Parameter(torch.randn(dim) * 0.01)
-        if selective_dynamics:
-            self.selection_net = nn.Linear(dim, dim * 2)
 
-    def _get_effective_lambda(self, x_state=None):
-        l_phys = torch.complex(-torch.exp(torch.clamp(self.ld, max=5.0)), self.lf)
-        l_law = torch.complex(torch.clamp(self.law_re, min=-5.0, max=1.0), self.law_im)
-        Lambda = l_phys + l_law
-        if self.selective_dynamics and x_state is not None:
-            sel_out = self.selection_net(x_state.real)
-            sel = torch.view_as_complex(sel_out.view(*sel_out.shape[:-1], -1, 2))
-            Lambda = Lambda * torch.sigmoid(sel)
-        return Lambda
+    def _get_effective_lambda(self):
+        l_phys = torch.complex(-torch.exp(torch.clamp(self.ld, max=10.0)), self.lf)
+        l_law = torch.complex(torch.clamp(self.law_re, -5, 5), self.law_im)
+        return l_phys + l_law
 
     def _get_source_bias(self):
         return torch.complex(self.src_re, self.src_im)
 
-    def get_transition_operators(self, dt, x_state=None):
+    def get_transition_operators(self, dt):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         dt_eff = (dt / self.dt_ref).unsqueeze(-1)
-        Lambda = self._get_effective_lambda(x_state)
+        Lambda = self._get_effective_lambda()
         Z = Lambda * dt_eff
+        
         mask = torch.abs(Z) < 1e-4
         phi1 = torch.where(mask, 1.0 + 0.5 * Z + (Z**2)/6.0, torch.expm1(Z) / torch.where(mask, torch.ones_like(Z), Z))
         return torch.exp(Z), phi1 * (dt_eff * self.dt_ref)
 
-    def generate_stochastic_term(self, target_shape, dt, dtype, x_state=None):
+    def generate_stochastic_term(self, target_shape, dt, dtype):
         if not self.training or self.noise_scale <= 0:
             return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        Lambda = self._get_effective_lambda(x_state)
-        l_re = Lambda.real
-        var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1)) / (2 * torch.clamp(l_re, max=-1e-6))
+        l_re = self._get_effective_lambda().real
+        var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1)) / (2 * l_re - 1e-6)
         std = torch.sqrt(torch.abs(var)).to(dtype)
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
@@ -136,9 +139,12 @@ class TemporalPropagator(nn.Module):
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
-        op_decay, op_forcing = self.get_transition_operators(dt, x_state=x_tilde)
+        
+        op_decay, op_forcing = self.get_transition_operators(dt)
         bias = self._get_source_bias()
+        
         h_tilde_next = h_tilde * op_decay + (x_tilde + bias) * op_forcing
-        h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype, x_state=x_tilde)
+        h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
+        
         return self.basis.decode(h_tilde_next)
     
