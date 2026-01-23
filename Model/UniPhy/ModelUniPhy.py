@@ -79,10 +79,11 @@ class UniPhyBlock(nn.Module):
         delta_p = self.ffn(x_in)
         x = x + delta_p.view(B, T, D, H, W)
         return x
-    
+
 class UniPhyModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, embed_dim=64, depth=4, patch_size=16, img_height=64, img_width=128):
         super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pad_h = (patch_size - img_height % patch_size) % patch_size
         pad_w = (patch_size - img_width % patch_size) % patch_size
         h_dim, w_dim = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
@@ -96,19 +97,30 @@ class UniPhyModel(nn.Module):
         return self.decoder(z, x)
         
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
+        device = next(self.parameters()).device
         z = self.encoder(x_cond)
         states = []
         for block in self.blocks:
             z = block(z, dt_cond)
-            states.append(block.last_h_state)
-        predictions, z_curr = [], z[:, -1]
+            states.append(block.last_h_state.to("cpu"))
+            
+        predictions, z_curr = [], z[:, -1].detach()
+        
         for k in range(k_steps):
             dt_k = dt_future[:, k] if (isinstance(dt_future, torch.Tensor) and dt_future.ndim > 0) else dt_future
             z_next, new_states = z_curr, []
+            
             for i, block in enumerate(self.blocks):
-                z_next, h_next = block.forward_step(z_next, states[i], dt_k)
-                new_states.append(h_next)
-            states, z_curr = new_states, z_next
-            predictions.append(self.decoder(z_curr.unsqueeze(1), None).squeeze(1))
+                h_prev = states[i].to(device)
+                z_next, h_next = block.forward_step(z_next, h_prev, dt_k)
+                new_states.append(h_next.to("cpu"))
+                del h_prev
+            
+            states, z_curr = new_states, z_next.detach()
+            
+            with torch.no_grad():
+                pred_pixel = self.decoder(z_curr.unsqueeze(1), None).squeeze(1).to("cpu")
+                predictions.append(pred_pixel)
+        
         return torch.stack(predictions, dim=1)
     
