@@ -23,7 +23,7 @@ class ComplexFFN(nn.Module):
         return torch.complex(out_re, out_im)
 
 class UniPhyFeedForwardNetwork(nn.Module):
-    def __init__(self, dim, expand=4):
+    def __init__(self, dim, expand):
         super().__init__()
         self.dim = dim
         self.hidden_dim = dim * expand

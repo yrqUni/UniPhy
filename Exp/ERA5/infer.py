@@ -77,6 +77,7 @@ def main():
         in_channels=model_args["in_channels"],
         out_channels=model_args["out_channels"],
         embed_dim=model_args["embed_dim"],
+        expand=model_args["expand"],
         depth=model_args["depth"],
         patch_size=model_args["patch_size"],
         img_height=model_args["img_height"],

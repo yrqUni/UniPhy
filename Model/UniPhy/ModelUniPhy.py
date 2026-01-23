@@ -8,7 +8,7 @@ from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, dim, img_height, img_width, kernel_size=3, expand=4):
+    def __init__(self, dim, expand, img_height, img_width, kernel_size=3):
         super().__init__()
         self.dim = dim
         self.img_height = img_height
@@ -81,14 +81,14 @@ class UniPhyBlock(nn.Module):
         return x
 
 class UniPhyModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, depth=4, patch_size=16, img_height=64, img_width=128):
+    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, depth=4, patch_size=16, img_height=64, img_width=128):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pad_h = (patch_size - img_height % patch_size) % patch_size
         pad_w = (patch_size - img_width % patch_size) % patch_size
         h_dim, w_dim = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, h_dim, w_dim) for _ in range(depth)])
+        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, h_dim, w_dim) for _ in range(depth)])
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
 
     def forward(self, x, dt):

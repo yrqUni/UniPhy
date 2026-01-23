@@ -46,6 +46,7 @@ MODEL_ARG_KEYS = [
     "in_channels",
     "out_channels",
     "embed_dim",
+    "expand",
     "depth",
     "patch_size",
     "img_height",
@@ -103,6 +104,7 @@ class Args:
         self.in_channels = 30
         self.out_channels = 30
         self.embed_dim = 480
+        self.expand = 4
         self.patch_size = 32
         self.depth = 6
 
@@ -262,6 +264,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
         in_channels=args.in_channels,
         out_channels=args.out_channels,
         embed_dim=args.embed_dim,
+        expand=args.expand,
         depth=args.depth,
         patch_size=args.patch_size,
         img_height=args.img_height,
