@@ -111,7 +111,7 @@ class UniPhyModel(nn.Module):
         
     @torch.no_grad()
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
-        device = next(self.parameters()).device
+        device = x_cond.device
         z = self.encoder(x_cond)
         z_ic = z.clone()
         states = []
@@ -121,6 +121,7 @@ class UniPhyModel(nn.Module):
             states.append(block.last_h_state.detach())
         z_curr = z[:, -1].detach()
         predictions = []
+        x_ref = x_cond[:, -1:]
         for k in range(k_steps):
             dt_k = dt_future[:, k] if (isinstance(dt_future, torch.Tensor) and dt_future.ndim > 0) else dt_future
             z_next = z_curr
@@ -137,7 +138,8 @@ class UniPhyModel(nn.Module):
             z_fused_step = 0
             for w, out in zip(weights, step_outputs):
                 z_fused_step = z_fused_step + w * out
-            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), x_cond[:, -1:])
+            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), x_ref)
             predictions.append(pred_pixel.squeeze(1))
+            x_ref = pred_pixel 
         return torch.stack(predictions, dim=1)
     
