@@ -35,55 +35,64 @@ class UniPhyBlock(nn.Module):
 
     def forward(self, x, dt):
         B, T, D, H, W = x.shape
-        resid = x
         x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
-        x_mid = x_s.view(B, T, D, H, W) + resid
-        resid_mid = x_mid
-        x_t = x_mid.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
+        x_spatial = x_s.view(B, T, D, H, W).add(x)
+        
+        x_t = x_spatial.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
-        dt_expanded = torch.as_tensor(dt, device=x.device).view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
+        
+        dt_tensor = torch.as_tensor(dt, device=x.device)
+        dt_expanded = dt_tensor.view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
+        
         x_encoded = self.prop.basis.encode(x_t)
         gate = F.silu(self.prop.input_gate(x_encoded.real))
-        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
-        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded, x_encoded)
+        x_gated = x_encoded.mul(torch.complex(gate, torch.zeros_like(gate)))
+        
+        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded, x_gated)
         bias = self.prop._get_source_bias()
-        u_t = (x_encoded + bias) * op_forcing
+        u_t = x_gated.add(bias).mul(op_forcing)
+        
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
-        u_t = u_t + noise
-        h_eigen = self.pscan(op_decay, u_t)
-        self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
+        u_t_noisy = u_t.add(noise)
+        
+        h_eigen = self.pscan(op_decay, u_t_noisy)
+        self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :]).detach()
+        
         x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
-        x_out = x_drift + resid_mid
-        delta_p = self.ffn(x_out.view(B * T, D, H, W))
-        return x_out + delta_p.view(B, T, D, H, W)
+        x_temporal = x_drift.add(x_spatial)
+        
+        delta_p = self.ffn(x_temporal.view(B * T, D, H, W))
+        return x_temporal.add(delta_p.view(B, T, D, H, W))
 
     def forward_step(self, x_step, h_prev, dt_step):
         B, D, H, W = x_step.shape
-        resid = x_step
         x_s = x_step.permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
-        x_mid = x_s + resid
-        resid_mid = x_mid
-        x_t = x_mid.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
+        x_spatial = x_s.add(x_step)
+        
+        x_t = x_spatial.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
+        
         dt_t = torch.as_tensor(dt_step, device=x_step.device).view(-1, 1)
         x_encoded = self.prop.basis.encode(x_t)
         gate = F.silu(self.prop.input_gate(x_encoded.real))
-        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
-        op_decay, op_forcing = self.prop.get_transition_operators(dt_t, x_encoded)
-        bias = self.prop._get_source_bias()
-        u_t = (x_encoded + bias) * op_forcing
+        x_gated = x_encoded.mul(torch.complex(gate, torch.zeros_like(gate)))
+        
+        op_decay, op_forcing = self.prop.get_transition_operators(dt_t, x_gated)
+        u_t = x_gated.add(self.prop._get_source_bias()).mul(op_forcing)
+        
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_t, u_t.dtype)
-        u_t = u_t + noise
-        h_next = h_prev * op_decay.squeeze(1) + u_t.squeeze(1)
-        h_decoded = self.prop.basis.decode(h_next)
-        x_drift = h_decoded.real.view(B, H, W, D).permute(0, 3, 1, 2)
-        x_out = x_drift + resid_mid
-        delta_p = self.ffn(x_out)
-        return x_out + delta_p, h_next
+        u_t_noisy = u_t.add(noise)
+        
+        h_next = h_prev.mul(op_decay.squeeze(1)).add(u_t_noisy.squeeze(1))
+        x_drift = self.prop.basis.decode(h_next).real.view(B, H, W, D).permute(0, 3, 1, 2)
+        
+        x_temporal = x_drift.add(x_spatial)
+        delta_p = self.ffn(x_temporal)
+        return x_temporal.add(delta_p), h_next
 
 class UniPhyModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, checkpointing=True):
@@ -95,59 +104,65 @@ class UniPhyModel(nn.Module):
         feat_h, feat_w = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
         self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, feat_h, feat_w) for _ in range(depth)])
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
-        self.fusion_weights = nn.Parameter(torch.ones(depth, dtype=torch.float32))
-        self.ic_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.fusion_weights = nn.Parameter(torch.ones(depth))
+        self.ic_scale = nn.Parameter(torch.zeros(1))
         self.checkpointing = checkpointing
 
     def forward(self, x, dt):
-        z = self.encoder(x)
-        z_ic = z.clone()
+        z_init = self.encoder(x)
+        z_ic = z_init.clone()
         weights = F.softmax(self.fusion_weights, dim=0)
-        z_fused = 0 
-        z_curr = z
+        
+        block_outputs = []
+        z_flow = z_init
+        
         for i, block in enumerate(self.blocks):
-            # 关键：显式 clone 彻底断开就地操作链条
-            z_in = z_curr.clone() + z_ic * self.ic_scale
+            z_in = z_flow.clone().add(z_ic.mul(self.ic_scale))
             if self.training and self.checkpointing:
-                z_out = checkpoint.checkpoint(block, z_in, dt, use_reentrant=False)
+                z_flow = checkpoint.checkpoint(block, z_in, dt, use_reentrant=False)
             else:
-                z_out = block(z_in, dt)
-            z_fused = z_fused + z_out * weights[i]
-            z_curr = z_out
+                z_flow = block(z_in, dt)
+            block_outputs.append(z_flow.mul(weights[i]))
+            
+        z_fused = torch.stack(block_outputs, dim=0).sum(dim=0)
         return self.decoder(z_fused, x)
         
     @torch.no_grad()
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
-        z = self.encoder(x_cond)
-        z_ic = z.clone()
+        z_init = self.encoder(x_cond)
+        z_ic = z_init.clone()
         states = []
-        z_curr_init = z
+        z_flow = z_init
         for block in self.blocks:
-            z_in = z_curr_init.clone() + z_ic * self.ic_scale
-            z_out = block(z_in, dt_cond)
-            states.append(block.last_h_state.detach())
-            z_curr_init = z_out
-        z_curr = z_curr_init[:, -1].detach()
-        predictions = []
+            z_in = z_flow.clone().add(z_ic.mul(self.ic_scale))
+            z_flow = block(z_in, dt_cond)
+            states.append(block.last_h_state.clone())
+            
+        z_curr = z_flow[:, -1]
         x_ref = x_cond[:, -1:]
+        predictions = []
+        
         for k in range(k_steps):
             dt_k = dt_future[:, k]
-            z_layer_in = z_curr
+            z_step_flow = z_curr
             new_states = []
-            step_outputs = []
+            step_outs = []
+            
             for i, block in enumerate(self.blocks):
-                h_prev = states[i]
-                z_layer_in_ic = z_layer_in.clone() + z_ic[:, -1] * self.ic_scale
-                z_out, h_next = block.forward_step(z_layer_in_ic, h_prev, dt_k)
-                step_outputs.append(z_out)
-                new_states.append(h_next.detach())
-                z_layer_in = z_out
+                z_in_step = z_step_flow.clone().add(z_ic[:, -1].mul(self.ic_scale))
+                z_out, h_next = block.forward_step(z_in_step, states[i], dt_k)
+                step_outs.append(z_out)
+                new_states.append(h_next)
+                z_step_flow = z_out
+                
             states = new_states
-            z_curr = z_out
+            z_curr = z_step_flow
             weights = F.softmax(self.fusion_weights, dim=0)
-            z_fused_step = sum(w * out for w, out in zip(weights, step_outputs))
-            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), x_ref)
+            z_fused = torch.stack([out.mul(w) for w, out in zip(weights, step_outs)], dim=0).sum(dim=0)
+            
+            pred_pixel = self.decoder(z_fused.unsqueeze(1), x_ref)
             predictions.append(pred_pixel.squeeze(1))
             x_ref = pred_pixel
+            
         return torch.stack(predictions, dim=1)
-        
+    
