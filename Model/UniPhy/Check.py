@@ -81,16 +81,19 @@ def check_variable_dt_broadcasting():
     h = torch.randn(B_HW, T, dim, device=device, dtype=torch.cdouble)
     x = torch.zeros(B_HW, T, dim, device=device, dtype=torch.cdouble)
     dt_multi = torch.rand(B_HW, T, device=device) + 0.5
-    op_d, op_phi1, op_phi2 = prop.get_transition_operators(dt_multi)
+    op_d, op_phi1 = prop.get_transition_operators(dt_multi)
     if op_d.shape == (B_HW, T, dim): pass
     else: print(f"Broadcasting Shape Error: {op_d.shape}")
 
 def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, C, H, W = 1, 5, 2, 32, 32
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W).to(device)
+    
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
     model.eval()
-    model.blocks[0].prop.noise_scale = 0.0
+    
+    for block in model.blocks:
+        block.prop.noise_scale = 0.0
     
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.rand(B, T, device=device, dtype=torch.float64) + 1.0
@@ -99,59 +102,53 @@ def check_full_model_consistency():
         out_parallel = model(x, dt)
         
         z = model.encoder(x)
-        z_input = z + z * model.ic_scale
-        
-        block = model.blocks[0]
-        
-        B_seq, T_seq, D_seq, H_seq, W_seq = z_input.shape
-        x_s = z_input.view(B_seq * T_seq, D_seq, H_seq, W_seq).permute(0, 2, 3, 1)
-        x_s = block._complex_norm(x_s, block.norm_spatial).permute(0, 3, 1, 2)
-        x_s = block._spatial_op(x_s)
-        x_spatial = x_s.view(B_seq, T_seq, D_seq, H_seq, W_seq) + z_input
-        
-        x_t = x_spatial.permute(0, 3, 4, 1, 2).reshape(B_seq * H_seq * W_seq, T_seq, D_seq)
-        x_t = block._complex_norm(x_t, block.norm_temporal)
-        dt_expanded = dt.view(B_seq, 1, 1, T_seq).expand(B_seq, H_seq, W_seq, T_seq).reshape(B_seq * H_seq * W_seq, T_seq)
-        
-        prop = block.prop
-        x_encoded = prop.basis.encode(x_t)
-        gate = F.silu(prop.input_gate(x_encoded.real))
-        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
-        
-        op_decay, op_phi1, op_phi2 = prop.get_transition_operators(dt_expanded, x_encoded)
-        bias = prop._get_source_bias()
-        x_forcing = x_encoded + bias
-        
-        x_curr = x_forcing
-        x_next = torch.cat([x_forcing[:, 1:], x_forcing[:, -1:]], dim=1)
-        coeff_curr = op_phi1 - op_phi2
-        coeff_next = op_phi2
-        u_t_eff = x_curr * coeff_curr + x_next * coeff_next
-        
-        h_curr = torch.zeros(B_seq * H_seq * W_seq, D_seq, device=device, dtype=torch.cdouble)
-        h_seq_list = []
-        
-        for t in range(T_seq):
-            h_curr = h_curr * op_decay[:, t] + u_t_eff[:, t]
-            h_seq_list.append(h_curr)
-            
-        h_eigen_seq = torch.stack(h_seq_list, dim=1)
-        
-        x_drift = prop.basis.decode(h_eigen_seq).real.view(B_seq, H_seq, W_seq, T_seq, D_seq).permute(0, 3, 4, 1, 2)
-        x_out = x_drift + x_spatial
-        
-        x_in_ffn = x_out.view(B_seq * T_seq, D_seq, H_seq, W_seq)
-        delta_p = block.ffn(x_in_ffn)
-        z_block_out = x_out + delta_p.view(B_seq, T_seq, D_seq, H_seq, W_seq)
-        
+        z_ic = z.clone()
         weights = F.softmax(model.fusion_weights, dim=0)
-        z_fused = z_block_out * weights[0]
+        z_fused = 0
         
-        out_seq = model.decoder(z_fused, x)
+        for i, block in enumerate(model.blocks):
+            z = z + z_ic * model.ic_scale
+            
+            B_seq, T_seq, D_seq, H_seq, W_seq = z.shape
+            x_s = z.view(B_seq * T_seq, D_seq, H_seq, W_seq).permute(0, 2, 3, 1)
+            x_s = block._complex_norm(x_s, block.norm_spatial).permute(0, 3, 1, 2)
+            x_s = block._spatial_op(x_s)
+            x_spatial = x_s.view(B_seq, T_seq, D_seq, H_seq, W_seq) + z
+            
+            x_t = x_spatial.permute(0, 3, 4, 1, 2).reshape(B_seq * H_seq * W_seq, T_seq, D_seq)
+            x_t = block._complex_norm(x_t, block.norm_temporal)
+            dt_expanded = dt.view(B_seq, 1, 1, T_seq).expand(B_seq, H_seq, W_seq, T_seq).reshape(B_seq * H_seq * W_seq, T_seq)
+            
+            x_encoded = block.prop.basis.encode(x_t)
+            gate = F.silu(block.prop.input_gate(x_encoded.real))
+            x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
+            
+            op_decay, op_forcing = block.prop.get_transition_operators(dt_expanded, x_encoded)
+            bias = block.prop._get_source_bias()
+            x_forcing = x_encoded + bias
+            u_t = x_forcing * op_forcing
+            
+            h = torch.zeros(B_seq * H_seq * W_seq, D_seq, device=device, dtype=torch.cdouble)
+            h_seq = []
+            
+            for t in range(T_seq):
+                h = h * op_decay[:, t] + u_t[:, t]
+                h_seq.append(h)
+                
+            h_eigen = torch.stack(h_seq, dim=1)
+            x_drift = block.prop.basis.decode(h_eigen).real.view(B_seq, H_seq, W_seq, T_seq, D_seq).permute(0, 3, 4, 1, 2)
+            x_out = x_drift + x_spatial
+            
+            x_in_ffn = x_out.view(B_seq * T_seq, D_seq, H_seq, W_seq)
+            delta_p = block.ffn(x_in_ffn)
+            z = x_out + delta_p.view(B_seq, T_seq, D_seq, H_seq, W_seq)
+            
+            z_fused = z_fused + z * weights[i]
+            
+        out_serial = model.decoder(z_fused, x)
         
-        diff = (out_parallel - out_seq).abs().max().item()
-        
-        if diff < 1e-8: pass
+        diff = (out_parallel - out_serial).abs().max().item()
+        if diff < 1e-12: pass
         else: print(f"PScan Consistency Error: {diff:.2e}")
 
 if __name__ == "__main__":

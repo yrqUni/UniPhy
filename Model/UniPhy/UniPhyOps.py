@@ -169,12 +169,8 @@ class TemporalPropagator(nn.Module):
         phi1 = torch.where(mask, 
                            1.0 + 0.5 * Z, 
                            torch.expm1(Z) / Z_safe)
-        
-        phi2 = torch.where(mask,
-                           0.5 + Z / 6.0,
-                           (torch.expm1(Z) - Z) / (Z_safe ** 2))
                            
-        return torch.exp(Z), phi1 * (dt_eff * self.dt_ref), phi2 * (dt_eff * self.dt_ref)
+        return torch.exp(Z), phi1 * (dt_eff * self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):
         if self.noise_scale <= 0:
@@ -222,28 +218,14 @@ class TemporalPropagator(nn.Module):
             
             x_tilde = x_tilde + (h_target - h_tilde) * bridge_strength
 
-        op_decay, op_phi1, op_phi2 = self.get_transition_operators(dt, x_tilde)
+        op_decay, op_phi1 = self.get_transition_operators(dt, x_tilde)
         bias = self._get_source_bias()
         
         x_forcing = x_tilde + bias
+        u_t = x_forcing * op_phi1
         
-        if x_tilde.shape[1] > 1:
-            x_curr = x_forcing
-            x_next = torch.cat([x_forcing[:, 1:], x_forcing[:, -1:]], dim=1)
-            
-            coeff_curr = op_phi1 - op_phi2
-            coeff_next = op_phi2
-            
-            u_t = x_curr * coeff_curr + x_next * coeff_next
-            
-            noise = self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
-            u_t = u_t + noise
-            
-            return self.basis.decode(h_tilde), op_decay, u_t
-            
-        else:
-            u_t = x_forcing * op_phi1
-            noise = self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
-            h_tilde_next = h_tilde * op_decay + u_t + noise
-            return self.basis.decode(h_tilde_next)
+        noise = self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
+        h_tilde_next = h_tilde * op_decay + u_t + noise
         
+        return self.basis.decode(h_tilde_next)
+    

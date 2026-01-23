@@ -76,27 +76,15 @@ class UniPhyBlock(nn.Module):
         gate = F.silu(self.prop.input_gate(x_encoded.real))
         x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
         
-        ops = self.prop.get_transition_operators(dt_expanded, x_encoded)
-        if len(ops) == 3:
-            op_decay, op_forcing, op_phi2 = ops
-        else:
-            op_decay, op_forcing = ops
-            op_phi2 = torch.zeros_like(op_forcing)
-
+        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded, x_encoded)
+            
         bias = self.prop._get_source_bias()
         x_forcing = x_encoded + bias
         
-        x_curr = x_forcing
-        x_next = torch.cat([x_forcing[:, 1:], x_forcing[:, -1:]], dim=1)
-        
-        coeff_curr = op_forcing - op_phi2
-        coeff_next = op_phi2
-        
-        u_t = x_curr * coeff_curr + x_next * coeff_next
+        u_t = x_forcing * op_forcing
         
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
-        
         h_eigen = self.pscan(op_decay, u_t)
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
         x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
