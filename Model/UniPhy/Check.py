@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import sys
 import os
 
@@ -91,6 +90,7 @@ def check_full_model_consistency():
     model.eval()
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.rand(B, T, device=device, dtype=torch.float64) + 1.0
+    
     with torch.no_grad():
         out_parallel = model(x, dt)
         
