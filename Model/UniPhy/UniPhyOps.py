@@ -75,7 +75,10 @@ class RiemannianCliffordConv2d(nn.Module):
         x_diffused = x + diffusion_term * local_viscosity * self.viscosity_scale * self.diffusion_scale
         x_scaled = x_diffused * scale
         out = self.conv(x_scaled)
-        out = out * inv_scale
+        if out.shape[1] == inv_scale.shape[1]:
+            out = out * inv_scale
+        else:
+            out = out * inv_scale.mean(dim=1, keepdim=True)
         return out
 
 class TemporalPropagator(nn.Module):
@@ -83,11 +86,9 @@ class TemporalPropagator(nn.Module):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
-        
         if noise_scale < 1e-9: init_val = -10.0
         else: init_val = float(np.log(np.exp(noise_scale) - 1.0))
         self.raw_noise_param = nn.Parameter(torch.tensor(init_val))
-        
         self.basis = ComplexSVDTransform(dim)
         self.ld = nn.Parameter(torch.empty(dim))
         self.lf = nn.Parameter(torch.empty(dim))
@@ -97,7 +98,6 @@ class TemporalPropagator(nn.Module):
         nn.init.zeros_(self.lambda_net.bias)
         self.input_gate = nn.Linear(dim, dim)
         nn.init.xavier_normal_(self.input_gate.weight)
-        nn.init.zeros_(self.input_gate.bias)
         self.src_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.src_im = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
@@ -122,10 +122,8 @@ class TemporalPropagator(nn.Module):
         real_part = np.real(eigenvalues)
         imag_part = np.imag(eigenvalues)
         sorted_indices = np.argsort(-real_part)
-        real_part = real_part[sorted_indices]
-        imag_part = imag_part[sorted_indices]
-        self.ld.data.copy_(torch.from_numpy(np.log(-real_part)).float())
-        self.lf.data.copy_(torch.from_numpy(imag_part).float())
+        self.ld.data.copy_(torch.from_numpy(np.log(-real_part[sorted_indices])).float())
+        self.lf.data.copy_(torch.from_numpy(imag_part[sorted_indices]).float())
 
     def _get_effective_lambda(self, x=None):
         l_phys = torch.complex(-torch.exp(self.ld), self.lf)
@@ -190,4 +188,3 @@ class TemporalPropagator(nn.Module):
         u_t = u_t + self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
         h_tilde_next = h_tilde * op_decay + u_t
         return self.basis.decode(h_tilde_next)
-    
