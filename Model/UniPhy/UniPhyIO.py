@@ -154,29 +154,36 @@ class UniPhyEnsembleDecoder(nn.Module):
                 B, D, H_p, W_p = z_latent.shape
                 T = 1
                 z_flat = z_latent
-            H, W = self.img_height, self.img_width
-            self.padder.set_padding(H, W)
+            H_raw, W_raw = H_p * self.patch_size, W_p * self.patch_size
+            self.padder.set_padding(H_raw, W_raw)
             C = -1 
+
         if z_flat.is_complex():
             z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
         else:
             z_cat = z_flat 
+
         x_feat = self.latent_proj(z_cat)
+        
         if member_idx is None:
             member_idx = torch.zeros((x_feat.shape[0],), dtype=torch.long, device=x_feat.device)
         elif member_idx.numel() == B and is_5d:
             member_idx = member_idx.repeat_interleave(T)
+            
         m_emb = self.member_emb(member_idx).unsqueeze(-1).unsqueeze(-1)
         h = x_feat + m_emb
         h = self.block(h)
         out = self.final_proj(h)
         out = F.pixel_shuffle(out, self.patch_size)
         out = self.padder.unpad(out)
-        if x_ref is None:
-             C = out.shape[1]
+        
+        _, C_actual, H_actual, W_actual = out.shape
+
         if is_5d:
-            out = out.view(B, T, C, H, W) 
+            out = out.view(B, T, C_actual, H_actual, W_actual) 
+            
         if x_ref is not None:
             out = self.conservation_constraint(out, x_ref)
+            
         return out
     
