@@ -40,18 +40,17 @@ class LearnableSphericalPosEmb(nn.Module):
         y_coord = torch.sin(theta_grid) * torch.sin(phi_grid)
         z_coord = torch.cos(theta_grid)
         coords = torch.stack([x_coord, y_coord, z_coord], dim=-1)
-        self.register_buffer('coords', coords)
+        self.register_buffer('coords', coords, persistent=False)
         self.mlp = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, dim),
             nn.LayerNorm(dim) 
         )
-        nn.init.normal_(self.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.mlp[2].weight, std=0.02)
 
     def forward(self, x):
-        emb = self.mlp(self.coords)
+        c = self.coords.detach().clone()
+        emb = self.mlp(c)
         emb = emb.permute(2, 0, 1).unsqueeze(0)
         return x + emb
 
