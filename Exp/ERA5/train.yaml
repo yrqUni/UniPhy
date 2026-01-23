@@ -1,10 +1,10 @@
 model:
   in_channels: 30
   out_channels: 30
-  embed_dim: 768
+  embed_dim: 512
   expand: 4
   num_experts: 8
-  depth: 12
+  depth: 8
   patch_size: 32
   img_height: 721
   img_width: 1440
@@ -24,7 +24,7 @@ train:
   epochs: 100
   grad_clip: 1.0
   grad_accum_steps: 1
-  ensemble_size: 2
+  ensemble_size: 3
   use_scheduler: false
   use_tf32: true
 
