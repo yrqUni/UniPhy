@@ -33,7 +33,7 @@ class UniPhyBlock(nn.Module):
         r, i = torch.chunk(out_cliff, 2, dim=1)
         return torch.complex(r, i)
 
-    def forward(self, x, dt, verify_serial=False):
+    def forward(self, x, dt):
         B, T, D, H, W = x.shape
         resid = x
         x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
@@ -53,15 +53,7 @@ class UniPhyBlock(nn.Module):
         u_t = x_forcing * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
-        if verify_serial:
-            h_seq = []
-            h = torch.zeros(B * H * W, D, device=x.device, dtype=u_t.dtype)
-            for t in range(T):
-                h = h * op_decay[:, t] + u_t[:, t]
-                h_seq.append(h)
-            h_eigen = torch.stack(h_seq, dim=1)
-        else:
-            h_eigen = self.pscan(op_decay, u_t)
+        h_eigen = self.pscan(op_decay, u_t)
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
         x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
@@ -105,7 +97,7 @@ class UniPhyModel(nn.Module):
         self.ic_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.checkpointing = checkpointing
 
-    def forward(self, x, dt, verify_serial=False):
+    def forward(self, x, dt):
         z = self.encoder(x)
         z_ic = z.clone()
         weights = F.softmax(self.fusion_weights, dim=0)
@@ -113,9 +105,9 @@ class UniPhyModel(nn.Module):
         for i, block in enumerate(self.blocks):
             z = z + z_ic * self.ic_scale
             if self.training and self.checkpointing:
-                z = checkpoint.checkpoint(block, z, dt, verify_serial, use_reentrant=False)
+                z = checkpoint.checkpoint(block, z, dt, use_reentrant=False)
             else:
-                z = block(z, dt, verify_serial=verify_serial)
+                z = block(z, dt)
             z_fused = z_fused + z * weights[i]
         return self.decoder(z_fused, x)
         
@@ -151,7 +143,7 @@ class UniPhyModel(nn.Module):
             z_fused_step = 0
             for w, out in zip(weights, step_outputs):
                 z_fused_step = z_fused_step + w * out
-            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), None).squeeze(1).to("cpu", non_blocking=True)
+            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), x_cond[:, -1:]).squeeze(1).to("cpu", non_blocking=True)
             predictions.append(pred_pixel)
         return torch.stack(predictions, dim=1)
     

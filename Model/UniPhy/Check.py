@@ -82,8 +82,8 @@ def check_variable_dt_broadcasting():
     B_HW, T = 16, 5
     h = torch.randn(B_HW, T, dim, device=device, dtype=torch.cdouble)
     x = torch.zeros(B_HW, T, dim, device=device, dtype=torch.cdouble)
-    dt_val = torch.rand(B_HW, T, device=device)
-    op_d, op_phi1 = prop.get_transition_operators(dt_val)
+    dt_multi = torch.rand(B_HW, T, device=device) + 0.5
+    op_d, op_phi1 = prop.get_transition_operators(dt_multi)
     if op_d.shape == (B_HW, T, dim): pass
     else: print(f"Broadcasting Shape Error: {op_d.shape}")
 
@@ -92,8 +92,7 @@ def check_full_model_consistency():
     B, T, C, H, W = 1, 5, 2, 32, 32
     model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
     model.eval()
-    for block in model.blocks:
-        block.prop.raw_noise_param.data.fill_(-100.0)
+    for block in model.blocks: block.prop.raw_noise_param.data.fill_(-100.0)
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.rand(B, T, device=device, dtype=torch.float64) + 1.0
     with torch.no_grad():
@@ -126,18 +125,15 @@ def check_forecast_consistency():
     B, T, C, H, W = 1, 3, 2, 32, 32
     model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
     model.eval()
-    for block in model.blocks:
-        block.prop.raw_noise_param.data.fill_(-100.0)
+    for block in model.blocks: block.prop.raw_noise_param.data.fill_(-100.0)
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.ones(B, T, device=device, dtype=torch.float64)
     with torch.no_grad():
         out_parallel = model(x, dt)
         out_forecast = model.forecast(x_cond=x[:, :1], dt_cond=dt[:, :1], k_steps=2, dt_future=dt[:, 1:])
-        
         step1_p = out_parallel[:, 1]
         step1_f = out_forecast[:, 0]
         diff1 = (step1_p - step1_f).abs().max().item()
-        
         if diff1 < 1e-12: pass
         else: print(f"Forecast Step 1 Consistency Error: {diff1:.2e}")
 
