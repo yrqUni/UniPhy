@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import sys
 import os
-import torch.nn.functional as F
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -88,22 +88,46 @@ def check_variable_dt_broadcasting():
 def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, C, H, W = 1, 5, 2, 32, 32
-    
     model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
     model.eval()
-    
     for block in model.blocks:
         block.prop.log_noise_scale.data.fill_(-100.0)
-    
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.rand(B, T, device=device, dtype=torch.float64) + 1.0
-    
     with torch.no_grad():
         out_parallel = model(x, dt)
-        out_serial = model.forward_serial_verify(x, dt)
-        
+        z = model.encoder(x)
+        z_ic = z.clone()
+        weights = F.softmax(model.fusion_weights, dim=0)
+        z_fused = 0
+        for i, block in enumerate(model.blocks):
+            z = z + z_ic * model.ic_scale
+            B_z, T_z, D_z, H_z, W_z = z.shape
+            x_s = z.view(B_z * T_z, D_z, H_z, W_z).permute(0, 2, 3, 1)
+            x_s = block._complex_norm(x_s, block.norm_spatial).permute(0, 3, 1, 2)
+            x_s = block._spatial_op(x_s)
+            x_spatial = x_s.view(B_z, T_z, D_z, H_z, W_z) + z
+            x_t = x_spatial.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
+            x_t = block._complex_norm(x_t, block.norm_temporal)
+            dt_exp = dt.view(B_z, 1, 1, T_z).expand(B_z, H_z, W_z, T_z).reshape(B_z * H_z * W_z, T_z)
+            x_enc = block.prop.basis.encode(x_t)
+            gt = F.silu(block.prop.input_gate(x_enc.real))
+            x_enc = x_enc * torch.complex(gt, torch.zeros_like(gt))
+            op_d, op_f = block.prop.get_transition_operators(dt_exp, x_enc)
+            u_t = (x_enc + block.prop._get_source_bias()) * op_f
+            h = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.cdouble)
+            h_list = []
+            for t in range(T_z):
+                h = h * op_d[:, t] + u_t[:, t]
+                h_list.append(h)
+            h_stack = torch.stack(h_list, dim=1)
+            x_dr = block.prop.basis.decode(h_stack).real.view(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
+            z_next = x_dr + x_spatial
+            z_next = z_next + block.ffn(z_next.view(B_z * T_z, D_z, H_z, W_z)).view(B_z, T_z, D_z, H_z, W_z)
+            z = z_next
+            z_fused = z_fused + z * weights[i]
+        out_serial = model.decoder(z_fused, x)
         diff = (out_parallel - out_serial).abs().max().item()
-        
         if diff < 1e-12: pass
         else: print(f"PScan Consistency Error: {diff:.2e}")
 
