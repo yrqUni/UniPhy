@@ -116,14 +116,14 @@ class UniPhyModel(nn.Module):
         z_ic = z.clone()
         states = []
         for block in self.blocks:
-            z = z + z_ic * self.ic_scale
-            z = block(z, dt_cond)
+            z_in = z + z_ic * self.ic_scale
+            _ = block(z_in, dt_cond)
             states.append(block.last_h_state.detach())
         z_curr = z[:, -1].detach()
         predictions = []
         x_ref = x_cond[:, -1:]
         for k in range(k_steps):
-            dt_k = dt_future[:, k] if (isinstance(dt_future, torch.Tensor) and dt_future.ndim > 0) else dt_future
+            dt_k = dt_future[:, k]
             z_next = z_curr
             new_states = []
             step_outputs = []
