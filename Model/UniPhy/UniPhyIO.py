@@ -104,7 +104,7 @@ class UniPhyEncoder(nn.Module):
         is_5d = x.ndim == 5
         if is_5d:
             B, T, C, H, W = x.shape
-            x = x.view(B * T, C, H, W)
+            x = x.reshape(B * T, C, H, W)
         x = self.padder.pad(x)
         x = F.pixel_unshuffle(x, self.patch_size)
         x_emb = self.proj(x)
@@ -113,7 +113,7 @@ class UniPhyEncoder(nn.Module):
         out = torch.complex(x_real, x_imag)
         if is_5d:
             _, D, H_p, W_p = out.shape
-            out = out.view(B, T, D, H_p, W_p)
+            out = out.reshape(B, T, D, H_p, W_p)
         return out
 
 class UniPhyEnsembleDecoder(nn.Module):
@@ -136,7 +136,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         is_5d = x_ref.ndim == 5
         if is_5d:
             B, T, C, H, W = x_ref.shape
-            z_flat = z_latent.view(B * T, *z_latent.shape[2:])
+            z_flat = z_latent.reshape(B * T, *z_latent.shape[2:])
         else:
             B, C, H, W = x_ref.shape
             T = 1
@@ -158,7 +158,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         out = F.pixel_shuffle(out, self.patch_size)
         out = self.padder.unpad(out)
         if is_5d:
-            out = out.view(B, T, C, H, W)
+            out = out.reshape(B, T, C, H, W)
         out = self.conservation_constraint(out, x_ref)
         return out
     

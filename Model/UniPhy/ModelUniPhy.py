@@ -44,11 +44,11 @@ class UniPhyBlock(nn.Module):
         x_t = self._complex_norm(x_t, self.norm_temporal)
         dt_t = torch.as_tensor(dt_step, device=x.device, dtype=x.real.dtype)
         if dt_t.numel() == B:
-            dt_expanded = dt_t.view(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
+            dt_expanded = dt_t.reshape(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
         else:
             dt_expanded = dt_t.reshape(-1, 1)
         h_next = self.prop.forward(h_prev, x_t, dt_expanded)
-        x_drift = h_next.real.view(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        x_drift = h_next.real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
         x = x_drift + resid
         x = x + self.ffn(x)
         return x, h_next
@@ -56,14 +56,14 @@ class UniPhyBlock(nn.Module):
     def forward(self, x, dt):
         B, T, D, H, W = x.shape
         resid = x
-        x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
+        x_s = x.reshape(B * T, D, H, W).permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
-        x = x_s.view(B, T, D, H, W) + resid
+        x = x_s.reshape(B, T, D, H, W) + resid
         resid = x
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
-        dt_expanded = torch.as_tensor(dt, device=x.device).view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
+        dt_expanded = torch.as_tensor(dt, device=x.device).reshape(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
         op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded)
         x_eigen = self.prop.basis.encode(x_t)
         bias = self.prop._get_source_bias()
@@ -72,11 +72,11 @@ class UniPhyBlock(nn.Module):
         u_t = u_t + noise
         h_eigen = self.pscan(op_decay, u_t)
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
-        x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        x_drift = self.prop.basis.decode(h_eigen).real.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
-        x_in = x.view(B * T, D, H, W)
+        x_in = x.reshape(B * T, D, H, W)
         delta_p = self.ffn(x_in)
-        x = x + delta_p.view(B, T, D, H, W)
+        x = x + delta_p.reshape(B, T, D, H, W)
         return x
 
 class UniPhyModel(nn.Module):

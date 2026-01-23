@@ -17,7 +17,7 @@ class RiemannianCliffordConv2d(nn.Module):
             nn.Sigmoid()
         )
         laplacian_init = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
-        self.laplacian_kernel = nn.Parameter(laplacian_init.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
+        self.laplacian_kernel = nn.Parameter(laplacian_init.reshape(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
         
         self.metric_scale = nn.Parameter(torch.tensor(0.1))
         self.viscosity_scale = nn.Parameter(torch.tensor(0.01))

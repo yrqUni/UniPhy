@@ -69,7 +69,7 @@ class _PScanFunction(torch.autograd.Function):
         L = X.shape[1]
         
         A_in, X_in = A.transpose(1, -1).contiguous(), X.transpose(1, -1).contiguous()
-        A_flat, X_flat = A_in.view(-1, L), X_in.view(-1, L)
+        A_flat, X_flat = A_in.reshape(-1, L), X_in.reshape(-1, L)
         
         A_real, X_real = torch.view_as_real(A_flat).contiguous(), torch.view_as_real(X_flat).contiguous()
         Y_real = torch.empty_like(X_real)
@@ -82,7 +82,7 @@ class _PScanFunction(torch.autograd.Function):
             L, BLOCK_SIZE, False
         )
         
-        Y = torch.view_as_complex(Y_real).view(*A_in.shape).transpose(1, -1)
+        Y = torch.view_as_complex(Y_real).reshape(*A_in.shape).transpose(1, -1)
         ctx.save_for_backward(A, Y)
         return Y
 
@@ -94,7 +94,7 @@ class _PScanFunction(torch.autograd.Function):
         
         L = A.shape[1]
         A_in, X_in = A_prep.transpose(1, -1).contiguous(), grad_output.transpose(1, -1).contiguous()
-        A_flat, X_flat = A_in.view(-1, L), X_in.view(-1, L)
+        A_flat, X_flat = A_in.reshape(-1, L), X_in.reshape(-1, L)
         
         A_real, X_real = torch.view_as_real(A_flat).contiguous(), torch.view_as_real(X_flat).contiguous()
         Y_real = torch.empty_like(X_real)
@@ -107,7 +107,7 @@ class _PScanFunction(torch.autograd.Function):
             L, BLOCK_SIZE, True
         )
         
-        dX = torch.view_as_complex(Y_real).view(*A_in.shape).transpose(1, -1)
+        dX = torch.view_as_complex(Y_real).reshape(*A_in.shape).transpose(1, -1)
         
         Y_prev = torch.cat([torch.zeros_like(Y[:, 0:1]), Y[:, :-1]], dim=1)
         dA = dX * Y_prev.conj()
