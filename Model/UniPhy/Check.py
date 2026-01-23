@@ -126,54 +126,41 @@ def check_forecast_consistency():
     model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
     model.eval()
     for block in model.blocks: block.prop.raw_noise_param.data.fill_(-100.0)
-    
     x_cond = torch.randn(B, T_cond, C, H, W, device=device, dtype=torch.float64)
     dt_cond = torch.ones(B, T_cond, device=device, dtype=torch.float64)
     dt_future = torch.ones(B, T_future, device=device, dtype=torch.float64)
-    
     with torch.no_grad():
         out_forecast = model.forecast(x_cond=x_cond, dt_cond=dt_cond, k_steps=T_future, dt_future=dt_future)
-        
         z = model.encoder(x_cond)
         z_ic = z.clone()
         states = []
         for block in model.blocks:
             z_in = z + z_ic * model.ic_scale
-            _ = block(z_in, dt_cond)
+            z = block(z_in, dt_cond)
             states.append(block.last_h_state.detach())
-        
         z_curr = z[:, -1]
         x_ref = x_cond[:, -1]
         manual_preds = []
-        
         for k in range(T_future):
             dt_k = dt_future[:, k]
-            z_next_input = z_curr
+            z_layer_in = z_curr
             new_states = []
             step_outputs = []
-            
             for i, block in enumerate(model.blocks):
                 h_p = states[i]
-                z_step, h_n = block.forward_step(z_next_input, h_p, dt_k)
+                z_layer_in = z_layer_in + z_ic[:, -1] * model.ic_scale
+                z_step, h_n = block.forward_step(z_layer_in, h_p, dt_k)
                 step_outputs.append(z_step)
                 new_states.append(h_n)
-            
+                z_layer_in = z_step
             states = new_states
-            z_curr = z_next_input
-            
-            z_curr = step_outputs[-1]
-            
+            z_curr = z_step
             weights = F.softmax(model.fusion_weights, dim=0)
-            z_fused_step = 0
-            for w, out in zip(weights, step_outputs):
-                z_fused_step = z_fused_step + w * out
-                
+            z_fused_step = sum(w * out for w, out in zip(weights, step_outputs))
             pred_pixel = model.decoder(z_fused_step.unsqueeze(1), x_ref.unsqueeze(1)).squeeze(1)
             manual_preds.append(pred_pixel)
             x_ref = pred_pixel
-            
         out_manual = torch.stack(manual_preds, dim=1)
-        
         diff = (out_forecast - out_manual).abs().max().item()
         if diff < 1e-12: pass
         else: print(f"Forecast Self-Consistency Error: {diff:.2e}")
@@ -189,3 +176,4 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         check_full_model_consistency()
         check_forecast_consistency()
+        

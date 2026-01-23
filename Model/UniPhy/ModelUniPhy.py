@@ -117,29 +117,29 @@ class UniPhyModel(nn.Module):
         states = []
         for block in self.blocks:
             z_in = z + z_ic * self.ic_scale
-            _ = block(z_in, dt_cond)
+            z = block(z_in, dt_cond)
             states.append(block.last_h_state.detach())
         z_curr = z[:, -1].detach()
-        predictions = []
         x_ref = x_cond[:, -1:]
+        predictions = []
         for k in range(k_steps):
             dt_k = dt_future[:, k]
-            z_next = z_curr
+            z_layer_in = z_curr
             new_states = []
             step_outputs = []
             for i, block in enumerate(self.blocks):
                 h_prev = states[i]
-                z_next, h_next = block.forward_step(z_next, h_prev, dt_k)
-                step_outputs.append(z_next)
+                z_layer_in = z_layer_in + z_ic[:, -1] * self.ic_scale
+                z_out, h_next = block.forward_step(z_layer_in, h_prev, dt_k)
+                step_outputs.append(z_out)
                 new_states.append(h_next.detach())
+                z_layer_in = z_out
             states = new_states
-            z_curr = z_next
+            z_curr = z_out
             weights = F.softmax(self.fusion_weights, dim=0)
-            z_fused_step = 0
-            for w, out in zip(weights, step_outputs):
-                z_fused_step = z_fused_step + w * out
+            z_fused_step = sum(w * out for w, out in zip(weights, step_outputs))
             pred_pixel = self.decoder(z_fused_step.unsqueeze(1), x_ref)
             predictions.append(pred_pixel.squeeze(1))
-            x_ref = pred_pixel 
+            x_ref = pred_pixel
         return torch.stack(predictions, dim=1)
     
