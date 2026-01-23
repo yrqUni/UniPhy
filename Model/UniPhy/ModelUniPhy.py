@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-
 from PScan import PScanTriton 
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
@@ -34,6 +33,43 @@ class UniPhyBlock(nn.Module):
         r, i = torch.chunk(out_cliff, 2, dim=1)
         return torch.complex(r, i)
 
+    def forward(self, x, dt, verify_serial=False):
+        B, T, D, H, W = x.shape
+        resid = x
+        x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
+        x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
+        x_s = self._spatial_op(x_s)
+        x = x_s.view(B, T, D, H, W) + resid
+        resid = x
+        x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
+        x_t = self._complex_norm(x_t, self.norm_temporal)
+        dt_expanded = torch.as_tensor(dt, device=x.device).view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
+        x_encoded = self.prop.basis.encode(x_t)
+        gate = F.silu(self.prop.input_gate(x_encoded.real))
+        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
+        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded, x_encoded)
+        bias = self.prop._get_source_bias()
+        x_forcing = x_encoded + bias
+        u_t = x_forcing * op_forcing
+        noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
+        u_t = u_t + noise
+        if verify_serial:
+            h_seq = []
+            h = torch.zeros(B * H * W, D, device=x.device, dtype=u_t.dtype)
+            for t in range(T):
+                h = h * op_decay[:, t] + u_t[:, t]
+                h_seq.append(h)
+            h_eigen = torch.stack(h_seq, dim=1)
+        else:
+            h_eigen = self.pscan(op_decay, u_t)
+        self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
+        x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        x = x_drift + resid
+        x_in = x.view(B * T, D, H, W)
+        delta_p = self.ffn(x_in)
+        x = x + delta_p.view(B, T, D, H, W)
+        return x
+
     def forward_step(self, x_step, h_prev, dt_step):
         B, D, H, W = x_step.shape
         resid = x_step
@@ -45,54 +81,15 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         dt_t = torch.as_tensor(dt_step, device=x.device, dtype=x.real.dtype)
-        if dt_t.numel() == B:
-            dt_expanded = dt_t.view(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
-        else:
-            dt_expanded = dt_t.reshape(-1, 1)
+        if dt_t.numel() == B: dt_expanded = dt_t.view(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
+        else: dt_expanded = dt_t.reshape(-1, 1)
         prop_out = self.prop.forward(h_prev, x_t, dt_expanded)
-        if isinstance(prop_out, tuple):
-            h_next = prop_out[0]
-        else:
-            h_next = prop_out
+        if isinstance(prop_out, tuple): h_next = prop_out[0]
+        else: h_next = prop_out
         x_drift = h_next.real.view(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
         x = x_drift + resid
         x = x + self.ffn(x)
         return x, h_next
-
-    def forward(self, x, dt):
-        B, T, D, H, W = x.shape
-        resid = x
-        x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
-        x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
-        x_s = self._spatial_op(x_s)
-        x = x_s.view(B, T, D, H, W) + resid
-        resid = x
-        x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
-        x_t = self._complex_norm(x_t, self.norm_temporal)
-        dt_expanded = torch.as_tensor(dt, device=x.device).view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
-        
-        x_encoded = self.prop.basis.encode(x_t)
-        
-        gate = F.silu(self.prop.input_gate(x_encoded.real))
-        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
-        
-        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded, x_encoded)
-            
-        bias = self.prop._get_source_bias()
-        x_forcing = x_encoded + bias
-        
-        u_t = x_forcing * op_forcing
-        
-        noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
-        u_t = u_t + noise
-        h_eigen = self.pscan(op_decay, u_t)
-        self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
-        x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
-        x = x_drift + resid
-        x_in = x.view(B * T, D, H, W)
-        delta_p = self.ffn(x_in)
-        x = x + delta_p.view(B, T, D, H, W)
-        return x
 
 class UniPhyModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, checkpointing=True):
@@ -108,23 +105,18 @@ class UniPhyModel(nn.Module):
         self.ic_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.checkpointing = checkpointing
 
-    def forward(self, x, dt):
+    def forward(self, x, dt, verify_serial=False):
         z = self.encoder(x)
         z_ic = z.clone()
-        
         weights = F.softmax(self.fusion_weights, dim=0)
         z_fused = 0 
-        
         for i, block in enumerate(self.blocks):
             z = z + z_ic * self.ic_scale
-            
             if self.training and self.checkpointing:
-                z = checkpoint.checkpoint(block, z, dt, use_reentrant=False)
+                z = checkpoint.checkpoint(block, z, dt, verify_serial, use_reentrant=False)
             else:
-                z = block(z, dt)
-            
+                z = block(z, dt, verify_serial=verify_serial)
             z_fused = z_fused + z * weights[i]
-            
         return self.decoder(z_fused, x)
         
     @torch.no_grad()
