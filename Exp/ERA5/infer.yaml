@@ -1,0 +1,13 @@
+inference:
+  ckpt_path: "./uniphy/ckpt/ep100_step50000.pth"
+  data_root: "/nfs/ERA5_data/data_norm"
+  save_dir: "./uniphy/results"
+  batch_size: 1
+  year_range: [2021, 2021]
+  cond_frames: 2
+  pred_frames: 8
+  dt_ref: 6.0
+  num_ensemble: 2
+  eval_sample_num: 100
+  device: "cuda"
+  use_tf32: true
