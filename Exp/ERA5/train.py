@@ -231,10 +231,9 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     global_step += 1
 
                     if rank == 0 and train_step % log_every == 0:
-                        cur_noise = F.softplus(model.module.blocks[0].prop.raw_noise_param).item()
-                        logger.info(f"CRPS: {crps:.4f} | MAE: {mae_val:.4f} | RMSE: {rmse_val:.4f} | Spread: {raw_spread:.4f} | Noise: {cur_noise:.4f}")
+                        logger.info(f"CRPS: {crps:.4f} | MAE: {mae_val:.4f} | RMSE: {rmse_val:.4f} | Spread: {raw_spread:.4f}")
                         if cfg['logging']['use_wandb']:
-                            wandb.log({"train/crps": crps, "train/mae": mae_val, "train/rmse": rmse_val, "train/spread": raw_spread, "train/noise_scale": cur_noise, "train/gn": gn})
+                            wandb.log({"train/crps": crps, "train/mae": mae_val, "train/rmse": rmse_val, "train/spread": raw_spread, "train/gn": gn})
 
                     if train_step % save_interval == 0:
                         save_ckpt(model, opt, ep+1, train_step, crps.item(), cfg, scheduler)
