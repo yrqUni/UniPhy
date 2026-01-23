@@ -337,7 +337,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                             elapsed = time.time() - start_time
                             start_time = time.time()
                             logger.info(
-                                f"Ep [param]{ep+1:03d}[/] | Step [param]{global_step:06d}[/] | "
                                 f"[metric]CRPS[/]: [value]{avg_crps:.4f}[/] | [metric]MAE[/]: [value]{avg_l1:.4f}[/] | "
                                 f"[metric]RMSE[/]: [value]{avg_rmse:.4f}[/] | "
                                 f"[metric]Spread[/]: [value]{avg_spread:.4f}[/] | [metric]GN[/]: [value]{gn:.2f}[/]"
