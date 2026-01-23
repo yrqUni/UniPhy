@@ -54,7 +54,7 @@ def check_ou_noise_scaling():
 def check_semigroup_property():
     dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = TemporalPropagator(dim, noise_scale=0.0, selective_dynamics=False).to(device)
+    prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
     prop.eval()
     h0 = torch.randn(1, dim, device=device, dtype=torch.cdouble)
     x0 = torch.zeros(1, dim, device=device, dtype=torch.cdouble)
