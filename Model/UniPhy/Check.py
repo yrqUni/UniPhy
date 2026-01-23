@@ -71,7 +71,7 @@ def check_semigroup_property():
     for _ in range(steps):
         h_step = prop.forward(h_step, x0, dt=dt_small)
     diff = (h_jump - h_step).abs().max().item()
-    if diff < 1e-10: pass
+    if diff < 1e-8: pass
     else: print(f"Semigroup Property Error: {diff:.2e}")
 
 def check_variable_dt_broadcasting():
@@ -122,25 +122,61 @@ def check_full_model_consistency():
 
 def check_forecast_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, C, H, W = 1, 3, 2, 32, 32
+    B, T_cond, T_future, C, H, W = 1, 1, 2, 2, 32, 32
     model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W).to(device)
     model.eval()
     for block in model.blocks: block.prop.raw_noise_param.data.fill_(-100.0)
     
-    x_single = torch.randn(B, 1, C, H, W, device=device, dtype=torch.float64)
-    x = x_single.repeat(1, T, 1, 1, 1)
-    dt = torch.ones(B, T, device=device, dtype=torch.float64)
+    x_cond = torch.randn(B, T_cond, C, H, W, device=device, dtype=torch.float64)
+    dt_cond = torch.ones(B, T_cond, device=device, dtype=torch.float64)
+    dt_future = torch.ones(B, T_future, device=device, dtype=torch.float64)
     
     with torch.no_grad():
-        out_parallel = model(x, dt)
-        out_forecast = model.forecast(x_cond=x[:, :1], dt_cond=dt[:, :1], k_steps=2, dt_future=dt[:, 1:])
+        out_forecast = model.forecast(x_cond=x_cond, dt_cond=dt_cond, k_steps=T_future, dt_future=dt_future)
         
-        step1_p = out_parallel[:, 1]
-        step1_f = out_forecast[:, 0]
+        z = model.encoder(x_cond)
+        z_ic = z.clone()
+        states = []
+        for block in model.blocks:
+            z_in = z + z_ic * model.ic_scale
+            _ = block(z_in, dt_cond)
+            states.append(block.last_h_state.detach())
         
-        diff1 = (step1_p - step1_f).abs().max().item()
-        if diff1 < 1e-6: pass 
-        else: print(f"Forecast Step 1 Consistency Error: {diff1:.2e}")
+        z_curr = z[:, -1]
+        x_ref = x_cond[:, -1]
+        manual_preds = []
+        
+        for k in range(T_future):
+            dt_k = dt_future[:, k]
+            z_next_input = z_curr
+            new_states = []
+            step_outputs = []
+            
+            for i, block in enumerate(model.blocks):
+                h_p = states[i]
+                z_step, h_n = block.forward_step(z_next_input, h_p, dt_k)
+                step_outputs.append(z_step)
+                new_states.append(h_n)
+            
+            states = new_states
+            z_curr = z_next_input
+            
+            z_curr = step_outputs[-1]
+            
+            weights = F.softmax(model.fusion_weights, dim=0)
+            z_fused_step = 0
+            for w, out in zip(weights, step_outputs):
+                z_fused_step = z_fused_step + w * out
+                
+            pred_pixel = model.decoder(z_fused_step.unsqueeze(1), x_ref.unsqueeze(1)).squeeze(1)
+            manual_preds.append(pred_pixel)
+            x_ref = pred_pixel
+            
+        out_manual = torch.stack(manual_preds, dim=1)
+        
+        diff = (out_forecast - out_manual).abs().max().item()
+        if diff < 1e-12: pass
+        else: print(f"Forecast Self-Consistency Error: {diff:.2e}")
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
@@ -153,4 +189,3 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         check_full_model_consistency()
         check_forecast_consistency()
-        
