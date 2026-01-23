@@ -73,9 +73,9 @@ class UniPhyBlock(nn.Module):
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
         x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
-        x_in = x.view(B * T, D, H, W)
+        x_in = x.reshape(B * T, D, H, W)
         delta_p = self.ffn(x_in)
-        x = x + delta_p.view(B, T, D, H, W)
+        x = x + delta_p.reshape(B, T, D, H, W)
         return x
     
 class UniPhyModel(nn.Module):
