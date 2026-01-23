@@ -4,13 +4,8 @@ import os
 import torch
 import gc
 import traceback
-import time
-
-try:
-    from ModelUniPhy import UniPhyModel
-except ImportError:
-    sys.path.append("/nfs/UniPhy/Model/UniPhy")
-    from ModelUniPhy import UniPhyModel
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
+from ModelUniPhy import UniPhyModel
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

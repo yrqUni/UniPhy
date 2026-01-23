@@ -20,9 +20,9 @@ def check_plu_invertibility():
     else: print(f"PLU Inversion Error: {err:.2e}")
 
 def check_parapool_conservation():
-    dim, expand = 64, 4
+    dim, expand, num_experts = 64, 4, 8
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ffn = UniPhyFeedForwardNetwork(dim, expand).to(device)
+    ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts).to(device)
     x = torch.randn(4, dim, 16, 16, device=device, dtype=torch.cdouble)
     delta = ffn(x)
     mean_val = delta.mean(dim=(-2, -1)).abs().max().item()

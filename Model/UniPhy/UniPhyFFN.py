@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 class LayerNorm2d(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6):
         super().__init__()
@@ -18,48 +17,47 @@ class LayerNorm2d(nn.Module):
         return x
     
 class ComplexDynamicFFN(nn.Module):
-    def __init__(self, dim, hidden_dim, num_experts=4):
+    def __init__(self, dim, hidden_dim, num_experts=8):
         super().__init__()
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
         self.spatial_re = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         self.spatial_im = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.experts_re = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
-        self.experts_im = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
+        self.experts_up_re = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
+        self.experts_up_im = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
+        self.experts_down_re = nn.Conv2d(hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts)
+        self.experts_down_im = nn.Conv2d(hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts)
         self.router = nn.Sequential(
-            nn.Conv2d(dim, dim // 4, 1),
-            LayerNorm2d(dim // 4) if dim // 4 > 0 else nn.Identity(),
+            nn.Conv2d(dim, dim, 1),
+            LayerNorm2d(dim),
             nn.GELU(),
-            nn.Conv2d(dim // 4, num_experts, 1) 
+            nn.Conv2d(dim, num_experts, 1)
         )
-        self.out_re = nn.Conv2d(hidden_dim, dim, 1)
-        self.out_im = nn.Conv2d(hidden_dim, dim, 1)
-        nn.init.zeros_(self.out_re.weight)
-        nn.init.zeros_(self.out_im.weight)
+        nn.init.xavier_uniform_(self.experts_down_re.weight)
+        nn.init.zeros_(self.experts_down_im.weight)
 
     def forward(self, z):
         re, im = z.real, z.imag
         B, C, H, W = re.shape
         re = self.spatial_re(re) - self.spatial_im(im)
         im = self.spatial_re(im) + self.spatial_im(re)
-        feat_combined = re + im 
-        route_weights = F.softmax(self.router(feat_combined), dim=1)
-        all_experts_re = self.experts_re(re) - self.experts_im(im)
-        all_experts_im = self.experts_re(im) + self.experts_im(re)
-        all_experts_re = all_experts_re.view(B, self.num_experts, self.hidden_dim, H, W)
-        all_experts_im = all_experts_im.view(B, self.num_experts, self.hidden_dim, H, W)
+        route_weights = F.softmax(self.router(re + im), dim=1)
+        up_re = self.experts_up_re(re) - self.experts_up_im(im)
+        up_im = self.experts_up_re(im) + self.experts_up_im(re)
+        up_re = F.silu(up_re)
+        up_im = F.silu(up_im)
+        down_re = self.experts_down_re(up_re) - self.experts_down_im(up_im)
+        down_im = self.experts_down_re(up_im) + self.experts_down_im(up_re)
+        down_re = down_re.view(B, self.num_experts, self.dim, H, W)
+        down_im = down_im.view(B, self.num_experts, self.dim, H, W)
         w = route_weights.unsqueeze(2)
-        h_re = (all_experts_re * w).sum(dim=1)
-        h_im = (all_experts_im * w).sum(dim=1)
-        h_re = F.silu(h_re)
-        h_im = F.silu(h_im)
-        out_re = self.out_re(h_re) - self.out_im(h_im)
-        out_i = self.out_re(h_im) + self.out_im(h_re)
-        return torch.complex(out_re, out_i)
+        out_re = (down_re * w).sum(dim=1)
+        out_im = (down_im * w).sum(dim=1)
+        return torch.complex(out_re, out_im)
     
 class UniPhyFeedForwardNetwork(nn.Module):
-    def __init__(self, dim, expand, num_experts=4):
+    def __init__(self, dim, expand, num_experts):
         super().__init__()
         self.dim = dim
         self.hidden_dim = int(dim * expand)

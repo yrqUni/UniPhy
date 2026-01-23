@@ -5,11 +5,10 @@ import os
 import random
 import sys
 import warnings
-
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
@@ -33,16 +32,13 @@ def compute_metrics(pred, target, lat_weight):
     if lat_weight is not None:
         if lat_weight.device != pred.device:
             lat_weight = lat_weight.to(pred.device)
-    
     error = pred - target
     mse = (error ** 2)
-    
     if lat_weight is not None:
         mse = mse * lat_weight
         rmse = torch.sqrt(mse.mean(dim=(0, 2, 3))).mean().item()
     else:
         rmse = torch.sqrt(mse.mean()).item()
-        
     return rmse
 
 def get_lat_weights(H, W, device):
@@ -63,56 +59,62 @@ def main():
     parser.add_argument("--dt_ref", type=float, default=6.0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_ensemble", type=int, default=1)
+    parser.add_argument("--eval_sample_num", type=int, default=100)
     args = parser.parse_args()
 
     set_random_seed(1017)
     os.makedirs(args.save_dir, exist_ok=True)
-    
     device = torch.device(args.device)
-    
+
     checkpoint = torch.load(args.ckpt, map_location="cpu")
     model_args = checkpoint["model_args"]
-    
+
     model = UniPhyModel(
         in_channels=model_args["in_channels"],
         out_channels=model_args["out_channels"],
         embed_dim=model_args["embed_dim"],
         expand=model_args["expand"],
+        num_experts=model_args.get("num_experts", 4),
         depth=model_args["depth"],
         patch_size=model_args["patch_size"],
         img_height=model_args["img_height"],
         img_width=model_args["img_width"]
     ).to(device)
-    
+
     sd = checkpoint["model"]
     new_sd = {k.replace("module.", ""): v for k, v in sd.items()}
     model.load_state_dict(new_sd, strict=True)
     model.eval()
-    
     print(f"Loaded model from {args.ckpt}")
 
     test_ds = ERA5_Dataset(
             input_dir=args.data_root,
             year_range=args.year_range,
-            is_train=False,
             sample_len=args.cond_frames + args.pred_frames,
-            eval_sample=args.eval_sample_num
+            look_ahead=2
             )
     
+    if args.eval_sample_num > 0 and args.eval_sample_num < len(test_ds):
+        total_len = len(test_ds)
+        indices = np.linspace(0, total_len - 1, args.eval_sample_num, dtype=int)
+        test_ds = Subset(test_ds, indices)
+        print(f"Subsampled dataset to {len(test_ds)} samples (from {total_len}).")
+
     test_loader = DataLoader(
             test_ds,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=1,
+            num_workers=2,
             pin_memory=True,
             prefetch_factor=2,
             persistent_workers=True
             )
 
     lat_weights = get_lat_weights(model_args["img_height"], model_args["img_width"], device)
-    
     all_rmses = []
-    
+
+    print(f"Start Inference on {len(test_loader)} batches...")
+
     with torch.no_grad():
         for i, data in tqdm(enumerate(test_loader), total=len(test_loader)):
             data = data.to(device).float()
@@ -135,17 +137,18 @@ def main():
             rmse = compute_metrics(pred_final, x_target, lat_weights)
             all_rmses.append(rmse)
             
-            if i % 100 == 0:
+            if i % 10 == 0:
                 print(f"Step {i}: RMSE = {rmse:.4f}")
-                
+
     mean_rmse = np.mean(all_rmses)
     print(f"\nFinal Test RMSE: {mean_rmse:.4f}")
     
     result_path = os.path.join(args.save_dir, "metric_summary.txt")
     with open(result_path, "w") as f:
         f.write(f"Checkpoint: {args.ckpt}\n")
+        f.write(f"Year Range: {args.year_range}\n")
         f.write(f"Mean RMSE: {mean_rmse:.4f}\n")
 
 if __name__ == "__main__":
     main()
-
+    

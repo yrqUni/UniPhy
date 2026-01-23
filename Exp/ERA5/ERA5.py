@@ -10,7 +10,7 @@ import threading
 import time
 
 class ERA5_Dataset(Dataset):
-    def __init__(self, input_dir, year_range, is_train=True, sample_len=8, look_ahead=2):
+    def __init__(self, input_dir, year_range, sample_len=8, look_ahead=2):
         self.input_root = input_dir
         self.sample_len = sample_len
         self.shm_root = "/dev/shm/era5_cache"
