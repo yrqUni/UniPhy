@@ -16,69 +16,76 @@ class RiemannianCliffordConv2d(nn.Module):
             nn.Conv2d(in_channels, in_channels, 1),
             nn.Sigmoid()
         )
-        laplacian = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
-        self.register_buffer('laplacian_kernel', laplacian.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
+        laplacian_init = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
+        self.laplacian_kernel = nn.Parameter(laplacian_init.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
+        
+        self.metric_scale = nn.Parameter(torch.tensor(0.1))
+        self.viscosity_scale = nn.Parameter(torch.tensor(0.01))
+        self.diffusion_scale = nn.Parameter(torch.tensor(0.01))
+        
         self.groups = in_channels
 
     def forward(self, x):
         dtype = self.conv.weight.dtype
         x = x.to(dtype)
         base_log = self.log_metric_param.to(dtype)
-        dynamic_log = self.metric_refiner(x) * 0.1
+        dynamic_log = self.metric_refiner(x) * self.metric_scale
         effective_log_metric = base_log + dynamic_log
         scale = torch.exp(effective_log_metric)
         inv_scale = torch.exp(-effective_log_metric)
         kernel = self.laplacian_kernel.to(dtype)
         diffusion_term = F.conv2d(x, kernel, padding=1, groups=self.groups)
         local_viscosity = self.viscosity_gate(x) * inv_scale
-        x_diffused = x + diffusion_term * local_viscosity * 0.01
+        x_diffused = x + diffusion_term * local_viscosity * self.viscosity_scale * self.diffusion_scale
         x_scaled = x_diffused * scale
         out = self.conv(x_scaled)
         out = out * inv_scale
         return out
 
-class ComplexPLUTransform(nn.Module):
+class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        perm_idx = torch.randperm(dim)
-        self.register_buffer('perm_idx', perm_idx)
-        self.register_buffer('inv_perm_idx', torch.argsort(perm_idx))
-        self.l_re = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.l_im = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.u_re = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.u_im = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.u_s = nn.Parameter(torch.zeros(dim))
-        self.u_p = nn.Parameter(torch.zeros(dim))
-        self.register_buffer('mask_l', torch.tril(torch.ones(dim, dim), diagonal=-1))
-        self.register_buffer('mask_u', torch.triu(torch.ones(dim, dim), diagonal=1))
+        self.u_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.u_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.v_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.v_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.01)
+        self.log_sigma = nn.Parameter(torch.zeros(dim))
 
-    def _mat(self):
-        device = self.l_re.device
-        dtype = self.l_re.dtype
-        L = torch.complex(self.l_re * self.mask_l + torch.eye(self.dim, device=device, dtype=dtype), self.l_im * self.mask_l)
-        diag = torch.complex(torch.exp(self.u_s) * torch.cos(self.u_p), torch.exp(self.u_s) * torch.sin(self.u_p))
-        U = torch.complex(self.u_re, self.u_im) * self.mask_u + torch.diag_embed(diag)
-        return L, U
+    def _cayley_transform(self, raw_re, raw_im):        
+        A_re = (raw_re - raw_re.T) * 0.5
+        A_im = (raw_im + raw_im.T) * 0.5
+        A = torch.complex(A_re, A_im)
+        I = torch.eye(self.dim, device=raw_re.device, dtype=A.dtype)
+        U = torch.linalg.solve(I - A, I + A) 
+        return U
+
+    def _get_basis(self):
+        U = self._cayley_transform(self.u_raw_re, self.u_raw_im)
+        V = self._cayley_transform(self.v_raw_re, self.v_raw_im)
+        S = torch.exp(self.log_sigma).type_as(U)
+        S_mat = torch.diag_embed(S + 0j) 
+        return U, S_mat, V
 
     def encode(self, x):
-        L, U = self._mat()
-        L_inv = torch.linalg.solve_triangular(L, torch.eye(self.dim, device=x.device, dtype=L.dtype), upper=False)
-        U_inv = torch.linalg.solve_triangular(U, torch.eye(self.dim, device=x.device, dtype=U.dtype), upper=True)
-        mat_inv = U_inv @ L_inv
-        return torch.matmul(x[..., self.inv_perm_idx].to(mat_inv.dtype), mat_inv.T)
+        U, S_mat, V = self._get_basis()
+        S_inv_val = torch.exp(-self.log_sigma).type_as(U)
+        S_inv = torch.diag_embed(S_inv_val + 0j)
+        M_inv = V @ S_inv @ U.conj().T
+        return torch.matmul(x.to(M_inv.dtype), M_inv.T)
 
     def decode(self, x):
-        L, U = self._mat()
-        return torch.matmul(torch.matmul(x, U.T), L.T)[..., self.perm_idx]
-
+        U, S_mat, V = self._get_basis()
+        M = U @ S_mat @ V.conj().T
+        return torch.matmul(x.to(M.dtype), M.T)
+    
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
         self.noise_scale = noise_scale
-        self.basis = ComplexPLUTransform(dim)
+        self.basis = ComplexSVDTransform(dim)
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
         self.lf = nn.Parameter(torch.randn(dim) * 1.0)
         self.src_re = nn.Parameter(torch.randn(dim) * 0.01)
