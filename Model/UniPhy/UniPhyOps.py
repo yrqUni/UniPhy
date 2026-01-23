@@ -79,7 +79,7 @@ class RiemannianCliffordConv2d(nn.Module):
         return out
 
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
+    def __init__(self, dim, dt_ref=1.0):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
