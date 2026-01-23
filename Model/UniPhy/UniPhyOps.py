@@ -99,6 +99,16 @@ class TemporalPropagator(nn.Module):
         self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_im = nn.Parameter(torch.randn(dim) * 0.01)
 
+        self.num_groups = 4
+        base_scales = [1.0, 1.0/6.0, 1.0/24.0, 1.0/120.0]
+        group_dim = dim // self.num_groups
+        scales_tensor = torch.zeros(dim)
+        for i, s in enumerate(base_scales):
+            start = i * group_dim
+            end = start + group_dim if i < self.num_groups - 1 else dim
+            scales_tensor[start:end] = s
+        self.register_buffer('dt_scales', scales_tensor.view(1, 1, dim))
+
     def _get_effective_lambda(self, x=None):
         l_phys = torch.complex(-torch.exp(self.ld), self.lf)
         l_law = torch.complex(self.law_re, self.law_im)
@@ -116,13 +126,19 @@ class TemporalPropagator(nn.Module):
 
     def get_transition_operators(self, dt, x=None):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        dt_eff = (dt / self.dt_ref).unsqueeze(-1)
+        
+        if dt.ndim == 2:
+            dt_expanded = dt.unsqueeze(-1)
+        else:
+            dt_expanded = dt.reshape(-1, 1, 1)
+            
+        dt_scaled = dt_expanded * self.dt_scales
+        dt_eff = dt_scaled / self.dt_ref
         
         Lambda = self._get_effective_lambda(x)
         Z = Lambda * dt_eff
         
         mask = torch.abs(Z) < 1e-4
-        
         Z_safe = torch.where(mask, torch.ones_like(Z), Z)
         
         phi1 = torch.where(mask, 
@@ -138,20 +154,46 @@ class TemporalPropagator(nn.Module):
     def generate_stochastic_term(self, target_shape, dt, dtype):
         if not self.training or self.noise_scale <= 0:
             return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
+        
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
+        if dt.ndim == 2:
+            dt_expanded = dt.unsqueeze(-1)
+        else:
+            dt_expanded = dt.reshape(-1, 1, 1)
+            
+        dt_scaled = dt_expanded * self.dt_scales
+        dt_eff = dt_scaled / self.dt_ref
+        
         l_re = self._get_effective_lambda(None).real
-        var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1)) / (2 * l_re)
+        var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * dt_eff) / (2 * l_re)
         std = torch.sqrt(torch.abs(var)).to(dtype)
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
-    def forward(self, h_prev, x_input, dt):
+    def forward(self, h_prev, x_input, dt, x_target=None, dt_remaining=None):
         h_tilde = self.basis.encode(h_prev)
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
         
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
-        
+
+        if x_target is not None and dt_remaining is not None:
+            h_target = self.basis.encode(x_target)
+            if h_target.ndim == 2: h_target = h_target.unsqueeze(1)
+            
+            dt_rem_tensor = torch.as_tensor(dt_remaining, device=dt.device, dtype=dt.dtype)
+            if dt_rem_tensor.ndim == 2: dt_rem_tensor = dt_rem_tensor.unsqueeze(-1)
+            else: dt_rem_tensor = dt_rem_tensor.reshape(-1, 1, 1)
+            
+            dt_tensor = torch.as_tensor(dt, device=dt.device, dtype=dt.dtype)
+            if dt_tensor.ndim == 2: dt_tensor = dt_tensor.unsqueeze(-1)
+            else: dt_tensor = dt_tensor.reshape(-1, 1, 1)
+
+            bridge_strength = dt_tensor / (dt_rem_tensor + 1e-6)
+            bridge_strength = torch.clamp(bridge_strength, 0.0, 1.0)
+            
+            x_tilde = x_tilde + (h_target - h_tilde) * bridge_strength
+
         op_decay, op_phi1, op_phi2 = self.get_transition_operators(dt, x_tilde)
         bias = self._get_source_bias()
         

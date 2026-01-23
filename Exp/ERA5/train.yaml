@@ -27,8 +27,6 @@ train:
   ensemble_size: 2
   use_scheduler: false
   use_tf32: true
-  use_amp: true
-  use_compile: false
 
 logging:
   log_every: 1

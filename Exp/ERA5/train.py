@@ -218,13 +218,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
 
     model = UniPhyModel(**cfg['model']).cuda(local_rank)
     
-    if cfg['train'].get('use_compile', False):
-        try:
-            if rank == 0: console.print("[green]Compiling model...[/]")
-            model = torch.compile(model)
-        except Exception as e:
-            if rank == 0: console.print(f"[red]Compile failed, fallback to eager mode: {e}[/]")
-
     log_model_stats(model, rank)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
 
@@ -263,9 +256,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     start_time = time.time()
     ensemble_size = cfg['train']['ensemble_size']
     grad_clip = cfg['train']['grad_clip']
-    use_amp = cfg['train'].get('use_amp', True)
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
+    
     for ep in range(start_ep, epochs):
         train_sampler.set_epoch(ep)
         
@@ -295,26 +286,24 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                 with sync_ctx:
                     ensemble_preds = []
                     
-                    with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                        for _ in range(ensemble_size):
-                            pred = model(x_in, dt)
-                            B_seq, T_seq, C, H, W = target.shape
-                            ensemble_preds.append(pred.view(B_seq * T_seq, C, H, W))
-                            del pred
-                        
-                        pred_ensemble = torch.stack(ensemble_preds, dim=1)
-                        target_flat = target.view(B_seq * T_seq, C, H, W)
-                        
-                        loss = crps_ensemble_loss(pred_ensemble, target_flat)
+                    for _ in range(ensemble_size):
+                        pred = model(x_in, dt)
+                        B_seq, T_seq, C, H, W = target.shape
+                        ensemble_preds.append(pred.view(B_seq * T_seq, C, H, W))
+                        del pred
+                    
+                    pred_ensemble = torch.stack(ensemble_preds, dim=1)
+                    target_flat = target.view(B_seq * T_seq, C, H, W)
+                    
+                    loss = crps_ensemble_loss(pred_ensemble, target_flat)
                     
                     with torch.no_grad():
-                        pred_detach = pred_ensemble.detach().float()
+                        pred_detach = pred_ensemble.detach()
                         pred_mean = torch.mean(pred_detach, dim=1)
-                        target_f32 = target_flat.float()
-                        l1_val = F.l1_loss(pred_mean, target_f32)
-                        mse_val = F.mse_loss(pred_mean, target_f32)
+                        l1_val = F.l1_loss(pred_mean, target_flat)
+                        mse_val = F.mse_loss(pred_mean, target_flat)
                         spread_val = torch.std(pred_detach, dim=1).mean()
-                        del pred_detach, target_f32
+                        del pred_detach
 
                     if torch.isnan(loss) or torch.isinf(loss):
                         opt.zero_grad(set_to_none=True)
