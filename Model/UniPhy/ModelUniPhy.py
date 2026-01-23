@@ -106,7 +106,8 @@ class UniPhyModel(nn.Module):
         z_fused = 0 
         z_curr = z
         for i, block in enumerate(self.blocks):
-            z_in = z_curr + z_ic * self.ic_scale
+            # 关键：显式 clone 彻底断开就地操作链条
+            z_in = z_curr.clone() + z_ic * self.ic_scale
             if self.training and self.checkpointing:
                 z_out = checkpoint.checkpoint(block, z_in, dt, use_reentrant=False)
             else:
@@ -122,7 +123,7 @@ class UniPhyModel(nn.Module):
         states = []
         z_curr_init = z
         for block in self.blocks:
-            z_in = z_curr_init + z_ic * self.ic_scale
+            z_in = z_curr_init.clone() + z_ic * self.ic_scale
             z_out = block(z_in, dt_cond)
             states.append(block.last_h_state.detach())
             z_curr_init = z_out
@@ -136,7 +137,7 @@ class UniPhyModel(nn.Module):
             step_outputs = []
             for i, block in enumerate(self.blocks):
                 h_prev = states[i]
-                z_layer_in_ic = z_layer_in + z_ic[:, -1] * self.ic_scale
+                z_layer_in_ic = z_layer_in.clone() + z_ic[:, -1] * self.ic_scale
                 z_out, h_next = block.forward_step(z_layer_in_ic, h_prev, dt_k)
                 step_outputs.append(z_out)
                 new_states.append(h_next.detach())
