@@ -83,9 +83,9 @@ class TemporalPropagator(nn.Module):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
-        if noise_scale < 1e-9: init_val = -20.0
-        else: init_val = np.log(noise_scale)
-        self.log_noise_scale = nn.Parameter(torch.tensor(float(init_val)))
+        
+        self.raw_noise_param = nn.Parameter(torch.tensor(-2.0)) 
+        
         self.basis = ComplexSVDTransform(dim)
         self.ld = nn.Parameter(torch.empty(dim))
         self.lf = nn.Parameter(torch.empty(dim))
@@ -153,13 +153,14 @@ class TemporalPropagator(nn.Module):
         return torch.exp(Z), phi1 * (dt_eff * self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):
-        noise_scale = torch.exp(self.log_noise_scale)
-        if noise_scale <= 1e-6: return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
+        noise_scale = F.softplus(self.raw_noise_param) + 1e-3
+        
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         if dt.ndim == 2: dt_expanded = dt.unsqueeze(-1)
         else: dt_expanded = dt.reshape(-1, 1, 1)
         dt_scaled = dt_expanded * self.dt_scales
         dt_eff = dt_scaled / self.dt_ref
+        
         l_re = self._get_effective_lambda(None).real
         denom = 2 * l_re
         denom = torch.where(torch.abs(denom) < 1e-6, torch.ones_like(denom) * 1e-6, denom)

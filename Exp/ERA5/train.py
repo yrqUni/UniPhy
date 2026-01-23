@@ -61,14 +61,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rich")
 
-def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def crps_ensemble_loss(pred_ensemble: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     target = target.unsqueeze(1)
     mae = torch.mean(torch.abs(pred_ensemble - target), dim=1)
     M = pred_ensemble.shape[1]
     pred_sorted, _ = torch.sort(pred_ensemble, dim=1)
     indices = torch.arange(1, M + 1, device=pred_ensemble.device).view(1, M, 1, 1, 1)
     spread = torch.mean(pred_sorted * (2 * indices - M - 1), dim=1) / M
-    return (mae - spread).mean()
+    return (mae - spread).mean(), spread.mean()
 
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
@@ -295,7 +295,7 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                     pred_ensemble = torch.stack(ensemble_preds, dim=1)
                     target_flat = target.view(B_seq * T_seq, C, H, W)
                     
-                    loss = crps_ensemble_loss(pred_ensemble, target_flat)
+                    crps, avg_spread = crps_ensemble_loss(pred_ensemble, target_flat)
                     
                     with torch.no_grad():
                         pred_detach = pred_ensemble.detach()
@@ -303,7 +303,12 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
                         l1_val = F.l1_loss(pred_mean, target_flat)
                         mse_val = F.mse_loss(pred_mean, target_flat)
                         spread_val = torch.std(pred_detach, dim=1).mean()
+                        rmse_val = mse_val ** 0.5
                         del pred_detach
+                    
+                    spread_ratio_batch = avg_spread / (rmse_val + 1e-6)
+                    loss_collapse = torch.clamp(0.6 - spread_ratio_batch, min=0)
+                    loss = crps + loss_collapse
 
                     if torch.isnan(loss) or torch.isinf(loss):
                         opt.zero_grad(set_to_none=True)
@@ -389,4 +394,3 @@ if __name__ == "__main__":
         master_port=os.environ.get("MASTER_PORT", "12355"),
         cfg=cfg
     )
-    
