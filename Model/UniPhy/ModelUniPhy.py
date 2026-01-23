@@ -71,13 +71,18 @@ class UniPhyBlock(nn.Module):
         resid = x
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
-        dt_t = torch.as_tensor(dt_step, device=x.device, dtype=x.real.dtype)
-        if dt_t.numel() == B: dt_expanded = dt_t.view(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
-        else: dt_expanded = dt_t.reshape(-1, 1)
-        prop_out = self.prop.forward(h_prev, x_t, dt_expanded)
-        if isinstance(prop_out, tuple): h_next = prop_out[0]
-        else: h_next = prop_out
-        x_drift = h_next.real.view(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        dt_t = torch.as_tensor(dt_step, device=x.device).view(-1, 1)
+        x_encoded = self.prop.basis.encode(x_t)
+        gate = F.silu(self.prop.input_gate(x_encoded.real))
+        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
+        op_decay, op_forcing = self.prop.get_transition_operators(dt_t, x_encoded)
+        bias = self.prop._get_source_bias()
+        u_t = (x_encoded + bias) * op_forcing
+        noise = self.prop.generate_stochastic_term(u_t.shape, dt_t, u_t.dtype)
+        u_t = u_t + noise
+        h_next = h_prev * op_decay.squeeze(1) + u_t.squeeze(1)
+        h_decoded = self.prop.basis.decode(h_next)
+        x_drift = h_decoded.real.view(B, H, W, D).permute(0, 3, 1, 2)
         x = x_drift + resid
         x = x + self.ffn(x)
         return x, h_next
@@ -86,11 +91,8 @@ class UniPhyModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, checkpointing=True):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        pad_h = (patch_size - img_height % patch_size) % patch_size
-        pad_w = (patch_size - img_width % patch_size) % patch_size
-        h_dim, w_dim = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim) for _ in range(depth)])
+        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, img_height//patch_size, img_width//patch_size) for _ in range(depth)])
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
         self.fusion_weights = nn.Parameter(torch.ones(depth, dtype=torch.float32))
         self.ic_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
@@ -103,10 +105,7 @@ class UniPhyModel(nn.Module):
         z_fused = 0 
         for i, block in enumerate(self.blocks):
             z = z + z_ic * self.ic_scale
-            if self.training and self.checkpointing:
-                z = checkpoint.checkpoint(block, z, dt, use_reentrant=False)
-            else:
-                z = block(z, dt)
+            z = block(z, dt)
             z_fused = z_fused + z * weights[i]
         return self.decoder(z_fused, x)
         
@@ -120,9 +119,7 @@ class UniPhyModel(nn.Module):
             z = z + z_ic * self.ic_scale
             z = block(z, dt_cond)
             states.append(block.last_h_state.detach())
-            block.last_h_state = None 
         z_curr = z[:, -1].detach()
-        del z            
         predictions = []
         for k in range(k_steps):
             dt_k = dt_future[:, k] if (isinstance(dt_future, torch.Tensor) and dt_future.ndim > 0) else dt_future
