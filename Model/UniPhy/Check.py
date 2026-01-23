@@ -105,7 +105,10 @@ def check_full_model_consistency():
             z_seq_list.append(z_next)
             h_curr = h_next
         z_seq = torch.stack(z_seq_list, dim=1)
-        out_seq = model.decoder(z_seq, x)
+        z_seq = z_seq + z_seq * model.ic_scale
+        weights = torch.nn.functional.softmax(model.fusion_weights, dim=0)
+        z_fused = z_seq * weights[0]
+        out_seq = model.decoder(z_fused, x)
         diff = (out_parallel - out_seq).abs().max().item()
         if diff < 1e-10: pass
         else: print(f"PScan Consistency Error: {diff:.2e}")
