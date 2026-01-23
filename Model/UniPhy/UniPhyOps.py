@@ -177,7 +177,7 @@ class TemporalPropagator(nn.Module):
         return torch.exp(Z), phi1 * (dt_eff * self.dt_ref), phi2 * (dt_eff * self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):
-        if not self.training or self.noise_scale <= 0:
+        if self.noise_scale <= 0:
             return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
         
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)

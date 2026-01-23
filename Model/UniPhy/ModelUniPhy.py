@@ -1,249 +1,166 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+import torch.utils.checkpoint as checkpoint
 
-class ComplexSVDTransform(nn.Module):
-    def __init__(self, dim):
+from PScan import PScanTriton 
+from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
+from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
+from UniPhyFFN import UniPhyFeedForwardNetwork
+
+class UniPhyBlock(nn.Module):
+    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3):
         super().__init__()
         self.dim = dim
-        self.u_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.u_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.v_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.v_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.01)
-        self.log_sigma = nn.Parameter(torch.zeros(dim))
+        self.img_height = img_height
+        self.img_width = img_width
+        self.norm_spatial = nn.LayerNorm(dim * 2)
+        self.spatial_cliff = RiemannianCliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size//2, img_height=img_height, img_width=img_width)
+        self.norm_temporal = nn.LayerNorm(dim * 2)
+        self.prop = TemporalPropagator(dim, dt_ref=1.0, noise_scale=0.01)
+        self.pscan = PScanTriton()
+        self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
+        self.last_h_state = None
 
-    def _cayley_transform(self, raw_re, raw_im):        
-        A_re = (raw_re - raw_re.T) * 0.5
-        A_im = (raw_im + raw_im.T) * 0.5
-        A = torch.complex(A_re, A_im)
-        I = torch.eye(self.dim, device=raw_re.device, dtype=A.dtype)
-        U = torch.linalg.solve(I - A, I + A) 
-        return U
+    def _complex_norm(self, z, norm_layer):
+        z_cat = torch.cat([z.real, z.imag], dim=-1)
+        z_norm = norm_layer(z_cat)
+        r, i = torch.chunk(z_norm, 2, dim=-1)
+        return torch.complex(r, i)
 
-    def _get_basis(self):
-        U = self._cayley_transform(self.u_raw_re, self.u_raw_im)
-        V = self._cayley_transform(self.v_raw_re, self.v_raw_im)
-        S = torch.exp(self.log_sigma).type_as(U)
-        S_mat = torch.diag_embed(S + 0j) 
-        return U, S_mat, V
+    def _spatial_op(self, x):
+        x_real_imag = torch.cat([x.real, x.imag], dim=1)
+        out_cliff = self.spatial_cliff(x_real_imag)
+        r, i = torch.chunk(out_cliff, 2, dim=1)
+        return torch.complex(r, i)
 
-    def encode(self, x):
-        U, S_mat, V = self._get_basis()
-        S_inv_val = torch.exp(-self.log_sigma).type_as(U)
-        S_inv = torch.diag_embed(S_inv_val + 0j)
-        M_inv = V @ S_inv @ U.conj().T
-        return torch.matmul(x.to(M_inv.dtype), M_inv.T)
+    def forward_step(self, x_step, h_prev, dt_step):
+        B, D, H, W = x_step.shape
+        resid = x_step
+        x_s = x_step.permute(0, 2, 3, 1)
+        x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
+        x_s = self._spatial_op(x_s)
+        x = x_s + resid
+        resid = x
+        x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
+        x_t = self._complex_norm(x_t, self.norm_temporal)
+        dt_t = torch.as_tensor(dt_step, device=x.device, dtype=x.real.dtype)
+        if dt_t.numel() == B:
+            dt_expanded = dt_t.view(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
+        else:
+            dt_expanded = dt_t.reshape(-1, 1)
+        prop_out = self.prop.forward(h_prev, x_t, dt_expanded)
+        if isinstance(prop_out, tuple):
+            h_next = prop_out[0]
+        else:
+            h_next = prop_out
+        x_drift = h_next.real.view(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        x = x_drift + resid
+        x = x + self.ffn(x)
+        return x, h_next
 
-    def decode(self, x):
-        U, S_mat, V = self._get_basis()
-        M = U @ S_mat @ V.conj().T
-        return torch.matmul(x.to(M.dtype), M.T)
+    def forward(self, x, dt):
+        B, T, D, H, W = x.shape
+        resid = x
+        x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
+        x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
+        x_s = self._spatial_op(x_s)
+        x = x_s.view(B, T, D, H, W) + resid
+        resid = x
+        x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
+        x_t = self._complex_norm(x_t, self.norm_temporal)
+        dt_expanded = torch.as_tensor(dt, device=x.device).view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
+        
+        ops = self.prop.get_transition_operators(dt_expanded, x_t)
+        if len(ops) == 3:
+            op_decay, op_forcing, _ = ops
+        else:
+            op_decay, op_forcing = ops
+            
+        bias = self.prop._get_source_bias()
+        x_encoded = self.prop.basis.encode(x_t)
+        
+        gate = F.silu(self.prop.input_gate(x_encoded.real))
+        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
+        
+        u_t = (x_encoded + bias) * op_forcing
+        noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
+        u_t = u_t + noise
+        h_eigen = self.pscan(op_decay, u_t)
+        self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
+        x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        x = x_drift + resid
+        x_in = x.view(B * T, D, H, W)
+        delta_p = self.ffn(x_in)
+        x = x + delta_p.view(B, T, D, H, W)
+        return x
 
-class RiemannianCliffordConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, padding, img_height, img_width):
+class UniPhyModel(nn.Module):
+    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, checkpointing=True):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
-        self.log_metric_param = nn.Parameter(torch.zeros(1, 1, img_height, img_width))
-        self.metric_refiner = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels, 1),
-            nn.Tanh()
-        )
-        self.viscosity_gate = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 1),
-            nn.Sigmoid()
-        )
-        laplacian_init = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
-        self.laplacian_kernel = nn.Parameter(laplacian_init.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
-        
-        self.metric_scale = nn.Parameter(torch.tensor(0.1))
-        self.viscosity_scale = nn.Parameter(torch.tensor(0.01))
-        self.diffusion_scale = nn.Parameter(torch.tensor(0.01))
-        
-        self.groups = in_channels
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pad_h = (patch_size - img_height % patch_size) % patch_size
+        pad_w = (patch_size - img_width % patch_size) % patch_size
+        h_dim, w_dim = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
+        self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
+        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim) for _ in range(depth)])
+        self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
+        self.fusion_weights = nn.Parameter(torch.ones(depth, dtype=torch.float32))
+        self.ic_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.checkpointing = checkpointing
 
-    def forward(self, x):
-        dtype = self.conv.weight.dtype
-        x = x.to(dtype)
-        base_log = self.log_metric_param.to(dtype)
-        dynamic_log = self.metric_refiner(x) * self.metric_scale
-        effective_log_metric = base_log + dynamic_log
-        scale = torch.exp(effective_log_metric)
-        inv_scale = torch.exp(-effective_log_metric)
-        kernel = self.laplacian_kernel.to(dtype)
-        diffusion_term = F.conv2d(x, kernel, padding=1, groups=self.groups)
-        local_viscosity = self.viscosity_gate(x) * inv_scale
-        x_diffused = x + diffusion_term * local_viscosity * self.viscosity_scale * self.diffusion_scale
-        x_scaled = x_diffused * scale
-        out = self.conv(x_scaled)
-        out = out * inv_scale
-        return out
-
-class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
-        super().__init__()
-        self.dim = dim
-        self.dt_ref = dt_ref
-        self.noise_scale = noise_scale
-        self.basis = ComplexSVDTransform(dim)
+    def forward(self, x, dt):
+        z = self.encoder(x)
+        z_ic = z.clone()
         
-        self.ld = nn.Parameter(torch.empty(dim))
-        self.lf = nn.Parameter(torch.empty(dim))
-        self._init_hippo_spectrum()
+        weights = F.softmax(self.fusion_weights, dim=0)
+        z_fused = 0 
         
-        self.lambda_net = nn.Linear(dim, dim * 2) 
-        nn.init.zeros_(self.lambda_net.weight)
-        nn.init.zeros_(self.lambda_net.bias)
-
-        self.input_gate = nn.Linear(dim, dim)
-        nn.init.xavier_normal_(self.input_gate.weight)
-        nn.init.zeros_(self.input_gate.bias)
-        
-        self.src_re = nn.Parameter(torch.randn(dim) * 0.01)
-        self.src_im = nn.Parameter(torch.randn(dim) * 0.01)
-        self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
-        self.law_im = nn.Parameter(torch.randn(dim) * 0.01)
-
-        self.num_groups = 4
-        base_scales = [1.0, 1.0/6.0, 1.0/24.0, 1.0/120.0]
-        group_dim = dim // self.num_groups
-        scales_tensor = torch.zeros(dim)
-        for i, s in enumerate(base_scales):
-            start = i * group_dim
-            end = start + group_dim if i < self.num_groups - 1 else dim
-            scales_tensor[start:end] = s
-        self.register_buffer('dt_scales', scales_tensor.view(1, 1, dim))
-
-    def _init_hippo_spectrum(self):
-        N = self.dim
-        A = np.zeros((N, N))
-        for i in range(N):
-            for j in range(i + 1):
-                A[i, j] = -np.sqrt(2 * i + 1) * np.sqrt(2 * j + 1)
-        
-        eigenvalues = np.linalg.eigvals(A)
-        
-        real_part = np.real(eigenvalues)
-        imag_part = np.imag(eigenvalues)
-        
-        sorted_indices = np.argsort(-real_part)
-        real_part = real_part[sorted_indices]
-        imag_part = imag_part[sorted_indices]
-        
-        self.ld.data.copy_(torch.from_numpy(np.log(-real_part)).float())
-        self.lf.data.copy_(torch.from_numpy(imag_part).float())
-
-    def _get_effective_lambda(self, x=None):
-        l_phys = torch.complex(-torch.exp(self.ld), self.lf)
-        l_law = torch.complex(self.law_re, self.law_im)
-        l_base = l_phys + l_law
-        
-        if x is not None:
-            dyn_params = self.lambda_net(x.real) 
-            dyn_re, dyn_im = torch.chunk(dyn_params, 2, dim=-1)
-            l_dyn = torch.complex(torch.tanh(dyn_re), torch.tanh(dyn_im)) 
-            return l_base + l_dyn
-        return l_base
-
-    def _get_source_bias(self):
-        return torch.complex(self.src_re, self.src_im)
-
-    def get_transition_operators(self, dt, x=None):
-        dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        
-        if dt.ndim == 2:
-            dt_expanded = dt.unsqueeze(-1)
-        else:
-            dt_expanded = dt.reshape(-1, 1, 1)
+        for i, block in enumerate(self.blocks):
+            z = z + z_ic * self.ic_scale
             
-        dt_scaled = dt_expanded * self.dt_scales
-        dt_eff = dt_scaled / self.dt_ref
-        
-        Lambda = self._get_effective_lambda(x)
-        Z = Lambda * dt_eff
-        
-        mask = torch.abs(Z) < 1e-4
-        Z_safe = torch.where(mask, torch.ones_like(Z), Z)
-        
-        phi1 = torch.where(mask, 
-                           1.0 + 0.5 * Z, 
-                           torch.expm1(Z) / Z_safe)
-        
-        phi2 = torch.where(mask,
-                           0.5 + Z / 6.0,
-                           (torch.expm1(Z) - Z) / (Z_safe ** 2))
-                           
-        return torch.exp(Z), phi1 * (dt_eff * self.dt_ref), phi2 * (dt_eff * self.dt_ref)
-
-    def generate_stochastic_term(self, target_shape, dt, dtype):
-        if self.noise_scale <= 0:
-            return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
-        
-        dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        if dt.ndim == 2:
-            dt_expanded = dt.unsqueeze(-1)
-        else:
-            dt_expanded = dt.reshape(-1, 1, 1)
+            if self.training and self.checkpointing:
+                z = checkpoint.checkpoint(block, z, dt, use_reentrant=False)
+            else:
+                z = block(z, dt)
             
-        dt_scaled = dt_expanded * self.dt_scales
-        dt_eff = dt_scaled / self.dt_ref
+            z_fused = z_fused + z * weights[i]
+            
+        return self.decoder(z_fused, x)
         
-        l_re = self._get_effective_lambda(None).real
-        var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * dt_eff) / (2 * l_re)
-        std = torch.sqrt(torch.abs(var)).to(dtype)
-        noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
-        return noise * std
-
-    def forward(self, h_prev, x_input, dt, x_target=None, dt_remaining=None):
-        h_tilde = self.basis.encode(h_prev)
-        if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
-        
-        x_tilde = self.basis.encode(x_input)
-        if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
-        
-        gate = F.silu(self.input_gate(x_tilde.real))
-        x_tilde = x_tilde * torch.complex(gate, torch.zeros_like(gate))
-
-        if x_target is not None and dt_remaining is not None:
-            h_target = self.basis.encode(x_target)
-            if h_target.ndim == 2: h_target = h_target.unsqueeze(1)
-            
-            dt_rem_tensor = torch.as_tensor(dt_remaining, device=dt.device, dtype=dt.dtype)
-            if dt_rem_tensor.ndim == 2: dt_rem_tensor = dt_rem_tensor.unsqueeze(-1)
-            else: dt_rem_tensor = dt_rem_tensor.reshape(-1, 1, 1)
-            
-            dt_tensor = torch.as_tensor(dt, device=dt.device, dtype=dt.dtype)
-            if dt_tensor.ndim == 2: dt_tensor = dt_tensor.unsqueeze(-1)
-            else: dt_tensor = dt_tensor.reshape(-1, 1, 1)
-
-            bridge_strength = dt_tensor / (dt_rem_tensor + 1e-6)
-            bridge_strength = torch.clamp(bridge_strength, 0.0, 1.0)
-            
-            x_tilde = x_tilde + (h_target - h_tilde) * bridge_strength
-
-        op_decay, op_phi1, op_phi2 = self.get_transition_operators(dt, x_tilde)
-        bias = self._get_source_bias()
-        
-        x_forcing = x_tilde + bias
-        
-        if x_tilde.shape[1] > 1:
-            x_curr = x_forcing
-            x_next = torch.cat([x_forcing[:, 1:], x_forcing[:, -1:]], dim=1)
-            
-            coeff_curr = op_phi1 - op_phi2
-            coeff_next = op_phi2
-            
-            u_t = x_curr * coeff_curr + x_next * coeff_next
-            
-            noise = self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
-            u_t = u_t + noise
-            
-            return self.basis.decode(h_tilde), op_decay, u_t
-            
-        else:
-            u_t = x_forcing * op_phi1
-            noise = self.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
-            h_tilde_next = h_tilde * op_decay + u_t + noise
-            return self.basis.decode(h_tilde_next)
-        
+    @torch.no_grad()
+    def forecast(self, x_cond, dt_cond, k_steps, dt_future):
+        device = next(self.parameters()).device
+        z = self.encoder(x_cond)
+        z_ic = z.clone()
+        states = []
+        for block in self.blocks:
+            z = z + z_ic * self.ic_scale
+            z = block(z, dt_cond)
+            states.append(block.last_h_state.to("cpu"))
+            block.last_h_state = None 
+        z_curr = z[:, -1].detach()
+        del z            
+        predictions = []
+        for k in range(k_steps):
+            dt_k = dt_future[:, k] if (isinstance(dt_future, torch.Tensor) and dt_future.ndim > 0) else dt_future
+            z_next = z_curr
+            new_states = []
+            step_outputs = []
+            for i, block in enumerate(self.blocks):
+                h_prev = states[i].to(device, non_blocking=True)
+                z_next, h_next = block.forward_step(z_next, h_prev, dt_k)
+                step_outputs.append(z_next)
+                new_states.append(h_next.to("cpu", non_blocking=True))
+                del h_prev
+                del h_next
+            states = new_states
+            z_curr = z_next
+            weights = F.softmax(self.fusion_weights, dim=0)
+            z_fused_step = 0
+            for w, out in zip(weights, step_outputs):
+                z_fused_step = z_fused_step + w * out
+            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), None).squeeze(1).to("cpu", non_blocking=True)
+            predictions.append(pred_pixel)
+        return torch.stack(predictions, dim=1)
+    
