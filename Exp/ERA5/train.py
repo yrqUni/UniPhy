@@ -28,7 +28,8 @@ from rich.progress import (
     TextColumn,
     BarColumn,
     MofNCompleteColumn,
-    TimeRemainingColumn
+    TimeRemainingColumn,
+    TaskProgressColumn
 )
 from rich.panel import Panel
 from rich.table import Table
@@ -262,7 +263,6 @@ def run_ddp(rank: int, world_size: int, local_rank: int, master_addr: str, maste
     start_time = time.time()
     ensemble_size = cfg['train']['ensemble_size']
     grad_clip = cfg['train']['grad_clip']
-    
     use_amp = cfg['train'].get('use_amp', True)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
