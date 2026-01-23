@@ -49,8 +49,7 @@ class UniPhyBlock(nn.Module):
         x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
         op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded, x_encoded)
         bias = self.prop._get_source_bias()
-        x_forcing = x_encoded + bias
-        u_t = x_forcing * op_forcing
+        u_t = (x_encoded + bias) * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
         h_eigen = self.pscan(op_decay, u_t)
@@ -120,7 +119,7 @@ class UniPhyModel(nn.Module):
         for block in self.blocks:
             z = z + z_ic * self.ic_scale
             z = block(z, dt_cond)
-            states.append(block.last_h_state.to("cpu"))
+            states.append(block.last_h_state.detach())
             block.last_h_state = None 
         z_curr = z[:, -1].detach()
         del z            
@@ -131,19 +130,17 @@ class UniPhyModel(nn.Module):
             new_states = []
             step_outputs = []
             for i, block in enumerate(self.blocks):
-                h_prev = states[i].to(device, non_blocking=True)
+                h_prev = states[i]
                 z_next, h_next = block.forward_step(z_next, h_prev, dt_k)
                 step_outputs.append(z_next)
-                new_states.append(h_next.to("cpu", non_blocking=True))
-                del h_prev
-                del h_next
+                new_states.append(h_next.detach())
             states = new_states
             z_curr = z_next
             weights = F.softmax(self.fusion_weights, dim=0)
             z_fused_step = 0
             for w, out in zip(weights, step_outputs):
                 z_fused_step = z_fused_step + w * out
-            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), x_cond[:, -1:]).squeeze(1).to("cpu", non_blocking=True)
-            predictions.append(pred_pixel)
+            pred_pixel = self.decoder(z_fused_step.unsqueeze(1), x_cond[:, -1:])
+            predictions.append(pred_pixel.squeeze(1))
         return torch.stack(predictions, dim=1)
     

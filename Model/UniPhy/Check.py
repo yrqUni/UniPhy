@@ -131,8 +131,8 @@ def check_forecast_consistency():
     with torch.no_grad():
         out_parallel = model(x, dt)
         out_forecast = model.forecast(x_cond=x[:, :1], dt_cond=dt[:, :1], k_steps=2, dt_future=dt[:, 1:])
-        step1_p = out_parallel[:, 1]
-        step1_f = out_forecast[:, 0]
+        step1_p = out_parallel[:, 1].to(device)
+        step1_f = out_forecast[:, 0].to(device)
         diff1 = (step1_p - step1_f).abs().max().item()
         if diff1 < 1e-12: pass
         else: print(f"Forecast Step 1 Consistency Error: {diff1:.2e}")
