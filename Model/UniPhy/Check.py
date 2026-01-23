@@ -116,14 +116,11 @@ def check_forecast_implementation():
     x_cond = torch.randn(B, T_cond, C, H, W, device=device, dtype=torch.float64)
     dt_cond = torch.ones(B, T_cond, device=device, dtype=torch.float64)
     dt_future = torch.ones(B, K, device=device, dtype=torch.float64) * 0.5
-    try:
-        pred = model.forecast(x_cond, dt_cond, K, dt_future)
-        expected_shape = (B, K, C, H, W)
-        if pred.shape == expected_shape: pass
-        else: print(f"Forecast Shape Error: Expected {expected_shape}, got {pred.shape}")
-        if torch.isnan(pred).any() or torch.isinf(pred).any(): print("Forecast contains NaN or Inf")
-    except Exception as e:
-        print(f"Forecast Execution Error: {e}")
+    pred = model.forecast(x_cond, dt_cond, K, dt_future)
+    expected_shape = (B, K, C, H, W)
+    if pred.shape == expected_shape: pass
+    else: print(f"Forecast Shape Error: Expected {expected_shape}, got {pred.shape}")
+    if torch.isnan(pred).any() or torch.isinf(pred).any(): print("Forecast contains NaN or Inf")
         
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
