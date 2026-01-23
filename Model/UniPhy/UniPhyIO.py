@@ -40,17 +40,18 @@ class LearnableSphericalPosEmb(nn.Module):
         y_coord = torch.sin(theta_grid) * torch.sin(phi_grid)
         z_coord = torch.cos(theta_grid)
         coords = torch.stack([x_coord, y_coord, z_coord], dim=-1)
-        self.register_buffer('coords', coords, persistent=False)
+        self.register_buffer('coords', coords)
         self.mlp = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, dim),
             nn.LayerNorm(dim) 
         )
+        nn.init.normal_(self.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.mlp[2].weight, std=0.02)
 
     def forward(self, x):
-        c = self.coords.detach().clone()
-        emb = self.mlp(c)
+        emb = self.mlp(self.coords)
         emb = emb.permute(2, 0, 1).unsqueeze(0)
         return x + emb
 
@@ -116,11 +117,9 @@ class UniPhyEncoder(nn.Module):
         return out
 
 class UniPhyEnsembleDecoder(nn.Module):
-    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10, img_height=64, img_width=64):
+    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10, img_height=64):
         super().__init__()
         self.patch_size = patch_size
-        self.img_height = img_height
-        self.img_width = img_width
         self.padder = FlexiblePadder(patch_size, mode='replicate')
         self.ensemble_size = ensemble_size
         self.conservation_constraint = GlobalConservationConstraint(conserved_indices=[0])
@@ -133,30 +132,16 @@ class UniPhyEnsembleDecoder(nn.Module):
         )
         self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
 
-    def forward(self, z_latent, x_ref=None, member_idx=None):
-        if x_ref is not None:
-            is_5d = x_ref.ndim == 5
-            if is_5d:
-                B, T, C, H, W = x_ref.shape
-                z_flat = z_latent.reshape(B * T, *z_latent.shape[2:])
-            else:
-                B, C, H, W = x_ref.shape
-                T = 1
-                z_flat = z_latent
-            self.padder.set_padding(H, W)
+    def forward(self, z_latent, x_ref, member_idx=None):
+        is_5d = x_ref.ndim == 5
+        if is_5d:
+            B, T, C, H, W = x_ref.shape
+            z_flat = z_latent.view(B * T, *z_latent.shape[2:])
         else:
-            is_5d = z_latent.ndim == 5
-            if is_5d:
-                B, T, D, H_p, W_p = z_latent.shape
-                z_flat = z_latent.reshape(B * T, D, H_p, W_p)
-            else:
-                B, D, H_p, W_p = z_latent.shape
-                T = 1
-                z_flat = z_latent
-            H, W = self.img_height, self.img_width
-            self.padder.set_padding(H, W)
-            C = -1 
-            
+            B, C, H, W = x_ref.shape
+            T = 1
+            z_flat = z_latent
+        self.padder.set_padding(H, W)
         if z_flat.is_complex():
             z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
         else:
@@ -172,11 +157,8 @@ class UniPhyEnsembleDecoder(nn.Module):
         out = self.final_proj(h)
         out = F.pixel_shuffle(out, self.patch_size)
         out = self.padder.unpad(out)
-        if x_ref is None:
-             C = out.shape[1]
         if is_5d:
             out = out.view(B, T, C, H, W)
-        if x_ref is not None:
-            out = self.conservation_constraint(out, x_ref)
+        out = self.conservation_constraint(out, x_ref)
         return out
     

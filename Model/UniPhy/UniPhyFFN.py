@@ -38,15 +38,15 @@ class ComplexDynamicFFN(nn.Module):
         nn.init.zeros_(self.experts_down_im.weight)
 
     def forward(self, z):
-        re_in, im_in = z.real, z.imag
-        B, C, H, W = re_in.shape
-        re_feat = self.spatial_re(re_in) - self.spatial_im(im_in)
-        im_feat = self.spatial_re(im_in) + self.spatial_im(re_in)
-        route_weights = F.softmax(self.router(re_feat + im_feat), dim=1)
-        up_re = self.experts_up_re(re_feat) - self.experts_up_im(im_feat)
-        up_im = self.experts_up_re(im_feat) + self.experts_up_im(re_feat)
-        up_re = F.silu(up_re.clone())
-        up_im = F.silu(up_im.clone())
+        re, im = z.real, z.imag
+        B, C, H, W = re.shape
+        re = self.spatial_re(re) - self.spatial_im(im)
+        im = self.spatial_re(im) + self.spatial_im(re)
+        route_weights = F.softmax(self.router(re + im), dim=1)
+        up_re = self.experts_up_re(re) - self.experts_up_im(im)
+        up_im = self.experts_up_re(im) + self.experts_up_im(re)
+        up_re = F.silu(up_re)
+        up_im = F.silu(up_im)
         down_re = self.experts_down_re(up_re) - self.experts_down_im(up_im)
         down_im = self.experts_down_re(up_im) + self.experts_down_im(up_re)
         down_re = down_re.view(B, self.num_experts, self.dim, H, W)
@@ -55,7 +55,7 @@ class ComplexDynamicFFN(nn.Module):
         out_re = (down_re * w).sum(dim=1)
         out_im = (down_im * w).sum(dim=1)
         return torch.complex(out_re, out_im)
-
+    
 class UniPhyFeedForwardNetwork(nn.Module):
     def __init__(self, dim, expand, num_experts):
         super().__init__()
