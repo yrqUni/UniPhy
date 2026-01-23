@@ -14,7 +14,6 @@ class ComplexSVDTransform(nn.Module):
         self.log_sigma = nn.Parameter(torch.zeros(dim))
 
     def _cayley_transform(self, raw_re, raw_im):        
-        # 显式使用 .clone() 隔离 Parameter 内存，防止 DDP 认为发生了 inplace 修改
         re = raw_re.clone()
         im = raw_im.clone()
         A_re = re.sub(re.T).mul(0.5)
@@ -27,14 +26,12 @@ class ComplexSVDTransform(nn.Module):
     def _get_basis(self):
         U = self._cayley_transform(self.u_raw_re, self.u_raw_im)
         V = self._cayley_transform(self.v_raw_re, self.v_raw_im)
-        # 隔离 log_sigma
         S = torch.exp(self.log_sigma.clone()).type_as(U)
         S_mat = torch.diag_embed(S.add(0j)) 
         return U, S_mat, V
 
     def encode(self, x):
         U, S_mat, V = self._get_basis()
-        # 隔离 log_sigma 并计算逆
         S_inv_val = torch.exp(self.log_sigma.clone().neg()).type_as(U)
         S_inv = torch.diag_embed(S_inv_val.add(0j))
         M_inv = V.matmul(S_inv).matmul(U.conj().T)
