@@ -69,13 +69,19 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         dt_expanded = torch.as_tensor(dt, device=x.device).view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
+        
         ops = self.prop.get_transition_operators(dt_expanded, x_t)
         if len(ops) == 3:
             op_decay, op_forcing, _ = ops
         else:
             op_decay, op_forcing = ops
+            
         bias = self.prop._get_source_bias()
         x_encoded = self.prop.basis.encode(x_t)
+        
+        gate = F.silu(self.prop.input_gate(x_encoded.real))
+        x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
+        
         u_t = (x_encoded + bias) * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise

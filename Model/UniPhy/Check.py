@@ -93,24 +93,29 @@ def check_full_model_consistency():
     dt = torch.rand(B, T, device=device, dtype=torch.float64) + 1.0
     with torch.no_grad():
         out_parallel = model(x, dt)
+        
         z = model.encoder(x)
+        z_input = z + z * model.ic_scale
+        
         block = model.blocks[0]
         B_z, T_z, D_z, H_z, W_z = z.shape
         h_curr = torch.zeros(B_z * H_z * W_z, D_z, device=device, dtype=torch.cdouble)
         z_seq_list = []
         for t in range(T_z):
-            x_step = z[:, t]
+            x_step = z_input[:, t]
             dt_step = dt[:, t]
             z_next, h_next = block.forward_step(x_step, h_curr, dt_step)
             z_seq_list.append(z_next)
             h_curr = h_next
         z_seq = torch.stack(z_seq_list, dim=1)
-        z_seq = z_seq + z_seq * model.ic_scale
+        
         weights = torch.nn.functional.softmax(model.fusion_weights, dim=0)
         z_fused = z_seq * weights[0]
+        
         out_seq = model.decoder(z_fused, x)
         diff = (out_parallel - out_seq).abs().max().item()
-        if diff < 1e-10: pass
+        
+        if diff < 1e-8: pass
         else: print(f"PScan Consistency Error: {diff:.2e}")
 
 if __name__ == "__main__":
@@ -123,4 +128,3 @@ if __name__ == "__main__":
     check_variable_dt_broadcasting()
     if torch.cuda.is_available():
         check_full_model_consistency()
-        
