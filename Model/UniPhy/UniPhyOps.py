@@ -85,7 +85,13 @@ class TemporalPropagator(nn.Module):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
-        self.log_noise_scale = nn.Parameter(torch.tensor(-1.6))
+        
+        if noise_scale < 1e-9:
+            init_val = -20.0
+        else:
+            init_val = np.log(noise_scale)
+            
+        self.log_noise_scale = nn.Parameter(torch.tensor(float(init_val)))
         
         self.basis = ComplexSVDTransform(dim)
         
