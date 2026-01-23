@@ -96,6 +96,7 @@ class UniPhyModel(nn.Module):
         for block in self.blocks: z = block(z, dt)
         return self.decoder(z, x)
         
+    @torch.no_grad()
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
         device = next(self.parameters()).device
         z = self.encoder(x_cond)
@@ -103,24 +104,22 @@ class UniPhyModel(nn.Module):
         for block in self.blocks:
             z = block(z, dt_cond)
             states.append(block.last_h_state.to("cpu"))
-            
-        predictions, z_curr = [], z[:, -1].detach()
-        
+            block.last_h_state = None 
+        z_curr = z[:, -1].detach()
+        del z            
+        predictions = []
         for k in range(k_steps):
             dt_k = dt_future[:, k] if (isinstance(dt_future, torch.Tensor) and dt_future.ndim > 0) else dt_future
-            z_next, new_states = z_curr, []
-            
+            z_next = z_curr
+            new_states = []
             for i, block in enumerate(self.blocks):
-                h_prev = states[i].to(device)
+                h_prev = states[i].to(device, non_blocking=True)
                 z_next, h_next = block.forward_step(z_next, h_prev, dt_k)
-                new_states.append(h_next.to("cpu"))
+                new_states.append(h_next.to("cpu", non_blocking=True))
                 del h_prev
-            
-            states, z_curr = new_states, z_next.detach()
-            
-            with torch.no_grad():
-                pred_pixel = self.decoder(z_curr.unsqueeze(1), None).squeeze(1).to("cpu")
-                predictions.append(pred_pixel)
-        
+                del h_next
+            states = new_states
+            z_curr = z_next
+            pred_pixel = self.decoder(z_curr.unsqueeze(1), None).squeeze(1).to("cpu", non_blocking=True)
+            predictions.append(pred_pixel)
         return torch.stack(predictions, dim=1)
-    
