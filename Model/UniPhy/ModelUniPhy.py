@@ -75,7 +75,7 @@ class UniPhyBlock(nn.Module):
         x = x_drift + resid
         x_in = x.contiguous().view(B * T, D, H, W)
         delta_p = self.ffn(x_in)
-        x = x + delta_p.view(B, T, D, H, W)
+        x = x + delta_p.contiguous().view(B, T, D, H, W)
         return x
     
 class UniPhyModel(nn.Module):
