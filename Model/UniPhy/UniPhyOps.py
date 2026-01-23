@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
@@ -87,12 +88,17 @@ class TemporalPropagator(nn.Module):
         self.noise_scale = noise_scale
         self.basis = ComplexSVDTransform(dim)
         
-        self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
-        self.lf = nn.Parameter(torch.randn(dim) * 1.0)
+        self.ld = nn.Parameter(torch.empty(dim))
+        self.lf = nn.Parameter(torch.empty(dim))
+        self._init_hippo_spectrum()
         
         self.lambda_net = nn.Linear(dim, dim * 2) 
         nn.init.zeros_(self.lambda_net.weight)
         nn.init.zeros_(self.lambda_net.bias)
+
+        self.input_gate = nn.Linear(dim, dim)
+        nn.init.xavier_normal_(self.input_gate.weight)
+        nn.init.zeros_(self.input_gate.bias)
         
         self.src_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.src_im = nn.Parameter(torch.randn(dim) * 0.01)
@@ -108,6 +114,25 @@ class TemporalPropagator(nn.Module):
             end = start + group_dim if i < self.num_groups - 1 else dim
             scales_tensor[start:end] = s
         self.register_buffer('dt_scales', scales_tensor.view(1, 1, dim))
+
+    def _init_hippo_spectrum(self):
+        N = self.dim
+        A = np.zeros((N, N))
+        for i in range(N):
+            for j in range(i + 1):
+                A[i, j] = -np.sqrt(2 * i + 1) * np.sqrt(2 * j + 1)
+        
+        eigenvalues = np.linalg.eigvals(A)
+        
+        real_part = np.real(eigenvalues)
+        imag_part = np.imag(eigenvalues)
+        
+        sorted_indices = np.argsort(-real_part)
+        real_part = real_part[sorted_indices]
+        imag_part = imag_part[sorted_indices]
+        
+        self.ld.data.copy_(torch.from_numpy(np.log(-real_part)).float())
+        self.lf.data.copy_(torch.from_numpy(imag_part).float())
 
     def _get_effective_lambda(self, x=None):
         l_phys = torch.complex(-torch.exp(self.ld), self.lf)
@@ -176,6 +201,9 @@ class TemporalPropagator(nn.Module):
         
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
+        
+        gate = F.silu(self.input_gate(x_tilde.real))
+        x_tilde = x_tilde * torch.complex(gate, torch.zeros_like(gate))
 
         if x_target is not None and dt_remaining is not None:
             h_target = self.basis.encode(x_target)
