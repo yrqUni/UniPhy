@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 from PScan import PScanTriton 
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
@@ -38,9 +39,9 @@ class UniPhyBlock(nn.Module):
         x_s = x.view(B * T, D, H, W).permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
-        x = x_s.view(B, T, D, H, W) + resid
-        resid = x
-        x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
+        x_mid = x_s.view(B, T, D, H, W) + resid
+        resid_mid = x_mid
+        x_t = x_mid.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         dt_expanded = torch.as_tensor(dt, device=x.device).view(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
         x_encoded = self.prop.basis.encode(x_t)
@@ -54,11 +55,9 @@ class UniPhyBlock(nn.Module):
         h_eigen = self.pscan(op_decay, u_t)
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
         x_drift = self.prop.basis.decode(h_eigen).real.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
-        x = x_drift + resid
-        x_in = x.view(B * T, D, H, W)
-        delta_p = self.ffn(x_in)
-        x = x + delta_p.view(B, T, D, H, W)
-        return x
+        x_out = x_drift + resid_mid
+        delta_p = self.ffn(x_out.view(B * T, D, H, W))
+        return x_out + delta_p.view(B, T, D, H, W)
 
     def forward_step(self, x_step, h_prev, dt_step):
         B, D, H, W = x_step.shape
@@ -66,11 +65,11 @@ class UniPhyBlock(nn.Module):
         x_s = x_step.permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
-        x = x_s + resid
-        resid = x
-        x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
+        x_mid = x_s + resid
+        resid_mid = x_mid
+        x_t = x_mid.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
-        dt_t = torch.as_tensor(dt_step, device=x.device).view(-1, 1)
+        dt_t = torch.as_tensor(dt_step, device=x_step.device).view(-1, 1)
         x_encoded = self.prop.basis.encode(x_t)
         gate = F.silu(self.prop.input_gate(x_encoded.real))
         x_encoded = x_encoded * torch.complex(gate, torch.zeros_like(gate))
@@ -82,9 +81,9 @@ class UniPhyBlock(nn.Module):
         h_next = h_prev * op_decay.squeeze(1) + u_t.squeeze(1)
         h_decoded = self.prop.basis.decode(h_next)
         x_drift = h_decoded.real.view(B, H, W, D).permute(0, 3, 1, 2)
-        x = x_drift + resid
-        x = x + self.ffn(x)
-        return x, h_next
+        x_out = x_drift + resid_mid
+        delta_p = self.ffn(x_out)
+        return x_out + delta_p, h_next
 
 class UniPhyModel(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, checkpointing=True):
@@ -105,25 +104,31 @@ class UniPhyModel(nn.Module):
         z_ic = z.clone()
         weights = F.softmax(self.fusion_weights, dim=0)
         z_fused = 0 
+        z_curr = z
         for i, block in enumerate(self.blocks):
-            z = z + z_ic * self.ic_scale
-            z = block(z, dt)
-            z_fused = z_fused + z * weights[i]
+            z_in = z_curr + z_ic * self.ic_scale
+            if self.training and self.checkpointing:
+                z_out = checkpoint.checkpoint(block, z_in, dt, use_reentrant=False)
+            else:
+                z_out = block(z_in, dt)
+            z_fused = z_fused + z_out * weights[i]
+            z_curr = z_out
         return self.decoder(z_fused, x)
         
     @torch.no_grad()
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
-        device = x_cond.device
         z = self.encoder(x_cond)
         z_ic = z.clone()
         states = []
+        z_curr_init = z
         for block in self.blocks:
-            z_in = z + z_ic * self.ic_scale
-            z = block(z_in, dt_cond)
+            z_in = z_curr_init + z_ic * self.ic_scale
+            z_out = block(z_in, dt_cond)
             states.append(block.last_h_state.detach())
-        z_curr = z[:, -1].detach()
-        x_ref = x_cond[:, -1:]
+            z_curr_init = z_out
+        z_curr = z_curr_init[:, -1].detach()
         predictions = []
+        x_ref = x_cond[:, -1:]
         for k in range(k_steps):
             dt_k = dt_future[:, k]
             z_layer_in = z_curr
@@ -131,8 +136,8 @@ class UniPhyModel(nn.Module):
             step_outputs = []
             for i, block in enumerate(self.blocks):
                 h_prev = states[i]
-                z_layer_in = z_layer_in + z_ic[:, -1] * self.ic_scale
-                z_out, h_next = block.forward_step(z_layer_in, h_prev, dt_k)
+                z_layer_in_ic = z_layer_in + z_ic[:, -1] * self.ic_scale
+                z_out, h_next = block.forward_step(z_layer_in_ic, h_prev, dt_k)
                 step_outputs.append(z_out)
                 new_states.append(h_next.detach())
                 z_layer_in = z_out
@@ -144,4 +149,4 @@ class UniPhyModel(nn.Module):
             predictions.append(pred_pixel.squeeze(1))
             x_ref = pred_pixel
         return torch.stack(predictions, dim=1)
-    
+        
