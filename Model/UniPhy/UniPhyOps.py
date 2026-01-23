@@ -14,23 +14,28 @@ class ComplexSVDTransform(nn.Module):
         self.log_sigma = nn.Parameter(torch.zeros(dim))
 
     def _cayley_transform(self, raw_re, raw_im):        
-        A_re = raw_re.sub(raw_re.T).mul(0.5)
-        A_im = raw_im.add(raw_im.T).mul(0.5)
+        # 显式使用 .clone() 隔离 Parameter 内存，防止 DDP 认为发生了 inplace 修改
+        re = raw_re.clone()
+        im = raw_im.clone()
+        A_re = re.sub(re.T).mul(0.5)
+        A_im = im.add(im.T).mul(0.5)
         A = torch.complex(A_re, A_im)
-        I = torch.eye(self.dim, device=raw_re.device, dtype=A.dtype)
+        I = torch.eye(self.dim, device=re.device, dtype=A.dtype)
         U = torch.linalg.solve(I.sub(A), I.add(A)) 
         return U
 
     def _get_basis(self):
         U = self._cayley_transform(self.u_raw_re, self.u_raw_im)
         V = self._cayley_transform(self.v_raw_re, self.v_raw_im)
-        S = torch.exp(self.log_sigma).type_as(U)
+        # 隔离 log_sigma
+        S = torch.exp(self.log_sigma.clone()).type_as(U)
         S_mat = torch.diag_embed(S.add(0j)) 
         return U, S_mat, V
 
     def encode(self, x):
         U, S_mat, V = self._get_basis()
-        S_inv_val = torch.exp(self.log_sigma.neg()).type_as(U)
+        # 隔离 log_sigma 并计算逆
+        S_inv_val = torch.exp(self.log_sigma.clone().neg()).type_as(U)
         S_inv = torch.diag_embed(S_inv_val.add(0j))
         M_inv = V.matmul(S_inv).matmul(U.conj().T)
         return torch.matmul(x.to(M_inv.dtype), M_inv.T)
@@ -65,7 +70,7 @@ class RiemannianCliffordConv2d(nn.Module):
         dtype = self.conv.weight.dtype
         x = x.to(dtype)
         B, C, H, W = x.shape
-        base_log = self.log_metric_param.to(dtype)
+        base_log = self.log_metric_param.clone().to(dtype)
         if base_log.shape[-2:] != (H, W):
             base_log = F.interpolate(base_log, size=(H, W), mode='bilinear', align_corners=False)
         
@@ -131,8 +136,8 @@ class TemporalPropagator(nn.Module):
         self.lf.data.copy_(torch.from_numpy(imag_part[sorted_indices]).float())
 
     def _get_effective_lambda(self, x=None):
-        l_phys = torch.complex(torch.exp(self.ld).neg(), self.lf)
-        l_law = torch.complex(self.law_re, self.law_im)
+        l_phys = torch.complex(torch.exp(self.ld.clone()).neg(), self.lf.clone())
+        l_law = torch.complex(self.law_re.clone(), self.law_im.clone())
         l_base = l_phys.add(l_law)
         if x is not None:
             dyn_params = self.lambda_net(x.real) 
@@ -142,7 +147,7 @@ class TemporalPropagator(nn.Module):
         return l_base
 
     def _get_source_bias(self):
-        return torch.complex(self.src_re, self.src_im)
+        return torch.complex(self.src_re.clone(), self.src_im.clone())
 
     def get_transition_operators(self, dt, x=None):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
@@ -156,7 +161,7 @@ class TemporalPropagator(nn.Module):
         return torch.exp(Z), phi1.mul(dt_eff).mul(self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):
-        noise_scale = F.softplus(self.raw_noise_param).add(1e-6)
+        noise_scale = F.softplus(self.raw_noise_param.clone()).add(1e-6)
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         dt_expanded = dt.view(-1, 1, 1) if dt.ndim == 1 else dt.unsqueeze(-1) if dt.ndim == 2 else dt
         dt_eff = dt_expanded.mul(self.dt_scales).div(self.dt_ref)
