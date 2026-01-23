@@ -80,7 +80,7 @@ def check_variable_dt_broadcasting():
     h = torch.randn(B_HW, T, dim, device=device, dtype=torch.cdouble)
     x = torch.zeros(B_HW, T, dim, device=device, dtype=torch.cdouble)
     dt_multi = torch.rand(B_HW, T, device=device) + 0.5
-    op_d, op_f = prop.get_transition_operators(dt_multi)
+    op_d, op_phi1, op_phi2 = prop.get_transition_operators(dt_multi)
     if op_d.shape == (B_HW, T, dim): pass
     else: print(f"Broadcasting Shape Error: {op_d.shape}")
 
