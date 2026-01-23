@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 from PScan import PScanTriton 
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
@@ -95,7 +96,7 @@ class UniPhyBlock(nn.Module):
         return x
 
 class UniPhyModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128):
+    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, checkpointing=True):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pad_h = (patch_size - img_height % patch_size) % patch_size
@@ -106,19 +107,25 @@ class UniPhyModel(nn.Module):
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
         self.fusion_weights = nn.Parameter(torch.ones(depth, dtype=torch.float32))
         self.ic_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.checkpointing = checkpointing
 
     def forward(self, x, dt):
         z = self.encoder(x)
         z_ic = z.clone()
-        block_outputs = []
-        for block in self.blocks:
-            z = z + z_ic * self.ic_scale
-            z = block(z, dt)
-            block_outputs.append(z)
+        
         weights = F.softmax(self.fusion_weights, dim=0)
-        z_fused = 0
-        for w, out in zip(weights, block_outputs):
-            z_fused = z_fused + w * out
+        z_fused = 0 
+        
+        for i, block in enumerate(self.blocks):
+            z = z + z_ic * self.ic_scale
+            
+            if self.training and self.checkpointing:
+                z = checkpoint.checkpoint(block, z, dt, use_reentrant=False)
+            else:
+                z = block(z, dt)
+            
+            z_fused = z_fused + z * weights[i]
+            
         return self.decoder(z_fused, x)
         
     @torch.no_grad()
