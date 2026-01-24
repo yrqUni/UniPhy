@@ -33,8 +33,11 @@ def check_history_dependency():
     input_1 = x_seq_1.permute(0, 1, 3, 4, 2)
     input_2 = x_seq_2.permute(0, 1, 3, 4, 2)
     
-    src_1, _ = prop.compute_source_trajectory(input_1)
-    src_2, _ = prop.compute_source_trajectory(input_2)
+    mean_1 = input_1.mean(dim=(-2, -1))
+    mean_2 = input_2.mean(dim=(-2, -1))
+    
+    src_1 = prop.flux_tracker.project(prop.flux_tracker.get_operators(mean_1)[1]) 
+    src_2 = prop.flux_tracker.project(prop.flux_tracker.get_operators(mean_2)[1])
     
     diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
     
@@ -62,11 +65,10 @@ def check_full_model_consistency():
     
     with torch.no_grad():
         out_parallel = model(x, dt)
-        
         z = model.encoder(x)
-        
+
         for block in model.blocks:
-            h_state = torch.zeros(B, block.dim, dtype=torch.cdouble, device=device)
+            h_state = torch.zeros(B * H * W, block.dim, dtype=torch.cdouble, device=device)
             flux_state = torch.zeros(B, block.dim, dtype=torch.cdouble, device=device)
             z_steps = []
             

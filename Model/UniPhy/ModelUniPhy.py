@@ -76,8 +76,11 @@ class UniPhyBlock(nn.Module):
         x_eigen = self.prop.basis.encode(x_t)
         
         x_eigen_input = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2) 
+        x_mean_seq = x_eigen_input.mean(dim=(-2, -1))
         
-        source_seq, final_flux_state = self.prop.compute_source_trajectory(x_eigen_input) 
+        flux_A, flux_X = self.prop.flux_tracker.get_operators(x_mean_seq)
+        flux_states = self.pscan(flux_A, flux_X)
+        source_seq = self.prop.flux_tracker.project(flux_states)
         
         source_expanded = source_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
         source_flat = source_expanded.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D)
@@ -90,7 +93,7 @@ class UniPhyBlock(nn.Module):
         h_eigen = self.pscan(op_decay, u_t)
         
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
-        self.last_flux_state = final_flux_state
+        self.last_flux_state = flux_states[:, :, -1].permute(0, 1)
         
         x_drift = self.prop.basis.decode(h_eigen).real.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
@@ -124,13 +127,9 @@ class UniPhyModel(nn.Module):
         for block in self.blocks:
             z = block(z, dt_cond)
             
-            z_perm = z.permute(0, 1, 3, 4, 2)
-            x_encoded = block.prop.basis.encode(z_perm)
-            x_eigen_last_seq = x_encoded.mean(dim=(2, 3)) 
-            
             curr_flux = torch.zeros(x_cond.shape[0], block.dim, device=device, dtype=torch.cdouble)
-            for t in range(x_cond.shape[1]):
-                curr_flux, _ = block.prop.flux_tracker.forward_step(curr_flux, x_eigen_last_seq[:, t])
+            if block.last_flux_state is not None:
+                curr_flux = block.last_flux_state
                 
             states.append((block.last_h_state.to("cpu"), curr_flux.to("cpu")))
             block.last_h_state = None 

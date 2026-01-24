@@ -96,6 +96,32 @@ class GlobalFluxTracker(nn.Module):
     def _get_decay(self):
         return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
 
+    def get_operators(self, x_mean_seq):
+        B, T, D = x_mean_seq.shape
+        decay = self._get_decay() 
+        
+        x_flat = x_mean_seq.reshape(B * T, D)
+        x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
+        x_in = self.input_mix(x_cat)
+        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
+        u_t = torch.complex(x_re, x_im).reshape(B, T, D)
+        
+        A = decay.view(1, D, 1).expand(B, D, T)
+        X = u_t.permute(0, 2, 1)
+        
+        return A, X
+
+    def project(self, flux_states):
+        B, D, T = flux_states.shape
+        h_state = flux_states.permute(0, 2, 1) 
+        
+        h_flat = h_state.reshape(B * T, D)
+        out_cat = self.output_proj(torch.cat([h_flat.real, h_flat.imag], dim=-1))
+        out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
+        source_seq = torch.complex(out_re, out_im).reshape(B, T, D)
+        
+        return source_seq
+
     def forward_step(self, flux_state, x_mean):
         x_cat = torch.cat([x_mean.real, x_mean.imag], dim=-1)
         x_in = self.input_mix(x_cat)
@@ -110,32 +136,6 @@ class GlobalFluxTracker(nn.Module):
         source = torch.complex(out_re, out_im)
         
         return new_state, source
-
-    def forward_trajectory(self, x_mean_seq):
-        B, T, D = x_mean_seq.shape
-        decay = self._get_decay() 
-        
-        x_flat = x_mean_seq.reshape(B * T, D)
-        x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
-        x_in = self.input_mix(x_cat)
-        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        x_complex_seq = torch.complex(x_re, x_im).reshape(B, T, D)
-        
-        states = []
-        curr = torch.zeros(B, D, device=x_mean_seq.device, dtype=x_mean_seq.dtype)
-        
-        for t in range(T):
-            curr = curr * decay + x_complex_seq[:, t]
-            states.append(curr)
-            
-        states_seq = torch.stack(states, dim=1) 
-        
-        states_flat = states_seq.reshape(B * T, D)
-        out_cat = self.output_proj(torch.cat([states_flat.real, states_flat.imag], dim=-1))
-        out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
-        source_seq = torch.complex(out_re, out_im).reshape(B, T, D)
-        
-        return source_seq, curr
 
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
@@ -178,11 +178,6 @@ class TemporalPropagator(nn.Module):
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
-    def compute_source_trajectory(self, x_emb_seq):
-        x_mean = x_emb_seq.mean(dim=(-2, -1)) 
-        source_seq, final_state = self.flux_tracker.forward_trajectory(x_mean)
-        return source_seq, final_state
-
     def forward_step(self, h_prev, x_input, x_global_mean_encoded, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
@@ -210,4 +205,3 @@ class TemporalPropagator(nn.Module):
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
         
         return self.basis.decode(h_tilde_next), flux_next
-    
