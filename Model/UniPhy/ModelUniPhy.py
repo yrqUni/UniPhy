@@ -19,6 +19,7 @@ class UniPhyBlock(nn.Module):
         self.pscan = PScanTriton()
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
         self.last_h_state = None
+        self.last_flux_state = None
 
     def _complex_norm(self, z, norm_layer):
         z_cat = torch.cat([z.real, z.imag], dim=-1)
@@ -32,7 +33,7 @@ class UniPhyBlock(nn.Module):
         r, i = torch.chunk(out_cliff, 2, dim=1)
         return torch.complex(r, i)
 
-    def forward_step(self, x_step, h_prev, dt_step):
+    def forward_step(self, x_step, h_prev, dt_step, flux_prev):
         B, D, H, W = x_step.shape
         resid = x_step
         x_s = x_step.permute(0, 2, 3, 1)
@@ -47,11 +48,13 @@ class UniPhyBlock(nn.Module):
             dt_expanded = dt_t.reshape(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
         else:
             dt_expanded = dt_t.reshape(-1, 1)
-        h_next = self.prop.forward(h_prev, x_t, dt_expanded)
+        
+        h_next, flux_next = self.prop.forward_step(h_prev, x_t, dt_expanded, flux_prev)
+        
         x_drift = h_next.real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
         x = x_drift + resid
         x = x + self.ffn(x)
-        return x, h_next
+        return x, h_next, flux_next
 
     def forward(self, x, dt):
         B, T, D, H, W = x.shape
@@ -64,18 +67,31 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         dt_expanded = torch.as_tensor(dt, device=x.device).reshape(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
+        
         op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded)
+        
         x_eigen = self.prop.basis.encode(x_t)
         
-        x_eigen_mean = x_eigen.mean(dim=-2, keepdim=True)
-        dynamic_source = self.prop.source_perceiver(x_eigen_mean)
-        forcing_term = x_eigen + dynamic_source
+        x_eigen_seq = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2).mean(dim=(-2, -1)) 
+        x_eigen_input = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2) 
+        
+        source_seq = self.prop.compute_source_trajectory(x_eigen_input) 
+        
+        source_expanded = source_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
+        source_flat = source_expanded.reshape(B * T * H * W, D)
+        
+        forcing_term = x_eigen + source_flat
         
         u_t = forcing_term * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
         h_eigen = self.pscan(op_decay, u_t)
+        
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
+        
+        last_source_state = self.prop.flux_tracker.forward_step(torch.zeros_like(x_eigen_input[:,0].mean(dim=(-2,-1))), x_eigen_input.mean(dim=(-2,-1)))[0] 
+        self.last_flux_state = last_source_state 
+        
         x_drift = self.prop.basis.decode(h_eigen).real.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
         x_in = x.reshape(B * T, D, H, W)
@@ -103,27 +119,43 @@ class UniPhyModel(nn.Module):
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
         device = next(self.parameters()).device
         z = self.encoder(x_cond)
+        
         states = []
         for block in self.blocks:
             z = block(z, dt_cond)
-            states.append(block.last_h_state.to("cpu"))
+            
+            x_eigen_last_seq = block.prop.basis.encode(z).mean(dim=(-2,-1))
+            
+            curr_flux = torch.zeros(x_cond.shape[0], block.dim, device=device, dtype=torch.cdouble)
+            for t in range(x_cond.shape[1]):
+                curr_flux, _ = block.prop.flux_tracker.forward_step(curr_flux, x_eigen_last_seq[:, t])
+                
+            states.append((block.last_h_state.to("cpu"), curr_flux.to("cpu")))
             block.last_h_state = None 
+            block.last_flux_state = None
+            
         z_curr = z[:, -1].detach()
         del z            
+        
         predictions = []
         for k in range(k_steps):
             dt_k = dt_future[:, k] if (isinstance(dt_future, torch.Tensor) and dt_future.ndim > 0) else dt_future
             z_next = z_curr
             new_states = []
+            
             for i, block in enumerate(self.blocks):
-                h_prev = states[i].to(device, non_blocking=True)
-                z_next, h_next = block.forward_step(z_next, h_prev, dt_k)
-                new_states.append(h_next.to("cpu", non_blocking=True))
+                h_prev = states[i][0].to(device, non_blocking=True)
+                flux_prev = states[i][1].to(device, non_blocking=True)
+                
+                z_next, h_next, flux_next = block.forward_step(z_next, h_prev, dt_k, flux_prev)
+                new_states.append((h_next.to("cpu", non_blocking=True), flux_next.to("cpu", non_blocking=True)))
                 del h_prev
                 del h_next
+                
             states = new_states
             z_curr = z_next
             pred_pixel = self.decoder(z_curr.unsqueeze(1)).squeeze(1).to("cpu", non_blocking=True)
             predictions.append(pred_pixel)
+            
         return torch.stack(predictions, dim=1)
     
