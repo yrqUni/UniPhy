@@ -30,8 +30,11 @@ def check_history_dependency():
     
     x_seq_2[:, 0] += 10.0 
     
-    mean_1 = x_seq_1.mean(dim=(-2, -1))
-    mean_2 = x_seq_2.mean(dim=(-2, -1))
+    input_1 = x_seq_1.permute(0, 1, 3, 4, 2)
+    input_2 = x_seq_2.permute(0, 1, 3, 4, 2)
+    
+    mean_1 = input_1.mean(dim=(-2, -1))
+    mean_2 = input_2.mean(dim=(-2, -1))
     
     def manual_scan_project(mean_seq):
         A, X = prop.flux_tracker.get_operators(mean_seq)

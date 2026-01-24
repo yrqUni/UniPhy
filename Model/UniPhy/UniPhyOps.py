@@ -88,7 +88,6 @@ class GlobalFluxTracker(nn.Module):
         self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
         self.input_mix = nn.Linear(dim * 2, dim * 2)
         self.output_proj = nn.Linear(dim * 2, dim * 2)
-        self.pscan = PScanTriton()
         
         nn.init.xavier_uniform_(self.input_mix.weight)
         nn.init.zeros_(self.input_mix.bias)
@@ -108,8 +107,8 @@ class GlobalFluxTracker(nn.Module):
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
         u_t = torch.complex(x_re, x_im).reshape(B, T, D)
         
-        A = decay.view(1, D, 1).expand(B, D, T)
-        X = u_t.permute(0, 2, 1)
+        A = decay.view(1, D, 1).expand(B, D, T).contiguous()
+        X = u_t.permute(0, 2, 1).contiguous()
         
         return A, X
 
@@ -179,11 +178,6 @@ class TemporalPropagator(nn.Module):
         std = torch.sqrt(var).to(dtype)
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
-
-    def compute_source_trajectory(self, x_emb_seq):
-        x_mean = x_emb_seq.mean(dim=(-2, -1)) 
-        source_seq = self.flux_tracker.project(self.flux_tracker.get_operators(x_mean)[1])
-        return source_seq, None
 
     def forward_step(self, h_prev, x_input, x_global_mean_encoded, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)
