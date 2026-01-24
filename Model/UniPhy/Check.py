@@ -75,10 +75,11 @@ def check_full_model_consistency():
         out_parallel = model(x, dt)
         
         z = model.encoder(x)
+        B_z, T_z, D_z, H_z, W_z = z.shape
         
         for block in model.blocks:
-            h_state = torch.zeros(B * H * W, block.dim, dtype=torch.cdouble, device=device)
-            flux_state = torch.zeros(B, block.dim, dtype=torch.cdouble, device=device)
+            h_state = torch.zeros(B_z * H_z * W_z, block.dim, dtype=torch.cdouble, device=device)
+            flux_state = torch.zeros(B_z, block.dim, dtype=torch.cdouble, device=device)
             z_steps = []
             
             for t in range(T):
