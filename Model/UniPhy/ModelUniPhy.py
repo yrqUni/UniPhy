@@ -36,13 +36,17 @@ class UniPhyBlock(nn.Module):
     def forward_step(self, x_step, h_prev_latent, dt_step, flux_prev):
         B, D, H, W = x_step.shape
         resid = x_step
+        
         x_s = x_step.permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
         x = x_s + resid
-        resid = x
+        
+        resid = x 
+        
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
+        
         dt_t = torch.as_tensor(dt_step, device=x.device, dtype=x.real.dtype)
         if dt_t.numel() == B:
             dt_expanded = dt_t.reshape(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
@@ -63,11 +67,14 @@ class UniPhyBlock(nn.Module):
     def forward(self, x, dt):
         B, T, D, H, W = x.shape
         resid = x
+        
         x_s = x.reshape(B * T, D, H, W).permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
         x = x_s.reshape(B, T, D, H, W) + resid
-        resid = x
+        
+        resid = x 
+        
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         dt_expanded = torch.as_tensor(dt, device=x.device).reshape(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
