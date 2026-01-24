@@ -179,6 +179,11 @@ class TemporalPropagator(nn.Module):
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
+    def compute_source_trajectory(self, x_emb_seq):
+        x_mean = x_emb_seq.mean(dim=(-2, -1)) 
+        source_seq = self.flux_tracker.project(self.flux_tracker.get_operators(x_mean)[1])
+        return source_seq, None
+
     def forward_step(self, h_prev, x_input, x_global_mean_encoded, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
