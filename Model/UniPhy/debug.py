@@ -9,7 +9,6 @@ from UniPhyOps import GlobalFluxTracker, TemporalPropagator
 from ModelUniPhy import UniPhyBlock
 
 def check(name, parallel_out, serial_out, threshold=1e-6):
-    # Ensure comparisons happen on CPU to avoid sync issues during print
     p = parallel_out.detach().cpu()
     s = serial_out.detach().cpu()
     diff = (p - s).abs().max().item()
@@ -18,37 +17,28 @@ def check(name, parallel_out, serial_out, threshold=1e-6):
     return diff
 
 def debug_main():
-    # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_default_dtype(torch.float64)
     print(f"Running Debug on {device} (float64)...\n")
     
     B, T, D, H, W = 2, 8, 16, 4, 4
     
-    # ==========================================
-    # 1. Test GlobalFluxTracker
-    # ==========================================
+    # --- 1. Test GlobalFluxTracker ---
     print("--- 1. Testing GlobalFluxTracker ---")
     tracker = GlobalFluxTracker(D).to(device)
     tracker.eval()
     
-    # Input: Global Means (B, T, D) - Complex via real/imag split inside
     x_mean = torch.randn(B, T, D, device=device) + 1j * torch.randn(B, T, D, device=device)
     
-    # Parallel Path
     A, X = tracker.get_operators(x_mean)
-    # Simulate PScan manually to verify operator correctness vs logic
     h_par = torch.zeros(B, D, device=device, dtype=torch.complex128)
     h_states = []
     for t in range(T):
-        # PScan logic: h_t = A_t * h_{t-1} + X_t
-        # A is (B, D, T), X is (B, D, T)
         h_par = A[:, :, t] * h_par + X[:, :, t]
         h_states.append(h_par)
-    h_stack = torch.stack(h_states, dim=2) # (B, D, T)
-    src_par = tracker.project(h_stack) # (B, T, D)
+    h_stack = torch.stack(h_states, dim=2)
+    src_par = tracker.project(h_stack)
     
-    # Serial Path
     src_ser_list = []
     flux_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
     for t in range(T):
@@ -58,71 +48,53 @@ def debug_main():
     
     check("GlobalFluxTracker", src_par, src_ser)
 
-    # ==========================================
-    # 2. Test TemporalPropagator
-    # ==========================================
+    # --- 2. Test TemporalPropagator ---
     print("\n--- 2. Testing TemporalPropagator ---")
     prop = TemporalPropagator(D, noise_scale=0.0).to(device)
     prop.eval()
     
-    # Inputs: (B*HW, T, D)
     x_raw = torch.randn(B * H * W, T, D, device=device) + 1j * torch.randn(B * H * W, T, D, device=device)
-    dt = torch.ones(B * H * W, T, device=device) # Constant dt for simplicity check
+    dt = torch.ones(B * H * W, T, device=device)
     
-    # --- Parallel Path (Mimicking ModelUniPhy logic) ---
-    op_decay, op_forcing = prop.get_transition_operators(dt) # (N, T, D)
-    x_eigen = prop.basis.encode(x_raw) # (N, T, D)
+    op_decay, op_forcing = prop.get_transition_operators(dt)
+    x_eigen = prop.basis.encode(x_raw)
     
-    # Simulate Global Mean Calculation (Parallel)
-    # Reshape N -> B, H, W to get global mean
-    x_eigen_reshaped = x_eigen.view(B, H, W, T, D).permute(0, 3, 4, 1, 2) # (B, T, D, H, W)
-    x_mean_fake = x_eigen_reshaped.mean(dim=(-2, -1)) # (B, T, D)
+    x_eigen_reshaped = x_eigen.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+    x_mean_fake = x_eigen_reshaped.mean(dim=(-2, -1))
     
-    # Flux Parallel
     fA, fX = prop.flux_tracker.get_operators(x_mean_fake)
-    # Manual Scan for Flux
     fh = torch.zeros(B, D, device=device, dtype=torch.complex128)
     fh_list = []
     for t in range(T):
         fh = fA[:, :, t] * fh + fX[:, :, t]
         fh_list.append(fh)
     f_states = torch.stack(fh_list, dim=2)
-    src_seq = prop.flux_tracker.project(f_states) # (B, T, D)
+    src_seq = prop.flux_tracker.project(f_states)
     
-    # Expand Source
     src_expanded = src_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
-    # Matches ModelUniPhy: permute(0, 2, 3, 1, 4) -> (B, H, W, T, D) -> reshape -> (N, T, D)
     src_flat = src_expanded.permute(0, 2, 3, 1, 4).reshape(B*H*W, T, D)
     
-    # Forcing
     forcing = x_eigen + src_flat
-    u_t = forcing * op_forcing # (N, T, D)
+    u_t = forcing * op_forcing
     
-    # Main Scan (Manual to isolate PScan kernel issues)
-    # op_decay is (N, T, D)
     h_main = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
     h_main_list = []
     for t in range(T):
-        # Serial recurrence: h = h * decay + u
         decay_t = op_decay[:, t, :]
         u_curr = u_t[:, t, :]
         h_main = h_main * decay_t + u_curr
         h_main_list.append(h_main)
-    h_final = torch.stack(h_main_list, dim=1) # (N, T, D)
+    h_final = torch.stack(h_main_list, dim=1)
     out_par = prop.basis.decode(h_final)
     
-    # --- Serial Path ---
     out_ser_list = []
     h_curr = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
     flux_curr = torch.zeros(B, D, device=device, dtype=torch.complex128)
     
     for t in range(T):
-        xt = x_raw[:, t].unsqueeze(1) # (N, 1, D)
-        dtt = dt[:, t].unsqueeze(1)   # (N, 1)
-        x_mean_t = x_mean_fake[:, t]  # (B, D)
-        
-        # In ModelUniPhy.forward_step, we pass encoded global mean.
-        # But for x_input, forward_step encodes it internally.
+        xt = x_raw[:, t].unsqueeze(1)
+        dtt = dt[:, t].unsqueeze(1)
+        x_mean_t = x_mean_fake[:, t]
         
         out_next, flux_next = prop.forward_step(h_curr, xt, x_mean_t, dtt, flux_curr)
         out_ser_list.append(out_next)
@@ -134,14 +106,12 @@ def debug_main():
     
     check("TemporalPropagator", out_par, out_ser)
 
-    # ==========================================
-    # 3. Test UniPhyBlock Integration
-    # ==========================================
+    # --- 3. Test UniPhyBlock Integration ---
     print("\n--- 3. Testing UniPhyBlock Integration ---")
-    block = UniPhyBlock(D, 4, 4, H, W, dt_ref=1.0).to(device)
+    # Initialize with noise_scale=0.0
+    block = UniPhyBlock(D, 4, 4, H, W, dt_ref=1.0, noise_scale=0.0).to(device)
     block.eval()
     
-    # Input MUST be complex for UniPhyBlock
     x_block = torch.randn(B, T, D, H, W, device=device) + 1j * torch.randn(B, T, D, H, W, device=device)
     dt_block = torch.ones(B, T, device=device)
     
@@ -155,8 +125,8 @@ def debug_main():
     
     z = x_block 
     for t in range(T):
-        xt = z[:, t] # (B, D, H, W)
-        dtt = dt_block[:, t] # (B,)
+        xt = z[:, t]
+        dtt = dt_block[:, t]
         
         y_next, h_next, f_next = block.forward_step(xt, h_state, dtt, f_state)
         y_ser_list.append(y_next)

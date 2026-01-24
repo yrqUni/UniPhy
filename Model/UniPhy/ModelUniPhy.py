@@ -7,7 +7,7 @@ from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3, dt_ref=1.0):
+    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3, dt_ref=1.0, noise_scale=0.01):
         super().__init__()
         self.dim = dim
         self.img_height = img_height
@@ -15,7 +15,7 @@ class UniPhyBlock(nn.Module):
         self.norm_spatial = nn.LayerNorm(dim * 2)
         self.spatial_cliff = RiemannianCliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size//2, img_height=img_height, img_width=img_width)
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = TemporalPropagator(dim, dt_ref=dt_ref, noise_scale=0.01)
+        self.prop = TemporalPropagator(dim, dt_ref=dt_ref, noise_scale=noise_scale)
         self.pscan = PScanTriton()
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
         self.last_h_state = None
