@@ -30,9 +30,8 @@ def check_history_dependency():
     
     x_seq_2[:, 0] += 10.0 
     
-    # Needs to match (B, T, D, H, W) as expected by compute_source_trajectory internal mean
-    input_1 = x_seq_1
-    input_2 = x_seq_2
+    input_1 = x_seq_1.permute(0, 1, 3, 4, 2)
+    input_2 = x_seq_2.permute(0, 1, 3, 4, 2)
     
     src_1, _ = prop.compute_source_trajectory(input_1)
     src_2, _ = prop.compute_source_trajectory(input_2)

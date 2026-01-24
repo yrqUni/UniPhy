@@ -193,7 +193,18 @@ class TemporalPropagator(nn.Module):
         
         op_decay, op_forcing = self.get_transition_operators(dt)
         
-        forcing_term = x_tilde + source.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+        B = source.shape[0]
+        total_batch = x_tilde.shape[0]
+        D = x_tilde.shape[-1]
+        
+        if total_batch % B != 0:
+             raise ValueError(f"Total batch size {total_batch} is not divisible by flux batch size {B}")
+        
+        spatial_size = total_batch // B
+        
+        source_expanded = source.view(B, 1, 1, D).expand(B, spatial_size, 1, D).reshape(total_batch, 1, D)
+        
+        forcing_term = x_tilde + source_expanded
         
         h_tilde_next = h_tilde * op_decay + forcing_term * op_forcing
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
