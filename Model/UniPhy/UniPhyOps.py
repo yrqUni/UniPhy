@@ -19,11 +19,9 @@ class RiemannianCliffordConv2d(nn.Module):
         )
         laplacian_init = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
         self.laplacian_kernel = nn.Parameter(laplacian_init.reshape(1, 1, 3, 3).repeat(in_channels, 1, 1, 1))
-        
         self.metric_scale = nn.Parameter(torch.tensor(0.1))
         self.viscosity_scale = nn.Parameter(torch.tensor(0.01))
         self.diffusion_scale = nn.Parameter(torch.tensor(0.01))
-        
         self.groups = in_channels
 
     def forward(self, x):
@@ -88,7 +86,6 @@ class GlobalFluxTracker(nn.Module):
         self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
         self.input_mix = nn.Linear(dim * 2, dim * 2)
         self.output_proj = nn.Linear(dim * 2, dim * 2)
-        
         nn.init.xavier_uniform_(self.input_mix.weight)
         nn.init.zeros_(self.input_mix.bias)
         nn.init.xavier_uniform_(self.output_proj.weight)
@@ -100,27 +97,22 @@ class GlobalFluxTracker(nn.Module):
     def get_operators(self, x_mean_seq):
         B, T, D = x_mean_seq.shape
         decay = self._get_decay() 
-        
         x_flat = x_mean_seq.reshape(B * T, D)
         x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
         x_in = self.input_mix(x_cat)
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
         u_t = torch.complex(x_re, x_im).reshape(B, T, D)
-        
-        A = decay.view(1, D, 1).expand(B, D, T).clone() 
+        A = decay.view(1, D, 1).expand(B, D, T).contiguous()
         X = u_t.permute(0, 2, 1).contiguous()
-        
         return A, X
 
     def project(self, flux_states):
         B, D, T = flux_states.shape
         h_state = flux_states.permute(0, 2, 1) 
-        
         h_flat = h_state.reshape(B * T, D)
         out_cat = self.output_proj(torch.cat([h_flat.real, h_flat.imag], dim=-1))
         out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
         source_seq = torch.complex(out_re, out_im).reshape(B, T, D)
-        
         return source_seq
 
     def forward_step(self, flux_state, x_mean):
@@ -128,14 +120,11 @@ class GlobalFluxTracker(nn.Module):
         x_in = self.input_mix(x_cat)
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
         x_complex = torch.complex(x_re, x_im)
-        
         decay = self._get_decay()
         new_state = flux_state * decay + x_complex
-        
         out_cat = self.output_proj(torch.cat([new_state.real, new_state.imag], dim=-1))
         out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
         source = torch.complex(out_re, out_im)
-        
         return new_state, source
 
 class TemporalPropagator(nn.Module):
@@ -146,7 +135,6 @@ class TemporalPropagator(nn.Module):
         self.noise_scale = noise_scale
         self.basis = ComplexSVDTransform(dim)
         self.flux_tracker = GlobalFluxTracker(dim)
-        
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
         self.lf = nn.Parameter(torch.randn(dim) * 1.0)
         self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
@@ -182,25 +170,16 @@ class TemporalPropagator(nn.Module):
     def forward_step(self, h_prev_latent, x_input, x_global_mean_encoded, dt, flux_state):
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
-
         flux_next, source = self.flux_tracker.forward_step(flux_state, x_global_mean_encoded)
-        
         op_decay, op_forcing = self.get_transition_operators(dt)
-        
         B = source.shape[0]
         total_batch = x_tilde.shape[0]
         D = x_tilde.shape[-1]
-        
         if total_batch % B != 0: pass 
-        
         spatial_size = total_batch // B
-        
         source_expanded = source.view(B, 1, 1, D).expand(B, spatial_size, 1, D).reshape(total_batch, 1, D)
-        
         forcing_term = x_tilde + source_expanded
-        
         h_tilde_next = h_prev_latent * op_decay + forcing_term * op_forcing
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
-        
         return h_tilde_next, flux_next
     
