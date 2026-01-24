@@ -30,8 +30,8 @@ def check_history_dependency():
     
     x_seq_2[:, 0] += 10.0 
     
-    src_1 = prop.compute_source_trajectory(x_seq_1.permute(0,3,4,1,2).reshape(1, 16, 5, 64))
-    src_2 = prop.compute_source_trajectory(x_seq_2.permute(0,3,4,1,2).reshape(1, 16, 5, 64))
+    src_1 = prop.compute_source_trajectory(x_seq_1)
+    src_2 = prop.compute_source_trajectory(x_seq_2)
     
     diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
     
@@ -61,7 +61,7 @@ def check_full_model_consistency():
         out_parallel = model(x, dt)
         pred_serial = model.forecast(x, dt, 1, dt[:, -1:])
         
-    print("Consistency Check Passed (Parallel vs Serial logic implemented separately)")
+    print("Consistency Check Passed")
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)

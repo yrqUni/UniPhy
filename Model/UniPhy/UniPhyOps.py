@@ -181,7 +181,7 @@ class TemporalPropagator(nn.Module):
     def compute_source_trajectory(self, x_emb_seq):
         x_mean = x_emb_seq.mean(dim=(-2, -1)) 
         source_seq = self.flux_tracker.forward_trajectory(x_mean)
-        return source_seq.unsqueeze(-1).unsqueeze(-1)
+        return source_seq
 
     def forward_step(self, h_prev, x_input, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)

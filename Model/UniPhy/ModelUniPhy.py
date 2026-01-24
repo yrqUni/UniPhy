@@ -72,13 +72,12 @@ class UniPhyBlock(nn.Module):
         
         x_eigen = self.prop.basis.encode(x_t)
         
-        x_eigen_seq = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2).mean(dim=(-2, -1)) 
         x_eigen_input = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2) 
         
         source_seq = self.prop.compute_source_trajectory(x_eigen_input) 
         
         source_expanded = source_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
-        source_flat = source_expanded.reshape(B * T * H * W, D)
+        source_flat = source_expanded.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D)
         
         forcing_term = x_eigen + source_flat
         
