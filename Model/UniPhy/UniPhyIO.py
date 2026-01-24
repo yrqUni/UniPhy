@@ -3,8 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class FlexiblePadder(nn.Module):
-    def __init__(self, patch_size, mode='replicate'):
+    def __init__(self, patch_size, mode="replicate"):
         super().__init__()
         self.patch_size = patch_size
         self.pad_h = 0
@@ -28,6 +29,7 @@ class FlexiblePadder(nn.Module):
         target_w = W - self.pad_w
         return x[..., :target_h, :target_w]
 
+
 class LearnableSphericalPosEmb(nn.Module):
     def __init__(self, dim, h, w, hidden_dim=None):
         super().__init__()
@@ -35,17 +37,17 @@ class LearnableSphericalPosEmb(nn.Module):
             hidden_dim = dim // 2
         phi = torch.linspace(0, 2 * math.pi, w)
         theta = torch.linspace(0, math.pi, h)
-        phi_grid, theta_grid = torch.meshgrid(phi, theta, indexing='xy')
+        phi_grid, theta_grid = torch.meshgrid(phi, theta, indexing="xy")
         x_coord = torch.sin(theta_grid) * torch.cos(phi_grid)
         y_coord = torch.sin(theta_grid) * torch.sin(phi_grid)
         z_coord = torch.cos(theta_grid)
         coords = torch.stack([x_coord, y_coord, z_coord], dim=-1)
-        self.register_buffer('coords', coords, persistent=False)
+        self.register_buffer("coords", coords, persistent=False)
         self.mlp = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, dim),
-            nn.LayerNorm(dim) 
+            nn.LayerNorm(dim),
         )
 
     def forward(self, x):
@@ -54,12 +56,13 @@ class LearnableSphericalPosEmb(nn.Module):
         emb = emb.permute(2, 0, 1).unsqueeze(0)
         return x + emb
 
+
 class UniPhyEncoder(nn.Module):
     def __init__(self, in_ch, embed_dim, patch_size=16, img_height=64, img_width=64):
         super().__init__()
         self.patch_size = patch_size
-        self.padder = FlexiblePadder(patch_size, mode='replicate')
-        self.unshuffle_dim = in_ch * (patch_size ** 2)
+        self.padder = FlexiblePadder(patch_size, mode="replicate")
+        self.unshuffle_dim = in_ch * (patch_size**2)
         self.proj = nn.Conv2d(self.unshuffle_dim, embed_dim * 2, kernel_size=1)
         nn.init.orthogonal_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
@@ -85,22 +88,36 @@ class UniPhyEncoder(nn.Module):
             out = out.reshape(B, T, D, H_p, W_p)
         return out
 
+
 class UniPhyEnsembleDecoder(nn.Module):
-    def __init__(self, out_ch, latent_dim, patch_size=16, model_channels=128, ensemble_size=10, img_height=64, img_width=64):
+    def __init__(
+        self,
+        out_ch,
+        latent_dim,
+        patch_size=16,
+        model_channels=128,
+        ensemble_size=10,
+        img_height=64,
+        img_width=64,
+    ):
         super().__init__()
         self.patch_size = patch_size
         self.img_height = img_height
         self.img_width = img_width
-        self.padder = FlexiblePadder(patch_size, mode='replicate')
+        self.padder = FlexiblePadder(patch_size, mode="replicate")
         self.ensemble_size = ensemble_size
-        self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
+        self.latent_proj = nn.Conv2d(
+            latent_dim * 2, model_channels, kernel_size=3, padding=1
+        )
         self.member_emb = nn.Embedding(ensemble_size, model_channels)
         self.block = nn.Sequential(
             nn.Conv2d(model_channels, model_channels, 3, 1, 1),
             nn.SiLU(),
-            nn.Conv2d(model_channels, model_channels, 3, 1, 1)
+            nn.Conv2d(model_channels, model_channels, 3, 1, 1),
         )
-        self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
+        self.final_proj = nn.Conv2d(
+            model_channels, out_ch * (patch_size**2), kernel_size=1
+        )
 
     def forward(self, z_latent, member_idx=None):
         is_5d = z_latent.ndim == 5
@@ -115,10 +132,12 @@ class UniPhyEnsembleDecoder(nn.Module):
         if z_flat.is_complex():
             z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
         else:
-            z_cat = z_flat 
+            z_cat = z_flat
         x_feat = self.latent_proj(z_cat)
         if member_idx is None:
-            member_idx = torch.zeros((x_feat.shape[0],), dtype=torch.long, device=x_feat.device)
+            member_idx = torch.zeros(
+                (x_feat.shape[0],), dtype=torch.long, device=x_feat.device
+            )
         elif member_idx.numel() == B and is_5d:
             member_idx = member_idx.repeat_interleave(T)
         m_emb = self.member_emb(member_idx).unsqueeze(-1).unsqueeze(-1)
@@ -130,6 +149,6 @@ class UniPhyEnsembleDecoder(nn.Module):
         out = self.padder.unpad(out)
         _, C_actual, H_actual, W_actual = out.shape
         if is_5d:
-            out = out.reshape(B, T, C_actual, H_actual, W_actual)  
+            out = out.reshape(B, T, C_actual, H_actual, W_actual)
         return out
     

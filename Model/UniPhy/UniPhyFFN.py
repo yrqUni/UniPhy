@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class LayerNorm2d(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6):
         super().__init__()
@@ -17,6 +18,7 @@ class LayerNorm2d(nn.Module):
         x = self.weight[:, None, None] * x + self.bias[:, None, None]
         return x
 
+
 class ComplexDynamicFFN(nn.Module):
     def __init__(self, dim, hidden_dim, num_experts=8):
         super().__init__()
@@ -27,13 +29,17 @@ class ComplexDynamicFFN(nn.Module):
         self.spatial_im = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         self.experts_up_re = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
         self.experts_up_im = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
-        self.experts_down_re = nn.Conv2d(hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts)
-        self.experts_down_im = nn.Conv2d(hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts)
+        self.experts_down_re = nn.Conv2d(
+            hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts
+        )
+        self.experts_down_im = nn.Conv2d(
+            hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts
+        )
         self.router = nn.Sequential(
             nn.Conv2d(dim, dim, 1),
             LayerNorm2d(dim),
             nn.GELU(),
-            nn.Conv2d(dim, num_experts, 1)
+            nn.Conv2d(dim, num_experts, 1),
         )
         nn.init.xavier_uniform_(self.experts_down_re.weight)
         nn.init.zeros_(self.experts_down_im.weight)
@@ -56,6 +62,7 @@ class ComplexDynamicFFN(nn.Module):
         out_re = (down_re * w).sum(dim=1)
         out_im = (down_im * w).sum(dim=1)
         return torch.complex(out_re, out_im)
+
 
 class UniPhyFeedForwardNetwork(nn.Module):
     def __init__(self, dim, expand, num_experts):
