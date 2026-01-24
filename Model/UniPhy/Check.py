@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from UniPhyOps import TemporalPropagator, ComplexSVDTransform
 from UniPhyFFN import UniPhyFeedForwardNetwork
 from ModelUniPhy import UniPhyModel
+from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 
 def check_basis_invertibility():
     dim = 64
@@ -35,7 +36,7 @@ def check_ffn_causality():
     ffn = UniPhyFeedForwardNetwork(dim=D, expand=4, num_experts=4).to(device)
     ffn.eval()
     
-    x = torch.randn(B, T, D, H, W, device=device)
+    x = torch.randn(B, T, D, H, W, device=device, dtype=torch.cdouble)
     
     x_par = x.reshape(B * T, D, H, W)
     out_par = ffn(x_par).reshape(B, T, D, H, W)
@@ -48,6 +49,27 @@ def check_ffn_causality():
     diff = (out_par - out_ser).abs().max().item()
     if diff < 1e-12: pass
     else: print(f"FFN Causality Error: {diff:.2e}")
+
+def check_io_shapes():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    B, T = 1, 5
+    C_in, C_out = 2, 2
+    H, W = 721, 1440 
+    Patch, Embed = 16, 64
+    
+    enc = UniPhyEncoder(in_ch=C_in, embed_dim=Embed, patch_size=Patch, img_height=H, img_width=W).to(device)
+    dec = UniPhyEnsembleDecoder(out_ch=C_out, latent_dim=Embed, patch_size=Patch, img_height=H, img_width=W).to(device)
+    
+    x = torch.randn(B, T, C_in, H, W, device=device, dtype=torch.float64)
+    z = enc(x)
+    
+    expected_h = (H + (Patch - H % Patch) % Patch) // Patch
+    expected_w = (W + (Patch - W % Patch) % Patch) // Patch
+    assert z.shape[-2] == expected_h
+    assert z.shape[-1] == expected_w
+    
+    out = dec(z)
+    assert out.shape == (B, T, C_out, H, W)
 
 def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,7 +127,7 @@ if __name__ == "__main__":
     check_basis_invertibility()
     check_eigenvalue_stability()
     check_ffn_causality()
+    check_io_shapes()
     if torch.cuda.is_available():
         check_full_model_consistency()
     print("Checks Completed.")
-    
