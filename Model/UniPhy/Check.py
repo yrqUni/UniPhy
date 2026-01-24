@@ -36,8 +36,19 @@ def check_history_dependency():
     mean_1 = input_1.mean(dim=(-2, -1))
     mean_2 = input_2.mean(dim=(-2, -1))
     
-    src_1 = prop.flux_tracker.project(prop.flux_tracker.get_operators(mean_1)[1]) 
-    src_2 = prop.flux_tracker.project(prop.flux_tracker.get_operators(mean_2)[1])
+    def manual_scan_project(mean_seq):
+        A, X = prop.flux_tracker.get_operators(mean_seq)
+        B, D, T_ = A.shape
+        h = torch.zeros(B, D, device=device, dtype=torch.cdouble)
+        states = []
+        for t in range(T_):
+            h = h * A[:, :, t] + X[:, :, t]
+            states.append(h)
+        flux_states = torch.stack(states, dim=2)
+        return prop.flux_tracker.project(flux_states)
+
+    src_1 = manual_scan_project(mean_1)
+    src_2 = manual_scan_project(mean_2)
     
     diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
     
@@ -65,8 +76,9 @@ def check_full_model_consistency():
     
     with torch.no_grad():
         out_parallel = model(x, dt)
+        
         z = model.encoder(x)
-
+        
         for block in model.blocks:
             h_state = torch.zeros(B * H * W, block.dim, dtype=torch.cdouble, device=device)
             flux_state = torch.zeros(B, block.dim, dtype=torch.cdouble, device=device)

@@ -205,3 +205,4 @@ class TemporalPropagator(nn.Module):
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
         
         return self.basis.decode(h_tilde_next), flux_next
+    

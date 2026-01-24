@@ -93,7 +93,7 @@ class UniPhyBlock(nn.Module):
         h_eigen = self.pscan(op_decay, u_t)
         
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
-        self.last_flux_state = flux_states[:, :, -1].permute(0, 1)
+        self.last_flux_state = flux_states[:, :, -1].permute(0, 1) 
         
         x_drift = self.prop.basis.decode(h_eigen).real.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
@@ -130,7 +130,14 @@ class UniPhyModel(nn.Module):
             curr_flux = torch.zeros(x_cond.shape[0], block.dim, device=device, dtype=torch.cdouble)
             if block.last_flux_state is not None:
                 curr_flux = block.last_flux_state
+            elif z.shape[1] > 0:
+                z_perm = z.permute(0, 1, 3, 4, 2)
+                x_encoded = block.prop.basis.encode(z_perm)
+                x_eigen_last_seq = x_encoded.mean(dim=(2, 3))
                 
+                for t in range(x_eigen_last_seq.shape[1]):
+                    curr_flux, _ = block.prop.flux_tracker.forward_step(curr_flux, x_eigen_last_seq[:, t])
+
             states.append((block.last_h_state.to("cpu"), curr_flux.to("cpu")))
             block.last_h_state = None 
             block.last_flux_state = None
