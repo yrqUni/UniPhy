@@ -24,12 +24,14 @@ def check_history_dependency():
     prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
     prop.eval()
     
+    # Input shape: (B, T, D, H, W). Permuted to (B, T, H, W, D) for compute_source_trajectory
     T = 5
     x_seq_1 = torch.randn(1, T, dim, 4, 4, device=device, dtype=torch.cdouble)
     x_seq_2 = x_seq_1.clone()
     
     x_seq_2[:, 0] += 10.0 
     
+    # Match expected input shape (B, T, H, W, D)
     input_1 = x_seq_1.permute(0, 1, 3, 4, 2)
     input_2 = x_seq_2.permute(0, 1, 3, 4, 2)
     
@@ -54,17 +56,46 @@ def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, C, H, W = 1, 5, 2, 32, 32
     dt_ref = 6.0
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=1, img_height=H, img_width=W, dt_ref=dt_ref).to(device)
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W, dt_ref=dt_ref).to(device)
     model.eval()
     
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.ones(B, T, device=device, dtype=torch.float64) * dt_ref
     
     with torch.no_grad():
+        # 1. Parallel Execution (PScan)
         out_parallel = model(x, dt)
-        pred_serial = model.forecast(x, dt, 1, dt[:, -1:])
         
-    print("Consistency Check Passed")
+        # 2. Serial Execution (Teacher Forcing)
+        # We manually emulate the block loop step-by-step to verify PScan == RNN
+        z = model.encoder(x)
+        
+        for block in model.blocks:
+            h_state = torch.zeros(B, block.dim, dtype=torch.cdouble, device=device)
+            flux_state = torch.zeros(B, block.dim, dtype=torch.cdouble, device=device)
+            z_steps = []
+            
+            for t in range(T):
+                x_step = z[:, t]
+                dt_step = dt[:, t]
+                
+                # Explicitly call forward_step (Serial Logic)
+                z_next, h_next, flux_next = block.forward_step(x_step, h_state, dt_step, flux_state)
+                
+                z_steps.append(z_next)
+                h_state = h_next
+                flux_state = flux_next
+            
+            z = torch.stack(z_steps, dim=1)
+            
+        out_serial = model.decoder(z)
+        
+        diff = (out_parallel - out_serial).abs().max().item()
+        
+    if diff < 1e-7:
+        print(f"Consistency Check Passed. Diff: {diff:.2e}")
+    else:
+        print(f"Consistency Check FAILED. Diff: {diff:.2e}")
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
@@ -75,3 +106,4 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         check_full_model_consistency()
     print("Checks Completed.")
+    
