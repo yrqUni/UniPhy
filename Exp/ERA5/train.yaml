@@ -8,8 +8,9 @@ model:
   patch_size: 32
   img_height: 721
   img_width: 1440
-  noise_scale: 0.01
+  dt_ref: 6.0
   sde_mode: "sde"
+  init_noise_scale: 0.01
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
@@ -17,7 +18,7 @@ data:
   window_size: 20
   sample_k: 5
   look_ahead: 2
-  dt_ref: 6.0
+  dt_ref: model.dt_ref
 
 train:
   batch_size: 1

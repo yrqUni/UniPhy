@@ -90,11 +90,11 @@ def check_full_model_consistency():
         img_height=H,
         img_width=W,
         dt_ref=dt_ref,
-        noise_scale=0.0,
+        sde_mode="det",
     ).to(device)
     model.eval()
     for block in model.blocks:
-        block.prop.noise_scale = 0.0
+        block.prop.init_noise_scale = 0.0
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.ones(B, T, device=device, dtype=torch.float64) * dt_ref
     with torch.no_grad():

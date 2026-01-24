@@ -172,7 +172,7 @@ class UniPhyModel(nn.Module):
         img_height=64,
         img_width=128,
         dt_ref=1.0,
-        noise_scale=0.01,
+        init_noise_scale=0.01,
         sde_mode="sde",
     ):
         super().__init__()
@@ -192,7 +192,7 @@ class UniPhyModel(nn.Module):
                     h_dim,
                     w_dim,
                     dt_ref=dt_ref,
-                    noise_scale=noise_scale,
+                    init_noise_scale=init_noise_scale,
                     sde_mode=sde_mode,
                 )
                 for _ in range(depth)

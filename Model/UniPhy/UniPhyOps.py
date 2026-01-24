@@ -136,12 +136,12 @@ class GlobalFluxTracker(nn.Module):
 
 
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01, sde_mode="sde"):
+    def __init__(self, dim, dt_ref=1.0, init_noise_scale=0.01, sde_mode="sde"):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
-        self.noise_scale = noise_scale
         self.sde_mode = sde_mode
+        self.noise_scale = nn.Parameter(torch.tensor(float(init_noise_scale))) if sde_mode=="sde" else None
         self.basis = ComplexSVDTransform(dim)
         self.flux_tracker = GlobalFluxTracker(dim)
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
@@ -170,7 +170,7 @@ class TemporalPropagator(nn.Module):
         return torch.exp(Z), phi1 * (dt_eff * self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):
-        if self.sde_mode != "sde" or self.noise_scale <= 0:
+        if self.sde_mode != "sde":
             return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         l_re = self._get_effective_lambda().real

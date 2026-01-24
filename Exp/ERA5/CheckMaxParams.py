@@ -65,6 +65,9 @@ def check_config_fit(args, dim, depth, experts, device):
             patch_size=args.patch_size,
             img_height=args.H,
             img_width=args.W,
+            dt_ref=6.0,
+            sde_mode="sde",
+            init_noise_scale=1.0,
         ).to(device)
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
