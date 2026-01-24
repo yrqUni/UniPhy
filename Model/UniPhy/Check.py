@@ -30,8 +30,11 @@ def check_history_dependency():
     
     x_seq_2[:, 0] += 10.0 
     
-    src_1, _ = prop.compute_source_trajectory(x_seq_1)
-    src_2, _ = prop.compute_source_trajectory(x_seq_2)
+    input_1 = x_seq_1.permute(0, 1, 3, 4, 2)
+    input_2 = x_seq_2.permute(0, 1, 3, 4, 2)
+    
+    src_1, _ = prop.compute_source_trajectory(input_1)
+    src_2, _ = prop.compute_source_trajectory(input_2)
     
     diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
     

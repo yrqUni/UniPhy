@@ -49,7 +49,10 @@ class UniPhyBlock(nn.Module):
         else:
             dt_expanded = dt_t.reshape(-1, 1)
         
-        h_next, flux_next = self.prop.forward_step(h_prev, x_t, dt_expanded, flux_prev)
+        x_encoded_local = self.prop.basis.encode(x_t)
+        x_global_mean_encoded = x_encoded_local.view(B, H * W, D).mean(dim=1)
+        
+        h_next, flux_next = self.prop.forward_step(h_prev, x_t, x_global_mean_encoded, dt_expanded, flux_prev)
         
         x_drift = h_next.real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
         x = x_drift + resid
@@ -123,7 +126,7 @@ class UniPhyModel(nn.Module):
             
             z_perm = z.permute(0, 1, 3, 4, 2)
             x_encoded = block.prop.basis.encode(z_perm)
-            x_eigen_last_seq = x_encoded.mean(dim=(2, 3))
+            x_eigen_last_seq = x_encoded.mean(dim=(2, 3)) 
             
             curr_flux = torch.zeros(x_cond.shape[0], block.dim, device=device, dtype=torch.cdouble)
             for t in range(x_cond.shape[1]):

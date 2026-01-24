@@ -90,7 +90,7 @@ class GlobalFluxTracker(nn.Module):
         
         nn.init.xavier_uniform_(self.input_mix.weight)
         nn.init.zeros_(self.input_mix.bias)
-        nn.init.zeros_(self.output_proj.weight)
+        nn.init.xavier_uniform_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
     def _get_decay(self):
@@ -183,14 +183,13 @@ class TemporalPropagator(nn.Module):
         source_seq, final_state = self.flux_tracker.forward_trajectory(x_mean)
         return source_seq, final_state
 
-    def forward_step(self, h_prev, x_input, dt, flux_state):
+    def forward_step(self, h_prev, x_input, x_global_mean_encoded, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
 
-        x_mean = x_tilde.mean(dim=(-2, -1)).squeeze(1)
-        flux_next, source = self.flux_tracker.forward_step(flux_state, x_mean)
+        flux_next, source = self.flux_tracker.forward_step(flux_state, x_global_mean_encoded)
         
         op_decay, op_forcing = self.get_transition_operators(dt)
         
