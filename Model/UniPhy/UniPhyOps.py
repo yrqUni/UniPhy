@@ -98,6 +98,9 @@ class GlobalFluxTracker(nn.Module):
         return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
 
     def get_operators(self, x_mean_seq):
+        if x_mean_seq.ndim != 3:
+             raise ValueError(f"Expected 3D input (B, T, D), got {x_mean_seq.shape}")
+             
         B, T, D = x_mean_seq.shape
         decay = self._get_decay() 
         
@@ -114,7 +117,7 @@ class GlobalFluxTracker(nn.Module):
 
     def project(self, flux_states):
         B, D, T = flux_states.shape
-        h_state = flux_states.permute(0, 2, 1) 
+        h_state = flux_states.permute(0, 2, 1)
         
         h_flat = h_state.reshape(B * T, D)
         out_cat = self.output_proj(torch.cat([h_flat.real, h_flat.imag], dim=-1))
@@ -194,7 +197,7 @@ class TemporalPropagator(nn.Module):
         D = x_tilde.shape[-1]
         
         if total_batch % B != 0:
-             pass
+             pass 
         
         spatial_size = total_batch // B
         
