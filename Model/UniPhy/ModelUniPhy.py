@@ -41,7 +41,7 @@ class UniPhyBlock(nn.Module):
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
         x = x_s + resid
-        resid = x  
+        resid = x
         
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
@@ -71,8 +71,7 @@ class UniPhyBlock(nn.Module):
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
         x = x_s.reshape(B, T, D, H, W) + resid
-        
-        resid = x 
+        resid = x
         
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
@@ -86,7 +85,8 @@ class UniPhyBlock(nn.Module):
         x_mean_seq = x_eigen_input.mean(dim=(-2, -1))
         
         flux_A, flux_X = self.prop.flux_tracker.get_operators(x_mean_seq)
-        flux_states = self.pscan(flux_A, flux_X)
+        flux_states = self.pscan(flux_A.to(torch.complex64), flux_X.to(torch.complex64))
+        flux_states = flux_states.to(x.dtype)
         source_seq = self.prop.flux_tracker.project(flux_states)
         
         source_expanded = source_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
@@ -101,7 +101,8 @@ class UniPhyBlock(nn.Module):
         A = op_decay.permute(0, 2, 1).contiguous()
         X = u_t.permute(0, 2, 1).contiguous()
         
-        h_eigen_perm = self.pscan(A, X)
+        h_eigen_perm = self.pscan(A.to(torch.complex64), X.to(torch.complex64))
+        h_eigen_perm = h_eigen_perm.to(x.dtype)
         h_eigen = h_eigen_perm.permute(0, 2, 1)
         
         self.last_h_state = h_eigen[:, -1, :].unsqueeze(1)
@@ -146,6 +147,7 @@ class UniPhyModel(nn.Module):
                 z_perm = z.permute(0, 1, 3, 4, 2)
                 x_encoded = block.prop.basis.encode(z_perm)
                 x_eigen_last_seq = x_encoded.mean(dim=(2, 3))
+                
                 for t in range(x_eigen_last_seq.shape[1]):
                     curr_flux, _ = block.prop.flux_tracker.forward_step(curr_flux, x_eigen_last_seq[:, t])
 
