@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PScan import PScanTriton
 
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height, img_width):
@@ -87,6 +88,7 @@ class GlobalFluxTracker(nn.Module):
         self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
         self.input_mix = nn.Linear(dim * 2, dim * 2)
         self.output_proj = nn.Linear(dim * 2, dim * 2)
+        self.pscan = PScanTriton()
         
         nn.init.xavier_uniform_(self.input_mix.weight)
         nn.init.zeros_(self.input_mix.bias)

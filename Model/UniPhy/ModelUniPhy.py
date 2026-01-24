@@ -91,8 +91,7 @@ class UniPhyBlock(nn.Module):
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
         
-        N = u_t.shape[0]
-        A = op_decay.unsqueeze(1).expand(N, D, T)
+        A = op_decay.permute(0, 2, 1)
         X = u_t.permute(0, 2, 1)
         
         h_eigen_perm = self.pscan(A, X)
