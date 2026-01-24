@@ -79,23 +79,63 @@ class ComplexSVDTransform(nn.Module):
         M = U @ S_mat @ V.conj().T
         return torch.matmul(x.to(M.dtype), M.T)
     
-class DynamicSourcePerceiver(nn.Module):
+class GlobalFluxTracker(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.perceiver = nn.Sequential(
-            nn.Linear(dim * 2, dim // 2),
-            nn.LayerNorm(dim // 2),
-            nn.SiLU(),
-            nn.Linear(dim // 2, dim * 2)
-        )
-        nn.init.zeros_(self.perceiver[-1].weight)
-        nn.init.zeros_(self.perceiver[-1].bias)
+        self.dim = dim
+        self.decay_re = nn.Parameter(torch.randn(dim) * 0.1 - 1.0)
+        self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
+        self.input_mix = nn.Linear(dim * 2, dim * 2)
+        self.output_proj = nn.Linear(dim * 2, dim * 2)
+        
+        nn.init.xavier_uniform_(self.input_mix.weight)
+        nn.init.zeros_(self.input_mix.bias)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
 
-    def forward(self, x_mean):
+    def _get_decay(self):
+        return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
+
+    def forward_step(self, flux_state, x_mean):
         x_cat = torch.cat([x_mean.real, x_mean.imag], dim=-1)
-        source_delta = self.perceiver(x_cat)
-        re, im = torch.chunk(source_delta, 2, dim=-1)
-        return torch.complex(re, im)
+        x_in = self.input_mix(x_cat)
+        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
+        x_complex = torch.complex(x_re, x_im)
+        
+        decay = self._get_decay()
+        new_state = flux_state * decay + x_complex
+        
+        out_cat = self.output_proj(torch.cat([new_state.real, new_state.imag], dim=-1))
+        out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
+        source = torch.complex(out_re, out_im)
+        
+        return new_state, source
+
+    def forward_trajectory(self, x_mean_seq):
+        B, T, D = x_mean_seq.shape
+        decay = self._get_decay() 
+        
+        x_flat = x_mean_seq.reshape(B * T, D)
+        x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
+        x_in = self.input_mix(x_cat)
+        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
+        x_complex_seq = torch.complex(x_re, x_im).reshape(B, T, D)
+        
+        states = []
+        curr = torch.zeros(B, D, device=x_mean_seq.device, dtype=x_mean_seq.dtype)
+        
+        for t in range(T):
+            curr = curr * decay + x_complex_seq[:, t]
+            states.append(curr)
+            
+        states_seq = torch.stack(states, dim=1) 
+        
+        states_flat = states_seq.reshape(B * T, D)
+        out_cat = self.output_proj(torch.cat([states_flat.real, states_flat.imag], dim=-1))
+        out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
+        source_seq = torch.complex(out_re, out_im).reshape(B, T, D)
+        
+        return source_seq
 
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
@@ -104,7 +144,7 @@ class TemporalPropagator(nn.Module):
         self.dt_ref = dt_ref
         self.noise_scale = noise_scale
         self.basis = ComplexSVDTransform(dim)
-        self.source_perceiver = DynamicSourcePerceiver(dim)
+        self.flux_tracker = GlobalFluxTracker(dim)
         
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
         self.lf = nn.Parameter(torch.randn(dim) * 1.0)
@@ -138,21 +178,26 @@ class TemporalPropagator(nn.Module):
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
-    def forward(self, h_prev, x_input, dt):
+    def compute_source_trajectory(self, x_emb_seq):
+        x_mean = x_emb_seq.mean(dim=(-2, -1)) 
+        source_seq = self.flux_tracker.forward_trajectory(x_mean)
+        return source_seq.unsqueeze(-1).unsqueeze(-1)
+
+    def forward_step(self, h_prev, x_input, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
 
-        x_mean_global = x_tilde.mean(dim=-2, keepdim=True)
-        dynamic_source = self.source_perceiver(x_mean_global)
+        x_mean = x_tilde.mean(dim=(-2, -1)).squeeze(1)
+        flux_next, source = self.flux_tracker.forward_step(flux_state, x_mean)
         
         op_decay, op_forcing = self.get_transition_operators(dt)
         
-        forcing_term = x_tilde + dynamic_source
+        forcing_term = x_tilde + source.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
         
         h_tilde_next = h_tilde * op_decay + forcing_term * op_forcing
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
         
-        return self.basis.decode(h_tilde_next)
+        return self.basis.decode(h_tilde_next), flux_next
     
