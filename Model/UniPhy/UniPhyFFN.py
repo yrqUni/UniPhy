@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 class LayerNorm2d(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6):
         super().__init__()
