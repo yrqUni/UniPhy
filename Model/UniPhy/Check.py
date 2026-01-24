@@ -5,115 +5,119 @@ import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from UniPhyOps import GlobalFluxTracker
-# Try to import PScan to check if it exists/works
-try:
-    from PScan import PScanTriton
-    pscan_available = True
-except ImportError:
-    pscan_available = False
-    print("Warning: PScanTriton not found, mocking it for logic check.")
+from UniPhyOps import TemporalPropagator, ComplexSVDTransform
+from UniPhyFFN import UniPhyFeedForwardNetwork
+from ModelUniPhy import UniPhyModel
 
-def debug_flux():
+def check_basis_invertibility():
+    dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.set_default_dtype(torch.float64)
-    print(f"Running Flux Tracker Isolation Debug on {device}...\n")
+    basis = ComplexSVDTransform(dim).to(device)
+    x = torch.randn(16, dim, device=device, dtype=torch.cdouble)
+    x_enc = basis.encode(x)
+    x_dec = basis.decode(x_enc)
+    err = (x - x_dec).abs().max().item()
+    if err < 1e-12: pass
+    else: print(f"Basis Inversion Error: {err:.2e}")
+
+def check_history_dependency():
+    dim = 64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
+    prop.eval()
     
-    B, T, D = 1, 5, 16
+    T = 5
+    x_seq_1 = torch.randn(1, T, dim, 4, 4, device=device, dtype=torch.cdouble)
+    x_seq_2 = x_seq_1.clone()
+    x_seq_2[:, 0] += 10.0 
     
-    # Init Tracker
-    tracker = GlobalFluxTracker(D).to(device)
-    tracker.eval()
+    mean_1 = x_seq_1.mean(dim=(-2, -1))
+    mean_2 = x_seq_2.mean(dim=(-2, -1))
     
-    # Random Input (Mean Sequence)
-    x_mean = torch.randn(B, T, D, device=device, dtype=torch.float64) + \
-             1j * torch.randn(B, T, D, device=device, dtype=torch.float64)
+    def manual_scan_project(mean_seq):
+        A, X = prop.flux_tracker.get_operators(mean_seq)
+        B, D, T_ = A.shape
+        h = torch.zeros(B, D, device=device, dtype=torch.cdouble)
+        states = []
+        for t in range(T_):
+            h = h * A[:, :, t] + X[:, :, t]
+            states.append(h)
+        flux_states = torch.stack(states, dim=2)
+        return prop.flux_tracker.project(flux_states)
+
+    src_1 = manual_scan_project(mean_1)
+    src_2 = manual_scan_project(mean_2)
     
-    # =========================================================
-    # 1. Parallel Path (PScan)
-    # =========================================================
-    print(">>> 1. Parallel Path (PScan)")
-    A_par, X_par = tracker.get_operators(x_mean)
-    # A_par: (B, D, T), X_par: (B, D, T)
+    diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
+    if diff_at_last_step > 1e-5: pass 
+    else: print(f"History Dependency Error: Diff: {diff_at_last_step:.2e}")
+
+def check_eigenvalue_stability():
+    dim = 64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop = TemporalPropagator(dim).to(device)
+    lambda_val = prop._get_effective_lambda()
+    max_real = lambda_val.real.max().item()
+    if max_real <= 1e-6: pass
+    else: print(f"Eigenvalue Stability Error: Max Real Part {max_real:.2e} > 0")
+
+def check_full_model_consistency():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running Full Model Consistency on {device}...")
     
-    # Use actual PScan if available, else manual simulation of PScan logic
-    if pscan_available:
-        pscan = PScanTriton()
-        flux_states_par = pscan(A_par, X_par) # (B, D, T)
+    B, T, C, H, W = 1, 5, 2, 32, 32
+    dt_ref = 6.0
+    
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W, dt_ref=dt_ref, noise_scale=0.0).to(device)
+    model.eval()
+    
+    for block in model.blocks:
+        block.prop.noise_scale = 0.0
+    
+    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
+    dt = torch.ones(B, T, device=device, dtype=torch.float64) * dt_ref
+    
+    with torch.no_grad():
+        out_parallel = model(x, dt)
+        
+        z = model.encoder(x)
+        B_z, T_z, D_z, H_z, W_z = z.shape
+        
+        for block in model.blocks:
+            h_state = torch.zeros(B_z * H_z * W_z, 1, block.dim, dtype=torch.cdouble, device=device)
+            flux_state = torch.zeros(B_z, block.dim, dtype=torch.cdouble, device=device)
+            z_steps = []
+            
+            for t in range(T):
+                x_step = z[:, t]
+                dt_step = dt[:, t]
+                
+                z_next, h_next, flux_next = block.forward_step(x_step, h_state, dt_step, flux_state)
+                
+                z_steps.append(z_next)
+                h_state = h_next
+                flux_state = flux_next
+            
+            z = torch.stack(z_steps, dim=1)
+            
+        out_serial = model.decoder(z)
+        
+        diff = (out_parallel - out_serial).abs().max().item()
+        
+    if diff < 1e-5:
+        print(f"Consistency Check Passed. Diff: {diff:.2e}")
     else:
-        # Manual PScan Simulation (Scan along last dim T)
-        # h_t = A_t * h_{t-1} + X_t
-        h = torch.zeros(B, D, device=device, dtype=torch.complex128)
-        outs = []
-        for t in range(T):
-            A_t = A_par[:, :, t]
-            X_t = X_par[:, :, t]
-            h = h * A_t + X_t
-            outs.append(h)
-        flux_states_par = torch.stack(outs, dim=2)
-        
-    print(f"    Flux States Par Shape: {flux_states_par.shape}")
-    print(f"    Flux States Par Mean:  {flux_states_par.mean().item():.6f}")
-
-    # =========================================================
-    # 2. Serial Path (Step-by-Step)
-    # =========================================================
-    print("\n>>> 2. Serial Path (Loop)")
-    
-    flux_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
-    flux_states_ser_list = []
-    
-    for t in range(T):
-        x_m = x_mean[:, t] # (B, D)
-        
-        # Step
-        # forward_step(flux_state, x_mean) -> returns (new_state, source)
-        flux_next, _ = tracker.forward_step(flux_state, x_m)
-        
-        flux_states_ser_list.append(flux_next)
-        flux_state = flux_next
-        
-    flux_states_ser = torch.stack(flux_states_ser_list, dim=2) # (B, D, T)
-    print(f"    Flux States Ser Mean:  {flux_states_ser.mean().item():.6f}")
-
-    # =========================================================
-    # 3. Compare Internal Operators (A, X) vs (Decay, Input)
-    # =========================================================
-    print("\n>>> 3. Component Check")
-    
-    # Check A vs Decay
-    # A_par is (B, D, T). Serial uses tracker._get_decay() (D)
-    decay_ref = tracker._get_decay()
-    A_slice = A_par[0, :, 0] # Should match decay
-    diff_A = (A_slice - decay_ref).abs().max().item()
-    print(f"    Operator A vs Decay Diff: {diff_A:.2e}")
-    
-    # Check X vs Input Mix
-    # X_par is (B, D, T). Serial uses input_mix(x_m)
-    x_m_0 = x_mean[:, 0]
-    x_cat = torch.cat([x_m_0.real, x_m_0.imag], dim=-1)
-    x_in = tracker.input_mix(x_cat)
-    x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-    x_c = torch.complex(x_re, x_im) # (B, D)
-    
-    X_slice = X_par[:, :, 0] # (B, D)
-    diff_X = (X_slice - x_c).abs().max().item()
-    print(f"    Operator X vs Input Diff: {diff_X:.2e}")
-
-    # =========================================================
-    # 4. Final Result
-    # =========================================================
-    print("\n>>> 4. Final Result")
-    diff_final = (flux_states_par - flux_states_ser).abs().max().item()
-    print(f"    Max Diff Flux States: {diff_final:.2e}")
-    
-    if diff_final > 1e-6:
-        print("    [FAIL] Mismatch detected.")
-        print(f"    Par[0,0,:]: {flux_states_par[0,0,:].detach().cpu().numpy()}")
-        print(f"    Ser[0,0,:]: {flux_states_ser[0,0,:].detach().cpu().numpy()}")
-    else:
-        print("    [PASS] Flux Tracker Logic is Consistent.")
+        print(f"Consistency Check FAILED. Diff: {diff:.2e}")
+        print(f"   Parallel Mean: {out_parallel.mean():.6f}")
+        print(f"   Serial   Mean: {out_serial.mean():.6f}")
 
 if __name__ == "__main__":
-    debug_flux()
+    torch.set_default_dtype(torch.float64)
+    print("Running Checks...")
+    check_basis_invertibility()
+    check_history_dependency()
+    check_eigenvalue_stability()
+    if torch.cuda.is_available():
+        check_full_model_consistency()
+    print("Checks Completed.")
     
