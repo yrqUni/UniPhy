@@ -7,7 +7,7 @@ from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3):
+    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3, dt_ref=1.0):
         super().__init__()
         self.dim = dim
         self.img_height = img_height
@@ -15,7 +15,7 @@ class UniPhyBlock(nn.Module):
         self.norm_spatial = nn.LayerNorm(dim * 2)
         self.spatial_cliff = RiemannianCliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size//2, img_height=img_height, img_width=img_width)
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = TemporalPropagator(dim, dt_ref=1.0, noise_scale=0.01)
+        self.prop = TemporalPropagator(dim, dt_ref=dt_ref, noise_scale=0.01)
         self.pscan = PScanTriton()
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
         self.last_h_state = None
@@ -66,8 +66,12 @@ class UniPhyBlock(nn.Module):
         dt_expanded = torch.as_tensor(dt, device=x.device).reshape(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
         op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded)
         x_eigen = self.prop.basis.encode(x_t)
-        bias = self.prop._get_source_bias()
-        u_t = (x_eigen + bias) * op_forcing
+        
+        x_eigen_mean = x_eigen.mean(dim=-2, keepdim=True)
+        dynamic_source = self.prop.source_perceiver(x_eigen_mean)
+        forcing_term = x_eigen + dynamic_source
+        
+        u_t = forcing_term * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
         h_eigen = self.pscan(op_decay, u_t)
@@ -80,20 +84,20 @@ class UniPhyBlock(nn.Module):
         return x
 
 class UniPhyModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128):
+    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, dt_ref=1.0):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pad_h = (patch_size - img_height % patch_size) % patch_size
         pad_w = (patch_size - img_width % patch_size) % patch_size
         h_dim, w_dim = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim) for _ in range(depth)])
+        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim, dt_ref=dt_ref) for _ in range(depth)])
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
 
     def forward(self, x, dt):
         z = self.encoder(x)
         for block in self.blocks: z = block(z, dt)
-        return self.decoder(z, x)
+        return self.decoder(z)
         
     @torch.no_grad()
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
@@ -119,7 +123,7 @@ class UniPhyModel(nn.Module):
                 del h_next
             states = new_states
             z_curr = z_next
-            pred_pixel = self.decoder(z_curr.unsqueeze(1), None).squeeze(1).to("cpu", non_blocking=True)
+            pred_pixel = self.decoder(z_curr.unsqueeze(1)).squeeze(1).to("cpu", non_blocking=True)
             predictions.append(pred_pixel)
         return torch.stack(predictions, dim=1)
     

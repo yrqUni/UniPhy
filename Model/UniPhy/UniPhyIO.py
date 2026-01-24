@@ -54,36 +54,6 @@ class LearnableSphericalPosEmb(nn.Module):
         emb = emb.permute(2, 0, 1).unsqueeze(0)
         return x + emb
 
-class GlobalConservationConstraint(nn.Module):
-    def __init__(self, conserved_indices=[0], conserve_energy=True, epsilon=1e-6):
-        super().__init__()
-        self.conserved_indices = conserved_indices
-        self.conserve_energy = conserve_energy
-        self.epsilon = epsilon
-
-    def forward(self, pred, ref):
-        if ref.ndim == 5:
-            ref_slice = ref[:, -1:, ...]
-        else:
-            ref_slice = ref.unsqueeze(1)
-        B, T, C, H, W = pred.shape
-        mask = torch.zeros(1, 1, C, 1, 1, device=pred.device, dtype=pred.dtype)
-        for idx in self.conserved_indices:
-            if idx < C:
-                mask[:, :, idx, :, :] = 1.0
-        ref_mean = ref_slice.mean(dim=(-2, -1), keepdim=True)
-        pred_mean = pred.mean(dim=(-2, -1), keepdim=True)
-        diff_mean = pred_mean - ref_mean
-        pred_centered = pred - (diff_mean * mask)
-        if self.conserve_energy:
-            ref_var = torch.var(ref_slice, dim=(-2, -1), keepdim=True, unbiased=False)
-            pred_var = torch.var(pred_centered, dim=(-2, -1), keepdim=True, unbiased=False)
-            scale = torch.sqrt((ref_var + self.epsilon) / (pred_var + self.epsilon))
-            ref_mean_target = ref_mean * mask + pred_mean * (1 - mask)
-            pred_scaled = (pred_centered - ref_mean_target) * (scale * mask + (1 - mask)) + ref_mean_target
-            return pred_scaled
-        return pred_centered
-
 class UniPhyEncoder(nn.Module):
     def __init__(self, in_ch, embed_dim, patch_size=16, img_height=64, img_width=64):
         super().__init__()
@@ -123,7 +93,6 @@ class UniPhyEnsembleDecoder(nn.Module):
         self.img_width = img_width
         self.padder = FlexiblePadder(patch_size, mode='replicate')
         self.ensemble_size = ensemble_size
-        self.conservation_constraint = GlobalConservationConstraint(conserved_indices=[0])
         self.latent_proj = nn.Conv2d(latent_dim * 2, model_channels, kernel_size=3, padding=1)
         self.member_emb = nn.Embedding(ensemble_size, model_channels)
         self.block = nn.Sequential(
@@ -133,29 +102,17 @@ class UniPhyEnsembleDecoder(nn.Module):
         )
         self.final_proj = nn.Conv2d(model_channels, out_ch * (patch_size ** 2), kernel_size=1)
 
-    def forward(self, z_latent, x_ref=None, member_idx=None):
-        if x_ref is not None:
-            is_5d = x_ref.ndim == 5
-            if is_5d:
-                B, T, C, H, W = x_ref.shape
-                z_flat = z_latent.reshape(B * T, *z_latent.shape[2:])
-            else:
-                B, C, H, W = x_ref.shape
-                T = 1
-                z_flat = z_latent
-            self.padder.set_padding(H, W)
+    def forward(self, z_latent, member_idx=None):
+        is_5d = z_latent.ndim == 5
+        if is_5d:
+            B, T, D, H_p, W_p = z_latent.shape
+            z_flat = z_latent.reshape(B * T, D, H_p, W_p)
         else:
-            is_5d = z_latent.ndim == 5
-            if is_5d:
-                B, T, D, H_p, W_p = z_latent.shape
-                z_flat = z_latent.reshape(B * T, D, H_p, W_p)
-            else:
-                B, D, H_p, W_p = z_latent.shape
-                T = 1
-                z_flat = z_latent
-            H_raw, W_raw = H_p * self.patch_size, W_p * self.patch_size
-            self.padder.set_padding(H_raw, W_raw)
-            C = -1 
+            B, D, H_p, W_p = z_latent.shape
+            T = 1
+            z_flat = z_latent
+        H_raw, W_raw = H_p * self.patch_size, W_p * self.patch_size
+        self.padder.set_padding(H_raw, W_raw)
 
         if z_flat.is_complex():
             z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
@@ -180,9 +137,6 @@ class UniPhyEnsembleDecoder(nn.Module):
 
         if is_5d:
             out = out.view(B, T, C_actual, H_actual, W_actual) 
-            
-        if x_ref is not None:
-            out = self.conservation_constraint(out, x_ref)
             
         return out
     

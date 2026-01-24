@@ -79,6 +79,24 @@ class ComplexSVDTransform(nn.Module):
         M = U @ S_mat @ V.conj().T
         return torch.matmul(x.to(M.dtype), M.T)
     
+class DynamicSourcePerceiver(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.perceiver = nn.Sequential(
+            nn.Linear(dim * 2, dim // 2),
+            nn.LayerNorm(dim // 2),
+            nn.SiLU(),
+            nn.Linear(dim // 2, dim * 2)
+        )
+        nn.init.zeros_(self.perceiver[-1].weight)
+        nn.init.zeros_(self.perceiver[-1].bias)
+
+    def forward(self, x_mean):
+        x_cat = torch.cat([x_mean.real, x_mean.imag], dim=-1)
+        source_delta = self.perceiver(x_cat)
+        re, im = torch.chunk(source_delta, 2, dim=-1)
+        return torch.complex(re, im)
+
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
         super().__init__()
@@ -86,20 +104,19 @@ class TemporalPropagator(nn.Module):
         self.dt_ref = dt_ref
         self.noise_scale = noise_scale
         self.basis = ComplexSVDTransform(dim)
+        self.source_perceiver = DynamicSourcePerceiver(dim)
+        
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
         self.lf = nn.Parameter(torch.randn(dim) * 1.0)
-        self.src_re = nn.Parameter(torch.randn(dim) * 0.01)
-        self.src_im = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.law_im = nn.Parameter(torch.randn(dim) * 0.01)
 
     def _get_effective_lambda(self):
         l_phys = torch.complex(-torch.exp(self.ld), self.lf)
         l_law = torch.complex(self.law_re, self.law_im)
-        return l_phys + l_law
-
-    def _get_source_bias(self):
-        return torch.complex(self.src_re, self.src_im)
+        l_total = l_phys + l_law
+        stable_re = -F.softplus(-l_total.real)
+        return torch.complex(stable_re, l_total.imag)
 
     def get_transition_operators(self, dt):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
@@ -116,7 +133,8 @@ class TemporalPropagator(nn.Module):
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         l_re = self._get_effective_lambda().real
         var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1)) / (2 * l_re)
-        std = torch.sqrt(torch.abs(var)).to(dtype)
+        var = torch.clamp(var, min=0.0)
+        std = torch.sqrt(var).to(dtype)
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
@@ -125,9 +143,16 @@ class TemporalPropagator(nn.Module):
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
+
+        x_mean_global = x_tilde.mean(dim=-2, keepdim=True)
+        dynamic_source = self.source_perceiver(x_mean_global)
+        
         op_decay, op_forcing = self.get_transition_operators(dt)
-        bias = self._get_source_bias()
-        h_tilde_next = h_tilde * op_decay + (x_tilde + bias) * op_forcing
+        
+        forcing_term = x_tilde + dynamic_source
+        
+        h_tilde_next = h_tilde * op_decay + forcing_term * op_forcing
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
+        
         return self.basis.decode(h_tilde_next)
     
