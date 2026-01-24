@@ -75,8 +75,7 @@ class UniPhyBlock(nn.Module):
         
         x_eigen = self.prop.basis.encode(x_t)
         
-        x_eigen_input = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2) 
-        x_mean_seq = x_eigen_input.mean(dim=(-2, -1))
+        x_mean_seq = x_eigen.mean(dim=(-2, -1))
         
         flux_A, flux_X = self.prop.flux_tracker.get_operators(x_mean_seq)
         flux_states = self.pscan(flux_A, flux_X)
@@ -85,7 +84,7 @@ class UniPhyBlock(nn.Module):
         source_expanded = source_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
         source_flat = source_expanded.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D)
         
-        forcing_term = x_eigen + source_flat
+        forcing_term = x_eigen.reshape(B * H * W, T, D) + source_flat
         
         u_t = forcing_term * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
