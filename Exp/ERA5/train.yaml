@@ -8,6 +8,8 @@ model:
   patch_size: 32
   img_height: 721
   img_width: 1440
+  noise_scale: 0.01
+  sde_mode: "sde"
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
@@ -39,3 +41,4 @@ logging:
   wandb_project: "ERA5"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
+  

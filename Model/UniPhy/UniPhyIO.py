@@ -63,12 +63,10 @@ class UniPhyEncoder(nn.Module):
         self.proj = nn.Conv2d(self.unshuffle_dim, embed_dim * 2, kernel_size=1)
         nn.init.orthogonal_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
-        
         pad_h = (patch_size - img_height % patch_size) % patch_size
         pad_w = (patch_size - img_width % patch_size) % patch_size
         h_dim = (img_height + pad_h) // patch_size
         w_dim = (img_width + pad_w) // patch_size
-        
         self.pos_emb = LearnableSphericalPosEmb(embed_dim * 2, h_dim, w_dim)
 
     def forward(self, x):
@@ -76,14 +74,12 @@ class UniPhyEncoder(nn.Module):
         if is_5d:
             B, T, C, H, W = x.shape
             x = x.reshape(B * T, C, H, W)
-            
         x = self.padder.pad(x)
         x = F.pixel_unshuffle(x, self.patch_size)
         x_emb = self.proj(x)
         x_emb = self.pos_emb(x_emb)
         x_real, x_imag = torch.chunk(x_emb, 2, dim=1)
         out = torch.complex(x_real, x_imag)
-        
         if is_5d:
             _, D, H_p, W_p = out.shape
             out = out.reshape(B, T, D, H_p, W_p)
@@ -120,27 +116,20 @@ class UniPhyEnsembleDecoder(nn.Module):
             z_cat = torch.cat([z_flat.real, z_flat.imag], dim=1)
         else:
             z_cat = z_flat 
-
         x_feat = self.latent_proj(z_cat)
-        
         if member_idx is None:
             member_idx = torch.zeros((x_feat.shape[0],), dtype=torch.long, device=x_feat.device)
         elif member_idx.numel() == B and is_5d:
             member_idx = member_idx.repeat_interleave(T)
-            
         m_emb = self.member_emb(member_idx).unsqueeze(-1).unsqueeze(-1)
         h = x_feat + m_emb
         h = self.block(h)
         out = self.final_proj(h)
         out = F.pixel_shuffle(out, self.patch_size)
-        
         self.padder.set_padding(self.img_height, self.img_width)
         out = self.padder.unpad(out)
-        
         _, C_actual, H_actual, W_actual = out.shape
-
         if is_5d:
-            out = out.reshape(B, T, C_actual, H_actual, W_actual) 
-            
+            out = out.reshape(B, T, C_actual, H_actual, W_actual)  
         return out
     

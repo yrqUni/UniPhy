@@ -63,6 +63,11 @@ def main():
     checkpoint = torch.load(cfg['ckpt_path'], map_location="cpu")
     model_args = checkpoint["model_args"]
 
+    if 'sde_mode' in cfg:
+        model_args['sde_mode'] = cfg['sde_mode']
+    if 'noise_scale' in cfg:
+        model_args['noise_scale'] = cfg['noise_scale']
+
     model = UniPhyModel(**model_args).to(device)
     
     sd = checkpoint["model"]

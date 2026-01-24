@@ -125,11 +125,12 @@ class GlobalFluxTracker(nn.Module):
         return new_state, source
 
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
+    def __init__(self, dim, dt_ref=1.0, noise_scale=0.01, sde_mode="sde"):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
         self.noise_scale = noise_scale
+        self.sde_mode = sde_mode
         self.basis = ComplexSVDTransform(dim)
         self.flux_tracker = GlobalFluxTracker(dim)
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
@@ -154,8 +155,9 @@ class TemporalPropagator(nn.Module):
         return torch.exp(Z), phi1 * (dt_eff * self.dt_ref)
 
     def generate_stochastic_term(self, target_shape, dt, dtype):
-        if not self.training or self.noise_scale <= 0:
+        if self.sde_mode != "sde" or self.noise_scale <= 0:
             return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
+        
         dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         l_re = self._get_effective_lambda().real
         var = (self.noise_scale ** 2) * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1)) / (2 * l_re)
@@ -178,4 +180,3 @@ class TemporalPropagator(nn.Module):
         h_tilde_next = h_prev_latent * op_decay + forcing_term * op_forcing
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
         return h_tilde_next, flux_next
-    

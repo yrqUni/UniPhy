@@ -11,3 +11,6 @@ inference:
   eval_sample_num: 100
   device: "cuda"
   use_tf32: true
+  sde_mode: "sde"
+  noise_scale: 0.01
+  

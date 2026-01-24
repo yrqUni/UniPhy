@@ -7,7 +7,7 @@ from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3, dt_ref=1.0, noise_scale=0.01):
+    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3, dt_ref=1.0, noise_scale=0.01, sde_mode="sde"):
         super().__init__()
         self.dim = dim
         self.img_height = img_height
@@ -15,7 +15,7 @@ class UniPhyBlock(nn.Module):
         self.norm_spatial = nn.LayerNorm(dim * 2)
         self.spatial_cliff = RiemannianCliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size//2, img_height=img_height, img_width=img_width)
         self.norm_temporal = nn.LayerNorm(dim * 2)
-        self.prop = TemporalPropagator(dim, dt_ref=dt_ref, noise_scale=noise_scale)
+        self.prop = TemporalPropagator(dim, dt_ref=dt_ref, noise_scale=noise_scale, sde_mode=sde_mode)
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
         self.pscan_triton = PScanTriton()
         
@@ -127,14 +127,14 @@ class UniPhyBlock(nn.Module):
         return x
 
 class UniPhyModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, dt_ref=1.0, noise_scale=0.01):
+    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, dt_ref=1.0, noise_scale=0.01, sde_mode="sde"):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pad_h = (patch_size - img_height % patch_size) % patch_size
         pad_w = (patch_size - img_width % patch_size) % patch_size
         h_dim, w_dim = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim, dt_ref=dt_ref, noise_scale=noise_scale) for _ in range(depth)])
+        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim, dt_ref=dt_ref, noise_scale=noise_scale, sde_mode=sde_mode) for _ in range(depth)])
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
 
     def forward(self, x, dt):

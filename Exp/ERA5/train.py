@@ -247,3 +247,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with open(args.config, "r") as f: cfg = yaml.safe_load(f)
     run_ddp(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), int(os.environ["LOCAL_RANK"]), os.environ.get("MASTER_ADDR", "127.0.0.1"), os.environ.get("MASTER_PORT", "12355"), cfg)
+    
