@@ -98,9 +98,6 @@ class GlobalFluxTracker(nn.Module):
         return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
 
     def get_operators(self, x_mean_seq):
-        if x_mean_seq.ndim != 3:
-             raise ValueError(f"Expected 3D input (B, T, D), got {x_mean_seq.shape}")
-             
         B, T, D = x_mean_seq.shape
         decay = self._get_decay() 
         

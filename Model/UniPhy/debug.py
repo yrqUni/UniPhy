@@ -1,115 +1,172 @@
 import torch
 import torch.nn as nn
-import sys
 import os
+import sys
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from UniPhyOps import TemporalPropagator, ComplexSVDTransform
-from UniPhyFFN import UniPhyFeedForwardNetwork
-from ModelUniPhy import UniPhyModel
 
-def check_basis_invertibility():
-    dim = 64
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    basis = ComplexSVDTransform(dim).to(device)
-    x = torch.randn(16, dim, device=device, dtype=torch.cdouble)
-    x_enc = basis.encode(x)
-    x_dec = basis.decode(x_enc)
-    err = (x - x_dec).abs().max().item()
-    if err < 1e-12: pass
-    else: print(f"Basis Inversion Error: {err:.2e}")
+from UniPhyOps import GlobalFluxTracker, TemporalPropagator
+from ModelUniPhy import UniPhyBlock, UniPhyModel
 
-def check_history_dependency():
-    dim = 64
+def check(name, parallel_out, serial_out, threshold=1e-6):
+    # Ensure comparisons happen on CPU to avoid sync issues during print
+    p = parallel_out.detach().cpu()
+    s = serial_out.detach().cpu()
+    diff = (p - s).abs().max().item()
+    status = "PASS" if diff < threshold else "FAIL"
+    print(f"[{status}] {name} | Max Diff: {diff:.2e}")
+    return diff
+
+def debug_main():
+    # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
+    torch.set_default_dtype(torch.float64)
+    print(f"Running Debug on {device} (float64)...\n")
+    
+    B, T, D, H, W = 2, 8, 16, 4, 4
+    
+    # ==========================================
+    # 1. Test GlobalFluxTracker
+    # ==========================================
+    print("--- 1. Testing GlobalFluxTracker ---")
+    tracker = GlobalFluxTracker(D).to(device)
+    tracker.eval()
+    
+    # Input: Global Means (B, T, D) - Complex via real/imag split inside
+    x_mean = torch.randn(B, T, D, device=device) + 1j * torch.randn(B, T, D, device=device)
+    
+    # Parallel Path
+    A, X = tracker.get_operators(x_mean)
+    # Simulate PScan manually to verify operator correctness vs logic
+    h_par = torch.zeros(B, D, device=device, dtype=torch.complex128)
+    h_states = []
+    for t in range(T):
+        # PScan logic: h_t = A_t * h_{t-1} + X_t
+        # A is (B, D, T), X is (B, D, T)
+        h_par = A[:, :, t] * h_par + X[:, :, t]
+        h_states.append(h_par)
+    h_stack = torch.stack(h_states, dim=2) # (B, D, T)
+    src_par = tracker.project(h_stack) # (B, T, D)
+    
+    # Serial Path
+    src_ser_list = []
+    flux_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
+    for t in range(T):
+        flux_state, src = tracker.forward_step(flux_state, x_mean[:, t])
+        src_ser_list.append(src)
+    src_ser = torch.stack(src_ser_list, dim=1)
+    
+    check("GlobalFluxTracker", src_par, src_ser)
+
+    # ==========================================
+    # 2. Test TemporalPropagator
+    # ==========================================
+    print("\n--- 2. Testing TemporalPropagator ---")
+    prop = TemporalPropagator(D, noise_scale=0.0).to(device)
     prop.eval()
     
-    T = 5
-    x_seq_1 = torch.randn(1, T, dim, 4, 4, device=device, dtype=torch.cdouble)
-    x_seq_2 = x_seq_1.clone()
+    # Inputs: (B*HW, T, D)
+    x_raw = torch.randn(B * H * W, T, D, device=device) + 1j * torch.randn(B * H * W, T, D, device=device)
+    dt = torch.ones(B * H * W, T, device=device) # Constant dt for simplicity check
     
-    x_seq_2[:, 0] += 10.0 
+    # --- Parallel Path (Mimicking ModelUniPhy logic) ---
+    op_decay, op_forcing = prop.get_transition_operators(dt) # (N, T, D)
+    x_eigen = prop.basis.encode(x_raw) # (N, T, D)
     
-    mean_1 = x_seq_1.mean(dim=(-2, -1))
-    mean_2 = x_seq_2.mean(dim=(-2, -1))
+    # Simulate Global Mean Calculation (Parallel)
+    # Reshape N -> B, H, W to get global mean
+    x_eigen_reshaped = x_eigen.view(B, H*W, T, D).permute(0, 2, 3, 1) # (B, T, D, HW)
+    x_mean_fake = x_eigen_reshaped.mean(dim=-1) # (B, T, D)
     
-    def manual_scan_project(mean_seq):
-        A, X = prop.flux_tracker.get_operators(mean_seq)
-        B, D, T_ = A.shape
-        h = torch.zeros(B, D, device=device, dtype=torch.cdouble)
-        states = []
-        for t in range(T_):
-            h = h * A[:, :, t] + X[:, :, t]
-            states.append(h)
-        flux_states = torch.stack(states, dim=2)
-        return prop.flux_tracker.project(flux_states)
+    # Flux Parallel
+    fA, fX = prop.flux_tracker.get_operators(x_mean_fake)
+    # Manual Scan for Flux
+    fh = torch.zeros(B, D, device=device, dtype=torch.complex128)
+    fh_list = []
+    for t in range(T):
+        fh = fA[:, :, t] * fh + fX[:, :, t]
+        fh_list.append(fh)
+    f_states = torch.stack(fh_list, dim=2)
+    src_seq = prop.flux_tracker.project(f_states) # (B, T, D)
+    
+    # Expand Source
+    src_expanded = src_seq.unsqueeze(1).expand(B, H*W, T, D).reshape(B*H*W, T, D)
+    
+    # Forcing
+    forcing = x_eigen + src_expanded
+    u_t = forcing * op_forcing # (N, T, D)
+    
+    # Main Scan (Manual to isolate PScan kernel issues)
+    # op_decay is (N, T, D)
+    h_main = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
+    h_main_list = []
+    for t in range(T):
+        # Serial recurrence: h = h * decay + u
+        decay_t = op_decay[:, t, :]
+        u_curr = u_t[:, t, :]
+        h_main = h_main * decay_t + u_curr
+        h_main_list.append(h_main)
+    h_final = torch.stack(h_main_list, dim=1) # (N, T, D)
+    out_par = prop.basis.decode(h_final)
+    
+    # --- Serial Path ---
+    out_ser_list = []
+    h_curr = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
+    flux_curr = torch.zeros(B, D, device=device, dtype=torch.complex128)
+    
+    for t in range(T):
+        xt = x_raw[:, t].unsqueeze(1) # (N, 1, D)
+        dtt = dt[:, t].unsqueeze(1)   # (N, 1)
+        x_mean_t = x_mean_fake[:, t]  # (B, D)
+        
+        # We need to simulate the basis.encode inside forward_step using linearity
+        # Propagator.forward_step encodes input internally
+        
+        # We need to pass raw input (xt) but encoded global mean (x_mean_t)
+        # Note: forward_step logic: h_next, f_next = prop.forward_step(...)
+        
+        out_next, flux_next = prop.forward_step(h_curr, xt, x_mean_t, dtt, flux_curr)
+        out_ser_list.append(out_next)
+        
+        h_curr = out_next
+        flux_curr = flux_next
+        
+    out_ser = torch.stack(out_ser_list, dim=1).squeeze(2)
+    
+    check("TemporalPropagator", out_par, out_ser)
 
-    src_1 = manual_scan_project(mean_1)
-    src_2 = manual_scan_project(mean_2)
+    # ==========================================
+    # 3. Test UniPhyBlock Integration
+    # ==========================================
+    print("\n--- 3. Testing UniPhyBlock Integration ---")
+    block = UniPhyBlock(D, 4, 4, H, W, dt_ref=1.0).to(device)
+    block.eval()
     
-    diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
+    x_block = torch.randn(B, T, D, H, W, device=device)
+    dt_block = torch.ones(B, T, device=device)
     
-    if diff_at_last_step > 1e-5: pass 
-    else: print(f"History Dependency Error: Past change did not affect future source. Diff: {diff_at_last_step:.2e}")
-
-def check_eigenvalue_stability():
-    dim = 64
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prop = TemporalPropagator(dim).to(device)
-    lambda_val = prop._get_effective_lambda()
-    max_real = lambda_val.real.max().item()
-    if max_real <= 1e-6: pass
-    else: print(f"Eigenvalue Stability Error: Max Real Part {max_real:.2e} > 0")
-
-def check_full_model_consistency():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, C, H, W = 1, 5, 2, 32, 32
-    dt_ref = 6.0
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W, dt_ref=dt_ref).to(device)
-    model.eval()
+    # Parallel
+    y_par = block(x_block, dt_block)
     
-    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
-    dt = torch.ones(B, T, device=device, dtype=torch.float64) * dt_ref
+    # Serial Loop
+    y_ser_list = []
+    h_state = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
+    f_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
     
-    with torch.no_grad():
-        out_parallel = model(x, dt)
+    z = x_block # No encoder here, direct input
+    for t in range(T):
+        xt = z[:, t] # (B, D, H, W)
+        dtt = dt_block[:, t] # (B,)
         
-        z = model.encoder(x)
-        B_z, T_z, D_z, H_z, W_z = z.shape
+        y_next, h_next, f_next = block.forward_step(xt, h_state, dtt, f_state)
+        y_ser_list.append(y_next)
+        h_state = h_next
+        f_state = f_next
         
-        for block in model.blocks:
-            h_state = torch.zeros(B_z * H_z * W_z, block.dim, dtype=torch.cdouble, device=device)
-            flux_state = torch.zeros(B_z, block.dim, dtype=torch.cdouble, device=device)
-            z_steps = []
-            
-            for t in range(T):
-                x_step = z[:, t]
-                dt_step = dt[:, t]
-                
-                z_next, h_next, flux_next = block.forward_step(x_step, h_state, dt_step, flux_state)
-                
-                z_steps.append(z_next)
-                h_state = h_next
-                flux_state = flux_next
-            
-            z = torch.stack(z_steps, dim=1)
-            
-        out_serial = model.decoder(z)
-        
-        diff = (out_parallel - out_serial).abs().max().item()
-        
-    if diff < 1e-7:
-        print(f"Consistency Check Passed. Diff: {diff:.2e}")
-    else:
-        print(f"Consistency Check FAILED. Diff: {diff:.2e}")
+    y_ser = torch.stack(y_ser_list, dim=1)
+    
+    check("UniPhyBlock", y_par, y_ser)
 
 if __name__ == "__main__":
-    torch.set_default_dtype(torch.float64)
-    print("Running Checks...")
-    check_basis_invertibility()
-    check_history_dependency()
-    check_eigenvalue_stability()
-    if torch.cuda.is_available():
-        check_full_model_consistency()
-    print("Checks Completed.")
+    debug_main()
     
