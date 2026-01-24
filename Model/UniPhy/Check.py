@@ -1,12 +1,10 @@
 import torch
-import torch.nn as nn
 import sys
 import os
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from UniPhyOps import TemporalPropagator, ComplexSVDTransform
-from UniPhyFFN import UniPhyFeedForwardNetwork
 from ModelUniPhy import UniPhyModel
 
 def check_basis_invertibility():
@@ -33,13 +31,13 @@ def check_history_dependency():
     mean_2 = x_seq_2.mean(dim=(-2, -1))
     def manual_scan_project(mean_seq):
         A, X = prop.flux_tracker.get_operators(mean_seq)
-        B, D, T_ = A.shape
+        B, T_, D = A.shape
         h = torch.zeros(B, D, device=device, dtype=torch.cdouble)
         states = []
         for t in range(T_):
-            h = h * A[:, :, t] + X[:, :, t]
+            h = h * A[:, t, :] + X[:, t, :]
             states.append(h)
-        flux_states = torch.stack(states, dim=2)
+        flux_states = torch.stack(states, dim=1)
         return prop.flux_tracker.project(flux_states)
     src_1 = manual_scan_project(mean_1)
     src_2 = manual_scan_project(mean_2)
@@ -101,4 +99,3 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         check_full_model_consistency()
     print("Checks Completed.")
-    

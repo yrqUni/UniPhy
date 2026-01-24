@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from PScan import PScanTriton 
+
+from PScan import PScanTriton
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
@@ -15,8 +16,8 @@ class UniPhyBlock(nn.Module):
         self.spatial_cliff = RiemannianCliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size//2, img_height=img_height, img_width=img_width)
         self.norm_temporal = nn.LayerNorm(dim * 2)
         self.prop = TemporalPropagator(dim, dt_ref=dt_ref, noise_scale=noise_scale)
-        self.pscan = PScanTriton()
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
+        self.pscan_triton = PScanTriton()
         self.last_h_state = None
         self.last_flux_state = None
 
@@ -32,25 +33,45 @@ class UniPhyBlock(nn.Module):
         r, i = torch.chunk(out_cliff, 2, dim=1)
         return torch.complex(r, i)
 
+    def _run_pscan(self, A, X):
+        is_double = A.dtype in [torch.float64, torch.complex128]
+        if not is_double:
+            return self.pscan_triton(A.transpose(1, 2), X.transpose(1, 2)).transpose(1, 2)
+        else:
+            B, T, D = X.shape
+            h = torch.zeros(B, D, device=X.device, dtype=X.dtype)
+            h_list = []
+            for t in range(T):
+                h = h * A[:, t, :] + X[:, t, :]
+                h_list.append(h)
+            return torch.stack(h_list, dim=1)
+
     def forward_step(self, x_step, h_prev_latent, dt_step, flux_prev):
         B, D, H, W = x_step.shape
         resid = x_step
+        
         x_s = x_step.permute(0, 2, 3, 1)
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
         x = x_s + resid
         resid = x 
+        
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
+        
         dt_t = torch.as_tensor(dt_step, device=x.device, dtype=x.real.dtype)
         if dt_t.numel() == B:
             dt_expanded = dt_t.reshape(B, 1, 1, 1).expand(B, H, W, 1).reshape(-1, 1)
         else:
             dt_expanded = dt_t.reshape(-1, 1)
+        
         x_encoded_local = self.prop.basis.encode(x_t)
         x_global_mean_encoded = x_encoded_local.view(B, H * W, D).mean(dim=1)
+        
         h_next_latent, flux_next = self.prop.forward_step(h_prev_latent, x_t, x_global_mean_encoded, dt_expanded, flux_prev)
+        
         x_drift = self.prop.basis.decode(h_next_latent).real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        
         x = x_drift + resid
         x = x + self.ffn(x)
         return x, h_next_latent, flux_next
@@ -66,33 +87,30 @@ class UniPhyBlock(nn.Module):
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
         dt_expanded = torch.as_tensor(dt, device=x.device).reshape(B, 1, 1, T).expand(B, H, W, T).reshape(B * H * W, T)
-        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded)
+        op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded) 
         x_eigen = self.prop.basis.encode(x_t)
         x_eigen_input = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2) 
         x_mean_seq = x_eigen_input.mean(dim=(-2, -1))
-        
         flux_A, flux_X = self.prop.flux_tracker.get_operators(x_mean_seq)
-        flux_states = self.pscan(flux_A.to(torch.complex64), flux_X.to(torch.complex64))
-        flux_states = flux_states.to(x.dtype)
-        
-        source_seq = self.prop.flux_tracker.project(flux_states)
+        flux_states = self._run_pscan(flux_A, flux_X) 
+        source_seq = self.prop.flux_tracker.project(flux_states) 
         source_expanded = source_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
         source_flat = source_expanded.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D)
         forcing_term = x_eigen + source_flat
         u_t = forcing_term * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
+        A = op_decay.contiguous()
+        X = u_t.contiguous()
         
-        A = op_decay.permute(0, 2, 1).contiguous()
-        X = u_t.permute(0, 2, 1).contiguous()
-        h_eigen_perm = self.pscan(A.to(torch.complex64), X.to(torch.complex64))
-        h_eigen_perm = h_eigen_perm.to(x.dtype)
-        h_eigen = h_eigen_perm.permute(0, 2, 1)
-        
+        h_eigen = self._run_pscan(A, X)
+
         self.last_h_state = h_eigen[:, -1, :].unsqueeze(1)
-        self.last_flux_state = flux_states[:, :, -1].permute(0, 1) 
+        self.last_flux_state = flux_states[:, -1, :]
+        
         x_drift = self.prop.basis.decode(h_eigen).real.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
         x = x_drift + resid
+        
         x_in = x.reshape(B * T, D, H, W)
         delta_p = self.ffn(x_in)
         x = x + delta_p.reshape(B, T, D, H, W)

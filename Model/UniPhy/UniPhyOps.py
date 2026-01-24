@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PScan import PScanTriton
 
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height, img_width):
@@ -101,15 +100,13 @@ class GlobalFluxTracker(nn.Module):
         x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
         x_in = self.input_mix(x_cat)
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        u_t = torch.complex(x_re, x_im).reshape(B, T, D)
-        A = decay.view(1, D, 1).expand(B, D, T).contiguous()
-        X = u_t.permute(0, 2, 1).contiguous()
+        X = torch.complex(x_re, x_im).reshape(B, T, D).contiguous()
+        A = decay.view(1, 1, D).expand(B, T, D).contiguous()
         return A, X
 
     def project(self, flux_states):
-        B, D, T = flux_states.shape
-        h_state = flux_states.permute(0, 2, 1) 
-        h_flat = h_state.reshape(B * T, D)
+        B, T, D = flux_states.shape
+        h_flat = flux_states.reshape(B * T, D)
         out_cat = self.output_proj(torch.cat([h_flat.real, h_flat.imag], dim=-1))
         out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
         source_seq = torch.complex(out_re, out_im).reshape(B, T, D)
@@ -175,7 +172,6 @@ class TemporalPropagator(nn.Module):
         B = source.shape[0]
         total_batch = x_tilde.shape[0]
         D = x_tilde.shape[-1]
-        if total_batch % B != 0: pass 
         spatial_size = total_batch // B
         source_expanded = source.view(B, 1, 1, D).expand(B, spatial_size, 1, D).reshape(total_batch, 1, D)
         forcing_term = x_tilde + source_expanded

@@ -16,7 +16,7 @@ class LayerNorm2d(nn.Module):
         x = (x - u) / torch.sqrt(s + self.eps)
         x = self.weight[:, None, None] * x + self.bias[:, None, None]
         return x
-    
+
 class ComplexDynamicFFN(nn.Module):
     def __init__(self, dim, hidden_dim, num_experts=8):
         super().__init__()
@@ -56,7 +56,7 @@ class ComplexDynamicFFN(nn.Module):
         out_re = (down_re * w).sum(dim=1)
         out_im = (down_im * w).sum(dim=1)
         return torch.complex(out_re, out_im)
-    
+
 class UniPhyFeedForwardNetwork(nn.Module):
     def __init__(self, dim, expand, num_experts):
         super().__init__()
