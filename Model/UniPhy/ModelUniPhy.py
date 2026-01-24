@@ -90,7 +90,13 @@ class UniPhyBlock(nn.Module):
         u_t = forcing_term * op_forcing
         noise = self.prop.generate_stochastic_term(u_t.shape, dt_expanded, u_t.dtype)
         u_t = u_t + noise
-        h_eigen = self.pscan(op_decay, u_t)
+        
+        N = u_t.shape[0]
+        A = op_decay.unsqueeze(1).expand(N, D, T)
+        X = u_t.permute(0, 2, 1)
+        
+        h_eigen_perm = self.pscan(A, X)
+        h_eigen = h_eigen_perm.permute(0, 2, 1)
         
         self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
         self.last_flux_state = flux_states[:, :, -1].permute(0, 1) 
