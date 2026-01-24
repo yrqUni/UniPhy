@@ -30,8 +30,8 @@ def check_history_dependency():
     
     x_seq_2[:, 0] += 10.0 
     
-    src_1 = prop.compute_source_trajectory(x_seq_1)
-    src_2 = prop.compute_source_trajectory(x_seq_2)
+    src_1, _ = prop.compute_source_trajectory(x_seq_1)
+    src_2, _ = prop.compute_source_trajectory(x_seq_2)
     
     diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
     
@@ -72,4 +72,3 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         check_full_model_consistency()
     print("Checks Completed.")
-    

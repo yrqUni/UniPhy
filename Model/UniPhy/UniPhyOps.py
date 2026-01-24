@@ -135,7 +135,7 @@ class GlobalFluxTracker(nn.Module):
         out_re, out_im = torch.chunk(out_cat, 2, dim=-1)
         source_seq = torch.complex(out_re, out_im).reshape(B, T, D)
         
-        return source_seq
+        return source_seq, curr
 
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref=1.0, noise_scale=0.01):
@@ -180,8 +180,8 @@ class TemporalPropagator(nn.Module):
 
     def compute_source_trajectory(self, x_emb_seq):
         x_mean = x_emb_seq.mean(dim=(-2, -1)) 
-        source_seq = self.flux_tracker.forward_trajectory(x_mean)
-        return source_seq
+        source_seq, final_state = self.flux_tracker.forward_trajectory(x_mean)
+        return source_seq, final_state
 
     def forward_step(self, h_prev, x_input, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)
