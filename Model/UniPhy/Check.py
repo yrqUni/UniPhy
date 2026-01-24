@@ -8,8 +8,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from ModelUniPhy import UniPhyModel
 
-# 全局变量用于存储串行运行的中间结果
-serial_intermediates = {"h_next": [], "drift": [], "forcing": []}
+# Global storage for serial intermediates
+serial_intermediates = {"h_next": [], "drift": [], "forcing": [], "flux": []}
 
 def forward_step_hook(self, x_step, h_prev_latent, dt_step, flux_prev):
     B, D, H, W = x_step.shape
@@ -38,7 +38,11 @@ def forward_step_hook(self, x_step, h_prev_latent, dt_step, flux_prev):
     
     # Reconstruct forcing for check
     x_tilde = x_encoded_local 
+    # flux_prev MUST be (B, D). If it's (B*HW, D), forcing will be WRONG.
+    # GlobalFluxTracker.forward_step expects (B, D).
     _, source = self.prop.flux_tracker.forward_step(flux_prev, x_global_mean_encoded)
+    
+    # Expand source to spatial dims for forcing addition
     source_expanded = source.view(B, 1, 1, D).expand(B, H*W, 1, D).reshape(B*H*W, 1, D)
     forcing = x_tilde + source_expanded
     serial_intermediates["forcing"].append(forcing.detach())
@@ -46,6 +50,7 @@ def forward_step_hook(self, x_step, h_prev_latent, dt_step, flux_prev):
     # Actual Step
     h_next_latent, flux_next = self.prop.forward_step(h_prev_latent, x_t, x_global_mean_encoded, dt_expanded, flux_prev)
     serial_intermediates["h_next"].append(h_next_latent.detach()) 
+    serial_intermediates["flux"].append(flux_next.detach())
     
     # Decode
     x_drift = self.prop.basis.decode(h_next_latent).real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
@@ -77,27 +82,23 @@ def run_comparison():
     with torch.no_grad():
         z = model.encoder(x)
         
-        # 获取正确的 Latent 尺寸
+        # Get dimensions
         B_z, T_z, D_z, H_z, W_z = z.shape
         print(f"    Encoder Output Shape: {z.shape}")
         
         block = model.blocks[0]
         
-        # --- Manual Parallel Trace using H_z, W_z ---
+        # --- Manual Parallel Trace ---
         resid = z
-        # Spatial
         x_s = z.reshape(B_z * T_z, D_z, H_z, W_z).permute(0, 2, 3, 1)
         x_s = block._complex_norm(x_s, block.norm_spatial).permute(0, 3, 1, 2)
         x_s = block._spatial_op(x_s)
         x = x_s.reshape(B_z, T_z, D_z, H_z, W_z) + resid
-        resid = x # Update Resid
+        resid = x 
         
-        # Temporal Input
         x_t = x.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
         x_t = block._complex_norm(x_t, block.norm_temporal)
         
-        # Propagator Prep
-        # Expand dt to match latent spatial size (H_z * W_z)
         dt_exp = dt.reshape(B, 1, 1, T).expand(B, H_z, W_z, T).reshape(B*H_z*W_z, T)
         op_decay, op_forcing = block.prop.get_transition_operators(dt_exp)
         
@@ -105,22 +106,19 @@ def run_comparison():
         x_eigen_input = x_eigen.reshape(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
         x_mean_seq = x_eigen_input.mean(dim=(-2, -1))
         
-        # Flux
+        # Flux (Parallel)
         fA, fX = block.prop.flux_tracker.get_operators(x_mean_seq)
         f_states = block.pscan(fA, fX)
         src_seq = block.prop.flux_tracker.project(f_states)
         src_flat = src_seq.unsqueeze(2).unsqueeze(2).expand(B_z, T_z, H_z, W_z, D_z).permute(0, 2, 3, 1, 4).reshape(B_z*H_z*W_z, T_z, D_z)
         
-        # Forcing
         forcing_par = x_eigen + src_flat 
         
-        # Recurrence (PScan)
         u_t = forcing_par * op_forcing
         A = op_decay.permute(0, 2, 1).contiguous()
         X = u_t.permute(0, 2, 1).contiguous()
         h_eigen_par = block.pscan(A, X).permute(0, 2, 1) 
         
-        # Drift
         drift_par = block.prop.basis.decode(h_eigen_par).real
         
     print(">>> 2. Executing Serial Forward (Test)...")
@@ -128,8 +126,11 @@ def run_comparison():
         serial_intermediates["h_next"] = []
         serial_intermediates["drift"] = [] 
         serial_intermediates["forcing"] = []
+        serial_intermediates["flux"] = []
         
         h_state = torch.zeros(B_z * H_z * W_z, 1, block.dim, dtype=torch.cdouble, device=device)
+        # CRITICAL FIX: Flux state must be (B, D), NOT (B*HW, D)
+        # GlobalFluxTracker operates on global means, so its state is global (per batch).
         flux_state = torch.zeros(B_z, block.dim, dtype=torch.cdouble, device=device)
         
         for t in range(T):
@@ -146,6 +147,13 @@ def run_comparison():
     forcing_ser_stack = torch.stack(serial_intermediates["forcing"], dim=1).squeeze(2)
     diff_f = (forcing_par - forcing_ser_stack).abs().max().item()
     print(f"Max Diff Forcing: {diff_f:.2e}")
+    
+    # Flux State
+    print(f"\n--- Flux State (Internal) ---")
+    # flux_states from parallel is (B, D, T). Serial is list of (B, D)
+    flux_ser_stack = torch.stack(serial_intermediates["flux"], dim=2) # (B, D, T)
+    diff_flux = (f_states - flux_ser_stack).abs().max().item()
+    print(f"Max Diff Flux:    {diff_flux:.2e}")
 
     # H_Next
     print(f"\n--- Latent State H ---")

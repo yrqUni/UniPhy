@@ -41,8 +41,7 @@ class UniPhyBlock(nn.Module):
         x_s = self._complex_norm(x_s, self.norm_spatial).permute(0, 3, 1, 2)
         x_s = self._spatial_op(x_s)
         x = x_s + resid
-        
-        resid = x 
+        resid = x  
         
         x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
         x_t = self._complex_norm(x_t, self.norm_temporal)
