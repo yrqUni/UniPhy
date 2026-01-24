@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PScan import PScanTriton
 
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height, img_width):
@@ -114,7 +113,7 @@ class GlobalFluxTracker(nn.Module):
 
     def project(self, flux_states):
         B, D, T = flux_states.shape
-        h_state = flux_states.permute(0, 2, 1) 
+        h_state = flux_states.permute(0, 2, 1)
         
         h_flat = h_state.reshape(B * T, D)
         out_cat = self.output_proj(torch.cat([h_flat.real, h_flat.imag], dim=-1))
@@ -179,11 +178,6 @@ class TemporalPropagator(nn.Module):
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
-    def compute_source_trajectory(self, x_emb_seq):
-        x_mean = x_emb_seq.mean(dim=(-2, -1)) 
-        source_seq = self.flux_tracker.project(self.flux_tracker.get_operators(x_mean)[1])
-        return source_seq, None
-
     def forward_step(self, h_prev, x_input, x_global_mean_encoded, dt, flux_state):
         h_tilde = self.basis.encode(h_prev)
         if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
@@ -199,10 +193,9 @@ class TemporalPropagator(nn.Module):
         D = x_tilde.shape[-1]
         
         if total_batch % B != 0:
-             raise ValueError(f"Total batch size {total_batch} is not divisible by flux batch size {B}")
+             pass
         
         spatial_size = total_batch // B
-        
         source_expanded = source.view(B, 1, 1, D).expand(B, spatial_size, 1, D).reshape(total_batch, 1, D)
         
         forcing_term = x_tilde + source_expanded
