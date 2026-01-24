@@ -24,16 +24,15 @@ def check_history_dependency():
     prop = TemporalPropagator(dim, noise_scale=0.0).to(device)
     prop.eval()
     
-    # Input shape: (B, T, D, H, W). Permuted to (B, T, H, W, D) for compute_source_trajectory
     T = 5
     x_seq_1 = torch.randn(1, T, dim, 4, 4, device=device, dtype=torch.cdouble)
     x_seq_2 = x_seq_1.clone()
     
     x_seq_2[:, 0] += 10.0 
     
-    # Match expected input shape (B, T, H, W, D)
-    input_1 = x_seq_1.permute(0, 1, 3, 4, 2)
-    input_2 = x_seq_2.permute(0, 1, 3, 4, 2)
+    # Needs to match (B, T, D, H, W) as expected by compute_source_trajectory internal mean
+    input_1 = x_seq_1
+    input_2 = x_seq_2
     
     src_1, _ = prop.compute_source_trajectory(input_1)
     src_2, _ = prop.compute_source_trajectory(input_2)
@@ -63,11 +62,8 @@ def check_full_model_consistency():
     dt = torch.ones(B, T, device=device, dtype=torch.float64) * dt_ref
     
     with torch.no_grad():
-        # 1. Parallel Execution (PScan)
         out_parallel = model(x, dt)
         
-        # 2. Serial Execution (Teacher Forcing)
-        # We manually emulate the block loop step-by-step to verify PScan == RNN
         z = model.encoder(x)
         
         for block in model.blocks:
@@ -79,7 +75,6 @@ def check_full_model_consistency():
                 x_step = z[:, t]
                 dt_step = dt[:, t]
                 
-                # Explicitly call forward_step (Serial Logic)
                 z_next, h_next, flux_next = block.forward_step(x_step, h_state, dt_step, flux_state)
                 
                 z_steps.append(z_next)
