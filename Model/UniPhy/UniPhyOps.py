@@ -136,7 +136,7 @@ class GlobalFluxTracker(nn.Module):
 
 
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref=1.0, init_noise_scale=0.01, sde_mode="sde"):
+    def __init__(self, dim, dt_ref=1.0, sde_mode="sde", init_noise_scale=0.01):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref

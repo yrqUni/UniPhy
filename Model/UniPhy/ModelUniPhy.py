@@ -17,7 +17,7 @@ class UniPhyBlock(nn.Module):
         img_width,
         kernel_size=3,
         dt_ref=1.0,
-        noise_scale=0.01,
+        init_noise_scale=0.01,
         sde_mode="sde",
     ):
         super().__init__()
@@ -35,7 +35,7 @@ class UniPhyBlock(nn.Module):
         )
         self.norm_temporal = nn.LayerNorm(dim * 2)
         self.prop = TemporalPropagator(
-            dim, dt_ref=dt_ref, noise_scale=noise_scale, sde_mode=sde_mode
+            dim, dt_ref=dt_ref, sde_mode=sde_mode, init_noise_scale=init_noise_scale
         )
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
         self.pscan_triton = PScanTriton()
@@ -172,8 +172,8 @@ class UniPhyModel(nn.Module):
         img_height=64,
         img_width=128,
         dt_ref=1.0,
-        init_noise_scale=0.01,
         sde_mode="sde",
+        init_noise_scale=0.01,
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -192,8 +192,8 @@ class UniPhyModel(nn.Module):
                     h_dim,
                     w_dim,
                     dt_ref=dt_ref,
-                    init_noise_scale=init_noise_scale,
                     sde_mode=sde_mode,
+                    init_noise_scale=init_noise_scale,
                 )
                 for _ in range(depth)
             ]
