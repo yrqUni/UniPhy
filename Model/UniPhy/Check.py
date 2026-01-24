@@ -115,7 +115,7 @@ def check_full_model_consistency():
         diff = (out_parallel - out_serial).abs().max().item()
         
     if diff < 1e-7:
-        print(f"Consistency Check Passed. Diff: {diff:.2e}")
+        pass    
     else:
         print(f"Consistency Check FAILED. Diff: {diff:.2e}")
         print(f"   Parallel Mean: {out_parallel.mean():.6f}")

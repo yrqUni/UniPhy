@@ -18,6 +18,11 @@ class UniPhyBlock(nn.Module):
         self.prop = TemporalPropagator(dim, dt_ref=dt_ref, noise_scale=noise_scale)
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
         self.pscan_triton = PScanTriton()
+        
+        self.drift_proj = nn.Linear(dim, dim)
+        nn.init.xavier_uniform_(self.drift_proj.weight, gain=0.01)
+        nn.init.zeros_(self.drift_proj.bias)
+
         self.last_h_state = None
         self.last_flux_state = None
 
@@ -70,7 +75,9 @@ class UniPhyBlock(nn.Module):
         
         h_next_latent, flux_next = self.prop.forward_step(h_prev_latent, x_t, x_global_mean_encoded, dt_expanded, flux_prev)
         
-        x_drift = self.prop.basis.decode(h_next_latent).real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        x_drift_decoded = self.prop.basis.decode(h_next_latent).real
+        x_drift_proj = self.drift_proj(x_drift_decoded)
+        x_drift = x_drift_proj.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
         
         x = x_drift + resid
         x = x + self.ffn(x)
@@ -108,7 +115,10 @@ class UniPhyBlock(nn.Module):
         self.last_h_state = h_eigen[:, -1, :].unsqueeze(1)
         self.last_flux_state = flux_states[:, -1, :]
         
-        x_drift = self.prop.basis.decode(h_eigen).real.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        x_drift_decoded = self.prop.basis.decode(h_eigen).real
+        x_drift_proj = self.drift_proj(x_drift_decoded)
+        x_drift = x_drift_proj.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
+        
         x = x_drift + resid
         
         x_in = x.reshape(B * T, D, H, W)

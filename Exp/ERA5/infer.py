@@ -33,7 +33,7 @@ def compute_metrics(pred, target, lat_weight):
     mse = (error ** 2)
     if lat_weight is not None:
         mse = mse * lat_weight
-        rmse = torch.sqrt(mse.mean(dim=(0, 2, 3))).mean().item()
+        rmse = torch.sqrt(mse.mean()).item()
     else:
         rmse = torch.sqrt(mse.mean()).item()
     return rmse

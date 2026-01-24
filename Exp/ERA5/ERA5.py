@@ -7,6 +7,7 @@ from collections import OrderedDict
 import threading
 import time
 import random
+import uuid
 
 class ERA5_Dataset(Dataset):
     def __init__(self, input_dir, year_range, window_size=16, sample_k=4, look_ahead=2, is_train=True, dt_ref=6.0):
@@ -16,7 +17,8 @@ class ERA5_Dataset(Dataset):
         self.look_ahead = look_ahead
         self.is_train = is_train
         self.dt_ref = dt_ref
-        self.shm_root = "/dev/shm/era5_cache"
+        
+        self.shm_root = f"/dev/shm/era5_cache/{uuid.uuid4().hex}"
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         
         self.all_info = []
