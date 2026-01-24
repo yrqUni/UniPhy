@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PScan import PScanTriton
 
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, img_height, img_width):
@@ -113,7 +114,7 @@ class GlobalFluxTracker(nn.Module):
 
     def project(self, flux_states):
         B, D, T = flux_states.shape
-        h_state = flux_states.permute(0, 2, 1)
+        h_state = flux_states.permute(0, 2, 1) 
         
         h_flat = h_state.reshape(B * T, D)
         out_cat = self.output_proj(torch.cat([h_flat.real, h_flat.imag], dim=-1))

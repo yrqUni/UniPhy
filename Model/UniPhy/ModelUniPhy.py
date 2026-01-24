@@ -108,14 +108,14 @@ class UniPhyBlock(nn.Module):
         return x
 
 class UniPhyModel(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, dt_ref=1.0):
+    def __init__(self, in_channels=2, out_channels=2, embed_dim=64, expand=4, num_experts=4, depth=4, patch_size=16, img_height=64, img_width=128, dt_ref=1.0, noise_scale=0.01):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pad_h = (patch_size - img_height % patch_size) % patch_size
         pad_w = (patch_size - img_width % patch_size) % patch_size
         h_dim, w_dim = (img_height + pad_h) // patch_size, (img_width + pad_w) // patch_size
         self.encoder = UniPhyEncoder(in_channels, embed_dim, patch_size, img_height, img_width)
-        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim, dt_ref=dt_ref) for _ in range(depth)])
+        self.blocks = nn.ModuleList([UniPhyBlock(embed_dim, expand, num_experts, h_dim, w_dim, dt_ref=dt_ref, noise_scale=noise_scale) for _ in range(depth)])
         self.decoder = UniPhyEnsembleDecoder(out_channels, embed_dim, patch_size, img_height=img_height)
 
     def forward(self, x, dt):
