@@ -6,7 +6,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from UniPhyOps import GlobalFluxTracker, TemporalPropagator
-from ModelUniPhy import UniPhyBlock, UniPhyModel
+from ModelUniPhy import UniPhyBlock
 
 def check(name, parallel_out, serial_out, threshold=1e-6):
     # Ensure comparisons happen on CPU to avoid sync issues during print
@@ -75,8 +75,8 @@ def debug_main():
     
     # Simulate Global Mean Calculation (Parallel)
     # Reshape N -> B, H, W to get global mean
-    x_eigen_reshaped = x_eigen.view(B, H*W, T, D).permute(0, 2, 3, 1) # (B, T, D, HW)
-    x_mean_fake = x_eigen_reshaped.mean(dim=-1) # (B, T, D)
+    x_eigen_reshaped = x_eigen.view(B, H, W, T, D).permute(0, 3, 4, 1, 2) # (B, T, D, H, W)
+    x_mean_fake = x_eigen_reshaped.mean(dim=(-2, -1)) # (B, T, D)
     
     # Flux Parallel
     fA, fX = prop.flux_tracker.get_operators(x_mean_fake)
@@ -90,10 +90,12 @@ def debug_main():
     src_seq = prop.flux_tracker.project(f_states) # (B, T, D)
     
     # Expand Source
-    src_expanded = src_seq.unsqueeze(1).expand(B, H*W, T, D).reshape(B*H*W, T, D)
+    src_expanded = src_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
+    # Matches ModelUniPhy: permute(0, 2, 3, 1, 4) -> (B, H, W, T, D) -> reshape -> (N, T, D)
+    src_flat = src_expanded.permute(0, 2, 3, 1, 4).reshape(B*H*W, T, D)
     
     # Forcing
-    forcing = x_eigen + src_expanded
+    forcing = x_eigen + src_flat
     u_t = forcing * op_forcing # (N, T, D)
     
     # Main Scan (Manual to isolate PScan kernel issues)
@@ -119,11 +121,8 @@ def debug_main():
         dtt = dt[:, t].unsqueeze(1)   # (N, 1)
         x_mean_t = x_mean_fake[:, t]  # (B, D)
         
-        # We need to simulate the basis.encode inside forward_step using linearity
-        # Propagator.forward_step encodes input internally
-        
-        # We need to pass raw input (xt) but encoded global mean (x_mean_t)
-        # Note: forward_step logic: h_next, f_next = prop.forward_step(...)
+        # In ModelUniPhy.forward_step, we pass encoded global mean.
+        # But for x_input, forward_step encodes it internally.
         
         out_next, flux_next = prop.forward_step(h_curr, xt, x_mean_t, dtt, flux_curr)
         out_ser_list.append(out_next)
@@ -142,7 +141,8 @@ def debug_main():
     block = UniPhyBlock(D, 4, 4, H, W, dt_ref=1.0).to(device)
     block.eval()
     
-    x_block = torch.randn(B, T, D, H, W, device=device)
+    # Input MUST be complex for UniPhyBlock
+    x_block = torch.randn(B, T, D, H, W, device=device) + 1j * torch.randn(B, T, D, H, W, device=device)
     dt_block = torch.ones(B, T, device=device)
     
     # Parallel
@@ -153,7 +153,7 @@ def debug_main():
     h_state = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
     f_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
     
-    z = x_block # No encoder here, direct input
+    z = x_block 
     for t in range(T):
         xt = z[:, t] # (B, D, H, W)
         dtt = dt_block[:, t] # (B,)
