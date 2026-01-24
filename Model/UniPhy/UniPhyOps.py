@@ -98,6 +98,8 @@ class GlobalFluxTracker(nn.Module):
         return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
 
     def get_operators(self, x_mean_seq):
+        if x_mean_seq.ndim != 3:
+             raise ValueError(f"Expected 3D input (B, T, D), got {x_mean_seq.shape}")
         B, T, D = x_mean_seq.shape
         decay = self._get_decay() 
         
@@ -179,9 +181,7 @@ class TemporalPropagator(nn.Module):
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
         return noise * std
 
-    def forward_step(self, h_prev, x_input, x_global_mean_encoded, dt, flux_state):
-        h_tilde = self.basis.encode(h_prev)
-        if h_tilde.ndim == 2: h_tilde = h_tilde.unsqueeze(1)
+    def forward_step(self, h_prev_latent, x_input, x_global_mean_encoded, dt, flux_state):
         x_tilde = self.basis.encode(x_input)
         if x_tilde.ndim == 2: x_tilde = x_tilde.unsqueeze(1)
 
@@ -193,8 +193,7 @@ class TemporalPropagator(nn.Module):
         total_batch = x_tilde.shape[0]
         D = x_tilde.shape[-1]
         
-        if total_batch % B != 0:
-             pass 
+        if total_batch % B != 0: pass 
         
         spatial_size = total_batch // B
         
@@ -202,8 +201,8 @@ class TemporalPropagator(nn.Module):
         
         forcing_term = x_tilde + source_expanded
         
-        h_tilde_next = h_tilde * op_decay + forcing_term * op_forcing
+        h_tilde_next = h_prev_latent * op_decay + forcing_term * op_forcing
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(h_tilde_next.shape, dt, h_tilde_next.dtype)
         
-        return self.basis.decode(h_tilde_next), flux_next
+        return h_tilde_next, flux_next
     

@@ -33,7 +33,7 @@ class UniPhyBlock(nn.Module):
         r, i = torch.chunk(out_cliff, 2, dim=1)
         return torch.complex(r, i)
 
-    def forward_step(self, x_step, h_prev, dt_step, flux_prev):
+    def forward_step(self, x_step, h_prev_latent, dt_step, flux_prev):
         B, D, H, W = x_step.shape
         resid = x_step
         x_s = x_step.permute(0, 2, 3, 1)
@@ -52,12 +52,13 @@ class UniPhyBlock(nn.Module):
         x_encoded_local = self.prop.basis.encode(x_t)
         x_global_mean_encoded = x_encoded_local.view(B, H * W, D).mean(dim=1)
         
-        h_next, flux_next = self.prop.forward_step(h_prev, x_t, x_global_mean_encoded, dt_expanded, flux_prev)
+        h_next_latent, flux_next = self.prop.forward_step(h_prev_latent, x_t, x_global_mean_encoded, dt_expanded, flux_prev)
         
-        x_drift = h_next.real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        x_drift = self.prop.basis.decode(h_next_latent).real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        
         x = x_drift + resid
         x = x + self.ffn(x)
-        return x, h_next, flux_next
+        return x, h_next_latent, flux_next
 
     def forward(self, x, dt):
         B, T, D, H, W = x.shape
@@ -97,7 +98,7 @@ class UniPhyBlock(nn.Module):
         h_eigen_perm = self.pscan(A, X)
         h_eigen = h_eigen_perm.permute(0, 2, 1)
         
-        self.last_h_state = self.prop.basis.decode(h_eigen[:, -1, :])
+        self.last_h_state = h_eigen[:, -1, :].unsqueeze(1)
         self.last_flux_state = flux_states[:, :, -1].permute(0, 1) 
         
         x_drift = self.prop.basis.decode(h_eigen).real.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)
@@ -139,7 +140,6 @@ class UniPhyModel(nn.Module):
                 z_perm = z.permute(0, 1, 3, 4, 2)
                 x_encoded = block.prop.basis.encode(z_perm)
                 x_eigen_last_seq = x_encoded.mean(dim=(2, 3))
-                
                 for t in range(x_eigen_last_seq.shape[1]):
                     curr_flux, _ = block.prop.flux_tracker.forward_step(curr_flux, x_eigen_last_seq[:, t])
 
@@ -157,13 +157,13 @@ class UniPhyModel(nn.Module):
             new_states = []
             
             for i, block in enumerate(self.blocks):
-                h_prev = states[i][0].to(device, non_blocking=True)
+                h_prev_latent = states[i][0].to(device, non_blocking=True)
                 flux_prev = states[i][1].to(device, non_blocking=True)
                 
-                z_next, h_next, flux_next = block.forward_step(z_next, h_prev, dt_k, flux_prev)
-                new_states.append((h_next.to("cpu", non_blocking=True), flux_next.to("cpu", non_blocking=True)))
-                del h_prev
-                del h_next
+                z_next, h_next_latent, flux_next = block.forward_step(z_next, h_prev_latent, dt_k, flux_prev)
+                new_states.append((h_next_latent.to("cpu", non_blocking=True), flux_next.to("cpu", non_blocking=True)))
+                del h_prev_latent
+                del h_next_latent
                 
             states = new_states
             z_curr = z_next

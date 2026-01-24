@@ -75,18 +75,19 @@ def debug_main():
     forcing = x_eigen + src_flat
     u_t = forcing * op_forcing
     
-    h_main = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
+    h_main = torch.zeros(B*H*W, 1, D, device=device, dtype=torch.complex128) # Latent state is (N, 1, D)
     h_main_list = []
     for t in range(T):
-        decay_t = op_decay[:, t, :]
-        u_curr = u_t[:, t, :]
+        decay_t = op_decay[:, t, :].unsqueeze(1)
+        u_curr = u_t[:, t, :].unsqueeze(1)
         h_main = h_main * decay_t + u_curr
-        h_main_list.append(h_main)
-    h_final = torch.stack(h_main_list, dim=1)
+        h_main_list.append(h_main) # (N, 1, D)
+    h_final = torch.stack(h_main_list, dim=1).squeeze(2) # (N, T, D)
     out_par = prop.basis.decode(h_final)
     
     out_ser_list = []
-    h_curr = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
+    # h_curr must match forward_step input expectation (Latent)
+    h_curr = torch.zeros(B*H*W, 1, D, device=device, dtype=torch.complex128)
     flux_curr = torch.zeros(B, D, device=device, dtype=torch.complex128)
     
     for t in range(T):
@@ -94,10 +95,14 @@ def debug_main():
         dtt = dt[:, t].unsqueeze(1)
         x_mean_t = x_mean_fake[:, t]
         
-        out_next, flux_next = prop.forward_step(h_curr, xt, x_mean_t, dtt, flux_curr)
+        # Propagator forward step now returns LATENT h_next
+        h_next_latent, flux_next = prop.forward_step(h_curr, xt, x_mean_t, dtt, flux_curr)
+        
+        # Decode manually for check
+        out_next = prop.basis.decode(h_next_latent)
         out_ser_list.append(out_next)
         
-        h_curr = out_next
+        h_curr = h_next_latent
         flux_curr = flux_next
         
     out_ser = torch.stack(out_ser_list, dim=1).squeeze(2)
@@ -114,7 +119,8 @@ def debug_main():
     y_par = block(x_block, dt_block)
     
     y_ser_list = []
-    h_state = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
+    # Initialize h_state in Latent Space: (N, 1, D)
+    h_state = torch.zeros(B*H*W, 1, D, device=device, dtype=torch.complex128)
     f_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
     
     z = x_block 
