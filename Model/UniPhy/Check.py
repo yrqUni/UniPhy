@@ -9,10 +9,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from ModelUniPhy import UniPhyModel
 
 # --- Monkey Patching to Inspect Internals ---
-# We replace the forward_step method of the block instance 
-# with a version that prints intermediate means.
-
 def forward_step_debug(self, x_step, h_prev_latent, dt_step, flux_prev):
+    # Serial execution probe
     B, D, H, W = x_step.shape
     resid = x_step
     
@@ -24,10 +22,8 @@ def forward_step_debug(self, x_step, h_prev_latent, dt_step, flux_prev):
     x_s = self._spatial_op(x_s)
     x = x_s + resid
     
+    resid = x # Update resid!
     print(f"    [S] After Spatial Mean: {x.mean().item():.6f}")
-    
-    # UPDATE RESID
-    resid = x 
     
     # 2. Temporal Input
     x_t = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
@@ -67,56 +63,61 @@ def run_trace():
     torch.set_default_dtype(torch.float64)
     print(f"Running Deep Trace on {device}...\n")
     
-    B, T, C, H, W = 1, 5, 2, 32, 32
+    B, T, C, H_in, W_in = 1, 5, 2, 32, 32
     dt_ref = 6.0
     
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W, dt_ref=dt_ref, noise_scale=0.0).to(device)
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H_in, img_width=W_in, dt_ref=dt_ref, noise_scale=0.0).to(device)
     model.eval()
     for b in model.blocks: b.prop.noise_scale = 0.0
     
     # Patch the FIRST block
     model.blocks[0].forward_step = types.MethodType(forward_step_debug, model.blocks[0])
     
-    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
+    x = torch.randn(B, T, C, H_in, W_in, device=device, dtype=torch.float64)
     dt = torch.ones(B, T, device=device, dtype=torch.float64) * dt_ref
     
     # --- Parallel Run ---
     print(">>> Running Parallel Forward...")
     out_par = model(x, dt)
     
-    # Hack to get Parallel Intermediates from Block 0
-    # We re-run components of Block 0 Parallel manually to print stats
+    # --- Manual Re-run of Block 0 Parallel Logic for Comparison ---
     print("\n>>> Re-running Block 0 Parallel Components for Step 0...")
     z = model.encoder(x)
+    
+    # Correctly get feature map dimensions
+    B_z, T_z, D_z, H_z, W_z = z.shape
+    print(f"    Encoder Output Shape: {z.shape}")
+    
     block = model.blocks[0]
     
     # 1. Spatial Par
-    x0 = z[:, 0] # Step 0 input
+    x0 = z[:, 0] # Step 0 input (B, D, H, W)
     print(f"    [P] Input Mean: {x0.mean().item():.6f}")
     
     resid = z
-    x_s = z.reshape(B * T, 16, H, W).permute(0, 2, 3, 1)
+    # Reshape using CORRECT dimensions (H_z, W_z)
+    x_s = z.reshape(B_z * T_z, D_z, H_z, W_z).permute(0, 2, 3, 1)
     x_s = block._complex_norm(x_s, block.norm_spatial).permute(0, 3, 1, 2)
     x_s = block._spatial_op(x_s)
-    x_out_s = x_s.reshape(B, T, 16, H, W) + resid
+    x_out_s = x_s.reshape(B_z, T_z, D_z, H_z, W_z) + resid
+    
+    resid = x_out_s # Update Parallel Resid!
     print(f"    [P] After Spatial Mean (t=0): {x_out_s[:,0].mean().item():.6f}")
     
     # 2. Temporal Input
-    resid = x_out_s
-    x_t = x_out_s.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, 16)
+    x_t = x_out_s.permute(0, 3, 4, 1, 2).reshape(B_z * H_z * W_z, T_z, D_z)
     x_t = block._complex_norm(x_t, block.norm_temporal)
     print(f"    [P] Temporal Input Norm Mean (t=0): {x_t[:,0].mean().item():.6f}")
     
     # 3. Global Mean
     x_eigen = block.prop.basis.encode(x_t)
-    x_eigen_input = x_eigen.reshape(B, H, W, T, 16).permute(0, 3, 4, 1, 2)
+    x_eigen_input = x_eigen.reshape(B_z, H_z, W_z, T_z, D_z).permute(0, 3, 4, 1, 2)
     x_mean_seq = x_eigen_input.mean(dim=(-2, -1))
     print(f"    [P] Global Mean (t=0): {x_mean_seq[:,0].mean().item():.6f}")
     
     # --- Serial Run ---
     print("\n>>> Running Serial Forward (Watch Logs)...")
     
-    B_z, T_z, D_z, H_z, W_z = z.shape
     h_state = torch.zeros(B_z * H_z * W_z, 1, block.dim, dtype=torch.cdouble, device=device)
     flux_state = torch.zeros(B_z, block.dim, dtype=torch.cdouble, device=device)
     
