@@ -5,138 +5,138 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from UniPhyOps import GlobalFluxTracker, TemporalPropagator
 from ModelUniPhy import UniPhyBlock
 
-def check(name, parallel_out, serial_out, threshold=1e-6):
-    p = parallel_out.detach().cpu()
-    s = serial_out.detach().cpu()
-    diff = (p - s).abs().max().item()
-    status = "PASS" if diff < threshold else "FAIL"
-    print(f"[{status}] {name} | Max Diff: {diff:.2e}")
-    return diff
+def report(name, p, s):
+    # Move to CPU for comparison
+    diff = (p.detach().cpu() - s.detach().cpu()).abs().max().item()
+    status = "PASS" if diff < 1e-6 else "FAIL"
+    print(f"[{status}] {name} Diff: {diff:.2e}")
 
-def debug_main():
+def debug_block_components():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_default_dtype(torch.float64)
-    print(f"Running Debug on {device} (float64)...\n")
+    print(f"Debugging UniPhyBlock Components on {device}...\n")
     
-    B, T, D, H, W = 2, 8, 16, 4, 4
-    
-    # --- 1. Test GlobalFluxTracker ---
-    print("--- 1. Testing GlobalFluxTracker ---")
-    tracker = GlobalFluxTracker(D).to(device)
-    tracker.eval()
-    
-    x_mean = torch.randn(B, T, D, device=device) + 1j * torch.randn(B, T, D, device=device)
-    
-    A, X = tracker.get_operators(x_mean)
-    h_par = torch.zeros(B, D, device=device, dtype=torch.complex128)
-    h_states = []
-    for t in range(T):
-        h_par = A[:, :, t] * h_par + X[:, :, t]
-        h_states.append(h_par)
-    h_stack = torch.stack(h_states, dim=2)
-    src_par = tracker.project(h_stack)
-    
-    src_ser_list = []
-    flux_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
-    for t in range(T):
-        flux_state, src = tracker.forward_step(flux_state, x_mean[:, t])
-        src_ser_list.append(src)
-    src_ser = torch.stack(src_ser_list, dim=1)
-    
-    check("GlobalFluxTracker", src_par, src_ser)
-
-    # --- 2. Test TemporalPropagator ---
-    print("\n--- 2. Testing TemporalPropagator ---")
-    prop = TemporalPropagator(D, noise_scale=0.0).to(device)
-    prop.eval()
-    
-    x_raw = torch.randn(B * H * W, T, D, device=device) + 1j * torch.randn(B * H * W, T, D, device=device)
-    dt = torch.ones(B * H * W, T, device=device)
-    
-    op_decay, op_forcing = prop.get_transition_operators(dt)
-    x_eigen = prop.basis.encode(x_raw)
-    
-    x_eigen_reshaped = x_eigen.view(B, H, W, T, D).permute(0, 3, 4, 1, 2)
-    x_mean_fake = x_eigen_reshaped.mean(dim=(-2, -1))
-    
-    fA, fX = prop.flux_tracker.get_operators(x_mean_fake)
-    fh = torch.zeros(B, D, device=device, dtype=torch.complex128)
-    fh_list = []
-    for t in range(T):
-        fh = fA[:, :, t] * fh + fX[:, :, t]
-        fh_list.append(fh)
-    f_states = torch.stack(fh_list, dim=2)
-    src_seq = prop.flux_tracker.project(f_states)
-    
-    src_expanded = src_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
-    src_flat = src_expanded.permute(0, 2, 3, 1, 4).reshape(B*H*W, T, D)
-    
-    forcing = x_eigen + src_flat
-    u_t = forcing * op_forcing
-    
-    h_main = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
-    h_main_list = []
-    for t in range(T):
-        decay_t = op_decay[:, t, :]
-        u_curr = u_t[:, t, :]
-        h_main = h_main * decay_t + u_curr
-        h_main_list.append(h_main)
-    h_final = torch.stack(h_main_list, dim=1)
-    out_par = prop.basis.decode(h_final)
-    
-    out_ser_list = []
-    h_curr = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
-    flux_curr = torch.zeros(B, D, device=device, dtype=torch.complex128)
-    
-    for t in range(T):
-        xt = x_raw[:, t].unsqueeze(1)
-        dtt = dt[:, t].unsqueeze(1)
-        x_mean_t = x_mean_fake[:, t]
-        
-        out_next, flux_next = prop.forward_step(h_curr, xt, x_mean_t, dtt, flux_curr)
-        out_ser_list.append(out_next)
-        
-        h_curr = out_next
-        flux_curr = flux_next
-        
-    out_ser = torch.stack(out_ser_list, dim=1).squeeze(2)
-    
-    check("TemporalPropagator", out_par, out_ser)
-
-    # --- 3. Test UniPhyBlock Integration ---
-    print("\n--- 3. Testing UniPhyBlock Integration ---")
-    # Initialize with noise_scale=0.0
+    B, T, D, H, W = 2, 5, 4, 4, 4 
+    # Ensure noise is 0 to rule out stochastic mismatch
     block = UniPhyBlock(D, 4, 4, H, W, dt_ref=1.0, noise_scale=0.0).to(device)
     block.eval()
     
-    x_block = torch.randn(B, T, D, H, W, device=device) + 1j * torch.randn(B, T, D, H, W, device=device)
-    dt_block = torch.ones(B, T, device=device)
+    # Complex Inputs
+    x_in = torch.randn(B, T, D, H, W, device=device) + 1j * torch.randn(B, T, D, H, W, device=device)
     
-    # Parallel
-    y_par = block(x_block, dt_block)
+    # -------------------------------------------------------------------------
+    # 1. Spatial Part Consistency
+    # -------------------------------------------------------------------------
+    # Parallel Spatial Path
+    x = x_in
+    resid = x
+    x_s_par = x.reshape(B * T, D, H, W).permute(0, 2, 3, 1) # (BT, H, W, D)
+    x_s_par = block._complex_norm(x_s_par, block.norm_spatial).permute(0, 3, 1, 2)
+    x_s_par = block._spatial_op(x_s_par)
+    x_spatial_par = x_s_par.reshape(B, T, D, H, W) + resid
     
-    # Serial Loop
-    y_ser_list = []
+    # Serial Spatial Path
+    x_spatial_ser_list = []
+    for t in range(T):
+        xt = x_in[:, t] # (B, D, H, W)
+        resid_t = xt
+        x_s_ser = xt.permute(0, 2, 3, 1) # (B, H, W, D)
+        x_s_ser = block._complex_norm(x_s_ser, block.norm_spatial).permute(0, 3, 1, 2)
+        x_s_ser = block._spatial_op(x_s_ser)
+        x_t_out = x_s_ser + resid_t
+        x_spatial_ser_list.append(x_t_out)
+    x_spatial_ser = torch.stack(x_spatial_ser_list, dim=1)
+    
+    report("Spatial Ops", x_spatial_par, x_spatial_ser)
+    
+    # -------------------------------------------------------------------------
+    # 2. Temporal Input Prep Consistency
+    # -------------------------------------------------------------------------
+    # Use consistent input from previous stage
+    x_temporal_in = x_spatial_par
+    
+    # Parallel Prep
+    resid_par = x_temporal_in
+    x_t_par = x_temporal_in.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, D)
+    x_t_par = block._complex_norm(x_t_par, block.norm_temporal) # (N, T, D)
+    
+    # Serial Prep
+    x_t_ser_list = []
+    for t in range(T):
+        xt = x_temporal_in[:, t] # (B, D, H, W)
+        # Mimic forward_step logic
+        xt_reshaped = xt.permute(0, 2, 3, 1).reshape(B * H * W, 1, D)
+        xt_norm = block._complex_norm(xt_reshaped, block.norm_temporal)
+        x_t_ser_list.append(xt_norm)
+    x_t_ser = torch.stack(x_t_ser_list, dim=1).squeeze(2) # (N, T, D)
+    
+    report("Temporal Input Prep", x_t_par, x_t_ser)
+    
+    # -------------------------------------------------------------------------
+    # 3. Propagator Integration (Using Prepped Inputs)
+    # -------------------------------------------------------------------------
+    # Use consistent prepped input
+    x_prop_in = x_t_par
+    dt_prop_in = torch.ones(B*H*W, T, device=device)
+    
+    # Parallel Prop Logic (Manually expanded from ModelUniPhy.forward)
+    op_decay, op_forcing = block.prop.get_transition_operators(dt_prop_in)
+    x_eigen = block.prop.basis.encode(x_prop_in)
+    
+    x_eigen_input = x_eigen.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2) 
+    x_mean_seq = x_eigen_input.mean(dim=(-2, -1))
+    
+    flux_A, flux_X = block.prop.flux_tracker.get_operators(x_mean_seq)
+    flux_states = block.pscan(flux_A, flux_X)
+    source_seq = block.prop.flux_tracker.project(flux_states)
+    
+    source_expanded = source_seq.unsqueeze(2).unsqueeze(2).expand(B, T, H, W, D)
+    source_flat = source_expanded.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D)
+    
+    forcing = x_eigen + source_flat
+    u_t = forcing * op_forcing
+    
+    A = op_decay.permute(0, 2, 1).contiguous()
+    X = u_t.permute(0, 2, 1).contiguous()
+    h_eigen = block.pscan(A, X).permute(0, 2, 1)
+    
+    x_drift_par = block.prop.basis.decode(h_eigen).real
+    x_out_par = x_drift_par.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2) + resid_par
+    
+    # Serial Prop Logic
+    x_out_ser_list = []
     h_state = torch.zeros(B*H*W, D, device=device, dtype=torch.complex128)
     f_state = torch.zeros(B, D, device=device, dtype=torch.complex128)
     
-    z = x_block 
+    # Need to unsqueeze dt to match serial step logic (N, 1)
+    dt_serial_in = dt_prop_in.unsqueeze(2) 
+    
     for t in range(T):
-        xt = z[:, t]
-        dtt = dt_block[:, t]
+        # xt_step from serial prep list is (N, 1, D)
+        xt_step = x_t_ser_list[t] 
+        resid_t = resid_par[:, t] # (B, D, H, W)
         
-        y_next, h_next, f_next = block.forward_step(xt, h_state, dtt, f_state)
-        y_ser_list.append(y_next)
+        # Calculate mean from Encoded xt_step
+        x_encoded_local = block.prop.basis.encode(xt_step)
+        x_global_mean_encoded = x_encoded_local.view(B, H * W, D).mean(dim=1)
+        
+        dt_step = dt_serial_in[:, t]
+        
+        h_next, f_next = block.prop.forward_step(h_state, xt_step, x_global_mean_encoded, dt_step, f_state)
+        
+        x_drift_t = h_next.real.reshape(B, H, W, 1, D).permute(0, 3, 4, 1, 2).squeeze(1)
+        x_out_t = x_drift_t + resid_t
+        x_out_ser_list.append(x_out_t)
+        
         h_state = h_next
         f_state = f_next
         
-    y_ser = torch.stack(y_ser_list, dim=1)
+    x_out_ser = torch.stack(x_out_ser_list, dim=1)
     
-    check("UniPhyBlock", y_par, y_ser)
+    report("Propagator+Residual Integration", x_out_par, x_out_ser)
 
 if __name__ == "__main__":
-    debug_main()
+    debug_block_components()
     
