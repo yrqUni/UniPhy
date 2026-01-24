@@ -84,12 +84,17 @@ def check_full_model_consistency():
         B_z, T_z, D_z, H_z, W_z = z.shape
         
         for block in model.blocks:
+            # 修正重点：h_state 必须初始化为 (N, 1, D)
             h_state = torch.zeros(B_z * H_z * W_z, 1, block.dim, dtype=torch.cdouble, device=device)
+            # flux_state 必须初始化为 (B, D)
             flux_state = torch.zeros(B_z, block.dim, dtype=torch.cdouble, device=device)
             z_steps = []
             
+            # 必须用上一层完整的 z 序列来进行这一层的循环
+            # z 的形状是 (B, T, D, H, W)
+            
             for t in range(T):
-                x_step = z[:, t]
+                x_step = z[:, t] # 取出时刻 t 的所有数据
                 dt_step = dt[:, t]
                 
                 z_next, h_next, flux_next = block.forward_step(x_step, h_state, dt_step, flux_state)
