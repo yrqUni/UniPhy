@@ -18,7 +18,7 @@ def check_basis_invertibility():
     x_dec = basis.decode(x_enc)
     err = (x - x_dec).abs().max().item()
     if err < 1e-12: pass
-    else: print(f"[WARN] Basis Inversion Error: {err:.2e}")
+    else: print(f"Basis Inversion Error: {err:.2e}")
 
 def check_history_dependency():
     dim = 64
@@ -50,7 +50,7 @@ def check_history_dependency():
     
     diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
     if diff_at_last_step > 1e-5: pass 
-    else: print(f"[WARN] History Dependency Error: Diff {diff_at_last_step:.2e}")
+    else: print(f"History Dependency Error: Past change did not affect future source. Diff: {diff_at_last_step:.2e}")
 
 def check_eigenvalue_stability():
     dim = 64
@@ -59,7 +59,7 @@ def check_eigenvalue_stability():
     lambda_val = prop._get_effective_lambda()
     max_real = lambda_val.real.max().item()
     if max_real <= 1e-6: pass
-    else: print(f"[WARN] Eigenvalue Stability Error: Max Real {max_real:.2e} > 0")
+    else: print(f"Eigenvalue Stability Error: Max Real Part {max_real:.2e} > 0")
 
 def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,8 +108,8 @@ def check_full_model_consistency():
         print(f"Consistency Check Passed. Diff: {diff:.2e}")
     else:
         print(f"Consistency Check FAILED. Diff: {diff:.2e}")
-        print(f"   Parallel Mean: {out_parallel.mean():.4f}")
-        print(f"   Serial   Mean: {out_serial.mean():.4f}")
+        print(f"   Parallel Mean: {out_parallel.mean():.6f}")
+        print(f"   Serial   Mean: {out_serial.mean():.6f}")
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
@@ -120,3 +120,4 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         check_full_model_consistency()
     print("Checks Completed.")
+    
