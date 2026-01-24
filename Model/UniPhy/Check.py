@@ -27,7 +27,6 @@ def check_history_dependency():
     T = 5
     x_seq_1 = torch.randn(1, T, dim, 4, 4, device=device, dtype=torch.cdouble)
     x_seq_2 = x_seq_1.clone()
-    
     x_seq_2[:, 0] += 10.0 
     
     mean_1 = x_seq_1.mean(dim=(-2, -1))
@@ -48,7 +47,6 @@ def check_history_dependency():
     src_2 = manual_scan_project(mean_2)
     
     diff_at_last_step = (src_1[:, -1] - src_2[:, -1]).abs().mean().item()
-    
     if diff_at_last_step > 1e-5: pass 
     else: print(f"History Dependency Error: Past change did not affect future source. Diff: {diff_at_last_step:.2e}")
 
@@ -65,7 +63,7 @@ def check_full_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, C, H, W = 1, 5, 2, 32, 32
     dt_ref = 6.0
-    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W, dt_ref=dt_ref).to(device)
+    model = UniPhyModel(in_channels=C, out_channels=C, embed_dim=16, depth=2, img_height=H, img_width=W, dt_ref=dt_ref, noise_scale=0.0).to(device)
     model.eval()
     
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
@@ -78,7 +76,7 @@ def check_full_model_consistency():
         B_z, T_z, D_z, H_z, W_z = z.shape
         
         for block in model.blocks:
-            h_state = torch.zeros(B_z * H_z * W_z, block.dim, dtype=torch.cdouble, device=device)
+            h_state = torch.zeros(B_z * H_z * W_z, 1, block.dim, dtype=torch.cdouble, device=device)
             flux_state = torch.zeros(B_z, block.dim, dtype=torch.cdouble, device=device)
             z_steps = []
             
