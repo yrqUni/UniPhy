@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(
         self,
@@ -44,126 +45,102 @@ class RiemannianCliffordConv2d(nn.Module):
 
         self.metric_scale = nn.Parameter(torch.tensor(0.1))
         self.viscosity_scale = nn.Parameter(torch.tensor(0.01))
-        self.diffusion_scale = nn.Parameter(torch.tensor(0.01))
+
+        self.dispersion_kernel = nn.Parameter(
+            torch.randn(in_channels, 1, 3, 3) * 0.01
+        )
         self.dispersion_scale = nn.Parameter(torch.tensor(0.01))
 
         self.anti_diffusion_gate = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 4, 1),
-            nn.SiLU(),
-            nn.Conv2d(in_channels // 4, in_channels, 1),
+            nn.Conv2d(in_channels, in_channels, 1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        B, C, H, W = x.shape
+        base_out = self.conv(x)
 
-        metric = torch.exp(self.log_metric_param * self.metric_scale)
-        if metric.shape[-2:] != (H, W):
-            metric = F.interpolate(metric, size=(H, W), mode="bilinear", align_corners=False)
+        metric_field = self.log_metric_param.expand(x.size(0), -1, -1, -1)
+        metric_refine = self.metric_refiner(x)
+        metric_field = metric_field * (1 + metric_refine)
 
-        refine = self.metric_refiner(x)
-        metric = metric * (1.0 + refine)
+        laplacian = F.conv2d(x, self.laplacian_kernel, padding=1, groups=self.groups)
+        viscosity_weight = self.viscosity_gate(x)
+        diffusion = laplacian * viscosity_weight * self.viscosity_scale
 
-        scale = torch.sqrt(metric + 1e-8)
-        inv_scale = 1.0 / scale
-
-        x_scaled = x * scale
-        
-        laplacian_kernel = self.laplacian_kernel.to(dtype=x.dtype)
-
-        diffusion_term = F.conv2d(
-            x_scaled, laplacian_kernel, padding=1, groups=self.groups
-        )
-
-        local_viscosity = self.viscosity_gate(x) * inv_scale
-
-        diffusion = diffusion_term * local_viscosity * self.viscosity_scale * self.diffusion_scale
+        dispersion = F.conv2d(x, self.dispersion_kernel, padding=1, groups=self.groups)
+        dispersion = dispersion * self.dispersion_scale
 
         anti_diff_weight = self.anti_diffusion_gate(x)
-        dispersion = -diffusion_term * self.dispersion_scale
+        dispersion = dispersion * anti_diff_weight
 
-        x_evolved = x_scaled + diffusion - anti_diff_weight * diffusion * 0.5 + dispersion
+        metric_correction = metric_field * base_out * self.metric_scale
 
-        x_final = x_evolved * inv_scale
-        out = self.conv(x_final)
+        return base_out + metric_correction + diffusion + dispersion
 
-        return out
 
 class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
-        q_re, _ = torch.linalg.qr(torch.randn(dim, dim))
-        q_im, _ = torch.linalg.qr(torch.randn(dim, dim))
+        self.U_re = nn.Parameter(torch.eye(dim))
+        self.U_im = nn.Parameter(torch.zeros(dim, dim))
+        self.V_re = nn.Parameter(torch.eye(dim))
+        self.V_im = nn.Parameter(torch.zeros(dim, dim))
 
-        self.u_raw_re = nn.Parameter(q_re * 0.1)
-        self.u_raw_im = nn.Parameter(q_im * 0.1)
-        self.v_raw_re = nn.Parameter(q_re.T * 0.1)
-        self.v_raw_im = nn.Parameter(q_im.T * 0.1)
-        self.log_sigma = nn.Parameter(torch.zeros(dim))
-
-        n = torch.arange(dim)
-        k = torch.arange(dim).reshape(-1, 1)
-        dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
-        self.register_buffer("dft_basis", dft_matrix)
         self.dft_weight = nn.Parameter(torch.tensor(0.2))
 
-    def _cayley_orthogonalize(self, raw_re, raw_im):
-        A = torch.complex(raw_re, raw_im)
-        A_skew = A - A.T.conj()
-        I = torch.eye(self.dim, device=A.device, dtype=A.dtype)
-        Q = torch.linalg.solve(I + A_skew, I - A_skew)
-        return Q
+        self.register_buffer("dft_matrix_re", self._build_dft_matrix(dim).real)
+        self.register_buffer("dft_matrix_im", self._build_dft_matrix(dim).imag)
 
-    def _get_basis(self):
-        U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
-        V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
-        S = torch.diag(torch.exp(self.log_sigma).to(U.dtype))
-        return U, S, V
+    def _build_dft_matrix(self, n):
+        idx = torch.arange(n, dtype=torch.float64)
+        phase = -2 * torch.pi * idx.unsqueeze(0) * idx.unsqueeze(1) / n
+        return torch.complex(torch.cos(phase), torch.sin(phase)) / (n ** 0.5)
+
+    def _get_U(self):
+        return torch.complex(self.U_re, self.U_im)
+
+    def _get_V(self):
+        return torch.complex(self.V_re, self.V_im)
+
+    def _get_dft(self):
+        return torch.complex(self.dft_matrix_re, self.dft_matrix_im)
 
     def encode(self, x):
-        U, S_mat, V = self._get_basis()
-        S_diag = torch.diag(S_mat)
+        U = self._get_U().to(x.dtype)
+        dft = self._get_dft().to(x.dtype)
+        w = torch.sigmoid(self.dft_weight)
 
-        learned_path = torch.einsum("...d, de -> ...e", x, V) * S_diag
+        x_svd = torch.einsum("...d,de->...e", x, U)
+        x_dft = torch.einsum("...d,de->...e", x, dft)
 
-        x_complex = x if x.is_complex() else torch.complex(x, torch.zeros_like(x))
-        dft_basis = self.dft_basis.to(dtype=x_complex.dtype)
-        dft_path = torch.einsum("...d, de -> ...e", x_complex, dft_basis)
+        return (1 - w) * x_svd + w * x_dft
 
-        alpha = torch.sigmoid(self.dft_weight)
-        return learned_path * (1 - alpha) + dft_path * alpha
+    def decode(self, z):
+        U = self._get_U().to(z.dtype)
+        dft = self._get_dft().to(z.dtype)
+        w = torch.sigmoid(self.dft_weight)
 
-    def decode(self, h):
-        U, S_mat, V = self._get_basis()
-        S_diag = torch.diag(S_mat)
-        alpha = torch.sigmoid(self.dft_weight)
-        
-        W_learned = V * S_diag.unsqueeze(0) * (1 - alpha)
-        
-        dft_basis = self.dft_basis.to(dtype=h.dtype)
-        W_dft = dft_basis * alpha
-        W_total = W_learned + W_dft
-        
-        if h.is_complex() and not W_total.is_complex():
-            W_total = W_total.to(h.dtype)
-            
-        x_rec = torch.linalg.solve(W_total.T, h.unsqueeze(-1)).squeeze(-1)
-        return x_rec
+        z_svd = torch.einsum("...d,ed->...e", z, U.conj())
+        z_dft = torch.einsum("...d,ed->...e", z, dft.conj().T)
+
+        return (1 - w) * z_svd + w * z_dft
+
 
 class GlobalFluxTracker(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
-        self.decay_re = nn.Parameter(torch.randn(dim) * 0.1 - 1.0)
-        self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
+        self.decay_re = nn.Parameter(torch.zeros(dim))
+        self.decay_im = nn.Parameter(torch.zeros(dim))
 
         self.input_mix = nn.Linear(dim * 2, dim * 2)
         self.output_proj = nn.Linear(dim * 2, dim * 2)
 
-        nn.init.xavier_uniform_(self.input_mix.weight)
+        nn.init.eye_(self.input_mix.weight[:dim, :dim])
+        nn.init.eye_(self.input_mix.weight[dim:, dim:])
         nn.init.zeros_(self.input_mix.bias)
         nn.init.xavier_uniform_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
@@ -172,6 +149,9 @@ class GlobalFluxTracker(nn.Module):
             nn.Linear(dim * 2, dim),
             nn.Sigmoid()
         )
+
+        self.gate_min = 0.01
+        self.gate_max = 0.99
 
     def _get_decay(self):
         return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
@@ -208,9 +188,11 @@ class GlobalFluxTracker(nn.Module):
         source = self.project(new_state)
 
         s_cat = torch.cat([new_state.real, new_state.imag], dim=-1)
-        gate = torch.sigmoid(self.gate_net(s_cat)) 
+        gate = self.gate_net(s_cat)
+        gate = torch.clamp(gate, min=self.gate_min, max=self.gate_max)
 
         return new_state, source, gate
+
 
 class TemporalPropagator(nn.Module):
     def __init__(
@@ -242,66 +224,74 @@ class TemporalPropagator(nn.Module):
         self.basis = ComplexSVDTransform(dim)
         self.flux_tracker = GlobalFluxTracker(dim)
 
-        self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
-        self.lf = nn.Parameter(torch.randn(dim) * 1.0)
-        self.law_re = nn.Parameter(torch.randn(dim) * 0.01)
-        self.law_im = nn.Parameter(torch.randn(dim) * 0.01)
+        self.lam_re = nn.Parameter(torch.randn(dim) * 0.01)
+        self.lam_im = nn.Parameter(torch.randn(dim) * 0.1)
 
     def _get_effective_lambda(self):
-        l_phys = torch.complex(-torch.exp(self.ld), self.lf)
-        l_law = torch.complex(self.law_re, self.law_im)
-        l_total = l_phys + l_law
-
-        bounded_re = torch.tanh(l_total.real) * self.max_growth_rate
-        return torch.complex(bounded_re, l_total.imag)
+        lam_re_bounded = self.lam_re.clamp(-self.max_growth_rate, self.max_growth_rate)
+        return torch.complex(lam_re_bounded, self.lam_im)
 
     def get_transition_operators(self, dt):
-        dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
         lam = self._get_effective_lambda()
+        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(dt, device=lam.device)
 
-        if dt.ndim == 0:
-            dt = dt.unsqueeze(0)
+        if dt_tensor.ndim == 0:
+            dt_ratio = dt_tensor / self.dt_ref
+        else:
+            dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
 
-        dt_ratio = dt / self.dt_ref
-        exp_arg = lam.unsqueeze(0) * dt_ratio.unsqueeze(-1)
+        exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
-        forcing = (decay - 1) / (lam.unsqueeze(0) + 1e-8)
+
+        lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
+        forcing = torch.expm1(exp_arg) / lam_safe
 
         return decay, forcing
 
-    def generate_stochastic_term(self, target_shape, dt, dtype, h_state=None):
+    def get_transition_operators_batch(self, dt_seq):
+        lam = self._get_effective_lambda()
+
+        if dt_seq.ndim == 1:
+            dt_ratio = dt_seq.unsqueeze(-1) / self.dt_ref
+        elif dt_seq.ndim == 2:
+            dt_ratio = dt_seq.unsqueeze(-1) / self.dt_ref
+        else:
+            dt_ratio = dt_seq / self.dt_ref
+
+        exp_arg = lam * dt_ratio
+        decay = torch.exp(exp_arg)
+
+        lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
+        forcing = torch.expm1(exp_arg) / lam_safe
+
+        return decay, forcing
+
+    def generate_stochastic_term(self, shape, dt, dtype, h_state=None):
         if self.sde_mode != "sde":
-            return torch.zeros(target_shape, device=self.ld.device, dtype=dtype)
+            return torch.zeros(shape, dtype=dtype, device=self.base_noise.device)
 
-        dt = torch.as_tensor(dt, device=self.ld.device, dtype=self.ld.dtype)
-        l_re = self._get_effective_lambda().real
+        device = self.base_noise.device
+        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(dt, device=device)
 
-        base_var = (
-            (self.base_noise ** 2)
-            * torch.expm1(2 * l_re * (dt / self.dt_ref).unsqueeze(-1))
-            / (2 * l_re + 1e-8)
-        )
-        base_var = torch.clamp(base_var, min=0.0)
+        base_scale = self.base_noise.abs() * torch.sqrt(dt_tensor.abs().float() + 1e-8)
 
         if h_state is not None and self.uncertainty_net is not None:
-            h_mean = h_state.mean(dim=1) if h_state.ndim > 2 else h_state
-            h_input = h_mean.real if h_mean.is_complex() else h_mean
-            local_uncertainty = self.uncertainty_net(h_input)
-
-            while local_uncertainty.ndim < base_var.ndim:
-                local_uncertainty = local_uncertainty.unsqueeze(1)
-
-            dynamic_var = base_var * local_uncertainty
+            h_flat = h_state.reshape(-1, self.dim)
+            h_real = torch.cat([h_flat.real, h_flat.imag], dim=-1) if h_flat.is_complex() else h_flat
+            h_mag = h_real.abs().mean(dim=-1, keepdim=True)
+            uncertainty = self.uncertainty_net(h_mag.expand(-1, self.dim))
+            uncertainty = uncertainty.reshape(shape)
+            scale = base_scale * (1 + uncertainty)
         else:
-            dynamic_var = base_var
+            scale = base_scale
 
-        std = torch.sqrt(dynamic_var).to(dtype)
-        noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
-        return noise * std
+        noise_re = torch.randn(shape, device=device, dtype=torch.float64 if dtype == torch.cdouble else torch.float32)
+        noise_im = torch.randn(shape, device=device, dtype=torch.float64 if dtype == torch.cdouble else torch.float32)
+
+        return torch.complex(noise_re, noise_im) * scale
 
     def forward_step(self, h_prev_latent, x_input, x_global_mean_encoded, dt, flux_state):
         x_tilde = self.basis.encode(x_input)
-
         if x_tilde.ndim == 2:
             x_tilde = x_tilde.unsqueeze(1)
 
@@ -321,7 +311,6 @@ class TemporalPropagator(nn.Module):
             .expand(B, spatial_size, 1, D)
             .reshape(total_batch, 1, D)
         )
-
         gate_expanded = (
             gate.view(B, 1, 1, D)
             .expand(B, spatial_size, 1, D)
@@ -329,11 +318,8 @@ class TemporalPropagator(nn.Module):
         )
 
         forcing_term = x_tilde * gate_expanded + source_expanded * (1 - gate_expanded)
-        h_tilde_next = h_prev_latent * op_decay + forcing_term * op_forcing
 
-        h_tilde_next = h_tilde_next + self.generate_stochastic_term(
-            h_tilde_next.shape, dt, h_tilde_next.dtype, h_state=h_tilde_next
-        )
+        h_tilde_next = h_prev_latent * op_decay + forcing_term * op_forcing
 
         return h_tilde_next, flux_next
     
