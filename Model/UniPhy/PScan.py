@@ -250,79 +250,31 @@ def expand_diag_to_matrix(A_diag, D):
     return A_mat
 
 
-class _PScanDiagFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, A, X):
-        B, L, C, D, _ = X.shape
-        ctx.shape_A_orig = A.shape
-        ctx.shape_X_orig = X.shape
-
-        is_diag = (A.ndim == 4)
-        ctx.is_diag = is_diag
-
-        if is_diag:
-            A_mat = expand_diag_to_matrix(A, D)
-        else:
-            A_mat = A
-
-        A_work = A_mat.contiguous()
-        X_work = X.contiguous()
-
-        A_perm = A_work.permute(0, 2, 1, 3, 4).contiguous()
-        X_perm = X_work.permute(0, 2, 1, 3, 4).contiguous()
-
-        A_flat = A_perm.reshape(B * C, L, D, D)
-        X_flat = X_perm.reshape(B * C, L, D, D)
-
-        A_real = torch.view_as_real(A_flat).contiguous()
-        X_real = torch.view_as_real(X_flat).contiguous()
-
-        Y_real = run_mat2x2_pscan(A_real, X_real, L, reverse=False)
-
-        Y_flat = torch.view_as_complex(Y_real)
-        Y_perm = Y_flat.reshape(B, C, L, D, D)
-        Y = Y_perm.permute(0, 2, 1, 3, 4).contiguous()
-
-        ctx.save_for_backward(A_mat, Y)
-
-        return Y
-
-    @staticmethod
-    def backward(ctx, grad_Y):
-        A_mat, Y = ctx.saved_tensors
-        is_diag = ctx.is_diag
-
-        B, L, C, D, _ = grad_Y.shape
-
-        A_conj = A_mat.conj()
-
-        grad_Y_perm = grad_Y.permute(0, 2, 1, 3, 4).contiguous()
-        A_conj_perm = A_conj.permute(0, 2, 1, 3, 4).contiguous()
-
-        grad_Y_flat = grad_Y_perm.reshape(B * C, L, D, D)
-        A_conj_flat = A_conj_perm.reshape(B * C, L, D, D)
-
-        grad_Y_real = torch.view_as_real(grad_Y_flat).contiguous()
-        A_conj_real = torch.view_as_real(A_conj_flat).contiguous()
-
-        dX_real = run_mat2x2_pscan(A_conj_real, grad_Y_real, L, reverse=True)
-
-        dX_flat = torch.view_as_complex(dX_real)
-        dX_perm = dX_flat.reshape(B, C, L, D, D)
-        dX = dX_perm.permute(0, 2, 1, 3, 4).contiguous()
-
-        Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
-        dA_full = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
-
-        if is_diag:
-            dA = dA_full.diagonal(dim1=-2, dim2=-1)
-        else:
-            dA = dA_full
-
-        return dA, dX
+def sequential_pscan_forward(A, X):
+    B, L, C, D1, D2 = X.shape
+    Y = torch.zeros_like(X)
+    Y[:, 0] = X[:, 0]
+    for t in range(1, L):
+        Y[:, t] = torch.einsum("bcij,bcjk->bcik", A[:, t], Y[:, t - 1]) + X[:, t]
+    return Y
 
 
-class _PScanMatFunction(torch.autograd.Function):
+def sequential_pscan_backward(A, Y, grad_Y):
+    B, L, C, D1, D2 = grad_Y.shape
+
+    Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
+    grad_A = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
+
+    grad_X = torch.zeros_like(grad_Y)
+    grad_X[:, L - 1] = grad_Y[:, L - 1]
+    for t in range(L - 2, -1, -1):
+        A_H = A[:, t + 1].conj().transpose(-1, -2)
+        grad_X[:, t] = grad_Y[:, t] + torch.einsum("bcij,bcjk->bcik", A_H, grad_X[:, t + 1])
+
+    return grad_A, grad_X
+
+
+class _PScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
         B, L, C, D1, D2 = X.shape
@@ -351,7 +303,7 @@ class _PScanMatFunction(torch.autograd.Function):
 
         Y_real = run_mat2x2_pscan(A_real, X_real, L, reverse=False)
 
-        Y_flat = torch.view_as_complex(Y_real)
+        Y_flat = torch.view_as_complex(Y_real.contiguous())
         Y_perm = Y_flat.reshape(B, C, L, D1, D2)
         Y = Y_perm.permute(0, 2, 1, 3, 4).contiguous()
 
@@ -366,38 +318,49 @@ class _PScanMatFunction(torch.autograd.Function):
 
         B, L, C, D1, D2 = grad_Y.shape
 
-        A_conj = A_mat.conj()
-
-        grad_Y_perm = grad_Y.permute(0, 2, 1, 3, 4).contiguous()
-        A_conj_perm = A_conj.permute(0, 2, 1, 3, 4).contiguous()
-
-        grad_Y_flat = grad_Y_perm.reshape(B * C, L, D1, D2)
-        A_conj_flat = A_conj_perm.reshape(B * C, L, D1, D2)
-
-        grad_Y_real = torch.view_as_real(grad_Y_flat).contiguous()
-        A_conj_real = torch.view_as_real(A_conj_flat).contiguous()
-
-        dX_real = run_mat2x2_pscan(A_conj_real, grad_Y_real, L, reverse=True)
-
-        dX_flat = torch.view_as_complex(dX_real)
-        dX_perm = dX_flat.reshape(B, C, L, D1, D2)
-        dX = dX_perm.permute(0, 2, 1, 3, 4).contiguous()
-
         Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
-        dA_full = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
+        grad_A_full = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
+
+        A_shift = torch.cat([
+            A_mat[:, 1:],
+            torch.eye(D1, dtype=A_mat.dtype, device=A_mat.device)
+            .unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            .expand(B, 1, C, D1, D2)
+        ], dim=1)
+        A_H = A_shift.conj().transpose(-1, -2)
+
+        A_H_perm = A_H.permute(0, 2, 1, 3, 4).contiguous()
+        grad_Y_perm = grad_Y.permute(0, 2, 1, 3, 4).contiguous()
+
+        A_H_flat = A_H_perm.reshape(B * C, L, D1, D2)
+        grad_Y_flat = grad_Y_perm.reshape(B * C, L, D1, D2)
+
+        A_H_real = torch.view_as_real(A_H_flat).contiguous()
+        grad_Y_real = torch.view_as_real(grad_Y_flat).contiguous()
+
+        grad_X_real = run_mat2x2_pscan(A_H_real, grad_Y_real, L, reverse=True)
+
+        grad_X_flat = torch.view_as_complex(grad_X_real.contiguous())
+        grad_X_perm = grad_X_flat.reshape(B, C, L, D1, D2)
+        grad_X = grad_X_perm.permute(0, 2, 1, 3, 4).contiguous()
 
         if is_diag:
-            dA = dA_full.diagonal(dim1=-2, dim2=-1)
+            grad_A = grad_A_full.diagonal(dim1=-2, dim2=-1)
         else:
-            dA = dA_full
+            grad_A = grad_A_full
 
-        return dA, dX
+        return grad_A, grad_X
 
 
 def pscan(A, X, mode="auto"):
     is_diag = (A.ndim == X.ndim - 1)
 
-    if mode == "diag" or (mode == "auto" and is_diag):
-        return _PScanDiagFunction.apply(A, X)
+    if is_diag:
+        D = X.shape[-1]
+        A_mat = expand_diag_to_matrix(A, D)
     else:
-        return _PScanMatFunction.apply(A, X)
+        A_mat = A
+
+    Y = _PScanFunction.apply(A_mat, X)
+
+    return Y
