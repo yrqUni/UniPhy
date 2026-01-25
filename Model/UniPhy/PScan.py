@@ -4,6 +4,20 @@ import triton
 import triton.language as tl
 
 @triton.jit
+def matmul_complex_tl(ar, ai, br, bi):
+    ar_e = tl.expand_dims(ar, 2)
+    ai_e = tl.expand_dims(ai, 2)
+    br_e = tl.expand_dims(br, 0)
+    bi_e = tl.expand_dims(bi, 0)
+    
+    rr = tl.sum(ar_e * br_e, axis=1)
+    ri = tl.sum(ar_e * bi_e, axis=1)
+    ir = tl.sum(ai_e * br_e, axis=1)
+    ii = tl.sum(ai_e * bi_e, axis=1)
+    
+    return rr - ii, ri + ir
+
+@triton.jit
 def combine_diag(alr, ali, xlr, xli, arr, ari, xrr, xri):
     rar = arr * alr - ari * ali
     rai = arr * ali + ari * alr
@@ -13,17 +27,12 @@ def combine_diag(alr, ali, xlr, xli, arr, ari, xrr, xri):
 
 @triton.jit
 def combine_mat(alr, ali, xlr, xli, arr, ari, xrr, xri):
-    rar = tl.dot(arr, alr) - tl.dot(ari, ali)
-    rai = tl.dot(arr, ali) + tl.dot(ari, alr)
-    rxr = tl.dot(arr, xlr) - tl.dot(ari, xli) + xrr
-    rxi = tl.dot(arr, xli) + tl.dot(ari, xlr) + xri
-    return rar, rai, rxr, rxi
+    rar, rai = matmul_complex_tl(arr, ari, alr, ali)
+    rxr_m, rxi_m = matmul_complex_tl(arr, ari, xlr, xli)
+    return rar, rai, rxr_m + xrr, rxi_m + xri
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ],
+    configs=[triton.Config({}, num_warps=4), triton.Config({}, num_warps=8)],
     key=["L"],
 )
 @triton.jit
@@ -51,10 +60,7 @@ def pscan_diag_kernel(
     tl.store(y_base + 1, yi, mask=mask)
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ],
+    configs=[triton.Config({}, num_warps=4), triton.Config({}, num_warps=8)],
     key=["L", "D"],
 )
 @triton.jit
@@ -143,7 +149,7 @@ class _PScanFunction(torch.autograd.Function):
         if is_mat:
             A_H = A.conj().transpose(-1, -2)
             A_rev = torch.empty_like(A_H)
-            A_rev[:, 0] = 0.0
+            A_rev[:, 0] = torch.eye(D, device=A.device, dtype=A.dtype)
             if L > 1:
                 A_rev[:, 1:] = A_H[:, 1:].flip(1)
             X_rev = g.flip(1)
@@ -165,8 +171,7 @@ class _PScanFunction(torch.autograd.Function):
             return dA, dX
         else:
             A_conj = A.conj()
-            A_rev = torch.empty_like(A_conj)
-            A_rev[:, 0] = 0.0
+            A_rev = torch.ones_like(A_conj)
             if L > 1:
                 A_rev[:, 1:] = A_conj[:, 1:].flip(1)
             X_rev = g.flip(1)
