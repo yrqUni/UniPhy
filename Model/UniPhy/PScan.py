@@ -4,6 +4,20 @@ import triton
 import triton.language as tl
 
 @triton.jit
+def matmul_complex_manual(ar, ai, br, bi, D: tl.constexpr):
+    ar_e = tl.reshape(ar, (D, D, 1))
+    ai_e = tl.reshape(ai, (D, D, 1))
+    br_e = tl.reshape(br, (1, D, D))
+    bi_e = tl.reshape(bi, (1, D, D))
+    
+    rr = tl.sum(ar_e * br_e, axis=1)
+    ri = tl.sum(ar_e * bi_e, axis=1)
+    ir = tl.sum(ai_e * br_e, axis=1)
+    ii = tl.sum(ai_e * bi_e, axis=1)
+    
+    return rr - ii, ri + ir
+
+@triton.jit
 def combine_diag(alr, ali, xlr, xli, arr, ari, xrr, xri):
     rar = arr * alr - ari * ali
     rai = arr * ali + ari * alr
@@ -12,12 +26,13 @@ def combine_diag(alr, ali, xlr, xli, arr, ari, xrr, xri):
     return rar, rai, rxr, rxi
 
 @triton.jit
-def combine_mat(alr, ali, xlr, xli, arr, ari, xrr, xri):
-    rar = tl.dot(arr, alr) - tl.dot(ari, ali)
-    rai = tl.dot(arr, ali) + tl.dot(ari, alr)
-    rxr = tl.dot(arr, xlr) - tl.dot(ari, xli) + xrr
-    rxi = tl.dot(arr, xli) + tl.dot(ari, xlr) + xri
-    return rar, rai, rxr, rxi
+def combine_mat(alr, ali, xlr, xli, arr, ari, xrr, xri, D: tl.constexpr):
+    rar, rai = matmul_complex_manual(arr, ari, alr, ali, D)
+    rxr_m, rxi_m = matmul_complex_manual(arr, ari, xlr, xli, D)
+    rxr = rxr_m + xrr
+    rxi = rxi_m + xri
+    return tl.reshape(rar, (D * D,)), tl.reshape(rai, (D * D,)), \
+           tl.reshape(rxr, (D * D,)), tl.reshape(rxi, (D * D,))
 
 @triton.autotune(
     configs=[triton.Config({}, num_warps=4), triton.Config({}, num_warps=8)],
@@ -32,13 +47,17 @@ def pscan_diag_kernel(
     pid = tl.program_id(axis=0)
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < L
+    
     a_base = A_ptr + pid * stride_b + offs * stride_t
     x_base = X_ptr + pid * stride_b + offs * stride_t
+    
     ar = tl.load(a_base, mask=mask, other=0.0)
     ai = tl.load(a_base + 1, mask=mask, other=0.0)
     xr = tl.load(x_base, mask=mask, other=0.0)
     xi = tl.load(x_base + 1, mask=mask, other=0.0)
+    
     _, _, yr, yi = tl.associative_scan((ar, ai, xr, xi), axis=0, combine_fn=combine_diag)
+    
     y_base = Y_ptr + pid * stride_b + offs * stride_t
     tl.store(y_base, yr, mask=mask)
     tl.store(y_base + 1, yi, mask=mask)
@@ -56,24 +75,38 @@ def pscan_mat_kernel(
 ):
     pid = tl.program_id(axis=0)
     offs_t = tl.arange(0, BLOCK_SIZE)
-    offs_r = tl.arange(0, D)
-    offs_c = tl.arange(0, D)
+    offs_d2 = tl.arange(0, D * D)
     mask_t = offs_t < L
+    
     t_idx = tl.where(REVERSE, L - 1 - offs_t, offs_t)
-    a_ptrs = A_ptr + pid * stride_ba + t_idx[:, None, None] * stride_ta + \
-             offs_r[None, :, None] * stride_ra + offs_c[None, None, :] * stride_ca
-    ar = tl.load(a_ptrs, mask=mask_t[:, None, None], other=0.0)
-    ai = tl.load(a_ptrs + 1, mask=mask_t[:, None, None], other=0.0)
-    x_ptrs = X_ptr + pid * stride_bx + t_idx[:, None, None] * stride_tx + \
-             offs_r[None, :, None] * stride_dx
-    xr_vec = tl.load(x_ptrs, mask=mask_t[:, None, None], other=0.0)
-    xi_vec = tl.load(x_ptrs + 1, mask=mask_t[:, None, None], other=0.0)
-    xr = tl.where(offs_c[None, None, :] == 0, xr_vec, 0.0)
-    xi = tl.where(offs_c[None, None, :] == 0, xi_vec, 0.0)
-    _, _, yr_mat, yi_mat = tl.associative_scan((ar, ai, xr, xi), axis=0, combine_fn=combine_mat)
-    y_ptrs = Y_ptr + pid * stride_bx + t_idx[:, None] * stride_tx + offs_r[None, :] * stride_dx
-    tl.store(y_ptrs, yr_mat[:, :, 0], mask=mask_t[:, None])
-    tl.store(y_ptrs + 1, yi_mat[:, :, 0], mask=mask_t[:, None])
+    
+    a_base = A_ptr + pid * stride_ba + t_idx[:, None] * stride_ta + offs_d2[None, :] * 2
+    x_base = X_ptr + pid * stride_bx + t_idx[:, None] * stride_tx + tl.arange(0, D)[None, :] * stride_dx
+    
+    ar_f = tl.load(a_base, mask=mask_t[:, None], other=0.0)
+    ai_f = tl.load(a_base + 1, mask=mask_t[:, None], other=0.0)
+    
+    xr_v = tl.load(x_base, mask=mask_t[:, None], other=0.0)
+    xi_v = tl.load(x_base + 1, mask=mask_t[:, None], other=0.0)
+    
+    xr_mat = tl.reshape(xr_v, (BLOCK_SIZE, D, 1))
+    xi_mat = tl.reshape(xi_v, (BLOCK_SIZE, D, 1))
+    
+    offs_c = tl.arange(0, D)
+    xr_f = tl.reshape(tl.where(offs_c[None, None, :] == 0, xr_mat, 0.0), (BLOCK_SIZE, D * D))
+    xi_f = tl.reshape(tl.where(offs_c[None, None, :] == 0, xi_mat, 0.0), (BLOCK_SIZE, D * D))
+
+    def combine_fn(alr, ali, xlr, xli, arr, ari, xrr, xri):
+        return combine_mat(alr, ali, xlr, xli, arr, ari, xrr, xri, D)
+
+    _, _, yr_f, yi_f = tl.associative_scan((ar_f, ai_f, xr_f, xi_f), axis=0, combine_fn=combine_fn)
+    
+    y_out_base = Y_ptr + pid * stride_bx + t_idx[:, None] * stride_tx + tl.arange(0, D)[None, :] * stride_dx
+    yr_mat = tl.reshape(yr_f, (BLOCK_SIZE, D, D))
+    yi_mat = tl.reshape(yi_f, (BLOCK_SIZE, D, D))
+    
+    tl.store(y_out_base, yr_mat[:, :, 0], mask=mask_t[:, None])
+    tl.store(y_out_base + 1, yi_mat[:, :, 0], mask=mask_t[:, None])
 
 def next_power_of_2(n):
     return 1 << (n - 1).bit_length()
@@ -85,6 +118,7 @@ class _PScanFunction(torch.autograd.Function):
         ctx.is_mat = is_mat
         B, L, D = X.shape
         ctx.save_for_backward(A, X)
+        
         if is_mat:
             Ar, Xr = torch.view_as_real(A.contiguous()), torch.view_as_real(X.contiguous())
             Y = torch.empty_like(Xr)
@@ -109,10 +143,10 @@ class _PScanFunction(torch.autograd.Function):
         is_mat = ctx.is_mat
         B, L, D = X.shape
         g = grad_output.contiguous()
+        
         if is_mat:
             Ah = A.conj().transpose(-1, -2)
-            Ar = torch.empty_like(Ah)
-            Ar[:, 0] = 0.0
+            Ar = torch.zeros_like(Ah)
             if L > 1: Ar[:, 1:] = Ah[:, 1:]
             Ar_r, Gr_r = torch.view_as_real(Ar.contiguous()), torch.view_as_real(g.contiguous())
             Y_rev = torch.empty_like(Gr_r)
@@ -125,8 +159,7 @@ class _PScanFunction(torch.autograd.Function):
             return dA, dX
         else:
             Ac = A.conj()
-            Ar = torch.empty_like(Ac)
-            Ar[:, 0] = 0.0
+            Ar = torch.zeros_like(Ac)
             if L > 1: Ar[:, 1:] = Ac[:, 1:]
             Af = torch.view_as_real(Ar.transpose(1, 2).reshape(-1, L).contiguous())
             Gf = torch.view_as_real(g.transpose(1, 2).reshape(-1, L).contiguous())
