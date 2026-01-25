@@ -8,14 +8,6 @@ def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def get_autotune_configs():
-    return [
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ]
-
-
 @triton.jit
 def complex_mul(ar, ai, br, bi):
     return ar * br - ai * bi, ar * bi + ai * br
@@ -83,7 +75,14 @@ def mat2x2_scan_combine(
     )
 
 
-@triton.autotune(configs=get_autotune_configs(), key=["L"])
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=["L"],
+)
 @triton.jit
 def diag_pscan_kernel(
     A_ptr,
@@ -122,7 +121,14 @@ def diag_pscan_kernel(
     tl.store(Y_base + read_offs * stride_time + 1, acc_xi, mask=mask)
 
 
-@triton.autotune(configs=get_autotune_configs(), key=["L"])
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=["L"],
+)
 @triton.jit
 def mat2x2_pscan_kernel(
     A_ptr,
@@ -236,154 +242,162 @@ def run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     return Y_real
 
 
-def complex_to_real(z):
-    return torch.stack([z.real, z.imag], dim=-1)
-
-
-def real_to_complex(r):
-    return torch.complex(r[..., 0], r[..., 1])
+def expand_diag_to_matrix(A_diag, D):
+    B, L, C, _ = A_diag.shape
+    A_mat = torch.zeros(B, L, C, D, D, dtype=A_diag.dtype, device=A_diag.device)
+    idx = torch.arange(D, device=A_diag.device)
+    A_mat[..., idx, idx] = A_diag
+    return A_mat
 
 
 class _PScanDiagFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
-        A_orig_shape = A.shape
-        X_orig_shape = X.shape
+        B, L, C, D, _ = X.shape
+        ctx.shape_A_orig = A.shape
+        ctx.shape_X_orig = X.shape
 
-        is_diag_a = A.ndim == X.ndim - 1
+        is_diag = (A.ndim == 4)
+        ctx.is_diag = is_diag
 
-        if is_diag_a:
-            D = A.shape[-1]
-            A_expanded = torch.zeros(
-                *A.shape, D, dtype=A.dtype, device=A.device
-            )
-            idx = torch.arange(D, device=A.device)
-            A_expanded[..., idx, idx] = A
-            A_mat = A_expanded
+        if is_diag:
+            A_mat = expand_diag_to_matrix(A, D)
         else:
             A_mat = A
 
-        B_flat = A_mat.shape[0] * A_mat.shape[2]
-        L = A_mat.shape[1]
+        A_work = A_mat.contiguous()
+        X_work = X.contiguous()
 
-        A_real = complex_to_real(
-            A_mat.permute(0, 2, 1, 3, 4).reshape(B_flat, L, 2, 2)
-        ).contiguous()
-        X_real = complex_to_real(
-            X.permute(0, 2, 1, 3, 4).reshape(B_flat, L, 2, 2)
-        ).contiguous()
+        A_perm = A_work.permute(0, 2, 1, 3, 4).contiguous()
+        X_perm = X_work.permute(0, 2, 1, 3, 4).contiguous()
+
+        A_flat = A_perm.reshape(B * C, L, D, D)
+        X_flat = X_perm.reshape(B * C, L, D, D)
+
+        A_real = torch.view_as_real(A_flat).contiguous()
+        X_real = torch.view_as_real(X_flat).contiguous()
 
         Y_real = run_mat2x2_pscan(A_real, X_real, L, reverse=False)
 
-        Y = real_to_complex(Y_real).reshape(
-            X.shape[0], X.shape[2], L, 2, 2
-        ).permute(0, 2, 1, 3, 4)
+        Y_flat = torch.view_as_complex(Y_real)
+        Y_perm = Y_flat.reshape(B, C, L, D, D)
+        Y = Y_perm.permute(0, 2, 1, 3, 4).contiguous()
 
         ctx.save_for_backward(A_mat, Y)
-        ctx.is_diag_a = is_diag_a
-        ctx.A_orig_shape = A_orig_shape
 
-        return Y.contiguous()
+        return Y
 
     @staticmethod
     def backward(ctx, grad_Y):
         A_mat, Y = ctx.saved_tensors
-        is_diag_a = ctx.is_diag_a
-        A_orig_shape = ctx.A_orig_shape
+        is_diag = ctx.is_diag
 
         B, L, C, D, _ = grad_Y.shape
 
-        Y_shifted = torch.zeros_like(Y)
-        Y_shifted[:, 1:] = Y[:, :-1]
-
-        grad_A_mat = torch.einsum("blcij,blckj->blcik", grad_Y, Y_shifted.conj())
-
         A_conj = A_mat.conj()
-        B_flat = B * C
-        L = grad_Y.shape[1]
 
-        grad_Y_real = complex_to_real(
-            grad_Y.permute(0, 2, 1, 3, 4).reshape(B_flat, L, 2, 2)
-        ).contiguous()
-        A_conj_real = complex_to_real(
-            A_conj.permute(0, 2, 1, 3, 4).reshape(B_flat, L, 2, 2)
-        ).contiguous()
+        grad_Y_perm = grad_Y.permute(0, 2, 1, 3, 4).contiguous()
+        A_conj_perm = A_conj.permute(0, 2, 1, 3, 4).contiguous()
 
-        grad_X_real = run_mat2x2_pscan(A_conj_real, grad_Y_real, L, reverse=True)
+        grad_Y_flat = grad_Y_perm.reshape(B * C, L, D, D)
+        A_conj_flat = A_conj_perm.reshape(B * C, L, D, D)
 
-        grad_X = real_to_complex(grad_X_real).reshape(B, C, L, 2, 2).permute(0, 2, 1, 3, 4)
+        grad_Y_real = torch.view_as_real(grad_Y_flat).contiguous()
+        A_conj_real = torch.view_as_real(A_conj_flat).contiguous()
 
-        if is_diag_a:
-            idx = torch.arange(D, device=grad_A_mat.device)
-            grad_A = grad_A_mat[..., idx, idx]
+        dX_real = run_mat2x2_pscan(A_conj_real, grad_Y_real, L, reverse=True)
+
+        dX_flat = torch.view_as_complex(dX_real)
+        dX_perm = dX_flat.reshape(B, C, L, D, D)
+        dX = dX_perm.permute(0, 2, 1, 3, 4).contiguous()
+
+        Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
+        dA_full = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
+
+        if is_diag:
+            dA = dA_full.diagonal(dim1=-2, dim2=-1)
         else:
-            grad_A = grad_A_mat
+            dA = dA_full
 
-        return grad_A.contiguous(), grad_X.contiguous()
+        return dA, dX
 
 
 class _PScanMatFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
-        B, L, C, D1, D2 = A.shape
-        B_flat = B * C
+        B, L, C, D1, D2 = X.shape
+        ctx.shape_A_orig = A.shape
+        ctx.shape_X_orig = X.shape
 
-        A_real = complex_to_real(
-            A.permute(0, 2, 1, 3, 4).reshape(B_flat, L, D1, D2)
-        ).contiguous()
-        X_real = complex_to_real(
-            X.permute(0, 2, 1, 3, 4).reshape(B_flat, L, D1, D2)
-        ).contiguous()
+        is_diag = (A.ndim == 4)
+        ctx.is_diag = is_diag
+
+        if is_diag:
+            A_mat = expand_diag_to_matrix(A, D1)
+        else:
+            A_mat = A
+
+        A_work = A_mat.contiguous()
+        X_work = X.contiguous()
+
+        A_perm = A_work.permute(0, 2, 1, 3, 4).contiguous()
+        X_perm = X_work.permute(0, 2, 1, 3, 4).contiguous()
+
+        A_flat = A_perm.reshape(B * C, L, D1, D2)
+        X_flat = X_perm.reshape(B * C, L, D1, D2)
+
+        A_real = torch.view_as_real(A_flat).contiguous()
+        X_real = torch.view_as_real(X_flat).contiguous()
 
         Y_real = run_mat2x2_pscan(A_real, X_real, L, reverse=False)
 
-        Y = real_to_complex(Y_real).reshape(B, C, L, D1, D2).permute(0, 2, 1, 3, 4)
+        Y_flat = torch.view_as_complex(Y_real)
+        Y_perm = Y_flat.reshape(B, C, L, D1, D2)
+        Y = Y_perm.permute(0, 2, 1, 3, 4).contiguous()
 
-        ctx.save_for_backward(A, Y)
+        ctx.save_for_backward(A_mat, Y)
 
-        return Y.contiguous()
+        return Y
 
     @staticmethod
     def backward(ctx, grad_Y):
-        A, Y = ctx.saved_tensors
+        A_mat, Y = ctx.saved_tensors
+        is_diag = ctx.is_diag
+
         B, L, C, D1, D2 = grad_Y.shape
 
-        Y_shifted = torch.zeros_like(Y)
-        Y_shifted[:, 1:] = Y[:, :-1]
+        A_conj = A_mat.conj()
 
-        grad_A = torch.einsum("blcij,blckj->blcik", grad_Y, Y_shifted.conj())
+        grad_Y_perm = grad_Y.permute(0, 2, 1, 3, 4).contiguous()
+        A_conj_perm = A_conj.permute(0, 2, 1, 3, 4).contiguous()
 
-        A_conj = A.conj()
-        B_flat = B * C
+        grad_Y_flat = grad_Y_perm.reshape(B * C, L, D1, D2)
+        A_conj_flat = A_conj_perm.reshape(B * C, L, D1, D2)
 
-        grad_Y_real = complex_to_real(
-            grad_Y.permute(0, 2, 1, 3, 4).reshape(B_flat, L, D1, D2)
-        ).contiguous()
-        A_conj_real = complex_to_real(
-            A_conj.permute(0, 2, 1, 3, 4).reshape(B_flat, L, D1, D2)
-        ).contiguous()
+        grad_Y_real = torch.view_as_real(grad_Y_flat).contiguous()
+        A_conj_real = torch.view_as_real(A_conj_flat).contiguous()
 
-        grad_X_real = run_mat2x2_pscan(A_conj_real, grad_Y_real, L, reverse=True)
+        dX_real = run_mat2x2_pscan(A_conj_real, grad_Y_real, L, reverse=True)
 
-        grad_X = real_to_complex(grad_X_real).reshape(B, C, L, D1, D2).permute(0, 2, 1, 3, 4)
+        dX_flat = torch.view_as_complex(dX_real)
+        dX_perm = dX_flat.reshape(B, C, L, D1, D2)
+        dX = dX_perm.permute(0, 2, 1, 3, 4).contiguous()
 
-        return grad_A.contiguous(), grad_X.contiguous()
+        Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
+        dA_full = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
+
+        if is_diag:
+            dA = dA_full.diagonal(dim1=-2, dim2=-1)
+        else:
+            dA = dA_full
+
+        return dA, dX
 
 
 def pscan(A, X, mode="auto"):
-    is_diag = A.ndim == X.ndim - 1
+    is_diag = (A.ndim == X.ndim - 1)
 
     if mode == "diag" or (mode == "auto" and is_diag):
         return _PScanDiagFunction.apply(A, X)
     else:
         return _PScanMatFunction.apply(A, X)
-
-
-class PScanTriton(nn.Module):
-    def __init__(self, mode="auto"):
-        super().__init__()
-        self.mode = mode
-
-    def forward(self, A, X):
-        return pscan(A, X, mode=self.mode)
-    
