@@ -72,7 +72,6 @@ def pscan_diag_kernel(
     
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < L
-    
     off_time = offs * stride_time
     
     ar = tl.load(A_base + off_time, mask=mask, other=0.0)
@@ -157,7 +156,10 @@ class _PScanFunction(torch.autograd.Function):
             if A.shape != X.shape:
                 A, X = torch.broadcast_tensors(A, X)
             
+            A = A.contiguous()
+            X = X.contiguous()
             B, L, D = A.shape
+            
             A_flat = A.transpose(1, 2).reshape(-1, L).contiguous()
             X_flat = X.transpose(1, 2).reshape(-1, L).contiguous()
             
@@ -187,9 +189,10 @@ class _PScanFunction(torch.autograd.Function):
         
         if is_matrix:
             B, L, D, _ = A.shape
-            A_conj = A.conj().permute(0, 1, 3, 2)
-            A_rev = torch.cat([torch.zeros_like(A_conj[:, 0:1]), A_conj[:, :-1]], dim=1)
-            A_rev = torch.flip(A_rev, [1]).contiguous()
+            A_H = A.conj().permute(0, 1, 3, 2)
+            A_shifted = A_H[:, 1:]
+            A_rev_part = torch.flip(A_shifted, [1])
+            A_rev = torch.cat([torch.zeros_like(A_H[:, 0:1]), A_rev_part], dim=1).contiguous()
             X_rev = torch.flip(grad_output, [1]).contiguous()
             
             A_real = torch.view_as_real(A_rev)
@@ -207,8 +210,10 @@ class _PScanFunction(torch.autograd.Function):
             )
             
             dX = torch.flip(torch.view_as_complex(dX_rev_real), [1])
+            
             Y_shift = torch.cat([torch.zeros_like(Y[:, 0:1]), Y[:, :-1]], dim=1)
             dA = dX.unsqueeze(-1) @ Y_shift.conj().unsqueeze(-2)
+            
             return dA, dX
             
         else:
@@ -218,10 +223,13 @@ class _PScanFunction(torch.autograd.Function):
                 A, _ = torch.broadcast_tensors(A, grad_output)
 
             B, L, D = A.shape
-            A_conj = A.conj()
-            A_rev = torch.cat([torch.zeros_like(A_conj[:, 0:1]), A_conj[:, :-1]], dim=1)
             
-            A_rev_flat = torch.flip(A_rev, [1]).transpose(1, 2).reshape(-1, L).contiguous()
+            A_conj = A.conj()
+            A_shifted = A_conj[:, 1:]
+            A_rev_part = torch.flip(A_shifted, [1])
+            A_rev = torch.cat([torch.zeros_like(A_conj[:, 0:1]), A_rev_part], dim=1).contiguous()
+            
+            A_rev_flat = A_rev.transpose(1, 2).reshape(-1, L).contiguous()
             X_rev_flat = torch.flip(grad_output, [1]).transpose(1, 2).reshape(-1, L).contiguous()
             
             A_real = torch.view_as_real(A_rev_flat)
