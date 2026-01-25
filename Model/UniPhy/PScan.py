@@ -1,213 +1,304 @@
 import torch
-import torch.nn as nn
 import triton
 import triton.language as tl
 
-@triton.jit
-def complex_mul(ar, ai, br, bi):
-    return ar * br - ai * bi, ar * bi + ai * br
-
-@triton.jit
-def complex_combine(ar, ai, xr, xi, br, bi, yr, yi):
-    new_ar, new_ai = complex_mul(br, bi, ar, ai)
-    bx_r, bx_i = complex_mul(br, bi, xr, xi)
-    new_xr = bx_r + yr
-    new_xi = bx_i + yi
-    return new_ar, new_ai, new_xr, new_xi
-
-@triton.jit
-def matrix_combine(a, x, b, y):
-    new_a = tl.sum(b[:, :, None] * a[None, :, :], axis=1)
-    new_x = tl.sum(b[:, :] * x[None, :], axis=1) + y
-    return new_a, new_x
-
-def get_configs():
+def get_autotune_configs():
     return [
+        triton.Config({}, num_warps=2),
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ]
 
-@triton.autotune(configs=get_configs(), key=["L"])
 @triton.jit
-def pscan_complex_kernel(
+def matmul_r(a, b, R: tl.constexpr):
+    acc = tl.zeros((R, R), dtype=tl.float32)
+    for k in range(R):
+        acc += a[:, k, None] * b[None, k, :]
+    return acc
+
+@triton.jit
+def matmul_rx(a, x, R: tl.constexpr):
+    acc = tl.zeros((R, R), dtype=tl.float32)
+    for k in range(R):
+        acc += a[:, k, None] * x[None, k, :]
+    return acc
+
+@triton.jit
+def diag_mul_rx(a, x, R: tl.constexpr):
+    return a[:, None] * x
+
+@triton.jit
+def combine_matrix(a_curr, x_curr, a_prev, x_prev, R: tl.constexpr):
+    a_new = matmul_r(a_curr, a_prev, R)
+    x_tmp = matmul_rx(a_curr, x_prev, R)
+    x_new = x_tmp + x_curr
+    return a_new, x_new
+
+@triton.jit
+def combine_diag(a_curr, x_curr, a_prev, x_prev, R: tl.constexpr):
+    a_new = a_curr * a_prev
+    x_tmp = diag_mul_rx(a_curr, x_prev, R)
+    x_new = x_tmp + x_curr
+    return a_new, x_new
+
+@triton.autotune(configs=get_autotune_configs(), key=["L", "R"])
+@triton.jit
+def pscan_fwd_kernel(
     A_ptr, X_ptr, Y_ptr,
     stride_batch, stride_time,
-    L,
+    L, R: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    REVERSE: tl.constexpr,
+    A_IS_DIAG: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < L
+
     A_base = A_ptr + pid * stride_batch
     X_base = X_ptr + pid * stride_batch
     Y_base = Y_ptr + pid * stride_batch
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < L
-    read_offs = tl.where(REVERSE, (L - 1 - offs), offs)
-    a_r = tl.load(A_base + read_offs * stride_time + 0, mask=mask, other=1.0)
-    a_i = tl.load(A_base + read_offs * stride_time + 1, mask=mask, other=0.0)
-    x_r = tl.load(X_base + read_offs * stride_time + 0, mask=mask, other=0.0)
-    x_i = tl.load(X_base + read_offs * stride_time + 1, mask=mask, other=0.0)
-    acc_ar, acc_ai, acc_xr, acc_xi = tl.associative_scan(
-        (a_r, a_i, x_r, x_i), axis=0, combine_fn=complex_combine
-    )
-    tl.store(Y_base + read_offs * stride_time + 0, acc_xr, mask=mask)
-    tl.store(Y_base + read_offs * stride_time + 1, acc_xi, mask=mask)
 
-@triton.autotune(configs=get_configs(), key=["L", "DIM"])
+    r_idx = tl.arange(0, R)
+    
+    if A_IS_DIAG:
+        a_ptrs = A_base + (offs[:, None] * stride_time) + r_idx[None, :]
+        a_vals = tl.load(a_ptrs, mask=mask[:, None], other=1.0)
+    else:
+        r_row = r_idx[:, None]
+        r_col = r_idx[None, :]
+        a_ptrs = A_base + (offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
+        a_vals = tl.load(a_ptrs, mask=mask[:, None, None], other=0.0)
+        # Identity for padding
+        eye = tl.zeros((R, R), dtype=tl.float32)
+        for i in range(R): eye[i, i] = 1.0
+        a_vals = tl.where(mask[:, None, None], a_vals, eye[None, :, :])
+
+    x_row = r_idx[:, None]
+    x_col = r_idx[None, :]
+    x_ptrs = X_base + (offs[:, None, None] * stride_time) + (x_row[None, :, :] * R + x_col[None, :, :])
+    x_vals = tl.load(x_ptrs, mask=mask[:, None, None], other=0.0)
+
+    if A_IS_DIAG:
+        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, combine_diag, R=R)
+    else:
+        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, combine_matrix, R=R)
+
+    tl.store(Y_base + (offs[:, None, None] * stride_time) + (x_row[None, :, :] * R + x_col[None, :, :]), acc_x, mask=mask[:, None, None])
+
+@triton.autotune(configs=get_autotune_configs(), key=["L", "R"])
 @triton.jit
-def pscan_matrix_kernel(
-    A_ptr, X_ptr, Y_ptr,
-    stride_batch_A, stride_time_A,
-    stride_batch_X, stride_time_X,
-    stride_batch_Y, stride_time_Y,
-    L,
-    DIM: tl.constexpr,
+def pscan_bwd_kernel(
+    A_ptr, X_grad_ptr, Y_grad_ptr, A_grad_ptr, Y_curr_ptr,
+    stride_batch, stride_time,
+    L, R: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    REVERSE: tl.constexpr,
+    A_IS_DIAG: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
-    offs_t = tl.arange(0, BLOCK_SIZE)
-    mask_t = offs_t < L
-    read_offs_t = tl.where(REVERSE, (L - 1 - offs_t), offs_t)
-    r = tl.arange(0, DIM)
-    ptr_A = A_ptr + pid * stride_batch_A + read_offs_t[:, None, None] * stride_time_A
-    offs_A = r[None, :, None] * DIM + r[None, None, :]
-    ptrs_A = ptr_A + offs_A
-    ptr_X = X_ptr + pid * stride_batch_X + read_offs_t[:, None] * stride_time_X
-    offs_X = r[None, :]
-    ptrs_X = ptr_X + offs_X
-    mask_A = mask_t[:, None, None]
-    mask_X = mask_t[:, None]
-    eye = (r[:, None] == r[None, :]).to(tl.float32)
-    a_block = tl.load(ptrs_A, mask=mask_A, other=eye)
-    x_vec = tl.load(ptrs_X, mask=mask_X, other=0.0)
-    acc_a, acc_x = tl.associative_scan(
-        (a_block, x_vec), axis=0, combine_fn=matrix_combine
-    )
-    ptr_Y = Y_ptr + pid * stride_batch_Y + read_offs_t[:, None] * stride_time_Y
-    ptrs_Y = ptr_Y + offs_X
-    tl.store(ptrs_Y, acc_x, mask=mask_X)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < L
+
+    # Pointers Setup
+    offset_base = pid * stride_batch
+    
+    # Backward Scan Logic:
+    # Reverse time scan. Inputs: X_grad (dL/dY). Multiplier: A^T (shifted by 1).
+    # We scan to get accumulated gradients dY_acc.
+    
+    # Logic: reverse offs for loading
+    read_offs = L - 1 - offs
+    read_mask = read_offs >= 0 # Should match mask
+    
+    # Load A (need A[t+1] for step t in backward recurrence)
+    # Shifted: at step t (reverse), we need A_{t+1}.
+    # A_ptr points to A_0.
+    # Load from read_offs + 1. If read_offs + 1 >= L, identity/zero.
+    
+    r_idx = tl.arange(0, R)
+    r_row = r_idx[:, None]
+    r_col = r_idx[None, :]
+    
+    a_read_offs = read_offs + 1
+    a_mask = (a_read_offs < L) & mask
+
+    if A_IS_DIAG:
+        a_ptrs = A_ptr + offset_base + (a_read_offs[:, None] * stride_time) + r_idx[None, :]
+        a_vals = tl.load(a_ptrs, mask=a_mask[:, None], other=0.0) 
+        # For backward diag, transpose is same. Just identity for boundary.
+        a_vals = tl.where(a_mask[:, None], a_vals, 1.0) # 1.0 is identity for mul
+    else:
+        # Load A and Transpose it immediately for Adjoint
+        # A stored as [L, R, R]. We want A[t+1]^T.
+        a_ptrs = A_ptr + offset_base + (a_read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
+        a_vals_orig = tl.load(a_ptrs, mask=a_mask[:, None, None], other=0.0)
+        # Transpose locally
+        a_vals = tl.trans(a_vals_orig, 1, 2) # [BLOCK, R, R] -> Transpose last two dims? No, triton trans needs perm
+        # Manual transpose in load or logic:
+        # Actually easier to just load transposed indices: load (col * R + row)
+        # But we loaded standard. Let's rebuild matrix logic.
+        # matmul_r handles [BLOCK, R, R]. We need to transpose the (R, R) part.
+        # Triton tl.trans is for 2D tensors. Here we have 3D (Block, R, R).
+        # We perform manual transpose via value swapping or just logic change? 
+        # Correct: use tl.permute? No.
+        # Let's reload with transposed indices for simplicity.
+        a_ptrs_T = A_ptr + offset_base + (a_read_offs[:, None, None] * stride_time) + (r_col[None, :, :] * R + r_row[None, :, :])
+        a_vals = tl.load(a_ptrs_T, mask=a_mask[:, None, None], other=0.0)
+        
+        eye = tl.zeros((R, R), dtype=tl.float32)
+        for i in range(R): eye[i, i] = 1.0
+        a_vals = tl.where(a_mask[:, None, None], a_vals, eye[None, :, :])
+
+    # Load X_grad (dL/dY)
+    x_g_ptrs = X_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
+    x_g_vals = tl.load(x_g_ptrs, mask=mask[:, None, None], other=0.0)
+
+    # Perform Backward Scan
+    if A_IS_DIAG:
+        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, combine_diag, R=R)
+    else:
+        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, combine_matrix, R=R)
+
+    # dY_acc is dX (dL/dX_t)
+    # Store dX
+    tl.store(X_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :]), dY_acc, mask=mask[:, None, None])
+
+    # Compute dA
+    # dA_t = dY_acc_t * Y_{t-1}^T
+    # We need Y_{t-1}. Y pointer points to Y_0.
+    # Load Y from read_offs - 1. If < 0, Zero.
+    
+    y_read_offs = read_offs - 1
+    y_mask = (y_read_offs >= 0) & mask
+    
+    y_ptrs = Y_curr_ptr + offset_base + (y_read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
+    y_vals = tl.load(y_ptrs, mask=y_mask[:, None, None], other=0.0)
+
+    # dA calculation
+    # For Diag: dA = dY * Y_prev (Elementwise sum over last dim? No, Diag A implies elementwise mul).
+    # dL/dA_diag_t = dY_t * Y_{t-1}.
+    if A_IS_DIAG:
+        # dY_acc: [Block, R, R], Y_vals: [Block, R, R]
+        # But A is [Block, R]. We need to sum over the second R dimension?
+        # A_diag acts on X columns.
+        # Y_t = A_t * Y_{t-1} + X. Here * is broadcasting (R,1) * (R,R).
+        # dA_t = sum(dY_t * Y_{t-1}, axis=-1).
+        da_val = tl.sum(dY_acc * y_vals, axis=2) # [Block, R]
+        
+        # Store dA
+        da_ptrs = A_grad_ptr + offset_base + (read_offs[:, None] * stride_time) + r_idx[None, :]
+        tl.store(da_ptrs, da_val, mask=mask[:, None])
+    else:
+        # Matrix Case: dA_t = dY_t @ Y_{t-1}^T
+        # dY_acc: [Block, R, R]
+        # Y_vals: [Block, R, R]
+        # Result: [Block, R, R]
+        # Manual MatMul again: C = A @ B^T
+        # B^T indices: swap row/col
+        
+        da_mat = tl.zeros((R, R), dtype=tl.float32)
+        # Loop over K (inner dim)
+        for k in range(R):
+            # dY [i, k] * Y [j, k] (since Y is transposed)
+            da_mat += dY_acc[:, :, k, None] * y_vals[:, None, k, :]
+            
+        da_ptrs = A_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
+        tl.store(da_ptrs, da_mat, mask=mask[:, None, None])
 
 def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
-class _PScanFunction(torch.autograd.Function):
+class PScanTritonFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
-        is_matrix = (A.ndim == X.ndim + 1) and (A.shape[-1] == A.shape[-2])
-        ctx.is_matrix = is_matrix
-        ctx.shape_A_orig = A.shape
-        ctx.shape_X_orig = X.shape
-        if not is_matrix:
-            if A.ndim == X.ndim - 1:
-                A = A.unsqueeze(-1)
-            if A.shape != X.shape:
-                A, X = torch.broadcast_tensors(A, X)
-            L = X.shape[1]
-            A_inp = A.transpose(1, 2).contiguous()
-            X_inp = X.transpose(1, 2).contiguous()
-            batch_dims = A_inp.shape[0] * A_inp.shape[1]
-            A_flat = A_inp.view(batch_dims, L, 2)
-            X_flat = X_inp.view(batch_dims, L, 2)
-            Y_flat = torch.empty_like(X_flat)
-            BLOCK_SIZE = max(32, next_power_of_2(L))
-            pscan_complex_kernel[(batch_dims,)](
-                A_flat, X_flat, Y_flat,
-                A_flat.stride(0), A_flat.stride(1),
-                L, BLOCK_SIZE, False
-            )
-            Y = Y_flat.view(*A_inp.shape).transpose(1, 2).contiguous()
-            ctx.save_for_backward(A, Y)
-            return Y
+        # A: (B, L, C, R) [Diag] or (B, L, C, R, R) [Matrix]
+        # X: (B, L, C, R, R)
+        ctx.save_for_backward(A, X)
+        
+        B, L, C, R1 = A.shape[:4]
+        is_diag = (A.ndim == 4)
+        
+        if is_diag:
+            R = R1
+            # Flatten to (N, L, R)
+            A_in = A.permute(0, 2, 1, 3).reshape(B*C, L, R).contiguous()
         else:
-            L = X.shape[1]
-            D = X.shape[-1]
-            A_inp = A.transpose(1, 2).contiguous()
-            X_inp = X.transpose(1, 2).contiguous()
-            batch_dim = A_inp.shape[0] * A_inp.shape[1]
-            A_flat = A_inp.view(batch_dim, L, D, D)
-            X_flat = X_inp.view(batch_dim, L, D)
-            Y_flat = torch.empty_like(X_flat)
-            BLOCK_SIZE = max(32, next_power_of_2(L))
-            pscan_matrix_kernel[(batch_dim,)](
-                A_flat, X_flat, Y_flat,
-                A_flat.stride(0), A_flat.stride(1),
-                X_flat.stride(0), X_flat.stride(1),
-                Y_flat.stride(0), Y_flat.stride(1),
-                L, D, BLOCK_SIZE, False
-            )
-            Y = Y_flat.view(*X_inp.shape).transpose(1, 2).contiguous()
-            ctx.save_for_backward(A, Y)
-            return Y
+            R = R1
+            R2 = A.shape[4]
+            assert R == R2, "A must be square matrix"
+            A_in = A.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
+
+        X_in = X.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
+        Y = torch.empty_like(X_in)
+        
+        BLOCK_SIZE = next_power_of_2(L)
+        # Hardware limits check
+        if BLOCK_SIZE < 16: BLOCK_SIZE = 16
+        
+        # Grid: (Batch * Channel)
+        grid = (B * C, )
+        
+        pscan_fwd_kernel[grid](
+            A_in, X_in, Y,
+            A_in.stride(0), A_in.stride(1),
+            L, R, BLOCK_SIZE,
+            is_diag
+        )
+        
+        # Reshape Y back
+        Y_out = Y.view(B, C, L, R, R).permute(0, 2, 1, 3, 4)
+        ctx.y_out = Y_out 
+        ctx.is_diag = is_diag
+        
+        return Y_out
 
     @staticmethod
     def backward(ctx, grad_output):
-        A, Y = ctx.saved_tensors
-        is_matrix = ctx.is_matrix
-        L = A.shape[1]
-        if not is_matrix:
-            A_conj = A.clone()
-            A_conj[..., 1] = -A_conj[..., 1]
-            A_prep = torch.cat([A_conj[:, 1:], torch.zeros_like(A_conj[:, 0:1])], dim=1)
-            grad_output = grad_output.contiguous()
-            A_inp = A_prep.transpose(1, 2).contiguous()
-            X_inp = grad_output.transpose(1, 2).contiguous()
-            batch_dims = A_inp.shape[0] * A_inp.shape[1]
-            A_flat = A_inp.view(batch_dims, L, 2)
-            X_flat = X_inp.view(batch_dims, L, 2)
-            dX_flat = torch.empty_like(X_flat)
-            BLOCK_SIZE = max(32, next_power_of_2(L))
-            pscan_complex_kernel[(batch_dims,)](
-                A_flat, X_flat, dX_flat,
-                A_flat.stride(0), A_flat.stride(1),
-                L, BLOCK_SIZE, True
-            )
-            dX = dX_flat.view(*X_inp.shape).transpose(1, 2).contiguous()
-            Y_prev = torch.cat([torch.zeros_like(Y[:, 0:1]), Y[:, :-1]], dim=1)
-            Y_prev_conj = Y_prev.clone()
-            Y_prev_conj[..., 1] = -Y_prev_conj[..., 1]
-            dx_r, dx_i = dX[..., 0], dX[..., 1]
-            yp_r, yp_i = Y_prev_conj[..., 0], Y_prev_conj[..., 1]
-            da_r = dx_r * yp_r - dx_i * yp_i
-            da_i = dx_r * yp_i + dx_i * yp_r
-            dA = torch.stack([da_r, da_i], dim=-1)
-            if dA.shape != ctx.shape_A_orig:
-                for i, dim in enumerate(ctx.shape_A_orig):
-                    if dim == 1: dA = dA.sum(dim=i, keepdim=True)
-            if dX.shape != ctx.shape_X_orig:
-                for i, dim in enumerate(ctx.shape_X_orig):
-                    if dim == 1: dX = dX.sum(dim=i, keepdim=True)
-            return dA, dX
+        A, X = ctx.saved_tensors
+        Y = ctx.y_out
+        is_diag = ctx.is_diag
+        
+        B, L, C, R = X.shape[0], X.shape[1], X.shape[2], X.shape[3]
+        
+        # Prepare inputs for backward kernel
+        # X_grad corresponds to incoming grad_output (dL/dY)
+        X_grad = grad_output.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
+        
+        # A input (Original A)
+        if is_diag:
+            A_in = A.permute(0, 2, 1, 3).reshape(B*C, L, R).contiguous()
+            A_grad = torch.empty_like(A_in)
         else:
-            D = A.shape[-1]
-            A_shift = torch.cat([A[:, 1:], torch.zeros_like(A[:, 0:1])], dim=1)
-            A_prep = A_shift.transpose(-1, -2)
-            A_inp = A_prep.transpose(1, 2).contiguous()
-            G_inp = grad_output.transpose(1, 2).contiguous()
-            batch_dim = A_inp.shape[0] * A_inp.shape[1]
-            A_flat = A_inp.view(batch_dim, L, D, D)
-            G_flat = G_inp.view(batch_dim, L, D)
-            dX_flat = torch.empty_like(G_flat)
-            BLOCK_SIZE = max(32, next_power_of_2(L))
-            pscan_matrix_kernel[(batch_dim,)](
-                A_flat, G_flat, dX_flat,
-                A_flat.stride(0), A_flat.stride(1),
-                G_flat.stride(0), G_flat.stride(1),
-                dX_flat.stride(0), dX_flat.stride(1),
-                L, D, BLOCK_SIZE, True
-            )
-            dX = dX_flat.view(*G_inp.shape).transpose(1, 2).contiguous()
-            Y_prev = torch.cat([torch.zeros_like(Y[:, 0:1]), Y[:, :-1]], dim=1)
-            dA = torch.matmul(dX.unsqueeze(-1), Y_prev.unsqueeze(-2))
-            if dA.shape != ctx.shape_A_orig:
-                for i, dim in enumerate(ctx.shape_A_orig):
-                    if dim == 1: dA = dA.sum(dim=i, keepdim=True)
-            if dX.shape != ctx.shape_X_orig:
-                for i, dim in enumerate(ctx.shape_X_orig):
-                    if dim == 1: dX = dX.sum(dim=i, keepdim=True)
-            return dA, dX
+            A_in = A.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
+            A_grad = torch.empty_like(A_in)
+            
+        Y_curr = Y.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
+        
+        BLOCK_SIZE = next_power_of_2(L)
+        if BLOCK_SIZE < 16: BLOCK_SIZE = 16
+        grid = (B * C, )
+        
+        # In-place update X_grad to be dX
+        # A_grad will be computed
+        pscan_bwd_kernel[grid](
+            A_in, X_grad, None, A_grad, Y_curr,
+            A_in.stride(0), A_in.stride(1),
+            L, R, BLOCK_SIZE,
+            is_diag
+        )
+        
+        # Reshape Grads
+        dX = X_grad.view(B, C, L, R, R).permute(0, 2, 1, 3, 4)
+        if is_diag:
+            dA = A_grad.view(B, C, L, R).permute(0, 2, 1, 3)
+        else:
+            dA = A_grad.view(B, C, L, R, R).permute(0, 2, 1, 3, 4)
+            
+        return dA, dX
 
-class PScanTriton(nn.Module):
+class PScan(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        
     def forward(self, A, X):
-        return _PScanFunction.apply(A, X)
+        return PScanTritonFunction.apply(A, X)
     

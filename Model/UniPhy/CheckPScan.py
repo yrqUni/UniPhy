@@ -1,116 +1,103 @@
 import torch
-from PScan import PScanTriton
+from PScan import PScan
 
-def manual_scan_diagonal(A, X):
-    A_c = torch.view_as_complex(A)
-    X_c = torch.view_as_complex(X)
-    B, L, C = A_c.shape
-    H = torch.zeros(B, C, device=A.device, dtype=A_c.dtype)
-    Y = []
+def sequential_scan(A, X):
+    # A: (B, L, C, R) or (B, L, C, R, R)
+    # X: (B, L, C, R, R)
+    # Returns Y: (B, L, C, R, R)
+    
+    B, L, C, R, _ = X.shape
+    Y = torch.zeros_like(X)
+    h = torch.zeros((B, C, R, R), device=X.device, dtype=X.dtype)
+    
+    is_diag = (A.ndim == 4)
+    
     for t in range(L):
-        At = A_c[:, t, :]
-        Xt = X_c[:, t, :]
-        H = At * H + Xt
-        Y.append(H)
-    Y_stack = torch.stack(Y, dim=1)
-    return torch.view_as_real(Y_stack)
+        x_t = X[:, t] # (B, C, R, R)
+        if is_diag:
+            # A_t: (B, C, R)
+            a_t = A[:, t]
+            # Diagonal Mul: a_t broadcast to (B, C, R, 1) * h (B, C, R, R)
+            h = a_t.unsqueeze(-1) * h + x_t
+        else:
+            # A_t: (B, C, R, R)
+            a_t = A[:, t]
+            # Matrix Mul: (B, C, R, R) @ (B, C, R, R)
+            h = torch.matmul(a_t, h) + x_t
+        Y[:, t] = h
+        
+    return Y
 
-def manual_scan_matrix(A, X):
-    B, L, C, D, _ = A.shape
-    H = torch.zeros(B, C, D, device=A.device, dtype=A.dtype)
-    Y = []
-    for t in range(L):
-        At = A[:, t, :, :, :]
-        Xt = X[:, t, :, :]
-        H = torch.einsum('bcd,bd->bc', At, H) + Xt
-        Y.append(H)
-    return torch.stack(Y, dim=1)
-
-def check_diagonal_mode():
-    print("Checking Diagonal Complex Mode...")
+def check_consistency():
     torch.manual_seed(42)
-    B, L, C = 2, 64, 4
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    A = torch.randn(B, L, C, 2, device='cuda') * 0.5 
-    X = torch.randn(B, L, C, 2, device='cuda')
+    B, L, C, R = 2, 64, 4, 4
     
-    A.requires_grad = True
-    X.requires_grad = True
+    # Test 1: Diagonal A
+    print(f"--- Testing Diagonal A (BLCR) ---")
+    A_diag = torch.randn(B, L, C, R, device=device, requires_grad=True)
+    X = torch.randn(B, L, C, R, R, device=device, requires_grad=True)
     
-    pscan = PScanTriton()
-    Y_triton = pscan(A, X)
-    loss_triton = Y_triton.sum()
-    loss_triton.backward()
-    grad_A_triton = A.grad.clone()
-    grad_X_triton = X.grad.clone()
+    pscan = PScan()
     
-    A.grad = None
+    # Forward
+    Y_triton = pscan(A_diag, X)
+    Y_ref = sequential_scan(A_diag, X)
+    
+    diff = torch.abs(Y_triton - Y_ref).max()
+    print(f"Forward Max Difference: {diff.item()}")
+    assert diff < 1e-4, "Forward pass mismatch!"
+
+    # Backward
+    grad_output = torch.randn_like(Y_triton)
+    Y_triton.backward(grad_output)
+    dA_triton, dX_triton = A_diag.grad.clone(), X.grad.clone()
+    
+    A_diag.grad = None
     X.grad = None
     
-    Y_ref = manual_scan_diagonal(A, X)
-    loss_ref = Y_ref.sum()
-    loss_ref.backward()
-    grad_A_ref = A.grad.clone()
-    grad_X_ref = X.grad.clone()
+    Y_ref = sequential_scan(A_diag, X)
+    Y_ref.backward(grad_output)
+    dA_ref, dX_ref = A_diag.grad, X.grad
     
-    diff = (Y_triton - Y_ref).abs().max().item()
-    diff_grad_A = (grad_A_triton - grad_A_ref).abs().max().item()
-    diff_grad_X = (grad_X_triton - grad_X_ref).abs().max().item()
-    
-    print(f"Forward Max Diff: {diff:.6e}")
-    print(f"Grad A Max Diff:  {diff_grad_A:.6e}")
-    print(f"Grad X Max Diff:  {diff_grad_X:.6e}")
-    
-    assert diff < 1e-4
-    assert diff_grad_A < 1e-4
-    assert diff_grad_X < 1e-4
-    print("Diagonal Mode Passed!\n")
+    diff_da = torch.abs(dA_triton - dA_ref).max()
+    diff_dx = torch.abs(dX_triton - dX_ref).max()
+    print(f"Backward dA Diff: {diff_da.item()}")
+    print(f"Backward dX Diff: {diff_dx.item()}")
+    assert diff_da < 1e-4 and diff_dx < 1e-4, "Backward pass mismatch!"
 
-def check_matrix_mode():
-    print("Checking Matrix Real Mode...")
-    torch.manual_seed(42)
-    B, L, C, D = 2, 64, 4, 8
+    # Test 2: Matrix A
+    print(f"\n--- Testing Matrix A (BLCRR) ---")
+    A_mat = torch.randn(B, L, C, R, R, device=device, requires_grad=True) * 0.1 # Small values for stability
+    X = torch.randn(B, L, C, R, R, device=device, requires_grad=True)
     
-    A = torch.randn(B, L, C, D, D, device='cuda') * 0.1
-    X = torch.randn(B, L, C, D, device='cuda')
+    # Forward
+    Y_triton = pscan(A_mat, X)
+    Y_ref = sequential_scan(A_mat, X)
     
-    A.requires_grad = True
-    X.requires_grad = True
+    diff = torch.abs(Y_triton - Y_ref).max()
+    print(f"Forward Max Difference: {diff.item()}")
+    assert diff < 1e-4, "Forward pass mismatch!"
     
-    pscan = PScanTriton()
-    Y_triton = pscan(A, X)
-    loss_triton = Y_triton.sum()
-    loss_triton.backward()
-    grad_A_triton = A.grad.clone()
-    grad_X_triton = X.grad.clone()
+    # Backward
+    grad_output = torch.randn_like(Y_triton)
+    Y_triton.backward(grad_output)
+    dA_triton, dX_triton = A_mat.grad.clone(), X.grad.clone()
     
-    A.grad = None
+    A_mat.grad = None
     X.grad = None
     
-    Y_ref = manual_scan_matrix(A, X)
-    loss_ref = Y_ref.sum()
-    loss_ref.backward()
-    grad_A_ref = A.grad.clone()
-    grad_X_ref = X.grad.clone()
+    Y_ref = sequential_scan(A_mat, X)
+    Y_ref.backward(grad_output)
+    dA_ref, dX_ref = A_mat.grad, X.grad
     
-    diff = (Y_triton - Y_ref).abs().max().item()
-    diff_grad_A = (grad_A_triton - grad_A_ref).abs().max().item()
-    diff_grad_X = (grad_X_triton - grad_X_ref).abs().max().item()
-    
-    print(f"Forward Max Diff: {diff:.6e}")
-    print(f"Grad A Max Diff:  {diff_grad_A:.6e}")
-    print(f"Grad X Max Diff:  {diff_grad_X:.6e}")
-    
-    assert diff < 1e-4
-    assert diff_grad_A < 1e-3
-    assert diff_grad_X < 1e-3
-    print("Matrix Mode Passed!\n")
+    diff_da = torch.abs(dA_triton - dA_ref).max()
+    diff_dx = torch.abs(dX_triton - dX_ref).max()
+    print(f"Backward dA Diff: {diff_da.item()}")
+    print(f"Backward dX Diff: {diff_dx.item()}")
+    assert diff_da < 1e-3 and diff_dx < 1e-3, "Backward pass mismatch!" # Matrix mult accumulates more error
 
 if __name__ == "__main__":
-    if torch.cuda.is_available():
-        check_diagonal_mode()
-        check_matrix_mode()
-        print("All checks passed successfully.")
-    else:
-        print("CUDA not available.")
-        
+    check_consistency()
+    
