@@ -9,13 +9,13 @@ def sequential_pscan_diag(A, X):
     else:
         A_expanded = A
 
-    Y = torch.zeros_like(X)
-    Y[:, 0] = X[:, 0]
+    Y_list = [X[:, 0]]
 
     for t in range(1, L):
-        Y[:, t] = A_expanded[:, t] * Y[:, t - 1] + X[:, t]
+        Y_t = A_expanded[:, t] * Y_list[t - 1] + X[:, t]
+        Y_list.append(Y_t)
 
-    return Y
+    return torch.stack(Y_list, dim=1)
 
 
 def sequential_pscan_mat(A, X):
@@ -26,13 +26,13 @@ def sequential_pscan_mat(A, X):
             A_mat[..., i, i] = A[..., i]
         A = A_mat
 
-    Y = torch.zeros_like(X)
-    Y[:, 0] = X[:, 0]
+    Y_list = [X[:, 0]]
 
     for t in range(1, L):
-        Y[:, t] = torch.einsum('bcij,bcjk->bcik', A[:, t], Y[:, t - 1]) + X[:, t]
+        Y_t = torch.einsum('bcij,bcjk->bcik', A[:, t], Y_list[t - 1]) + X[:, t]
+        Y_list.append(Y_t)
 
-    return Y
+    return torch.stack(Y_list, dim=1)
 
 
 def check_forward_diag():
