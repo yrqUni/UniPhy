@@ -12,7 +12,6 @@ model:
   sde_mode: "sde"
   init_noise_scale: 1.0
   max_growth_rate: 0.3
-  use_dft_residual: true
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
