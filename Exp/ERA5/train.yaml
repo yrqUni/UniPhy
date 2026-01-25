@@ -18,7 +18,7 @@ data:
   window_size: 20
   sample_k: 5
   look_ahead: 2
-  dt_ref: model.dt_ref
+  dt_ref: 6.0
 
 train:
   batch_size: 1
