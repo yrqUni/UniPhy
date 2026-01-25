@@ -208,7 +208,7 @@ class GlobalFluxTracker(nn.Module):
         source = self.project(new_state)
 
         s_cat = torch.cat([new_state.real, new_state.imag], dim=-1)
-        gate = self.gate_net(s_cat)
+        gate = torch.sigmoid(self.gate_net(s_cat)) 
 
         return new_state, source, gate
 
