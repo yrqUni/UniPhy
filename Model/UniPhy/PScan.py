@@ -396,7 +396,7 @@ class PScan(nn.Module):
         elif self.mode == 'mat' or (self.mode == 'auto' and D == 2):
             return _PScanMatFunction.apply(A, X)
         else:
-            return _PScanMatFunction.apply(A, X)
+            raise ValueError(f"PScan mode '{self.mode}' is not supported for D={D} and is_diag={is_diag}.")
 
 
 def pscan(A, X, mode='auto'):
