@@ -1,12 +1,9 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from ModelUniPhy import UniPhyModel
-from UniPhyOps import TemporalPropagator, GlobalFluxTracker
+from UniPhyOps import TemporalPropagator, GlobalFluxTracker, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
-from UniPhySpatial import RiemannianCliffordConv2d
 from PScan import pscan
 
 
@@ -582,4 +579,3 @@ def run_all_checks():
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float32)
     run_all_checks()
-    
