@@ -96,10 +96,14 @@ class UniPhyBlock(nn.Module):
         op_decay = op_decay.view(B, T, 1, 1, D)
         op_forcing = op_forcing.view(B, T, 1, 1, D)
         u_t = forcing * op_forcing
-        A_time = op_decay.expand(B, T, H, W, D).reshape(B * H * W, T, 1, D)
-        X_time = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, 1, D)
+        
+        # Reshape to (Batch, T, D, 1) to treat D as independent channels
+        A_time = op_decay.expand(B, T, H, W, D).reshape(B * H * W, T, D, 1)
+        X_time = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
+        
         Y_time = self._run_pscan(A_time, X_time)
         u_t = Y_time.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
+        
         noise = self.prop.generate_stochastic_term(
             u_t.shape, dt_expanded, u_t.dtype, h_state=u_t
         )
