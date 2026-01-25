@@ -25,13 +25,12 @@ def get_args():
     parser.add_argument("--T", type=int, default=4)
     parser.add_argument("--patch_size", type=int, default=32)
     parser.add_argument("--min_search_dim", type=int, default=64)
-    parser.add_argument("--max_search_dim", type=int, default=1536)
+    parser.add_argument("--max_search_dim", type=int, default=1024)
     parser.add_argument("--dim_step", type=int, default=32)
-    parser.add_argument("--search_depths", type=int, nargs="+", default=[4, 6, 8, 12])
+    parser.add_argument("--search_depths", type=int, nargs="+", default=[4, 6, 8])
     parser.add_argument("--search_experts", type=int, nargs="+", default=[4, 8])
     parser.add_argument("--expand", type=int, default=4)
     parser.add_argument("--steps", type=int, default=3)
-    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--output", type=str, default="max_params_results.csv")
     return parser.parse_args()
 
@@ -39,7 +38,6 @@ def get_args():
 def check_config_fit(args, embed_dim, depth, experts, device):
     model = None
     optimizer = None
-    scaler = None
 
     try:
         torch.cuda.empty_cache()
@@ -64,7 +62,6 @@ def check_config_fit(args, embed_dim, depth, experts, device):
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-        scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
         x = torch.randn(args.bs, args.T, args.C, args.H, args.W, device=device)
         dt = torch.ones(args.bs, args.T, device=device) * 6.0
@@ -77,16 +74,14 @@ def check_config_fit(args, embed_dim, depth, experts, device):
             torch.cuda.synchronize()
             start_evt.record()
 
-            with torch.cuda.amp.autocast(enabled=args.amp):
-                out = model(x, dt)
-                if out.is_complex():
-                    loss = out.abs().mean()
-                else:
-                    loss = out.mean()
+            out = model(x, dt)
+            if out.is_complex():
+                loss = out.abs().mean()
+            else:
+                loss = out.mean()
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss.backward()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
             end_evt.record()
@@ -98,7 +93,7 @@ def check_config_fit(args, embed_dim, depth, experts, device):
         avg_time = np.mean(times) if times else 0
         peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
-        del model, optimizer, scaler, x, dt, out, loss
+        del model, optimizer, x, dt, out, loss
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -109,8 +104,6 @@ def check_config_fit(args, embed_dim, depth, experts, device):
             del model
         if optimizer is not None:
             del optimizer
-        if scaler is not None:
-            del scaler
         torch.cuda.empty_cache()
         gc.collect()
         return False, 0, 0, 0
@@ -155,7 +148,13 @@ def binary_search_max_dim(args, depth, experts, device):
 
 def main():
     args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if not torch.cuda.is_available():
+        print("CUDA not available")
+        sys.exit(1)
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
 
     print("=" * 70)
     print("UniPhy Max Parameters Search")
@@ -166,7 +165,6 @@ def main():
     print(f"Search Depths: {args.search_depths}")
     print(f"Search Experts: {args.search_experts}")
     print(f"Dim Range: [{args.min_search_dim}, {args.max_search_dim}]")
-    print(f"AMP: {args.amp}")
     print("=" * 70)
 
     results = []
