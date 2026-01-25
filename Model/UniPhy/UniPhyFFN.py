@@ -25,42 +25,56 @@ class ComplexDynamicFFN(nn.Module):
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
+
         self.spatial_re = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         self.spatial_im = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+
         self.experts_up_re = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
         self.experts_up_im = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
+
         self.experts_down_re = nn.Conv2d(
             hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts
         )
         self.experts_down_im = nn.Conv2d(
             hidden_dim * num_experts, dim * num_experts, 1, groups=num_experts
         )
+
         self.router = nn.Sequential(
             nn.Conv2d(dim, dim, 1),
             LayerNorm2d(dim),
             nn.GELU(),
             nn.Conv2d(dim, num_experts, 1),
         )
+
         nn.init.xavier_uniform_(self.experts_down_re.weight)
         nn.init.zeros_(self.experts_down_im.weight)
 
     def forward(self, z):
         re, im = z.real, z.imag
         B, C, H, W = re.shape
-        re = self.spatial_re(re) - self.spatial_im(im)
-        im = self.spatial_re(im) + self.spatial_im(re)
+
+        re_new = self.spatial_re(re) - self.spatial_im(im)
+        im_new = self.spatial_re(im) + self.spatial_im(re)
+        re, im = re_new, im_new
+
         route_weights = F.softmax(self.router(re + im), dim=1)
+
         up_re = self.experts_up_re(re) - self.experts_up_im(im)
         up_im = self.experts_up_re(im) + self.experts_up_im(re)
+
         up_re = F.silu(up_re)
         up_im = F.silu(up_im)
+
         down_re = self.experts_down_re(up_re) - self.experts_down_im(up_im)
         down_im = self.experts_down_re(up_im) + self.experts_down_im(up_re)
+
         down_re = down_re.reshape(B, self.num_experts, self.dim, H, W)
         down_im = down_im.reshape(B, self.num_experts, self.dim, H, W)
+
         w = route_weights.unsqueeze(2)
         out_re = (down_re * w).sum(dim=1)
         out_im = (down_im * w).sum(dim=1)
+
         return torch.complex(out_re, out_im)
 
 

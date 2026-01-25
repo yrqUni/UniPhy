@@ -1,15 +1,10 @@
 import argparse
-import contextlib
 import datetime
-import glob
-import logging
 import os
 import random
 import sys
-import time
 import warnings
 import yaml
-from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,6 +14,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 import wandb
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -34,7 +30,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
 
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
@@ -44,249 +40,209 @@ from ModelUniPhy import UniPhyModel
 
 warnings.filterwarnings("ignore")
 
-custom_theme = Theme(
-    {
-        "metric": "bold cyan",
-        "value": "bold white",
-        "danger": "bold red",
-        "param": "dim yellow",
-    }
-)
+custom_theme = Theme({
+    "info": "cyan",
+    "warning": "yellow",
+    "error": "red bold",
+    "success": "green bold",
+})
+
 console = Console(theme=custom_theme)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[
-        RichHandler(console=console, rich_tracebacks=True, show_path=False, markup=True)
-    ],
-)
-logger = logging.getLogger("rich")
 
-
-def crps_ensemble_loss(
-    pred_ensemble: torch.Tensor, target: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    target = target.unsqueeze(1)
-    mae = torch.mean(torch.abs(pred_ensemble - target), dim=1)
-    M = pred_ensemble.shape[1]
-    pred_sorted, _ = torch.sort(pred_ensemble, dim=1)
-    indices = torch.arange(1, M + 1, device=pred_ensemble.device).view(1, M, 1, 1, 1)
-    spread = torch.mean(pred_sorted * (2 * indices - M - 1), dim=1) / M
-    return (mae - spread).mean(), spread.mean()
-
-
-def set_random_seed(seed: int, deterministic: bool = False) -> None:
+def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        if deterministic:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-        else:
-            torch.backends.cudnn.deterministic = False
-            torch.backends.cudnn.benchmark = True
 
 
-set_random_seed(1017, deterministic=False)
-
-
-def format_params(num):
-    if num >= 1e9:
-        readable = f"{num / 1e9:.2f}B"
-    elif num >= 1e6:
-        readable = f"{num / 1e6:.2f}M"
-    elif num >= 1e3:
-        readable = f"{num / 1e3:.2f}K"
-    else:
-        readable = f"{num}"
-    return f"{num:,} ({readable})"
-
-
-def log_model_stats(model: torch.nn.Module, rank: int) -> None:
-    if rank != 0:
-        return
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    grid = Table.grid(expand=True)
-    grid.add_column(justify="center", ratio=1)
-    grid.add_column(justify="right")
-    stats_table = Table(box=None, show_header=False, pad_edge=False)
-    stats_table.add_column("Metric", style="cyan")
-    stats_table.add_column("Value", style="bold white", justify="right")
-    stats_table.add_row("Total Params", format_params(total_params))
-    stats_table.add_row("Trainable", format_params(trainable_params))
-    console.print(
-        Panel(
-            stats_table,
-            title="[bold blue]Model Statistics[/]",
-            border_style="blue",
-            expand=False,
-        )
-    )
-
-
-def setup_ddp(
-    rank: int, world_size: int, master_addr: str, master_port: str, local_rank: int
-) -> None:
+def setup_ddp(rank, world_size, local_rank, master_addr, master_port):
     os.environ["MASTER_ADDR"] = master_addr
-    os.environ["MASTER_PORT"] = str(master_port)
-    dist.init_process_group(
-        "nccl",
-        rank=rank,
-        world_size=world_size,
-        timeout=datetime.timedelta(seconds=1800),
-    )
+    os.environ["MASTER_PORT"] = master_port
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(local_rank)
 
 
-def cleanup_ddp() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
+def cleanup_ddp():
+    dist.destroy_process_group()
 
 
-def setup_file_logging(cfg: dict, rank: int) -> None:
-    if rank != 0:
-        return
-    os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
-    log_filename = os.path.join(
-        cfg["logging"]["log_path"],
-        f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+def energy_penalty(pred_ensemble, target, threshold=1.5):
+    pred_energy = pred_ensemble.pow(2).mean(dim=(-2, -1))
+    target_energy = target.unsqueeze(1).pow(2).mean(dim=(-2, -1))
+    excess = F.relu(pred_energy - target_energy * threshold)
+    return excess.mean()
+
+
+def spectral_loss(pred, target):
+    pred_fft = torch.fft.rfft2(pred, norm="ortho")
+    target_fft = torch.fft.rfft2(target, norm="ortho")
+
+    H, W = pred_fft.shape[-2:]
+    freq_y = torch.arange(H, device=pred.device).float().view(-1, 1)
+    freq_x = torch.arange(W, device=pred.device).float().view(1, -1)
+    freq_weight = torch.sqrt(freq_y ** 2 + freq_x ** 2) + 1.0
+    freq_weight = freq_weight / freq_weight.max()
+
+    diff = torch.abs(pred_fft - target_fft) * freq_weight
+    return diff.mean()
+
+
+def crps_ensemble_loss(pred_ensemble, target):
+    B, M, C, H, W = pred_ensemble.shape
+    target_expanded = target.unsqueeze(1).expand_as(pred_ensemble)
+
+    mae_term = torch.abs(pred_ensemble - target_expanded).mean(dim=1)
+
+    pred_sorted, _ = torch.sort(pred_ensemble, dim=1)
+    diff_matrix = torch.abs(
+        pred_sorted.unsqueeze(2) - pred_sorted.unsqueeze(1)
     )
-    file_formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    file_handler = logging.FileHandler(log_filename)
-    file_handler.setFormatter(file_formatter)
-    root_logger = logging.getLogger()
-    root_logger.addHandler(file_handler)
+    spread_term = diff_matrix.mean(dim=(1, 2)) / (2.0 * M)
+
+    crps = mae_term.mean() - spread_term.mean()
+    return crps, spread_term.mean()
 
 
-def setup_wandb(rank, cfg):
-    if rank != 0 or not cfg["logging"].get("use_wandb", False):
-        return
-    wandb.init(
-        project=cfg["logging"]["wandb_project"],
-        entity=cfg["logging"]["wandb_entity"],
-        name=cfg["logging"]["wandb_run_name"],
-        config=cfg,
-    )
-
-
-def save_ckpt(
-    model: torch.nn.Module,
-    opt: torch.optim.Optimizer,
-    epoch: int,
-    step: int,
-    metric: float,
-    cfg: dict,
-    scheduler: Optional[Any] = None,
-) -> None:
-    if dist.get_rank() != 0:
-        return
+def save_ckpt(model, optimizer, epoch, step, loss, cfg, scheduler=None):
     ckpt_dir = cfg["logging"]["ckpt_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
+
     state = {
-        "model": (
-            model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-        ),
-        "optimizer": opt.state_dict(),
         "epoch": epoch,
         "step": step,
-        "metric": metric,
+        "loss": loss,
+        "model_state_dict": model.module.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
         "config": cfg,
-        "model_args": cfg["model"],
     }
-    if scheduler:
-        state["scheduler"] = scheduler.state_dict()
-    ckpt_path = os.path.join(ckpt_dir, f"ep{epoch}_step{step}_crps{metric:.4f}.pth")
+
+    if scheduler is not None:
+        state["scheduler_state_dict"] = scheduler.state_dict()
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_ep{epoch}_step{step}_{timestamp}.pt")
     torch.save(state, ckpt_path)
-    files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
-    files.sort(key=os.path.getmtime)
-    if len(files) > 3:
-        for f in files[:-3]:
-            try:
-                os.remove(f)
-            except:
-                pass
+
+    if dist.get_rank() == 0:
+        console.print(f"[success]Checkpoint saved: {ckpt_path}[/success]")
 
 
-def get_grad_stats(model: torch.nn.Module) -> Tuple[float, float, float]:
-    total_norm_sq = 0.0
-    max_abs = 0.0
-    param_norm_sq = 0.0
-    for p in model.parameters():
-        param_norm_sq += p.data.norm(2).item() ** 2
-        if p.grad is None:
-            continue
-        g = p.grad.data
-        total_norm_sq += g.norm(2).item() ** 2
-        max_abs = max(max_abs, g.abs().max().item())
-    return float(total_norm_sq**0.5), float(max_abs), float(param_norm_sq**0.5)
+def load_ckpt(model, optimizer, ckpt_path, scheduler=None):
+    if not os.path.exists(ckpt_path):
+        console.print(f"[warning]Checkpoint not found: {ckpt_path}[/warning]")
+        return 0, 0
+
+    state = torch.load(ckpt_path, map_location="cpu")
+    model.module.load_state_dict(state["model_state_dict"])
+    optimizer.load_state_dict(state["optimizer_state_dict"])
+
+    if scheduler is not None and "scheduler_state_dict" in state:
+        scheduler.load_state_dict(state["scheduler_state_dict"])
+
+    if dist.get_rank() == 0:
+        console.print(f"[success]Loaded checkpoint: {ckpt_path}[/success]")
+
+    return state.get("epoch", 0), state.get("step", 0)
 
 
-def run_ddp(
-    rank: int,
-    world_size: int,
-    local_rank: int,
-    master_addr: str,
-    master_port: str,
-    cfg: dict,
-) -> None:
-    setup_ddp(rank, world_size, master_addr, master_port, local_rank)
-    if rank == 0:
-        setup_file_logging(cfg, rank)
-        setup_wandb(rank, cfg)
+def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
+    setup_ddp(rank, world_size, local_rank, master_addr, master_port)
+    set_seed(42 + rank)
+
+    device = torch.device(f"cuda:{local_rank}")
 
     if cfg["train"]["use_tf32"]:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    model = UniPhyModel(**cfg["model"]).cuda(local_rank)
-    log_model_stats(model, rank)
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = UniPhyModel(
+        in_channels=cfg["model"]["in_channels"],
+        out_channels=cfg["model"]["out_channels"],
+        embed_dim=cfg["model"]["embed_dim"],
+        expand=cfg["model"]["expand"],
+        num_experts=cfg["model"]["num_experts"],
+        depth=cfg["model"]["depth"],
+        patch_size=cfg["model"]["patch_size"],
+        img_height=cfg["model"]["img_height"],
+        img_width=cfg["model"]["img_width"],
+        dt_ref=cfg["model"]["dt_ref"],
+        sde_mode=cfg["model"]["sde_mode"],
+        init_noise_scale=cfg["model"]["init_noise_scale"],
+    ).to(device)
 
-    train_ds = ERA5_Dataset(is_train=True, **cfg["data"])
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_ds, shuffle=False, drop_last=True
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    train_ds = ERA5_Dataset(
+        input_dir=cfg["data"]["input_dir"],
+        year_range=cfg["data"]["year_range"],
+        window_size=cfg["data"]["window_size"],
+        sample_k=cfg["data"]["sample_k"],
+        look_ahead=cfg["data"]["look_ahead"],
+        is_train=True,
+        dt_ref=cfg["data"]["dt_ref"],
     )
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
+
     train_loader = DataLoader(
         train_ds,
         sampler=train_sampler,
         batch_size=cfg["train"]["batch_size"],
-        num_workers=2,
+        num_workers=4,
         pin_memory=True,
+        prefetch_factor=2,
     )
 
-    opt = torch.optim.AdamW(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(cfg["train"]["lr"]),
         weight_decay=cfg["train"]["weight_decay"],
     )
+
     grad_accum_steps = cfg["train"]["grad_accum_steps"]
     epochs = cfg["train"]["epochs"]
-    scheduler = (
-        lr_scheduler.OneCycleLR(
-            opt,
+
+    scheduler = None
+    if cfg["train"]["use_scheduler"]:
+        scheduler = lr_scheduler.OneCycleLR(
+            optimizer,
             max_lr=float(cfg["train"]["lr"]),
             steps_per_epoch=len(train_loader) // grad_accum_steps,
             epochs=epochs,
         )
-        if cfg["train"]["use_scheduler"]
-        else None
-    )
 
+    start_epoch = 0
     global_step = 0
+
+    if cfg["logging"]["ckpt"]:
+        start_epoch, global_step = load_ckpt(
+            model, optimizer, cfg["logging"]["ckpt"], scheduler
+        )
+
+    if cfg["logging"]["use_wandb"] and rank == 0:
+        run_name = cfg["logging"]["wandb_run_name"] or f"uniphy_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        wandb.init(
+            project=cfg["logging"]["wandb_project"],
+            entity=cfg["logging"]["wandb_entity"],
+            name=run_name,
+            config=cfg,
+        )
+
     save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
     log_every = cfg["logging"]["log_every"]
+    wandb_every = cfg["logging"]["wandb_every"]
     ensemble_size = cfg["train"]["ensemble_size"]
 
-    for ep in range(epochs):
+    energy_weight = cfg["train"].get("energy_penalty_weight", 0.1)
+    spectral_weight = cfg["train"].get("spectral_loss_weight", 0.05)
+
+    for ep in range(start_epoch, epochs):
         train_sampler.set_epoch(ep)
+        model.train()
+
         with Progress(
             TextColumn("[bold blue]Epoch {task.fields[ep]}"),
             BarColumn(bar_width=40),
@@ -296,74 +252,124 @@ def run_ddp(
             console=console,
             disable=(rank != 0),
         ) as progress:
-            task = progress.add_task("Train", total=len(train_loader), ep=ep + 1)
-            for train_step, (data, dt) in enumerate(train_loader, start=1):
-                model.train()
-                data, dt = data.to(f"cuda:{local_rank}").float(), dt.to(
-                    f"cuda:{local_rank}"
+
+            task = progress.add_task(
+                "Training",
+                total=len(train_loader),
+                ep=f"{ep + 1}/{epochs}",
+            )
+
+            for train_step, (data, dt) in enumerate(train_loader):
+                data = data.to(device, non_blocking=True)
+                dt = dt.to(device, non_blocking=True)
+
+                input_seq = data[:, :-1]
+                target = data[:, -1]
+                dt_input = dt[:, :-1]
+
+                pred_ensemble_list = []
+                for _ in range(ensemble_size):
+                    pred = model(input_seq, dt_input)
+                    pred_ensemble_list.append(pred[:, -1])
+
+                pred_ensemble = torch.stack(pred_ensemble_list, dim=1)
+
+                B, M, C, H, W = pred_ensemble.shape
+                pred_flat = pred_ensemble.reshape(B, M, -1)
+                target_flat = target.reshape(B, -1).unsqueeze(-2).expand(-1, C, -1)
+                target_flat = target.reshape(B, -1)
+
+                pred_ensemble_reshaped = pred_ensemble.view(B, M, C * H * W)
+                target_reshaped = target.view(B, C * H * W)
+
+                crps, spread = crps_ensemble_loss(
+                    pred_ensemble.view(B, M, C, H, W),
+                    target.view(B, C, H, W),
                 )
-                x_in, target = data[:, :-1], data[:, 1:]
 
-                is_accum = train_step % grad_accum_steps != 0
-                sync_ctx = model.no_sync() if is_accum else contextlib.nullcontext()
+                pred_mean = pred_ensemble.mean(dim=1)
+                mae_val = F.l1_loss(pred_mean, target)
+                rmse_val = torch.sqrt(F.mse_loss(pred_mean, target))
+                raw_spread = pred_ensemble.std(dim=1).mean()
 
-                with sync_ctx:
-                    ensemble_preds = [
-                        model(x_in, dt).view(
-                            -1, target.shape[2], target.shape[3], target.shape[4]
-                        )
-                        for _ in range(ensemble_size)
-                    ]
-                    pred_ensemble = torch.stack(ensemble_preds, dim=1)
-                    target_flat = target.reshape(
-                        -1, target.shape[2], target.shape[3], target.shape[4]
+                loss_collapse = torch.clamp(0.4 * rmse_val - raw_spread, min=0)
+
+                loss_energy = energy_penalty(pred_ensemble, target, threshold=1.5)
+
+                loss_spectral = spectral_loss(pred_mean, target)
+
+                loss = (
+                    crps
+                    + 2.0 * loss_collapse
+                    + energy_weight * loss_energy
+                    + spectral_weight * loss_spectral
+                )
+
+                (loss / grad_accum_steps).backward()
+
+                if (train_step + 1) % grad_accum_steps == 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        cfg["train"]["grad_clip"],
                     )
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                    crps, avg_spread = crps_ensemble_loss(pred_ensemble, target_flat)
-
-                    with torch.no_grad():
-                        pred_mean = pred_ensemble.mean(dim=1)
-                        mae_val = F.l1_loss(pred_mean, target_flat)
-                        rmse_val = F.mse_loss(pred_mean, target_flat) ** 0.5
-                        raw_spread = pred_ensemble.std(dim=1).mean()
-
-                    loss_collapse = torch.clamp(0.4 * rmse_val - raw_spread, min=0)
-                    loss = crps + 2.0 * loss_collapse
-                    (loss / grad_accum_steps).backward()
-
-                if not is_accum:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), cfg["train"]["grad_clip"]
-                    )
-                    gn, _, _ = get_grad_stats(model)
-                    opt.step()
-                    opt.zero_grad(set_to_none=True)
-                    if scheduler:
+                    if scheduler is not None:
                         scheduler.step()
+
                     global_step += 1
 
-                    if rank == 0 and train_step % log_every == 0:
-                        logger.info(
-                            f"CRPS: {crps:.4f} | MAE: {mae_val:.4f} | RMSE: {rmse_val:.4f} | Spread: {raw_spread:.4f}"
-                        )
-                        if cfg["logging"]["use_wandb"]:
-                            wandb.log(
-                                {
-                                    "train/crps": crps,
-                                    "train/mae": mae_val,
-                                    "train/rmse": rmse_val,
-                                    "train/spread": raw_spread,
-                                    "train/gn": gn,
-                                }
-                            )
+                if rank == 0 and (train_step + 1) % log_every == 0:
+                    lr_current = optimizer.param_groups[0]["lr"]
+                    console.print(
+                        f"[info]Step {train_step + 1} | "
+                        f"CRPS: {crps.item():.4f} | "
+                        f"MAE: {mae_val.item():.4f} | "
+                        f"RMSE: {rmse_val.item():.4f} | "
+                        f"Spread: {raw_spread.item():.4f} | "
+                        f"Energy: {loss_energy.item():.4f} | "
+                        f"Spectral: {loss_spectral.item():.4f} | "
+                        f"LR: {lr_current:.2e}[/info]"
+                    )
 
-                    if train_step % save_interval == 0:
-                        save_ckpt(
-                            model, opt, ep + 1, train_step, crps.item(), cfg, scheduler
-                        )
+                if (
+                    rank == 0
+                    and cfg["logging"]["use_wandb"]
+                    and (train_step + 1) % wandb_every == 0
+                ):
+                    wandb.log({
+                        "train/crps": crps.item(),
+                        "train/mae": mae_val.item(),
+                        "train/rmse": rmse_val.item(),
+                        "train/spread": raw_spread.item(),
+                        "train/loss_collapse": loss_collapse.item(),
+                        "train/loss_energy": loss_energy.item(),
+                        "train/loss_spectral": loss_spectral.item(),
+                        "train/total_loss": loss.item(),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/epoch": ep,
+                        "train/global_step": global_step,
+                    })
+
+                if rank == 0 and (train_step + 1) % save_interval == 0:
+                    save_ckpt(
+                        model, optimizer, ep + 1, train_step + 1, crps.item(), cfg, scheduler
+                    )
+
                 progress.advance(task)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        if rank == 0:
+            save_ckpt(
+                model, optimizer, ep + 1, len(train_loader), crps.item(), cfg, scheduler
+            )
+
+    if cfg["logging"]["use_wandb"] and rank == 0:
+        wandb.finish()
+
     cleanup_ddp()
 
 
@@ -371,8 +377,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     args = parser.parse_args()
+
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
+
     run_ddp(
         int(os.environ["RANK"]),
         int(os.environ["WORLD_SIZE"]),
