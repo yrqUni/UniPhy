@@ -89,9 +89,7 @@ def pscan_matrix_kernel(
     mask_A = mask_t[:, None, None]
     mask_X = mask_t[:, None]
     
-    eye = tl.zeros((DIM, DIM), dtype=tl.float32)
-    for i in range(DIM):
-        eye[i, i] = 1.0
+    eye = (r[:, None] == r[None, :]).to(tl.float32)
         
     a_block = tl.load(ptrs_A, mask=mask_A, other=eye)
     x_block = tl.load(ptrs_X, mask=mask_X, other=0.0)
