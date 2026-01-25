@@ -9,27 +9,27 @@ def complex_mul_mat_mat(ar, ai, br, bi, R: tl.constexpr):
     ai = tl.reshape(ai, (R, R))
     br = tl.reshape(br, (R, R))
     bi = tl.reshape(bi, (R, R))
-    out_r = tl.dot(ar, br) - tl.dot(ai, bi)
-    out_i = tl.dot(ar, bi) + tl.dot(ai, br)
+    out_r = tl.dot(br, ar) - tl.dot(bi, ai)
+    out_i = tl.dot(br, ai) + tl.dot(bi, ar)
     return tl.ravel(out_r), tl.ravel(out_i)
 
 @triton.jit
-def complex_mul_mat_vec(ar, ai, xr, xi, R: tl.constexpr):
-    ar = tl.reshape(ar, (R, R))
-    ai = tl.reshape(ai, (R, R))
+def complex_mul_mat_vec(br, bi, xr, xi, R: tl.constexpr):
+    br = tl.reshape(br, (R, R))
+    bi = tl.reshape(bi, (R, R))
     xr = tl.reshape(xr, (R, 1))
     xi = tl.reshape(xi, (R, 1))
-    out_r = tl.dot(ar, xr) - tl.dot(ai, xi)
-    out_i = tl.dot(ar, xi) + tl.dot(ai, xr)
+    out_r = tl.dot(br, xr) - tl.dot(bi, xi)
+    out_i = tl.dot(br, xi) + tl.dot(bi, xr)
     return tl.ravel(out_r), tl.ravel(out_i)
 
 @triton.jit
-def scan_combine_fn(ar, ai, xr, xi, br, bi, yr, yi, R: tl.constexpr):
-    new_ar, new_ai = complex_mul_mat_mat(br, bi, ar, ai, R)
+def combine_fn(ar, ai, xr, xi, br, bi, yr, yi, R: tl.constexpr):
+    nar, nai = complex_mul_mat_mat(ar, ai, br, bi, R)
     bx_r, bx_i = complex_mul_mat_vec(br, bi, xr, xi, R)
-    new_xr = bx_r + yr
-    new_xi = bx_i + yi
-    return new_ar, new_ai, new_xr, new_xi
+    nxr = bx_r + yr
+    nxi = bx_i + yi
+    return nar, nai, nxr, nxi
 
 @triton.jit
 def pscan_kernel(
@@ -59,13 +59,13 @@ def pscan_kernel(
     x_i = tl.load(x_base + idx_l[:, None] * stride_xl + offs_vec[None, :] + R, mask=mask_l[:, None], other=0.0)
 
     if REVERSE:
-        is_identity = (offs_mat // R) == (offs_mat % R)
-        a_r = tl.where(offs_l[:, None] == 0, tl.where(is_identity, 1.0, 0.0), a_r)
+        eye_mask = (offs_mat // R) == (offs_mat % R)
+        a_r = tl.where(offs_l[:, None] == 0, tl.where(eye_mask, 1.0, 0.0), a_r)
         a_i = tl.where(offs_l[:, None] == 0, 0.0, a_i)
 
     res_ar, res_ai, res_xr, res_xi = tl.associative_scan(
         (a_r, a_i, x_r, x_i), axis=0, 
-        combine_fn=lambda ar, ai, xr, xi, br, bi, yr, yi: scan_combine_fn(ar, ai, xr, xi, br, bi, yr, yi, R)
+        combine_fn=combine_fn
     )
 
     y_base = Y_ptr + pid_b * stride_xb + pid_c * stride_xc
@@ -75,8 +75,8 @@ def pscan_kernel(
 class _PScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
-        ctx.save_for_diag = A.ndim == 4
-        if ctx.save_for_diag:
+        ctx.is_diag = A.ndim == 4
+        if ctx.is_diag:
             A = torch.diag_embed(A)
         
         B, L, C, R, _ = A.shape
@@ -120,7 +120,7 @@ class _PScanFunction(torch.autograd.Function):
         Y_prev[:, 1:] = Y[:, :-1]
         dA = torch.matmul(dX.unsqueeze(-1), Y_prev.conj().unsqueeze(-2))
         
-        if ctx.save_for_diag:
+        if ctx.is_diag:
             dA = torch.diagonal(dA, dim1=-2, dim2=-1)
             
         return dA, dX
