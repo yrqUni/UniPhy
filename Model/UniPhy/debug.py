@@ -100,13 +100,27 @@ def check_parallel_vs_serial_simplified():
     forcing = torch.randn(B, T, H, W, D, dtype=torch.cdouble, device=device)
     dt = torch.ones(T, device=device, dtype=torch.float64)
 
-    dt_expanded = dt.view(1, T, 1, 1, 1).expand(B, T, H, W, 1)
-    op_decay, op_forcing = prop.get_transition_operators(dt_expanded)
+    print("--- Computing Operators Per Timestep ---")
+    op_decay_list = []
+    op_forcing_list = []
+    for t in range(T):
+        dt_t = dt[t:t+1]
+        op_d, op_f = prop.get_transition_operators(dt_t)
+        op_d = op_d.squeeze()
+        op_f = op_f.squeeze()
+        op_decay_list.append(op_d)
+        op_forcing_list.append(op_f)
+        if t == 0:
+            print_tensor_stats(f"  op_decay[{t}]", op_d)
+            print_tensor_stats(f"  op_forcing[{t}]", op_f)
 
-    op_decay = op_decay.expand(B, T, H, W, D)
-    op_forcing = op_forcing.expand(B, T, H, W, D)
+    op_decay = torch.stack(op_decay_list, dim=0).unsqueeze(0)
+    op_forcing = torch.stack(op_forcing_list, dim=0).unsqueeze(0)
 
-    print("Input shapes:")
+    op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+    op_forcing = op_forcing.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+
+    print("\nInput shapes:")
     print(f"  forcing: {forcing.shape}")
     print(f"  op_decay: {op_decay.shape}")
     print(f"  op_forcing: {op_forcing.shape}")
@@ -265,8 +279,110 @@ def check_model_forward_step():
     return total_diff
 
 
-def trace_forward_step_internals():
-    print_section("Step 6: Trace forward_step Internals")
+def trace_model_internals():
+    print_section("Step 6: Trace Model Internals Step by Step")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+
+    from ModelUniPhy import UniPhyBlock
+
+    B, T, D, H, W = 1, 3, 4, 4, 4
+
+    block = UniPhyBlock(
+        dim=D, expand=2, num_experts=2,
+        img_height=H, img_width=W,
+        sde_mode="det"
+    ).to(device).double()
+    block.eval()
+
+    x = torch.randn(B, T, D, H, W, dtype=torch.cdouble, device=device)
+    dt = torch.ones(T, dtype=torch.float64, device=device)
+
+    print("--- TRACING PARALLEL forward() ---")
+
+    x_flat = x.reshape(B * T, D, H, W)
+    x_real = torch.cat([x_flat.real, x_flat.imag], dim=1)
+    x_norm = block.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+    x_spatial = block.spatial_cliff(x_norm)
+
+    x_re, x_im = torch.chunk(x_spatial, 2, dim=1)
+    x_spatial_complex = torch.complex(x_re, x_im)
+    x_spatial_5d = x_spatial_complex.reshape(B, T, D, H, W)
+
+    x_perm = x_spatial_5d.permute(0, 1, 3, 4, 2)
+    x_eigen_par = block.prop.basis.encode(x_perm)
+    print_tensor_stats("x_eigen (parallel)", x_eigen_par)
+
+    x_mean_par = x_eigen_par.mean(dim=(2, 3))
+    print_tensor_stats("x_mean (parallel)", x_mean_par)
+
+    A_flux, X_flux = block.prop.flux_tracker.get_operators(x_mean_par)
+    print_tensor_stats("A_flux", A_flux)
+    print_tensor_stats("X_flux", X_flux)
+
+    flux_seq = pscan(A_flux.unsqueeze(-1), X_flux.unsqueeze(-1)).squeeze(-1)
+    print_tensor_stats("flux_seq (parallel)", flux_seq)
+
+    source_seq = block.prop.flux_tracker.project(flux_seq)
+    print_tensor_stats("source_seq", source_seq)
+
+    gate_seq = torch.sigmoid(
+        block.prop.flux_tracker.gate_net(
+            torch.cat([flux_seq.real, flux_seq.imag], dim=-1)
+        )
+    )
+    print_tensor_stats("gate_seq", gate_seq)
+
+    print("\n--- TRACING SERIAL forward_step() ---")
+
+    h_state = torch.zeros(B * H * W, 1, D, dtype=torch.cdouble, device=device)
+    flux_state = torch.zeros(B, D, dtype=torch.cdouble, device=device)
+
+    for t in range(min(T, 2)):
+        print(f"\n  t={t}:")
+        x_t = x[:, t]
+
+        x_real_t = torch.cat([x_t.real, x_t.imag], dim=1)
+        x_norm_t = block.norm_spatial(x_real_t.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_spatial_t = block.spatial_cliff(x_norm_t)
+
+        x_s_re, x_s_im = torch.chunk(x_spatial_t, 2, dim=1)
+        x_spatial_complex_t = torch.complex(x_s_re, x_s_im)
+
+        x_perm_t = x_spatial_complex_t.permute(0, 2, 3, 1)
+        x_eigen_t = block.prop.basis.encode(x_perm_t)
+        print_tensor_stats(f"    x_eigen_t", x_eigen_t)
+
+        x_mean_t = x_eigen_t.mean(dim=(1, 2))
+        print_tensor_stats(f"    x_mean_t", x_mean_t)
+
+        par_x_mean = x_mean_par[:, t]
+        diff_x_mean = (x_mean_t - par_x_mean).abs().max().item()
+        print(f"    x_mean diff from parallel: {diff_x_mean:.2e}")
+
+        flux_next, source_t, gate_t = block.prop.flux_tracker.forward_step(flux_state, x_mean_t)
+        print_tensor_stats(f"    flux_next", flux_next)
+        print_tensor_stats(f"    source_t", source_t)
+        print_tensor_stats(f"    gate_t", gate_t)
+
+        par_flux = flux_seq[:, t]
+        diff_flux = (flux_next - par_flux).abs().max().item()
+        print(f"    flux diff from parallel: {diff_flux:.2e}")
+
+        par_source = source_seq[:, t]
+        diff_source = (source_t - par_source).abs().max().item()
+        print(f"    source diff from parallel: {diff_source:.2e}")
+
+        par_gate = gate_seq[:, t]
+        diff_gate = (gate_t - par_gate).abs().max().item()
+        print(f"    gate diff from parallel: {diff_gate:.2e}")
+
+        flux_state = flux_next
+
+
+def check_forward_step_recurrence():
+    print_section("Step 7: Check forward_step Recurrence Formula")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
@@ -276,130 +392,65 @@ def trace_forward_step_internals():
 
     prop = TemporalPropagator(D, dt_ref=1.0, sde_mode="det").to(device).double()
 
-    x_spatial = torch.randn(B, H, W, D, dtype=torch.cdouble, device=device)
-    h_prev = torch.zeros(B, H, W, D, dtype=torch.cdouble, device=device)
-    flux_prev = torch.zeros(B, D, dtype=torch.cdouble, device=device)
-    dt = torch.tensor(1.0, device=device, dtype=torch.float64)
+    print("Checking TemporalPropagator.forward_step implementation...")
 
-    x_eigen = prop.basis.encode(x_spatial)
-    print_tensor_stats("x_eigen", x_eigen)
+    if not hasattr(prop, 'forward_step'):
+        print("  WARNING: forward_step not found in TemporalPropagator!")
+        print("  This may cause inconsistency between parallel and serial modes.")
+        return False
 
-    x_mean = x_eigen.mean(dim=(1, 2))
-    print_tensor_stats("x_mean", x_mean)
+    import inspect
+    sig = inspect.signature(prop.forward_step)
+    print(f"  forward_step signature: {sig}")
 
-    flux_next, source, gate = prop.flux_tracker.forward_step(flux_prev, x_mean)
-    print_tensor_stats("flux_next", flux_next)
-    print_tensor_stats("source", source)
-    print_tensor_stats("gate", gate)
+    source = inspect.getsource(prop.forward_step)
+    print(f"\n  forward_step source code:")
+    for line in source.split('\n')[:20]:
+        print(f"    {line}")
 
-    dt_expanded = dt.view(1, 1, 1, 1)
-    op_decay, op_forcing = prop.get_transition_operators(dt_expanded)
-    print_tensor_stats("op_decay", op_decay)
-    print_tensor_stats("op_forcing", op_forcing)
-
-    source_exp = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
-    gate_exp = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
-
-    forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
-    print_tensor_stats("forcing", forcing)
-
-    h_next = h_prev * op_decay + forcing * op_forcing
-    print_tensor_stats("h_next (t=0, h_prev=0)", h_next)
-
-    print("\nExpected for t=0 with h_prev=0:")
-    print("  h_next = 0 * op_decay + forcing * op_forcing = forcing * op_forcing")
-    expected = forcing * op_forcing
-    diff = (h_next - expected).abs().max().item()
-    print(f"  Diff from expected: {diff:.2e}")
+    return True
 
 
-def compare_forward_formulas():
-    print_section("Step 7: Compare Forward Formulas in Detail")
+def diagnose_issue():
+    print_section("Step 8: Diagnose Root Cause")
 
     print("""
-PARALLEL forward() 中的公式 [4]:
-================================
-1. x_eigen = basis.encode(x_spatial)
-2. A_flux, X_flux = flux_tracker.get_operators(x_mean)
-3. flux_seq = pscan(A_flux, X_flux)
-4. source_seq = flux_tracker.project(flux_seq)
-5. gate_seq = sigmoid(gate_net(flux_seq))
-6. forcing = x_eigen * gate + source * (1 - gate)
-7. u_t = forcing * op_forcing        <-- X for PScan
-8. A_time = op_decay                  <-- A for PScan  
-9. Y = pscan(A_time, u_t)
+Based on the analysis, let's check the key difference:
+
+PARALLEL forward() in ModelUniPhy.py [4]:
+=========================================
+1. forcing = x_eigen * gate + source * (1 - gate)
+2. u_t = forcing * op_forcing
+3. A_time = op_decay
+4. Y = pscan(A_time, u_t)
    -> Y[0] = u_t[0] = forcing[0] * op_forcing[0]
    -> Y[t] = A[t] * Y[t-1] + u_t[t]
-           = op_decay * Y[t-1] + forcing[t] * op_forcing
 
+SERIAL forward_step() in ModelUniPhy.py [4]:
+============================================
+Calls self.prop.forward_step() which is in UniPhyOps.py [8]
 
-SERIAL forward_step() 中的公式 [8]:
-==================================
-1. x_tilde = basis.encode(x_input)
-2. flux_next, source, gate = flux_tracker.forward_step(flux_state, x_mean)
-3. forcing_term = x_tilde * gate + source * (1 - gate)
-4. h_next = h_prev * op_decay + forcing_term * op_forcing
+The question is: Does prop.forward_step use the same formula?
 
-对于 t=0, h_prev=0:
-  h[0] = 0 * op_decay + forcing[0] * op_forcing = forcing[0] * op_forcing  ✓
-
-对于 t=1:
-  h[1] = h[0] * op_decay + forcing[1] * op_forcing
-       = forcing[0] * op_forcing * op_decay + forcing[1] * op_forcing
-
-而 PScan:
-  Y[1] = A[1] * Y[0] + X[1]
-       = op_decay * (forcing[0] * op_forcing) + forcing[1] * op_forcing
-       = forcing[0] * op_forcing * op_decay + forcing[1] * op_forcing  ✓
-
-公式一致！
+Let's check if h_prev is encoded/decoded correctly.
 """)
-
-
-def check_flux_get_operators_vs_forward_step():
-    print_section("Step 8: Check flux_tracker.get_operators vs forward_step")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
     D = 4
-    B, T = 1, 3
+    prop = TemporalPropagator(D, dt_ref=1.0, sde_mode="det").to(device).double()
 
-    flux_tracker = GlobalFluxTracker(D).to(device).double()
+    print("Checking if basis encode/decode is invertible...")
+    x_test = torch.randn(1, 4, 4, D, dtype=torch.cdouble, device=device)
+    x_encoded = prop.basis.encode(x_test)
+    x_decoded = prop.basis.decode(x_encoded)
+    diff = (x_test - x_decoded).abs().max().item()
+    print(f"  encode->decode diff: {diff:.2e}")
 
-    x_mean_seq = torch.randn(B, T, D, dtype=torch.cdouble, device=device)
-
-    print("--- get_operators (for parallel) ---")
-    A_flux, X_flux = flux_tracker.get_operators(x_mean_seq)
-
-    print(f"A_flux shape: {A_flux.shape}")
-    print(f"X_flux shape: {X_flux.shape}")
-
-    for t in range(T):
-        print(f"  t={t}: A_flux={A_flux[0, t, 0].item():.4f}, X_flux={X_flux[0, t, 0].item():.4f}")
-
-    print("\n--- forward_step (for serial) ---")
-    flux_state = torch.zeros(B, D, dtype=torch.cdouble, device=device)
-    decay = flux_tracker._get_decay()
-    print(f"decay: {decay[0].item():.4f}")
-
-    for t in range(T):
-        x_t = x_mean_seq[:, t]
-
-        x_cat = torch.cat([x_t.real, x_t.imag], dim=-1)
-        x_in = flux_tracker.input_mix(x_cat)
-        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        flux_input = torch.complex(x_re, x_im)
-
-        print(f"  t={t}: flux_input={flux_input[0, 0].item():.4f}, expected X_flux={X_flux[0, t, 0].item():.4f}")
-
-        diff = (flux_input - X_flux[:, t]).abs().max().item()
-        print(f"       X_flux diff: {diff:.2e}")
-
-        if t == 0:
-            flux_state = flux_input
-        else:
-            flux_state = decay * flux_state + flux_input
+    if diff > 1e-5:
+        print("  WARNING: basis encode/decode is not invertible!")
+        print("  This could cause issues in forward_step.")
 
 
 def main():
@@ -419,11 +470,11 @@ def main():
 
     results['model_forward'] = check_model_forward_step()
 
-    trace_forward_step_internals()
+    trace_model_internals()
 
-    compare_forward_formulas()
+    check_forward_step_recurrence()
 
-    check_flux_get_operators_vs_forward_step()
+    diagnose_issue()
 
     print_section("SUMMARY")
 
