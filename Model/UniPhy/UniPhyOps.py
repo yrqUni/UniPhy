@@ -95,59 +95,32 @@ class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-
+        
         q_re, _ = torch.linalg.qr(torch.randn(dim, dim))
-        q_im, _ = torch.linalg.qr(torch.randn(dim, dim))
-
-        self.u_raw_re = nn.Parameter(q_re * 0.1)
-        self.u_raw_im = nn.Parameter(q_im * 0.1)
-        self.log_sigma = nn.Parameter(torch.zeros(dim))
-
+        self.U_re = nn.Parameter(q_re * 0.1)
+        self.U_im = nn.Parameter(torch.zeros(dim, dim))
         self.dft_weight = nn.Parameter(torch.tensor(0.2))
 
-        n = torch.arange(dim, dtype=torch.float64)
-        k = torch.arange(dim, dtype=torch.float64).unsqueeze(1)
-        dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
-        self.register_buffer("dft_re", dft_matrix.real.float())
-        self.register_buffer("dft_im", dft_matrix.imag.float())
-
     def _get_U(self):
-        return torch.complex(self.u_raw_re, self.u_raw_im)
-
-    def _get_dft(self):
-        return torch.complex(self.dft_re.to(self.u_raw_re.dtype), self.dft_im.to(self.u_raw_re.dtype))
-
-    def _get_sigma(self):
-        return torch.exp(self.log_sigma)
+        return torch.complex(self.U_re, self.U_im)
 
     def encode(self, x):
         U = self._get_U().to(x.dtype)
-        dft = self._get_dft().to(x.dtype)
-        sigma = self._get_sigma().to(x.real.dtype)
         w = torch.sigmoid(self.dft_weight)
-
+        
         x_u = torch.einsum("...d,de->...e", x, U)
-        x_u = x_u * sigma
-
-        x_dft = torch.fft.fft(x, dim=-1, norm="ortho")
-
+        x_dft = torch.fft.fft(x_u, dim=-1, norm="ortho")
         return (1 - w) * x_u + w * x_dft
 
     def decode(self, z):
         U = self._get_U().to(z.dtype)
-        dft = self._get_dft().to(z.dtype)
-        sigma = self._get_sigma().to(z.real.dtype)
         w = torch.sigmoid(self.dft_weight)
-
-        sigma_inv = 1.0 / (sigma + 1e-8)
-        U_H = U.conj().T
-
-        z_u = z * sigma_inv
-        z_u = torch.einsum("...d,de->...e", z_u, U_H)
-
-        z_dft = torch.fft.ifft(z, dim=-1, norm="ortho")
-
-        return (1 - w) * z_u + w * z_dft
+        
+        z_idft = torch.fft.ifft(z, dim=-1, norm="ortho")
+        z_mixed = (1 - w) * z + w * z_idft
+        
+        U_inv = torch.linalg.pinv(U)
+        return torch.einsum("...d,de->...e", z_mixed, U_inv)
 
 
 class GlobalFluxTracker(nn.Module):
