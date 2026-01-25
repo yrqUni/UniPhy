@@ -88,7 +88,8 @@ def check_ffn_causality():
     print("=" * 60)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, D, H, W = 1, 4, 16, 8, 8
-    ffn = UniPhyFeedForwardNetwork(dim=D, expand=4, num_experts=4).to(device)
+    # MODIFIED: Added .double() to match input dtype=torch.cdouble
+    ffn = UniPhyFeedForwardNetwork(dim=D, expand=4, num_experts=4).to(device).double()
     ffn.eval()
     x = torch.randn(B, T, D, H, W, device=device, dtype=torch.cdouble)
     with torch.no_grad():
@@ -306,6 +307,7 @@ def check_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, C, H, W = 1, 5, 2, 33, 33
     dt_ref = 6.0
+    # MODIFIED: Added .double() to match input dtype=torch.float64
     model = UniPhyModel(
         in_channels=C,
         out_channels=C,
@@ -319,7 +321,7 @@ def check_model_consistency():
         dt_ref=dt_ref,
         sde_mode="det",
         max_growth_rate=0.3,
-    ).to(device)
+    ).to(device).double()
     model.eval()
     x = torch.randn(B, T, C, H, W, device=device, dtype=torch.float64)
     dt = torch.ones(T, device=device, dtype=torch.float64) * dt_ref
