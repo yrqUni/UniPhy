@@ -149,27 +149,49 @@ class _PScanFunction(torch.autograd.Function):
         B, L, C, D1, D2_x = X.shape
         is_diag = (A.ndim == 4)
         ctx.is_diag = is_diag
-        need_pad = (D2_x == 1)
-        ctx.need_pad = need_pad
+        pad_d2 = (D2_x == 1)
+        pad_d1 = (D1 == 1)
+        ctx.pad_d2 = pad_d2
+        ctx.pad_d1 = pad_d1
+
+        X_in = X
+        if pad_d1:
+            X_in = F.pad(X_in, (0, 0, 0, 1), mode='constant', value=0.0)
+        if pad_d2:
+            X_in = F.pad(X_in, (0, 1), mode='constant', value=0.0)
+            
+        if is_diag:
+            A_mat = expand_diag_to_matrix(A, D1)
+        else:
+            A_mat = A
         
-        X_pad = F.pad(X, (0, 1), mode='constant', value=0.0) if need_pad else X
-        A_mat = expand_diag_to_matrix(A, D1) if is_diag else A
+        if pad_d1:
+            A_padded = F.pad(A_mat, (0, 1, 0, 1), mode='constant', value=0.0)
+            idx_pad = torch.zeros_like(A_padded)
+            idx_pad[..., 1, 1] = 1.0
+            A_mat = A_padded + idx_pad
             
         A_perm = A_mat.permute(0, 2, 1, 3, 4).contiguous()
-        X_perm = X_pad.permute(0, 2, 1, 3, 4).contiguous()
+        X_perm = X_in.permute(0, 2, 1, 3, 4).contiguous()
 
         A_flat = A_perm.reshape(B * C, L, A_mat.shape[-2], A_mat.shape[-1])
-        X_flat = X_perm.reshape(B * C, L, X_pad.shape[-2], X_pad.shape[-1])
+        X_flat = X_perm.reshape(B * C, L, X_in.shape[-2], X_in.shape[-1])
 
         A_real = torch.view_as_real(A_flat).contiguous()
         X_real = torch.view_as_real(X_flat).contiguous()
+        
         Y_real = run_mat2x2_pscan(A_real, X_real, L, reverse=False)
 
         Y_flat = torch.view_as_complex(Y_real.contiguous())
-        Y_perm = Y_flat.reshape(B, C, L, X_pad.shape[-2], X_pad.shape[-1])
+        Y_perm = Y_flat.reshape(B, C, L, X_in.shape[-2], X_in.shape[-1])
         Y_full = Y_perm.permute(0, 2, 1, 3, 4).contiguous()
 
-        Y = Y_full[..., :D2_x] if need_pad else Y_full
+        if pad_d1:
+            Y_full = Y_full[..., :D1, :]
+        if pad_d2:
+            Y_full = Y_full[..., :D2_x]
+            
+        Y = Y_full
         ctx.save_for_backward(A_mat, Y)
         return Y
 
@@ -177,17 +199,24 @@ class _PScanFunction(torch.autograd.Function):
     def backward(ctx, grad_Y):
         A_mat, Y = ctx.saved_tensors
         is_diag = ctx.is_diag
-        need_pad = ctx.need_pad
+        pad_d2 = ctx.pad_d2
+        pad_d1 = ctx.pad_d1
 
-        B, L, C, D1, D2_y = grad_Y.shape
-        if need_pad:
-            grad_Y_pad = F.pad(grad_Y, (0, 1), mode='constant', value=0.0)
-            Y_pad = F.pad(Y, (0, 1), mode='constant', value=0.0)
-        else:
-            grad_Y_pad = grad_Y
-            Y_pad = Y
+        B, L, C, D1_orig, D2_y = grad_Y.shape
+        grad_Y_in = grad_Y
+        Y_in = Y
+        
+        if pad_d1:
+            grad_Y_in = F.pad(grad_Y_in, (0, 0, 0, 1), mode='constant', value=0.0)
+            Y_in = F.pad(Y_in, (0, 0, 0, 1), mode='constant', value=0.0)
+            
+        if pad_d2:
+            grad_Y_in = F.pad(grad_Y_in, (0, 1), mode='constant', value=0.0)
+            Y_in = F.pad(Y_in, (0, 1), mode='constant', value=0.0)
 
-        D2_pad = grad_Y_pad.shape[-1]
+        D1 = A_mat.shape[-2]
+        D2_pad = grad_Y_in.shape[-1] 
+
         I = torch.eye(D1, dtype=A_mat.dtype, device=A_mat.device)
         I = I.reshape(1, 1, 1, D1, D1).expand(B, 1, C, D1, D1)
 
@@ -195,7 +224,7 @@ class _PScanFunction(torch.autograd.Function):
         A_H = A_shift.conj().transpose(-1, -2)
 
         A_H_perm = A_H.permute(0, 2, 1, 3, 4).contiguous()
-        grad_Y_perm = grad_Y_pad.permute(0, 2, 1, 3, 4).contiguous()
+        grad_Y_perm = grad_Y_in.permute(0, 2, 1, 3, 4).contiguous()
 
         A_H_flat = A_H_perm.reshape(B * C, L, D1, D1)
         grad_Y_flat = grad_Y_perm.reshape(B * C, L, D1, D2_pad)
@@ -208,9 +237,19 @@ class _PScanFunction(torch.autograd.Function):
         grad_X_perm = grad_X_flat.reshape(B, C, L, D1, D2_pad)
         grad_X_full = grad_X_perm.permute(0, 2, 1, 3, 4).contiguous()
 
-        grad_X = grad_X_full[..., :D2_y] if need_pad else grad_X_full
-        Y_prev = torch.cat([torch.zeros_like(Y_pad[:, :1]), Y_pad[:, :-1]], dim=1)
-        grad_A_full = torch.einsum("blcij,blckj->blcik", grad_X_full, Y_prev.conj())
+        if pad_d1:
+            grad_X_full = grad_X_full[..., :D1_orig, :]
+        if pad_d2:
+            grad_X = grad_X_full[..., :D2_y]
+        else:
+            grad_X = grad_X_full
+
+        Y_prev = torch.cat([torch.zeros_like(Y_in[:, :1]), Y_in[:, :-1]], dim=1)
+        grad_X_for_A = grad_X_flat.reshape(B, C, L, D1, D2_pad).permute(0, 2, 1, 3, 4).contiguous()
+        grad_A_full = torch.einsum("blcij,blckj->blcik", grad_X_for_A, Y_prev.conj())
+
+        if pad_d1:
+             grad_A_full = grad_A_full[..., :D1_orig, :D1_orig]
 
         grad_A = grad_A_full.diagonal(dim1=-2, dim2=-1) if is_diag else grad_A_full
         return grad_A, grad_X
