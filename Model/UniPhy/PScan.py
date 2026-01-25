@@ -14,15 +14,6 @@ def complex_mul(ar, ai, br, bi):
 
 
 @triton.jit
-def diag_scan_combine(ar, ai, xr, xi, br, bi, yr, yi):
-    new_ar, new_ai = complex_mul(br, bi, ar, ai)
-    bx_r, bx_i = complex_mul(br, bi, xr, xi)
-    new_xr = bx_r + yr
-    new_xi = bx_i + yi
-    return new_ar, new_ai, new_xr, new_xi
-
-
-@triton.jit
 def mat2x2_scan_combine(
     a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
     x00r, x00i, x01r, x01i, x10r, x10i, x11r, x11i,
@@ -73,52 +64,6 @@ def mat2x2_scan_combine(
         c00r, c00i, c01r, c01i, c10r, c10i, c11r, c11i,
         z00r, z00i, z01r, z01i, z10r, z10i, z11r, z11i,
     )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ],
-    key=["L"],
-)
-@triton.jit
-def diag_pscan_kernel(
-    A_ptr,
-    X_ptr,
-    Y_ptr,
-    stride_batch: tl.constexpr,
-    stride_time: tl.constexpr,
-    L,
-    BLOCK_SIZE: tl.constexpr,
-    REVERSE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-
-    A_base = A_ptr + pid * stride_batch
-    X_base = X_ptr + pid * stride_batch
-    Y_base = Y_ptr + pid * stride_batch
-
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < L
-
-    if REVERSE:
-        read_offs = L - 1 - offs
-    else:
-        read_offs = offs
-
-    a_r = tl.load(A_base + read_offs * stride_time + 0, mask=mask, other=1.0)
-    a_i = tl.load(A_base + read_offs * stride_time + 1, mask=mask, other=0.0)
-    x_r = tl.load(X_base + read_offs * stride_time + 0, mask=mask, other=0.0)
-    x_i = tl.load(X_base + read_offs * stride_time + 1, mask=mask, other=0.0)
-
-    acc_ar, acc_ai, acc_xr, acc_xi = tl.associative_scan(
-        (a_r, a_i, x_r, x_i), axis=0, combine_fn=diag_scan_combine
-    )
-
-    tl.store(Y_base + read_offs * stride_time + 0, acc_xr, mask=mask)
-    tl.store(Y_base + read_offs * stride_time + 1, acc_xi, mask=mask)
 
 
 @triton.autotune(
@@ -200,24 +145,6 @@ def mat2x2_pscan_kernel(
     tl.store(Y_base + read_offs * stride_x_time + 1 * stride_x_d1 + 1 * stride_x_d2 + 1, y11i, mask=mask)
 
 
-def run_diag_pscan(A_real, X_real, L, reverse=False):
-    Y_real = torch.empty_like(X_real)
-    BLOCK_SIZE = max(16, next_power_of_2(L))
-    num_batches = A_real.shape[0]
-
-    diag_pscan_kernel[(num_batches,)](
-        A_real,
-        X_real,
-        Y_real,
-        A_real.stride(0),
-        A_real.stride(1),
-        L,
-        BLOCK_SIZE,
-        reverse,
-    )
-    return Y_real
-
-
 def run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     Y_real = torch.empty_like(X_real)
     BLOCK_SIZE = max(16, next_power_of_2(L))
@@ -243,43 +170,17 @@ def run_mat2x2_pscan(A_real, X_real, L, reverse=False):
 
 
 def expand_diag_to_matrix(A_diag, D):
-    B, L, C, _ = A_diag.shape
-    A_mat = torch.zeros(B, L, C, D, D, dtype=A_diag.dtype, device=A_diag.device)
+    shape = A_diag.shape[:-1] + (D, D)
+    A_mat = torch.zeros(shape, dtype=A_diag.dtype, device=A_diag.device)
     idx = torch.arange(D, device=A_diag.device)
     A_mat[..., idx, idx] = A_diag
     return A_mat
-
-
-def sequential_pscan_forward(A, X):
-    B, L, C, D1, D2 = X.shape
-    Y = torch.zeros_like(X)
-    Y[:, 0] = X[:, 0]
-    for t in range(1, L):
-        Y[:, t] = torch.einsum("bcij,bcjk->bcik", A[:, t], Y[:, t - 1]) + X[:, t]
-    return Y
-
-
-def sequential_pscan_backward(A, Y, grad_Y):
-    B, L, C, D1, D2 = grad_Y.shape
-
-    Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
-    grad_A = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
-
-    grad_X = torch.zeros_like(grad_Y)
-    grad_X[:, L - 1] = grad_Y[:, L - 1]
-    for t in range(L - 2, -1, -1):
-        A_H = A[:, t + 1].conj().transpose(-1, -2)
-        grad_X[:, t] = grad_Y[:, t] + torch.einsum("bcij,bcjk->bcik", A_H, grad_X[:, t + 1])
-
-    return grad_A, grad_X
 
 
 class _PScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
         B, L, C, D1, D2 = X.shape
-        ctx.shape_A_orig = A.shape
-        ctx.shape_X_orig = X.shape
 
         is_diag = (A.ndim == 4)
         ctx.is_diag = is_diag
@@ -289,11 +190,8 @@ class _PScanFunction(torch.autograd.Function):
         else:
             A_mat = A
 
-        A_work = A_mat.contiguous()
-        X_work = X.contiguous()
-
-        A_perm = A_work.permute(0, 2, 1, 3, 4).contiguous()
-        X_perm = X_work.permute(0, 2, 1, 3, 4).contiguous()
+        A_perm = A_mat.permute(0, 2, 1, 3, 4).contiguous()
+        X_perm = X.permute(0, 2, 1, 3, 4).contiguous()
 
         A_flat = A_perm.reshape(B * C, L, D1, D2)
         X_flat = X_perm.reshape(B * C, L, D1, D2)
@@ -318,15 +216,10 @@ class _PScanFunction(torch.autograd.Function):
 
         B, L, C, D1, D2 = grad_Y.shape
 
-        Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
-        grad_A_full = torch.einsum("blcij,blckj->blcik", grad_Y, Y_prev.conj())
+        I = torch.eye(D1, dtype=A_mat.dtype, device=A_mat.device)
+        I = I.reshape(1, 1, 1, D1, D2).expand(B, 1, C, D1, D2)
 
-        A_shift = torch.cat([
-            A_mat[:, 1:],
-            torch.eye(D1, dtype=A_mat.dtype, device=A_mat.device)
-            .unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            .expand(B, 1, C, D1, D2)
-        ], dim=1)
+        A_shift = torch.cat([A_mat[:, 1:], I], dim=1)
         A_H = A_shift.conj().transpose(-1, -2)
 
         A_H_perm = A_H.permute(0, 2, 1, 3, 4).contiguous()
@@ -344,6 +237,9 @@ class _PScanFunction(torch.autograd.Function):
         grad_X_perm = grad_X_flat.reshape(B, C, L, D1, D2)
         grad_X = grad_X_perm.permute(0, 2, 1, 3, 4).contiguous()
 
+        Y_prev = torch.cat([torch.zeros_like(Y[:, :1]), Y[:, :-1]], dim=1)
+        grad_A_full = torch.einsum("blcij,blckj->blcik", grad_X, Y_prev.conj())
+
         if is_diag:
             grad_A = grad_A_full.diagonal(dim1=-2, dim2=-1)
         else:
@@ -352,7 +248,7 @@ class _PScanFunction(torch.autograd.Function):
         return grad_A, grad_X
 
 
-def pscan(A, X, mode="auto"):
+def pscan(A, X):
     is_diag = (A.ndim == X.ndim - 1)
 
     if is_diag:
@@ -361,6 +257,4 @@ def pscan(A, X, mode="auto"):
     else:
         A_mat = A
 
-    Y = _PScanFunction.apply(A_mat, X)
-
-    return Y
+    return _PScanFunction.apply(A_mat, X)
