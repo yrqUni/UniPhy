@@ -88,7 +88,6 @@ def check_ffn_causality():
     print("=" * 60)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, D, H, W = 1, 4, 16, 8, 8
-    # MODIFIED: Added .double() to match input dtype=torch.cdouble
     ffn = UniPhyFeedForwardNetwork(dim=D, expand=4, num_experts=4).to(device).double()
     ffn.eval()
     x = torch.randn(B, T, D, H, W, device=device, dtype=torch.cdouble)
@@ -116,7 +115,7 @@ def check_flux_tracker_gate():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dim = 64
     B = 2
-    tracker = GlobalFluxTracker(dim).to(device)
+    tracker = GlobalFluxTracker(dim).to(device).double()
     prev_state = torch.zeros(B, dim, device=device, dtype=torch.cdouble)
     x_t = torch.randn(B, dim, device=device, dtype=torch.cdouble)
     new_state, source, gate = tracker.forward_step(prev_state, x_t)
@@ -145,7 +144,7 @@ def check_heteroscedastic_noise():
     B, N, T = 2, 16, 1
     prop = TemporalPropagator(
         dim, dt_ref=6.0, sde_mode="sde", init_noise_scale=1.0
-    ).to(device)
+    ).to(device).double()
     target_shape = (B * N, T, dim)
     dt = torch.tensor([6.0], device=device)
     h_state_low = torch.ones(B * N, T, dim, device=device, dtype=torch.cdouble) * 0.1
@@ -307,7 +306,6 @@ def check_model_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, C, H, W = 1, 5, 2, 33, 33
     dt_ref = 6.0
-    # MODIFIED: Added .double() to match input dtype=torch.float64
     model = UniPhyModel(
         in_channels=C,
         out_channels=C,
