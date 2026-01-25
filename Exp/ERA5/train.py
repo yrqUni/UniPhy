@@ -28,6 +28,7 @@ from rich.progress import (
 )
 from rich.table import Table
 from rich.theme import Theme
+from rich.panel import Panel
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -54,6 +55,50 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def format_params(num):
+    if num >= 1e9:
+        return f"{num / 1e9:.2f}B"
+    elif num >= 1e6:
+        return f"{num / 1e6:.2f}M"
+    elif num >= 1e3:
+        return f"{num / 1e3:.2f}K"
+    else:
+        return str(num)
+
+
+def get_model_info(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+    return total_params, trainable_params, non_trainable_params
+
+
+def print_model_summary(model, cfg, rank):
+    if rank != 0:
+        return
+
+    total_params, trainable_params, non_trainable_params = get_model_info(model)
+
+    table = Table(title="Model Configuration", header_style="bold magenta")
+    table.add_column("Parameter", style="cyan")
+    table.add_column("Value", style="green")
+
+    table.add_row("Total Parameters", format_params(total_params))
+    table.add_row("Trainable Parameters", format_params(trainable_params))
+    table.add_row("Non-trainable Parameters", format_params(non_trainable_params))
+    table.add_row("", "")
+    table.add_row("Embed Dim", str(cfg["model"]["embed_dim"]))
+    table.add_row("Depth", str(cfg["model"]["depth"]))
+    table.add_row("Num Experts", str(cfg["model"]["num_experts"]))
+    table.add_row("Expand", str(cfg["model"]["expand"]))
+    table.add_row("Patch Size", str(cfg["model"]["patch_size"]))
+    table.add_row("Image Size", f"{cfg['model']['img_height']}x{cfg['model']['img_width']}")
+    table.add_row("SDE Mode", cfg["model"]["sde_mode"])
+
+    console.print(table)
+    console.print()
 
 
 def save_ckpt(model, optimizer, epoch, step, path, scheduler=None):
@@ -166,6 +211,8 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
         max_growth_rate=cfg["model"]["max_growth_rate"],
     ).cuda()
 
+    print_model_summary(model, cfg, rank)
+
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     train_dataset = ERA5_Dataset(
@@ -194,6 +241,11 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
         pin_memory=True,
     )
 
+    if rank == 0:
+        console.print(f"[info]Dataset size: {len(train_dataset)} samples[/info]")
+        console.print(f"[info]Batches per epoch: {len(train_loader)}[/info]")
+        console.print()
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(cfg["train"]["lr"]),
@@ -219,14 +271,17 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
         start_epoch, global_step = load_ckpt(
             model, optimizer, cfg["logging"]["ckpt"], scheduler
         )
+        if rank == 0:
+            console.print(f"[success]Resumed from checkpoint: epoch {start_epoch}, step {global_step}[/success]")
 
     if cfg["logging"]["use_wandb"] and rank == 0:
         run_name = cfg["logging"]["wandb_run_name"] or f"uniphy_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        total_params, _, _ = get_model_info(model.module)
         wandb.init(
             project=cfg["logging"]["wandb_project"],
             entity=cfg["logging"]["wandb_entity"],
             name=run_name,
-            config=cfg,
+            config={**cfg, "total_params": total_params},
         )
 
     save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
