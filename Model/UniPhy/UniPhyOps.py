@@ -95,32 +95,64 @@ class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        
+
         q_re, _ = torch.linalg.qr(torch.randn(dim, dim))
-        self.U_re = nn.Parameter(q_re * 0.1)
-        self.U_im = nn.Parameter(torch.zeros(dim, dim))
+        q_im, _ = torch.linalg.qr(torch.randn(dim, dim))
+
+        self.u_raw_re = nn.Parameter(q_re * 0.1)
+        self.u_raw_im = nn.Parameter(q_im * 0.1)
+        self.v_raw_re = nn.Parameter(q_re.T * 0.1)
+        self.v_raw_im = nn.Parameter(q_im.T * 0.1)
+        self.log_sigma = nn.Parameter(torch.zeros(dim))
+
+        n = torch.arange(dim)
+        k = torch.arange(dim).reshape(-1, 1)
+        dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
+        self.register_buffer("dft_basis", dft_matrix)
         self.dft_weight = nn.Parameter(torch.tensor(0.2))
 
-    def _get_U(self):
-        return torch.complex(self.U_re, self.U_im)
+    def _cayley_orthogonalize(self, raw_re, raw_im):
+        A = torch.complex(raw_re, raw_im)
+        A_skew = A - A.T.conj()
+        I = torch.eye(self.dim, device=A.device, dtype=A.dtype)
+        Q = torch.linalg.solve(I + A_skew, I - A_skew)
+        return Q
+
+    def _get_basis(self):
+        U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
+        V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
+        S = torch.diag(torch.exp(self.log_sigma).to(U.dtype))
+        return U, S, V
 
     def encode(self, x):
-        U = self._get_U().to(x.dtype)
-        w = torch.sigmoid(self.dft_weight)
-        
-        x_u = torch.einsum("...d,de->...e", x, U)
-        x_dft = torch.fft.fft(x_u, dim=-1, norm="ortho")
-        return (1 - w) * x_u + w * x_dft
+        U, S_mat, V = self._get_basis()
+        S_diag = torch.diag(S_mat)
 
-    def decode(self, z):
-        U = self._get_U().to(z.dtype)
-        w = torch.sigmoid(self.dft_weight)
+        learned_path = torch.einsum("...d, de -> ...e", x, V) * S_diag
+
+        x_complex = x if x.is_complex() else torch.complex(x, torch.zeros_like(x))
+        dft_basis = self.dft_basis.to(dtype=x_complex.dtype)
+        dft_path = torch.einsum("...d, de -> ...e", x_complex, dft_basis)
+
+        alpha = torch.sigmoid(self.dft_weight)
+        return learned_path * (1 - alpha) + dft_path * alpha
+
+    def decode(self, h):
+        U, S_mat, V = self._get_basis()
+        S_diag = torch.diag(S_mat)
+        alpha = torch.sigmoid(self.dft_weight)
         
-        z_idft = torch.fft.ifft(z, dim=-1, norm="ortho")
-        z_mixed = (1 - w) * z + w * z_idft
+        W_learned = V * S_diag.unsqueeze(0) * (1 - alpha)
         
-        U_inv = torch.linalg.pinv(U)
-        return torch.einsum("...d,de->...e", z_mixed, U_inv)
+        dft_basis = self.dft_basis.to(dtype=h.dtype)
+        W_dft = dft_basis * alpha
+        W_total = W_learned + W_dft
+        
+        if h.is_complex() and not W_total.is_complex():
+            W_total = W_total.to(h.dtype)
+            
+        x_rec = torch.linalg.solve(W_total.T, h.unsqueeze(-1)).squeeze(-1)
+        return x_rec
 
 
 class GlobalFluxTracker(nn.Module):
