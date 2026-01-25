@@ -47,7 +47,7 @@ def check_forward_diag():
     X = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda')
 
     Y_seq = sequential_pscan_diag(A, X)
-    Y_par = pscan(A, X, mode='diag')
+    Y_par = pscan(A, X)
 
     max_diff = (Y_seq - Y_par).abs().max().item()
     mean_diff = (Y_seq - Y_par).abs().mean().item()
@@ -76,7 +76,7 @@ def check_forward_mat():
     X = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda')
 
     Y_seq = sequential_pscan_mat(A, X)
-    Y_par = pscan(A, X, mode='mat')
+    Y_par = pscan(A, X)
 
     max_diff = (Y_seq - Y_par).abs().max().item()
     mean_diff = (Y_seq - Y_par).abs().mean().item()
@@ -105,7 +105,7 @@ def check_forward_diag_as_mat():
     X = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda')
 
     Y_seq = sequential_pscan_diag(A, X)
-    Y_par = pscan(A, X, mode='mat')
+    Y_par = pscan(A, X)
 
     max_diff = (Y_seq - Y_par).abs().max().item()
     mean_diff = (Y_seq - Y_par).abs().mean().item()
@@ -143,7 +143,7 @@ def check_backward_diag():
     loss_seq = Y_seq.abs().pow(2).sum()
     loss_seq.backward()
 
-    Y_par = pscan(A_par, X_par, mode='diag')
+    Y_par = pscan(A_par, X_par)
     loss_par = Y_par.abs().pow(2).sum()
     loss_par.backward()
 
@@ -184,7 +184,7 @@ def check_backward_mat():
     loss_seq = Y_seq.abs().pow(2).sum()
     loss_seq.backward()
 
-    Y_par = pscan(A_par, X_par, mode='mat')
+    Y_par = pscan(A_par, X_par)
     loss_par = Y_par.abs().pow(2).sum()
     loss_par.backward()
 
@@ -219,7 +219,7 @@ def check_gradcheck_diag():
     X.requires_grad_(True)
 
     def func(A, X):
-        return pscan(A, X, mode='diag')
+        return pscan(A, X)
 
     try:
         result = torch.autograd.gradcheck(func, (A, X), eps=1e-6, atol=1e-4, rtol=1e-3)
@@ -245,7 +245,7 @@ def check_gradcheck_mat():
     X.requires_grad_(True)
 
     def func(A, X):
-        return pscan(A, X, mode='mat')
+        return pscan(A, X)
 
     try:
         result = torch.autograd.gradcheck(func, (A, X), eps=1e-6, atol=1e-4, rtol=1e-3)
@@ -279,11 +279,11 @@ def check_various_shapes():
         X = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda')
 
         Y_seq_diag = sequential_pscan_diag(A_diag, X)
-        Y_par_diag = pscan(A_diag, X, mode='diag')
+        Y_par_diag = pscan(A_diag, X)
         diff_diag = (Y_seq_diag - Y_par_diag).abs().max().item()
 
         Y_seq_mat = sequential_pscan_mat(A_mat, X)
-        Y_par_mat = pscan(A_mat, X, mode='mat')
+        Y_par_mat = pscan(A_mat, X)
         diff_mat = (Y_seq_mat - Y_par_mat).abs().max().item()
 
         passed_diag = diff_diag < 1e-4
@@ -310,7 +310,7 @@ def check_long_sequence():
     X = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda')
 
     Y_seq = sequential_pscan_mat(A, X)
-    Y_par = pscan(A, X, mode='mat')
+    Y_par = pscan(A, X)
 
     max_diff = (Y_seq - Y_par).abs().max().item()
     mean_diff = (Y_seq - Y_par).abs().mean().item()
@@ -369,7 +369,7 @@ def benchmark():
     X = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda')
 
     for _ in range(3):
-        _ = pscan(A, X, mode='mat')
+        _ = pscan(A, X)
     torch.cuda.synchronize()
 
     n_iters = 100
@@ -384,7 +384,7 @@ def benchmark():
     torch.cuda.synchronize()
     start = time.time()
     for _ in range(n_iters):
-        _ = pscan(A, X, mode='mat')
+        _ = pscan(A, X)
     torch.cuda.synchronize()
     par_time = (time.time() - start) / n_iters * 1000
 
