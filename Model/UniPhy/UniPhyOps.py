@@ -146,8 +146,10 @@ class ComplexSVDTransform(nn.Module):
         dft_basis = self.dft_basis.to(dtype=h.dtype)
         W_total = W_learned + dft_basis * alpha
         
-        W_inv = torch.linalg.inv(W_total)
-        x_rec = torch.einsum("...d, de -> ...e", h, W_inv)
+        original_shape = h.shape
+        h_2d = h.reshape(-1, h.shape[-1])
+        x_2d = torch.linalg.solve(W_total.T, h_2d.T).T
+        x_rec = x_2d.reshape(original_shape)
         
         return x_rec
 
