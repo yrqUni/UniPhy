@@ -5,8 +5,10 @@ import yaml
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
@@ -15,14 +17,13 @@ from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhyModel
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
+plt.switch_backend('Agg')
 
 def get_lat_weights(H, W, device):
     lat = torch.linspace(-90, 90, H, device=device)
     weights = torch.cos(torch.deg2rad(lat))
     weights = weights / weights.mean()
     return weights.view(1, 1, 1, H, 1)
-
 
 def compute_metrics(pred, target, lat_weights):
     if pred.is_complex():
@@ -47,6 +48,38 @@ def compute_metrics(pred, target, lat_weights):
     rmse = torch.sqrt(mse.mean()).item()
     return rmse
 
+def save_visualization_gif(target, pred, save_path, channel_idx=0):
+    T = target.shape[0]
+    
+    target_np = target[:, channel_idx, :, :].cpu().numpy()
+    pred_np = pred[:, channel_idx, :, :].cpu().numpy()
+    
+    vmin = min(target_np.min(), pred_np.min())
+    vmax = max(target_np.max(), pred_np.max())
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    im0 = axes[0].imshow(target_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+    axes[0].set_title(f"Target (t=0)")
+    plt.colorbar(im0, ax=axes[0], fraction=0.035, pad=0.04)
+    
+    im1 = axes[1].imshow(pred_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+    axes[1].set_title(f"Prediction (t=0)")
+    plt.colorbar(im1, ax=axes[1], fraction=0.035, pad=0.04)
+    
+    def update(t):
+        axes[0].clear()
+        axes[1].clear()
+        
+        axes[0].imshow(target_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+        axes[0].set_title(f"Target (t={t+1})")
+        
+        axes[1].imshow(pred_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+        axes[1].set_title(f"Prediction (t={t+1})")
+        
+    ani = animation.FuncAnimation(fig, update, frames=T, interval=500)
+    ani.save(save_path, writer='pillow', fps=2)
+    plt.close(fig)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -66,6 +99,8 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
 
     os.makedirs(cfg["save_dir"], exist_ok=True)
+    vis_dir = os.path.join(cfg["save_dir"], "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
 
     checkpoint = torch.load(cfg["ckpt_path"], map_location="cpu")
 
@@ -133,45 +168,61 @@ def main():
 
     all_rmses = []
     all_rmses_per_step = [[] for _ in range(cfg["pred_frames"])]
+    
+    num_vis_saved = 0
+    max_vis = cfg.get("max_vis_samples", 5)
 
     print(f"Starting inference on {len(test_loader)} batches...")
 
-    with torch.no_grad():
-        for i, (data, dt_data) in tqdm(enumerate(test_loader), total=len(test_loader)):
-            data = data.to(device).float()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task("Inference", total=len(test_loader))
+        
+        with torch.no_grad():
+            for i, (data, dt_data) in enumerate(test_loader):
+                data = data.to(device).float()
 
-            x_cond = data[:, :cfg["cond_frames"]]
-            x_target = data[:, cfg["cond_frames"]:]
+                x_cond = data[:, :cfg["cond_frames"]]
+                x_target = data[:, cfg["cond_frames"]:]
 
-            dt_cond = torch.ones(x_cond.shape[0], cfg["cond_frames"], device=device) * cfg["dt_ref"]
-            dt_future = torch.ones(x_cond.shape[0], cfg["pred_frames"], device=device) * cfg["dt_ref"]
+                dt_cond = torch.ones(x_cond.shape[0], cfg["cond_frames"], device=device) * cfg["dt_ref"]
+                dt_future = torch.ones(x_cond.shape[0], cfg["pred_frames"], device=device) * cfg["dt_ref"]
 
-            if cfg.get("num_ensemble", 1) > 1:
-                ensemble_preds = []
-                for _ in range(cfg["num_ensemble"]):
-                    pred = model.forecast(x_cond, dt_cond, cfg["pred_frames"], dt_future)
-                    if pred.is_complex():
-                        pred = pred.real
-                    ensemble_preds.append(pred)
-                pred_final = torch.stack(ensemble_preds, dim=0).mean(dim=0)
-            else:
-                pred_final = model.forecast(x_cond, dt_cond, cfg["pred_frames"], dt_future)
-                if pred_final.is_complex():
-                    pred_final = pred_final.real
+                if cfg.get("num_ensemble", 1) > 1:
+                    ensemble_preds = []
+                    for _ in range(cfg["num_ensemble"]):
+                        pred = model.forecast(x_cond, dt_cond, cfg["pred_frames"], dt_future)
+                        if pred.is_complex():
+                            pred = pred.real
+                        ensemble_preds.append(pred)
+                    pred_final = torch.stack(ensemble_preds, dim=0).mean(dim=0)
+                else:
+                    pred_final = model.forecast(x_cond, dt_cond, cfg["pred_frames"], dt_future)
+                    if pred_final.is_complex():
+                        pred_final = pred_final.real
 
-            pred_final = pred_final.to(device)
+                pred_final = pred_final.to(device)
 
-            for t in range(min(cfg["pred_frames"], x_target.shape[1], pred_final.shape[1])):
-                rmse_t = compute_metrics(
-                    pred_final[:, t:t+1], x_target[:, t:t+1], lat_weights
-                )
-                all_rmses_per_step[t].append(rmse_t)
+                for t in range(min(cfg["pred_frames"], x_target.shape[1], pred_final.shape[1])):
+                    rmse_t = compute_metrics(
+                        pred_final[:, t:t+1], x_target[:, t:t+1], lat_weights
+                    )
+                    all_rmses_per_step[t].append(rmse_t)
 
-            rmse = compute_metrics(pred_final, x_target, lat_weights)
-            all_rmses.append(rmse)
+                rmse = compute_metrics(pred_final, x_target, lat_weights)
+                all_rmses.append(rmse)
 
-            if i % 10 == 0:
-                print(f"Batch {i}: RMSE = {rmse:.4f}")
+                if num_vis_saved < max_vis:
+                    gif_path = os.path.join(vis_dir, f"sample_{i}_vis.gif")
+                    save_visualization_gif(x_target[0], pred_final[0], gif_path)
+                    num_vis_saved += 1
+
+                progress.advance(task)
 
     mean_rmse = np.mean(all_rmses)
     std_rmse = np.std(all_rmses)
@@ -197,7 +248,7 @@ def main():
                 f.write(f"  Step {t+1}: {np.mean(all_rmses_per_step[t]):.4f}\n")
 
     print(f"\nResults saved to {result_path}")
-
+    print(f"Visualizations saved to {vis_dir}")
 
 if __name__ == "__main__":
     main()
