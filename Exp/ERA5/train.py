@@ -106,16 +106,18 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, step_in_accum):
     data = data.cuda(non_blocking=True)
     dt = dt.cuda(non_blocking=True)
 
-    data_complex = torch.complex(data, torch.zeros_like(data))
-
-    x_input = data_complex[:, :-1]
-    x_target = data_complex[:, 1:]
+    x_input = data[:, :-1]
+    x_target = data[:, 1:]
 
     dt_input = dt[:, :-1] if dt.ndim > 1 else dt[:-1]
 
     x_pred = model(x_input, dt_input)
 
-    loss_mse = F.mse_loss(x_pred.real, x_target.real) + F.mse_loss(x_pred.imag, x_target.imag)
+    if x_pred.is_complex():
+        loss_mse = F.mse_loss(x_pred.real, x_target) + F.mse_loss(x_pred.imag, torch.zeros_like(x_target))
+    else:
+        loss_mse = F.mse_loss(x_pred, x_target)
+
     loss_spectral = compute_spectral_loss(x_pred, x_target) * cfg["train"]["spectral_loss_weight"]
     loss_energy = compute_energy_penalty(x_pred, x_target) * cfg["train"]["energy_penalty_weight"]
 
