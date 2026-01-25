@@ -4,27 +4,49 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def complex_mul(ar, ai, br, bi):
-    return ar * br - ai * bi, ar * bi + ai * br
+def batch_matmul_real(ar, ai, br, bi):
+    ar_ = tl.expand_dims(ar, 3)
+    ai_ = tl.expand_dims(ai, 3)
+    br_ = tl.expand_dims(br, 2)
+    bi_ = tl.expand_dims(bi, 2)
+    
+    rr = ar_ * br_
+    ri = ar_ * bi_
+    ir = ai_ * br_
+    ii = ai_ * bi_
+    
+    cr = tl.sum(rr - ii, axis=2)
+    ci = tl.sum(ri + ir, axis=2)
+    return cr, ci
 
 @triton.jit
-def complex_matmul_op(ar, ai, br, bi):
-    res_r = tl.dot(ar, br) - tl.dot(ai, bi)
-    res_i = tl.dot(ar, bi) + tl.dot(ai, br)
-    return res_r, res_i
+def batch_matvec_real(ar, ai, xr, xi):
+    xr_ = tl.expand_dims(xr, 2)
+    xi_ = tl.expand_dims(xi, 2)
+    
+    rr = ar * xr_
+    ri = ar * xi_
+    ir = ai * xr_
+    ii = ai * xi_
+    
+    yr = tl.sum(rr - ii, axis=2)
+    yi = tl.sum(ri + ir, axis=2)
+    return yr, yi
 
 @triton.jit
 def scan_combine_diag(ar, ai, xr, xi, br, bi, yr, yi):
-    new_ar, new_ai = complex_mul(br, bi, ar, ai)
-    bx_r, bx_i = complex_mul(br, bi, xr, xi)
+    new_ar = ar * br - ai * bi
+    new_ai = ar * bi + ai * br
+    bx_r = br * xr - bi * xi
+    bx_i = br * xi + bi * xr
     new_xr = bx_r + yr
     new_xi = bx_i + yi
     return new_ar, new_ai, new_xr, new_xi
 
 @triton.jit
 def scan_combine_mat(ar, ai, xr, xi, br, bi, yr, yi):
-    new_ar, new_ai = complex_matmul_op(br, bi, ar, ai)
-    bx_r, bx_i = tl.dot(br, xr) - tl.dot(bi, xi), tl.dot(br, xi) + tl.dot(bi, xr)
+    new_ar, new_ai = batch_matmul_real(br, bi, ar, ai)
+    bx_r, bx_i = batch_matvec_real(br, bi, xr, xi)
     new_xr = bx_r + yr
     new_xi = bx_i + yi
     return new_ar, new_ai, new_xr, new_xi
@@ -50,20 +72,20 @@ def pscan_diag_kernel(
     
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < L
-
-    a_vals = tl.load(A_base + offs * stride_time, mask=mask, other=0.0)
-    x_vals = tl.load(X_base + offs * stride_time, mask=mask, other=0.0)
     
-    ar, ai = a_vals.real, a_vals.imag
-    xr, xi = x_vals.real, x_vals.imag
+    off_time = offs * stride_time
+    
+    ar = tl.load(A_base + off_time, mask=mask, other=0.0)
+    ai = tl.load(A_base + off_time + 1, mask=mask, other=0.0)
+    xr = tl.load(X_base + off_time, mask=mask, other=0.0)
+    xi = tl.load(X_base + off_time + 1, mask=mask, other=0.0)
 
-    acc_ar, acc_ai, acc_xr, acc_xi = tl.associative_scan(
+    _, _, acc_xr, acc_xi = tl.associative_scan(
         (ar, ai, xr, xi), axis=0, combine_fn=scan_combine_diag
     )
     
-    y_real = acc_xr
-    y_imag = acc_xi
-    tl.store(Y_base + offs * stride_time, y_real + 1j * y_imag, mask=mask)
+    tl.store(Y_base + off_time, acc_xr, mask=mask)
+    tl.store(Y_base + off_time + 1, acc_xi, mask=mask)
 
 @triton.autotune(configs=get_configs(), key=["L", "D"])
 @triton.jit
@@ -88,18 +110,18 @@ def pscan_mat_kernel(
     a_ptrs = A_ptr_base + row_offs[None, :, None] * stride_row_a + col_offs[None, None, :] * stride_col_a
     x_ptrs = X_ptr_base + row_offs[None, :] * stride_dim_x
     
-    a_vals = tl.load(a_ptrs, mask=mask[:, None, None], other=0.0)
-    x_vals = tl.load(x_ptrs, mask=mask[:, None], other=0.0)
-    
-    ar, ai = a_vals.real, a_vals.imag
-    xr, xi = x_vals.real, x_vals.imag
+    ar = tl.load(a_ptrs, mask=mask[:, None, None], other=0.0)
+    ai = tl.load(a_ptrs + 1, mask=mask[:, None, None], other=0.0)
+    xr = tl.load(x_ptrs, mask=mask[:, None], other=0.0)
+    xi = tl.load(x_ptrs + 1, mask=mask[:, None], other=0.0)
 
     _, _, acc_xr, acc_xi = tl.associative_scan(
         (ar, ai, xr, xi), axis=0, combine_fn=scan_combine_mat
     )
     
-    y_out = acc_xr + 1j * acc_xi
-    tl.store(Y_ptr_base + row_offs[None, :] * stride_dim_x, y_out, mask=mask[:, None])
+    y_ptrs = Y_ptr_base + row_offs[None, :] * stride_dim_x
+    tl.store(y_ptrs, acc_xr, mask=mask[:, None])
+    tl.store(y_ptrs + 1, acc_xi, mask=mask[:, None])
 
 def next_power_of_2(n):
     return 1 << (n - 1).bit_length()
@@ -113,20 +135,20 @@ class _PScanFunction(torch.autograd.Function):
         
         if is_matrix:
             B, L, D, _ = A.shape
-            A = A.contiguous()
-            X = X.contiguous()
-            Y = torch.empty_like(X)
+            A_real = torch.view_as_real(A).contiguous()
+            X_real = torch.view_as_real(X).contiguous()
+            Y_real = torch.empty_like(X_real)
             
-            BLOCK_SIZE = next_power_of_2(L)
-            if BLOCK_SIZE < 16: BLOCK_SIZE = 16
-            
+            BLOCK_SIZE = max(16, next_power_of_2(L))
             grid = (B,)
+            
             pscan_mat_kernel[grid](
-                A, X, Y,
-                A.stride(0), A.stride(1), A.stride(2), A.stride(3),
-                X.stride(0), X.stride(1), X.stride(2),
+                A_real, X_real, Y_real,
+                A_real.stride(0), A_real.stride(1), A_real.stride(2), A_real.stride(3),
+                X_real.stride(0), X_real.stride(1), X_real.stride(2),
                 L, D, BLOCK_SIZE=BLOCK_SIZE
             )
+            Y = torch.view_as_complex(Y_real)
             ctx.saved_Y = Y
             return Y
         else:
@@ -135,25 +157,24 @@ class _PScanFunction(torch.autograd.Function):
             if A.shape != X.shape:
                 A, X = torch.broadcast_tensors(A, X)
             
-            A = A.contiguous()
-            X = X.contiguous()
             B, L, D = A.shape
-            
             A_flat = A.transpose(1, 2).reshape(-1, L).contiguous()
             X_flat = X.transpose(1, 2).reshape(-1, L).contiguous()
-            Y_flat = torch.empty_like(X_flat)
             
-            BLOCK_SIZE = next_power_of_2(L)
-            if BLOCK_SIZE < 16: BLOCK_SIZE = 16
+            A_real = torch.view_as_real(A_flat)
+            X_real = torch.view_as_real(X_flat)
+            Y_real = torch.empty_like(X_real)
             
+            BLOCK_SIZE = max(16, next_power_of_2(L))
             grid = (A_flat.shape[0],)
+            
             pscan_diag_kernel[grid](
-                A_flat, X_flat, Y_flat,
-                A_flat.stride(0), A_flat.stride(1),
+                A_real, X_real, Y_real,
+                A_real.stride(0), A_real.stride(1),
                 L, BLOCK_SIZE=BLOCK_SIZE
             )
             
-            Y = Y_flat.view(B, D, L).transpose(1, 2)
+            Y = torch.view_as_complex(Y_real).view(B, D, L).transpose(1, 2)
             ctx.saved_Y = Y
             return Y
 
@@ -166,34 +187,31 @@ class _PScanFunction(torch.autograd.Function):
         
         if is_matrix:
             B, L, D, _ = A.shape
-            
             A_conj = A.conj().permute(0, 1, 3, 2)
             A_rev = torch.cat([torch.zeros_like(A_conj[:, 0:1]), A_conj[:, :-1]], dim=1)
             A_rev = torch.flip(A_rev, [1]).contiguous()
-            
             X_rev = torch.flip(grad_output, [1]).contiguous()
-            dX_rev = torch.empty_like(X_rev)
             
-            BLOCK_SIZE = next_power_of_2(L)
-            if BLOCK_SIZE < 16: BLOCK_SIZE = 16
+            A_real = torch.view_as_real(A_rev)
+            X_real = torch.view_as_real(X_rev)
+            dX_rev_real = torch.empty_like(X_real)
+            
+            BLOCK_SIZE = max(16, next_power_of_2(L))
             grid = (B,)
             
             pscan_mat_kernel[grid](
-                A_rev, X_rev, dX_rev,
-                A_rev.stride(0), A_rev.stride(1), A_rev.stride(2), A_rev.stride(3),
-                X_rev.stride(0), X_rev.stride(1), X_rev.stride(2),
+                A_real, X_real, dX_rev_real,
+                A_real.stride(0), A_real.stride(1), A_real.stride(2), A_real.stride(3),
+                X_real.stride(0), X_real.stride(1), X_real.stride(2),
                 L, D, BLOCK_SIZE=BLOCK_SIZE
             )
             
-            dX = torch.flip(dX_rev, [1])
-            
+            dX = torch.flip(torch.view_as_complex(dX_rev_real), [1])
             Y_shift = torch.cat([torch.zeros_like(Y[:, 0:1]), Y[:, :-1]], dim=1)
             dA = dX.unsqueeze(-1) @ Y_shift.conj().unsqueeze(-2)
-            
             return dA, dX
             
         else:
-            A = A.contiguous()
             if A.ndim == grad_output.ndim - 1:
                 A = A.unsqueeze(-1)
             if A.shape != grad_output.shape:
@@ -202,22 +220,24 @@ class _PScanFunction(torch.autograd.Function):
             B, L, D = A.shape
             A_conj = A.conj()
             A_rev = torch.cat([torch.zeros_like(A_conj[:, 0:1]), A_conj[:, :-1]], dim=1)
+            
             A_rev_flat = torch.flip(A_rev, [1]).transpose(1, 2).reshape(-1, L).contiguous()
-            
             X_rev_flat = torch.flip(grad_output, [1]).transpose(1, 2).reshape(-1, L).contiguous()
-            dX_rev_flat = torch.empty_like(X_rev_flat)
             
-            BLOCK_SIZE = next_power_of_2(L)
-            if BLOCK_SIZE < 16: BLOCK_SIZE = 16
+            A_real = torch.view_as_real(A_rev_flat)
+            X_real = torch.view_as_real(X_rev_flat)
+            dX_rev_real = torch.empty_like(X_real)
+            
+            BLOCK_SIZE = max(16, next_power_of_2(L))
             grid = (A_rev_flat.shape[0],)
             
             pscan_diag_kernel[grid](
-                A_rev_flat, X_rev_flat, dX_rev_flat,
-                A_rev_flat.stride(0), A_rev_flat.stride(1),
+                A_real, X_real, dX_rev_real,
+                A_real.stride(0), A_real.stride(1),
                 L, BLOCK_SIZE=BLOCK_SIZE
             )
             
-            dX_rev = dX_rev_flat.view(B, D, L).transpose(1, 2)
+            dX_rev = torch.view_as_complex(dX_rev_real).view(B, D, L).transpose(1, 2)
             dX = torch.flip(dX_rev, [1])
             
             Y_shift = torch.cat([torch.zeros_like(Y[:, 0:1]), Y[:, :-1]], dim=1)
