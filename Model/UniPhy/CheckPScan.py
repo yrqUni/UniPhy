@@ -338,11 +338,11 @@ def check_auto_mode():
     A_mat = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda') * 0.3
     X = torch.randn(B, L, C, D, D, dtype=torch.complex64, device='cuda')
 
-    Y_auto_diag = pscan(A_diag, X, mode='auto')
+    Y_auto_diag = pscan(A_diag, X)
     Y_seq_diag = sequential_pscan_diag(A_diag, X)
     diff_diag = (Y_auto_diag - Y_seq_diag).abs().max().item()
 
-    Y_auto_mat = pscan(A_mat, X, mode='auto')
+    Y_auto_mat = pscan(A_mat, X)
     Y_seq_mat = sequential_pscan_mat(A_mat, X)
     diff_mat = (Y_auto_mat - Y_seq_mat).abs().max().item()
 
