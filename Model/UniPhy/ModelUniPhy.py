@@ -97,8 +97,8 @@ class UniPhyBlock(nn.Module):
         op_forcing = op_forcing.view(B, T, 1, 1, D)
         u_t = forcing * op_forcing
         
-        # Reshape to (Batch, T, D, 1) to treat D as independent channels
-        A_time = op_decay.expand(B, T, H, W, D).reshape(B * H * W, T, D, 1)
+        # FIX: Permute before reshape to align B, H, W correctly with T
+        A_time = op_decay.expand(B, T, H, W, D).permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X_time = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         
         Y_time = self._run_pscan(A_time, X_time)
