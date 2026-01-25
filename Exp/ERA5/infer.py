@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import yaml
+import shutil
 
 import numpy as np
 import torch
@@ -48,38 +49,44 @@ def compute_metrics(pred, target, lat_weights):
     rmse = torch.sqrt(mse.mean()).item()
     return rmse
 
-def save_visualization_gif(target, pred, save_path, channel_idx=0):
-    T = target.shape[0]
+def save_all_channels_gif(target, pred, sample_dir):
+    os.makedirs(sample_dir, exist_ok=True)
     
-    target_np = target[:, channel_idx, :, :].cpu().numpy()
-    pred_np = pred[:, channel_idx, :, :].cpu().numpy()
+    T, C, H, W = target.shape
     
-    vmin = min(target_np.min(), pred_np.min())
-    vmax = max(target_np.max(), pred_np.max())
-    
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    
-    im0 = axes[0].imshow(target_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
-    axes[0].set_title(f"Target (t=0)")
-    plt.colorbar(im0, ax=axes[0], fraction=0.035, pad=0.04)
-    
-    im1 = axes[1].imshow(pred_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
-    axes[1].set_title(f"Prediction (t=0)")
-    plt.colorbar(im1, ax=axes[1], fraction=0.035, pad=0.04)
-    
-    def update(t):
-        axes[0].clear()
-        axes[1].clear()
+    for c in range(C):
+        target_np = target[:, c, :, :].cpu().numpy()
+        pred_np = pred[:, c, :, :].cpu().numpy()
         
-        axes[0].imshow(target_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
-        axes[0].set_title(f"Target (t={t+1})")
+        vmin = min(target_np.min(), pred_np.min())
+        vmax = max(target_np.max(), pred_np.max())
         
-        axes[1].imshow(pred_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
-        axes[1].set_title(f"Prediction (t={t+1})")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         
-    ani = animation.FuncAnimation(fig, update, frames=T, interval=500)
-    ani.save(save_path, writer='pillow', fps=2)
-    plt.close(fig)
+        im0 = axes[0].imshow(target_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+        axes[0].set_title(f"Target Ch{c} (t=0)")
+        plt.colorbar(im0, ax=axes[0], fraction=0.035, pad=0.04)
+        
+        im1 = axes[1].imshow(pred_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+        axes[1].set_title(f"Prediction Ch{c} (t=0)")
+        plt.colorbar(im1, ax=axes[1], fraction=0.035, pad=0.04)
+        
+        def update(t):
+            axes[0].clear()
+            axes[1].clear()
+            
+            axes[0].imshow(target_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            axes[0].set_title(f"Target Ch{c} (t={t+1})")
+            plt.colorbar(im0, ax=axes[0], fraction=0.035, pad=0.04)
+            
+            axes[1].imshow(pred_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            axes[1].set_title(f"Prediction Ch{c} (t={t+1})")
+            plt.colorbar(im1, ax=axes[1], fraction=0.035, pad=0.04)
+            
+        ani = animation.FuncAnimation(fig, update, frames=T, interval=500)
+        save_path = os.path.join(sample_dir, f"channel_{c:02d}.gif")
+        ani.save(save_path, writer='pillow', fps=2)
+        plt.close(fig)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -218,8 +225,8 @@ def main():
                 all_rmses.append(rmse)
 
                 if num_vis_saved < max_vis:
-                    gif_path = os.path.join(vis_dir, f"sample_{i}_vis.gif")
-                    save_visualization_gif(x_target[0], pred_final[0], gif_path)
+                    sample_dir = os.path.join(vis_dir, f"sample_{i}")
+                    save_all_channels_gif(x_target[0], pred_final[0], sample_dir)
                     num_vis_saved += 1
 
                 progress.advance(task)
