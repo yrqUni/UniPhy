@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import gc
 import os
 import random
 import sys
@@ -82,22 +83,19 @@ def load_ckpt(model, optimizer, path, scheduler=None):
 def compute_spectral_loss(pred, target):
     if pred.is_complex():
         pred_real = pred.real
-        target_real = target.real
     else:
         pred_real = pred
-        target_real = target
     pred_fft = torch.fft.rfft2(pred_real, norm="ortho")
-    target_fft = torch.fft.rfft2(target_real, norm="ortho")
+    target_fft = torch.fft.rfft2(target, norm="ortho")
     return F.l1_loss(pred_fft.abs(), target_fft.abs())
 
 
 def compute_energy_penalty(pred, target):
     if pred.is_complex():
         pred_energy = (pred.abs() ** 2).mean(dim=(-2, -1))
-        target_energy = (target.abs() ** 2).mean(dim=(-2, -1))
     else:
         pred_energy = (pred ** 2).mean(dim=(-2, -1))
-        target_energy = (target ** 2).mean(dim=(-2, -1))
+    target_energy = (target ** 2).mean(dim=(-2, -1))
     return F.mse_loss(pred_energy, target_energy)
 
 
@@ -229,8 +227,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
     save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
     log_every = cfg["logging"]["log_every"]
 
-    os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
-    os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
+    if rank == 0:
+        os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
+        os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
 
     for epoch in range(start_epoch, epochs):
         train_sampler.set_epoch(epoch)
@@ -294,13 +293,13 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
                         "train/step": global_step,
                     })
 
-            if global_step % save_interval == 0 and rank == 0:
-                ckpt_path = os.path.join(
-                    cfg["logging"]["ckpt_dir"],
-                    f"ckpt_epoch{epoch}_step{global_step}.pt"
-                )
-                save_ckpt(model, optimizer, epoch, global_step, ckpt_path, scheduler)
-                console.print(f"[success]Checkpoint saved: {ckpt_path}[/success]")
+                if global_step % save_interval == 0:
+                    ckpt_path = os.path.join(
+                        cfg["logging"]["ckpt_dir"],
+                        f"ckpt_epoch{epoch}_step{global_step}.pt"
+                    )
+                    save_ckpt(model, optimizer, epoch, global_step, ckpt_path, scheduler)
+                    console.print(f"[success]Checkpoint saved: {ckpt_path}[/success]")
 
         if rank == 0:
             progress.stop()
@@ -334,6 +333,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
             )
             save_ckpt(model, optimizer, epoch + 1, global_step, ckpt_path, scheduler)
             console.print(f"[success]Epoch checkpoint saved: {ckpt_path}[/success]")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if rank == 0 and cfg["logging"]["use_wandb"]:
         wandb.finish()
