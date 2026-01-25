@@ -17,8 +17,8 @@ def complex_combine(ar, ai, xr, xi, br, bi, yr, yi):
 
 @triton.jit
 def matrix_combine(a, x, b, y):
-    new_a = tl.sum(b[:, :, None, :] * a[:, None, :, :], axis=3)
-    new_x = tl.sum(b[:, :, None, :] * x[:, None, :, :], axis=3) + y
+    new_a = tl.sum(b[:, :, None] * a[None, :, :], axis=1)
+    new_x = tl.sum(b[:, :] * x[None, :], axis=1) + y
     return new_a, new_x
 
 def get_configs():
@@ -70,7 +70,6 @@ def pscan_matrix_kernel(
     mask_t = offs_t < L
     read_offs_t = tl.where(REVERSE, (L - 1 - offs_t), offs_t)
     r = tl.arange(0, DIM)
-    c = tl.arange(0, DIM)
     ptr_A = A_ptr + pid * stride_batch_A + read_offs_t[:, None, None] * stride_time_A
     offs_A = r[None, :, None] * DIM + r[None, None, :]
     ptrs_A = ptr_A + offs_A
@@ -82,14 +81,12 @@ def pscan_matrix_kernel(
     eye = (r[:, None] == r[None, :]).to(tl.float32)
     a_block = tl.load(ptrs_A, mask=mask_A, other=eye)
     x_vec = tl.load(ptrs_X, mask=mask_X, other=0.0)
-    x_mat = tl.where(c[None, None, :] == 0, x_vec[:, :, None], 0.0)
     acc_a, acc_x = tl.associative_scan(
-        (a_block, x_mat), axis=0, combine_fn=matrix_combine
+        (a_block, x_vec), axis=0, combine_fn=matrix_combine
     )
-    res_x = acc_x[:, :, 0]
     ptr_Y = Y_ptr + pid * stride_batch_Y + read_offs_t[:, None] * stride_time_Y
     ptrs_Y = ptr_Y + offs_X
-    tl.store(ptrs_Y, res_x, mask=mask_X)
+    tl.store(ptrs_Y, acc_x, mask=mask_X)
 
 def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
@@ -97,11 +94,7 @@ def next_power_of_2(n: int) -> int:
 class _PScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
-        is_matrix = (A.ndim >= 3) and (A.shape[-1] == A.shape[-2])
-        if A.shape[-1] == 2 and X.shape[-1] == 2 and A.ndim == X.ndim:
-             is_matrix = False
-        elif A.ndim == X.ndim + 1:
-             is_matrix = True
+        is_matrix = (A.ndim == X.ndim + 1) and (A.shape[-1] == A.shape[-2])
         ctx.is_matrix = is_matrix
         ctx.shape_A_orig = A.shape
         ctx.shape_X_orig = X.shape
