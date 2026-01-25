@@ -18,8 +18,7 @@ def complex_combine(ar, ai, xr, xi, br, bi, yr, yi):
 @triton.jit
 def matrix_combine(a, x, b, y):
     new_a = tl.sum(b[:, :, None, :] * a[:, None, :, :], axis=3)
-    bx = tl.sum(b[:, :, :] * x[:, None, :], axis=2)
-    new_x = bx + y
+    new_x = tl.sum(b[:, :, None, :] * x[:, None, :, :], axis=3) + y
     return new_a, new_x
 
 def get_configs():
@@ -71,6 +70,7 @@ def pscan_matrix_kernel(
     mask_t = offs_t < L
     read_offs_t = tl.where(REVERSE, (L - 1 - offs_t), offs_t)
     r = tl.arange(0, DIM)
+    c = tl.arange(0, DIM)
     ptr_A = A_ptr + pid * stride_batch_A + read_offs_t[:, None, None] * stride_time_A
     offs_A = r[None, :, None] * DIM + r[None, None, :]
     ptrs_A = ptr_A + offs_A
@@ -82,12 +82,14 @@ def pscan_matrix_kernel(
     eye = (r[:, None] == r[None, :]).to(tl.float32)
     a_block = tl.load(ptrs_A, mask=mask_A, other=eye)
     x_vec = tl.load(ptrs_X, mask=mask_X, other=0.0)
+    x_mat = tl.where(c[None, None, :] == 0, x_vec[:, :, None], 0.0)
     acc_a, acc_x = tl.associative_scan(
-        (a_block, x_vec), axis=0, combine_fn=matrix_combine
+        (a_block, x_mat), axis=0, combine_fn=matrix_combine
     )
+    res_x = acc_x[:, :, 0]
     ptr_Y = Y_ptr + pid * stride_batch_Y + read_offs_t[:, None] * stride_time_Y
     ptrs_Y = ptr_Y + offs_X
-    tl.store(ptrs_Y, acc_x, mask=mask_X)
+    tl.store(ptrs_Y, res_x, mask=mask_X)
 
 def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
@@ -205,19 +207,11 @@ class _PScanFunction(torch.autograd.Function):
             Y_prev = torch.cat([torch.zeros_like(Y[:, 0:1]), Y[:, :-1]], dim=1)
             dA = torch.matmul(dX.unsqueeze(-1), Y_prev.unsqueeze(-2))
             if dA.shape != ctx.shape_A_orig:
-                dims_to_sum = []
-                for i, (orig, curr) in enumerate(zip(ctx.shape_A_orig, dA.shape)):
-                     if orig == 1 and curr > 1:
-                         dims_to_sum.append(i)
-                if dims_to_sum:
-                    dA = dA.sum(dim=dims_to_sum, keepdim=True)
+                for i, dim in enumerate(ctx.shape_A_orig):
+                    if dim == 1: dA = dA.sum(dim=i, keepdim=True)
             if dX.shape != ctx.shape_X_orig:
-                dims_to_sum_x = []
-                for i, (orig, curr) in enumerate(zip(ctx.shape_X_orig, dX.shape)):
-                     if orig == 1 and curr > 1:
-                         dims_to_sum_x.append(i)
-                if dims_to_sum_x:
-                    dX = dX.sum(dim=dims_to_sum_x, keepdim=True)
+                for i, dim in enumerate(ctx.shape_X_orig):
+                    if dim == 1: dX = dX.sum(dim=i, keepdim=True)
             return dA, dX
 
 class PScanTriton(nn.Module):
