@@ -143,15 +143,12 @@ class ComplexSVDTransform(nn.Module):
         alpha = torch.sigmoid(self.dft_weight)
         
         W_learned = V * S_diag.unsqueeze(0) * (1 - alpha)
-        
         dft_basis = self.dft_basis.to(dtype=h.dtype)
-        W_dft = dft_basis * alpha
-        W_total = W_learned + W_dft
+        W_total = W_learned + dft_basis * alpha
         
-        if h.is_complex() and not W_total.is_complex():
-            W_total = W_total.to(h.dtype)
-            
-        x_rec = torch.linalg.solve(W_total.T, h.unsqueeze(-1)).squeeze(-1)
+        W_inv = torch.linalg.inv(W_total)
+        x_rec = torch.einsum("...d, de -> ...e", h, W_inv)
+        
         return x_rec
 
 
