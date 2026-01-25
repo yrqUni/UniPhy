@@ -22,12 +22,15 @@ class RiemannianCliffordConv2d(nn.Module):
             in_channels, out_channels, kernel_size, padding=padding, bias=False
         )
 
-        self.log_metric_param = nn.Parameter(torch.zeros(1, 1, img_height, img_width))
+        self.metric_field = nn.Parameter(
+            torch.zeros(1, 1, img_height, img_width)
+        )
 
         self.metric_refiner = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels, 1),
-            nn.Tanh()
+            nn.Flatten(),
+            nn.Linear(in_channels, in_channels),
+            nn.Tanh(),
         )
 
         self.viscosity_gate = nn.Sequential(
@@ -35,21 +38,18 @@ class RiemannianCliffordConv2d(nn.Module):
             nn.Sigmoid()
         )
 
-        laplacian_init = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32
+        laplacian = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]
         )
         self.register_buffer(
             "laplacian_kernel",
-            laplacian_init.reshape(1, 1, 3, 3).repeat(in_channels, 1, 1, 1)
+            laplacian.view(1, 1, 3, 3).repeat(in_channels, 1, 1, 1)
         )
 
         self.metric_scale = nn.Parameter(torch.tensor(0.1))
         self.viscosity_scale = nn.Parameter(torch.tensor(0.01))
-
-        self.dispersion_kernel = nn.Parameter(
-            torch.randn(in_channels, 1, 3, 3) * 0.01
-        )
         self.dispersion_scale = nn.Parameter(torch.tensor(0.01))
+        self.diffusion_scale = nn.Parameter(torch.tensor(1.0))
 
         self.anti_diffusion_gate = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 1),
@@ -57,25 +57,38 @@ class RiemannianCliffordConv2d(nn.Module):
         )
 
     def forward(self, x):
-        base_out = self.conv(x)
+        B, C, H, W = x.shape
 
-        metric_field = self.log_metric_param.expand(x.size(0), -1, -1, -1)
-        metric_refine = self.metric_refiner(x)
-        metric_field = metric_field * (1 + metric_refine)
+        metric_base = self.metric_field
+        if metric_base.shape[-2:] != (H, W):
+            metric_base = F.interpolate(
+                metric_base, size=(H, W), mode="bilinear", align_corners=False
+            )
 
-        laplacian = F.conv2d(x, self.laplacian_kernel, padding=1, groups=self.groups)
-        viscosity_weight = self.viscosity_gate(x)
-        diffusion = laplacian * viscosity_weight * self.viscosity_scale
+        refine_vec = self.metric_refiner(x)
+        metric_refine = refine_vec.view(B, 1, 1, 1)
 
-        dispersion = F.conv2d(x, self.dispersion_kernel, padding=1, groups=self.groups)
-        dispersion = dispersion * self.dispersion_scale
+        g = torch.exp(metric_base * self.metric_scale) * (1 + metric_refine * 0.1)
+        inv_scale = 1.0 / (g + 1e-6)
+        x_scaled = x * g
+
+        diffusion_term = F.conv2d(
+            x_scaled, self.laplacian_kernel, padding=1, groups=self.groups
+        )
+
+        local_viscosity = self.viscosity_gate(x) * inv_scale
+
+        diffusion = diffusion_term * local_viscosity * self.viscosity_scale * self.diffusion_scale
 
         anti_diff_weight = self.anti_diffusion_gate(x)
-        dispersion = dispersion * anti_diff_weight
+        dispersion = -diffusion_term * self.dispersion_scale
 
-        metric_correction = metric_field * base_out * self.metric_scale
+        x_evolved = x_scaled + diffusion - anti_diff_weight * diffusion * 0.5 + dispersion
 
-        return base_out + metric_correction + diffusion + dispersion
+        x_final = x_evolved * inv_scale
+        out = self.conv(x_final)
+
+        return out
 
 
 class ComplexSVDTransform(nn.Module):
@@ -83,29 +96,25 @@ class ComplexSVDTransform(nn.Module):
         super().__init__()
         self.dim = dim
 
-        self.U_re = nn.Parameter(torch.eye(dim))
+        self.U_re = nn.Parameter(torch.eye(dim) * 0.1)
         self.U_im = nn.Parameter(torch.zeros(dim, dim))
-        self.V_re = nn.Parameter(torch.eye(dim))
-        self.V_im = nn.Parameter(torch.zeros(dim, dim))
 
         self.dft_weight = nn.Parameter(torch.tensor(0.2))
 
-        self.register_buffer("dft_matrix_re", self._build_dft_matrix(dim).real)
-        self.register_buffer("dft_matrix_im", self._build_dft_matrix(dim).imag)
-
-    def _build_dft_matrix(self, n):
-        idx = torch.arange(n, dtype=torch.float64)
-        phase = -2 * torch.pi * idx.unsqueeze(0) * idx.unsqueeze(1) / n
-        return torch.complex(torch.cos(phase), torch.sin(phase)) / (n ** 0.5)
+        n = torch.arange(dim, dtype=torch.float64)
+        k = torch.arange(dim, dtype=torch.float64).unsqueeze(1)
+        dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
+        self.register_buffer("dft_matrix_re", dft_matrix.real.float())
+        self.register_buffer("dft_matrix_im", dft_matrix.imag.float())
 
     def _get_U(self):
         return torch.complex(self.U_re, self.U_im)
 
-    def _get_V(self):
-        return torch.complex(self.V_re, self.V_im)
-
     def _get_dft(self):
-        return torch.complex(self.dft_matrix_re, self.dft_matrix_im)
+        return torch.complex(
+            self.dft_matrix_re.to(self.U_re.dtype),
+            self.dft_matrix_im.to(self.U_re.dtype)
+        )
 
     def encode(self, x):
         U = self._get_U().to(x.dtype)
@@ -122,8 +131,11 @@ class ComplexSVDTransform(nn.Module):
         dft = self._get_dft().to(z.dtype)
         w = torch.sigmoid(self.dft_weight)
 
-        z_svd = torch.einsum("...d,ed->...e", z, U.conj())
-        z_dft = torch.einsum("...d,ed->...e", z, dft.conj().T)
+        U_inv = torch.linalg.pinv(U)
+        dft_inv = dft.conj().T
+
+        z_svd = torch.einsum("...d,de->...e", z, U_inv)
+        z_dft = torch.einsum("...d,de->...e", z, dft_inv)
 
         return (1 - w) * z_svd + w * z_dft
 
@@ -133,14 +145,13 @@ class GlobalFluxTracker(nn.Module):
         super().__init__()
         self.dim = dim
 
-        self.decay_re = nn.Parameter(torch.zeros(dim))
-        self.decay_im = nn.Parameter(torch.zeros(dim))
+        self.decay_re = nn.Parameter(torch.randn(dim) * 0.1 - 1.0)
+        self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
 
         self.input_mix = nn.Linear(dim * 2, dim * 2)
         self.output_proj = nn.Linear(dim * 2, dim * 2)
 
-        nn.init.eye_(self.input_mix.weight[:dim, :dim])
-        nn.init.eye_(self.input_mix.weight[dim:, dim:])
+        nn.init.xavier_uniform_(self.input_mix.weight)
         nn.init.zeros_(self.input_mix.bias)
         nn.init.xavier_uniform_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
@@ -237,26 +248,12 @@ class TemporalPropagator(nn.Module):
 
         if dt_tensor.ndim == 0:
             dt_ratio = dt_tensor / self.dt_ref
-        else:
+        elif dt_tensor.ndim == 1:
             dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
-
-        exp_arg = lam * dt_ratio
-        decay = torch.exp(exp_arg)
-
-        lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
-        forcing = torch.expm1(exp_arg) / lam_safe
-
-        return decay, forcing
-
-    def get_transition_operators_batch(self, dt_seq):
-        lam = self._get_effective_lambda()
-
-        if dt_seq.ndim == 1:
-            dt_ratio = dt_seq.unsqueeze(-1) / self.dt_ref
-        elif dt_seq.ndim == 2:
-            dt_ratio = dt_seq.unsqueeze(-1) / self.dt_ref
+        elif dt_tensor.ndim == 2:
+            dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
         else:
-            dt_ratio = dt_seq / self.dt_ref
+            dt_ratio = dt_tensor / self.dt_ref
 
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
