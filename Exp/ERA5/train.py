@@ -101,12 +101,13 @@ def print_model_summary(model, cfg, rank):
     console.print()
 
 
-def save_ckpt(model, optimizer, epoch, step, path, scheduler=None):
+def save_ckpt(model, optimizer, epoch, step, loss, path, scheduler=None):
     state = {
         "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
         "step": step,
+        "loss": loss,
     }
     if scheduler is not None:
         state["scheduler"] = scheduler.state_dict()
@@ -356,10 +357,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
                 if global_step % save_interval == 0:
                     ckpt_path = os.path.join(
                         cfg["logging"]["ckpt_dir"],
-                        f"ckpt_epoch{epoch}_step{global_step}.pt"
+                        f"ep{epoch}_step{global_step}_loss{metrics['loss']:.4f}.pt"
                     )
-                    save_ckpt(model, optimizer, epoch, global_step, ckpt_path, scheduler)
-                    console.print(f"[success]Checkpoint saved: {ckpt_path}[/success]")
+                    save_ckpt(model, optimizer, epoch, global_step, metrics['loss'], ckpt_path, scheduler)
 
         if rank == 0:
             progress.stop()
@@ -389,10 +389,9 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
 
             ckpt_path = os.path.join(
                 cfg["logging"]["ckpt_dir"],
-                f"ckpt_epoch{epoch + 1}.pt"
+                f"ep{epoch + 1}_step{global_step}_loss{avg_loss:.4f}.pt"
             )
-            save_ckpt(model, optimizer, epoch + 1, global_step, ckpt_path, scheduler)
-            console.print(f"[success]Epoch checkpoint saved: {ckpt_path}[/success]")
+            save_ckpt(model, optimizer, epoch + 1, global_step, avg_loss, ckpt_path, scheduler)
 
         gc.collect()
         torch.cuda.empty_cache()
