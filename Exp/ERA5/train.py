@@ -6,7 +6,6 @@ import random
 import sys
 import warnings
 import yaml
-
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -16,7 +15,6 @@ import wandb
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -28,16 +26,12 @@ from rich.progress import (
 )
 from rich.table import Table
 from rich.theme import Theme
-from rich.panel import Panel
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
-
 from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhyModel
-
 warnings.filterwarnings("ignore")
 
 custom_theme = Theme({
@@ -46,7 +40,6 @@ custom_theme = Theme({
     "error": "red bold",
     "success": "green bold",
 })
-
 console = Console(theme=custom_theme)
 
 
@@ -64,27 +57,22 @@ def format_params(num):
         return f"{num / 1e6:.2f}M"
     elif num >= 1e3:
         return f"{num / 1e3:.2f}K"
-    else:
-        return str(num)
+    return str(num)
 
 
 def get_model_info(model):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    non_trainable_params = total_params - trainable_params
-    return total_params, trainable_params, non_trainable_params
+    return total_params, trainable_params, total_params - trainable_params
 
 
 def print_model_summary(model, cfg, rank):
     if rank != 0:
         return
-
     total_params, trainable_params, non_trainable_params = get_model_info(model)
-
     table = Table(title="Model Configuration", header_style="bold magenta")
     table.add_column("Parameter", style="cyan")
     table.add_column("Value", style="green")
-
     table.add_row("Total Parameters", format_params(total_params))
     table.add_row("Trainable Parameters", format_params(trainable_params))
     table.add_row("Non-trainable Parameters", format_params(non_trainable_params))
@@ -96,7 +84,6 @@ def print_model_summary(model, cfg, rank):
     table.add_row("Patch Size", str(cfg["model"]["patch_size"]))
     table.add_row("Image Size", f"{cfg['model']['img_height']}x{cfg['model']['img_width']}")
     table.add_row("SDE Mode", cfg["model"]["sde_mode"])
-
     console.print(table)
     console.print()
 
@@ -126,6 +113,29 @@ def load_ckpt(model, optimizer, path, scheduler=None):
     return ckpt.get("epoch", 0), ckpt.get("step", 0)
 
 
+def compute_gradient_stats(model):
+    grad_norms = {}
+    total_norm = 0.0
+    count = 0
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.data.norm(2).item()
+            grad_norms[name] = grad_norm
+            total_norm += grad_norm ** 2
+            count += 1
+    total_norm = total_norm ** 0.5
+    max_grad = max(grad_norms.values()) if grad_norms else 0.0
+    min_grad = min(grad_norms.values()) if grad_norms else 0.0
+    avg_grad = sum(grad_norms.values()) / len(grad_norms) if grad_norms else 0.0
+    return {
+        "grad_norm_total": total_norm,
+        "grad_norm_max": max_grad,
+        "grad_norm_min": min_grad,
+        "grad_norm_avg": avg_grad,
+        "grad_count": count,
+    }
+
+
 def compute_spectral_loss(pred, target):
     if pred.is_complex():
         pred_real = pred.real
@@ -145,6 +155,18 @@ def compute_energy_penalty(pred, target):
     return F.mse_loss(pred_energy, target_energy)
 
 
+def compute_rmse(pred, target):
+    if pred.is_complex():
+        pred = pred.real
+    return torch.sqrt(F.mse_loss(pred, target))
+
+
+def compute_mae(pred, target):
+    if pred.is_complex():
+        pred = pred.real
+    return F.l1_loss(pred, target)
+
+
 def train_step(model, batch, optimizer, cfg, grad_accum_steps, step_in_accum):
     data, dt = batch
     data = data.cuda(non_blocking=True)
@@ -152,23 +174,34 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, step_in_accum):
 
     x_input = data[:, :-1]
     x_target = data[:, 1:]
-
     dt_input = dt[:, :-1] if dt.ndim > 1 else dt[:-1]
 
     x_pred = model(x_input, dt_input)
 
     if x_pred.is_complex():
-        loss_mse = F.mse_loss(x_pred.real, x_target) + F.mse_loss(x_pred.imag, torch.zeros_like(x_target))
+        pred_real = x_pred.real
+        loss_mse = F.mse_loss(pred_real, x_target)
+        loss_imag = F.mse_loss(x_pred.imag, torch.zeros_like(x_pred.imag))
     else:
-        loss_mse = F.mse_loss(x_pred, x_target)
+        pred_real = x_pred
+        loss_mse = F.mse_loss(pred_real, x_target)
+        loss_imag = torch.tensor(0.0, device=data.device)
 
-    loss_spectral = compute_spectral_loss(x_pred, x_target) * cfg["train"]["spectral_loss_weight"]
-    loss_energy = compute_energy_penalty(x_pred, x_target) * cfg["train"]["energy_penalty_weight"]
+    loss_spectral = compute_spectral_loss(x_pred, x_target)
+    loss_energy = compute_energy_penalty(x_pred, x_target)
 
-    loss = loss_mse + loss_spectral + loss_energy
-    loss = loss / grad_accum_steps
+    rmse = compute_rmse(x_pred, x_target)
+    mae = compute_mae(x_pred, x_target)
 
-    loss.backward()
+    spectral_weight = cfg["train"]["spectral_loss_weight"]
+    energy_weight = cfg["train"]["energy_penalty_weight"]
+
+    loss = loss_mse + loss_imag * 0.1 + loss_spectral * spectral_weight + loss_energy * energy_weight
+    loss_scaled = loss / grad_accum_steps
+
+    loss_scaled.backward()
+
+    grad_stats = compute_gradient_stats(model)
 
     if (step_in_accum + 1) % grad_accum_steps == 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
@@ -176,20 +209,25 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, step_in_accum):
         optimizer.zero_grad(set_to_none=True)
 
     return {
-        "loss": loss.item() * grad_accum_steps,
+        "loss": loss.item(),
         "mse": loss_mse.item(),
+        "rmse": rmse.item(),
+        "mae": mae.item(),
         "spectral": loss_spectral.item(),
         "energy": loss_energy.item(),
+        "imag": loss_imag.item() if isinstance(loss_imag, torch.Tensor) else loss_imag,
+        "grad_norm_total": grad_stats["grad_norm_total"],
+        "grad_norm_max": grad_stats["grad_norm_max"],
+        "grad_norm_min": grad_stats["grad_norm_min"],
+        "grad_norm_avg": grad_stats["grad_norm_avg"],
     }
 
 
 def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = master_port
-
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(local_rank)
-
     set_seed(42 + rank)
 
     if cfg["train"]["use_tf32"]:
@@ -213,7 +251,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
     ).cuda()
 
     print_model_summary(model, cfg, rank)
-
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     train_dataset = ERA5_Dataset(
@@ -227,11 +264,11 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
     )
 
     train_sampler = DistributedSampler(
-        train_dataset, 
-        num_replicas=world_size, 
-        rank=rank, 
-        shuffle=False, 
-        drop_last=True
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=True,
     )
 
     train_loader = DataLoader(
@@ -308,23 +345,20 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
             task = progress.add_task(f"Epoch {epoch + 1}/{epochs}", total=len(train_loader))
             progress.start()
 
-        epoch_loss = 0.0
-        epoch_mse = 0.0
-        epoch_spectral = 0.0
-        epoch_energy = 0.0
+        epoch_metrics = {
+            "loss": 0.0, "mse": 0.0, "rmse": 0.0, "mae": 0.0,
+            "spectral": 0.0, "energy": 0.0,
+            "grad_norm_total": 0.0, "grad_norm_max": 0.0,
+        }
         num_batches = 0
-
         optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
-            metrics = train_step(
-                model, batch, optimizer, cfg, grad_accum_steps, batch_idx
-            )
+            metrics = train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
 
-            epoch_loss += metrics["loss"]
-            epoch_mse += metrics["mse"]
-            epoch_spectral += metrics["spectral"]
-            epoch_energy += metrics["energy"]
+            for key in epoch_metrics:
+                if key in metrics:
+                    epoch_metrics[key] += metrics[key]
             num_batches += 1
 
             if scheduler is not None and (batch_idx + 1) % grad_accum_steps == 0:
@@ -339,19 +373,25 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
                     console.print(
                         f"[info]Step {global_step}[/info] | "
                         f"Loss: {metrics['loss']:.4f} | "
-                        f"MSE: {metrics['mse']:.4f} | "
-                        f"Spectral: {metrics['spectral']:.4f} | "
-                        f"Energy: {metrics['energy']:.4f}"
+                        f"RMSE: {metrics['rmse']:.4f} | "
+                        f"MAE: {metrics['mae']:.4f} | "
+                        f"GradNorm: {metrics['grad_norm_total']:.2e}"
                     )
 
                 if cfg["logging"]["use_wandb"] and batch_idx % cfg["logging"]["wandb_every"] == 0:
                     wandb.log({
-                        "train/loss": metrics["loss"],
-                        "train/mse": metrics["mse"],
-                        "train/spectral": metrics["spectral"],
-                        "train/energy": metrics["energy"],
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/step": global_step,
+                        "step": global_step,
+                        "loss": metrics["loss"],
+                        "mse": metrics["mse"],
+                        "rmse": metrics["rmse"],
+                        "mae": metrics["mae"],
+                        "spectral": metrics["spectral"],
+                        "energy": metrics["energy"],
+                        "lr": optimizer.param_groups[0]["lr"],
+                        "grad/norm_total": metrics["grad_norm_total"],
+                        "grad/norm_max": metrics["grad_norm_max"],
+                        "grad/norm_min": metrics["grad_norm_min"],
+                        "grad/norm_avg": metrics["grad_norm_avg"],
                     })
 
                 if global_step % save_interval == 0:
@@ -359,39 +399,27 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
                         cfg["logging"]["ckpt_dir"],
                         f"ep{epoch}_step{global_step}_loss{metrics['loss']:.4f}.pt"
                     )
-                    save_ckpt(model, optimizer, epoch, global_step, metrics['loss'], ckpt_path, scheduler)
+                    save_ckpt(model, optimizer, epoch, global_step, metrics["loss"], ckpt_path, scheduler)
 
         if rank == 0:
             progress.stop()
 
-            avg_loss = epoch_loss / num_batches
-            avg_mse = epoch_mse / num_batches
-            avg_spectral = epoch_spectral / num_batches
-            avg_energy = epoch_energy / num_batches
+            avg_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
 
             table = Table(title=f"Epoch {epoch + 1} Summary")
             table.add_column("Metric", style="cyan")
             table.add_column("Value", style="green")
-            table.add_row("Avg Loss", f"{avg_loss:.4f}")
-            table.add_row("Avg MSE", f"{avg_mse:.4f}")
-            table.add_row("Avg Spectral", f"{avg_spectral:.4f}")
-            table.add_row("Avg Energy", f"{avg_energy:.4f}")
+            table.add_row("Avg Loss", f"{avg_metrics['loss']:.4f}")
+            table.add_row("Avg RMSE", f"{avg_metrics['rmse']:.4f}")
+            table.add_row("Avg MAE", f"{avg_metrics['mae']:.4f}")
+            table.add_row("Avg GradNorm", f"{avg_metrics['grad_norm_total']:.2e}")
             console.print(table)
-
-            if cfg["logging"]["use_wandb"]:
-                wandb.log({
-                    "epoch/loss": avg_loss,
-                    "epoch/mse": avg_mse,
-                    "epoch/spectral": avg_spectral,
-                    "epoch/energy": avg_energy,
-                    "epoch": epoch + 1,
-                })
 
             ckpt_path = os.path.join(
                 cfg["logging"]["ckpt_dir"],
-                f"ep{epoch + 1}_step{global_step}_loss{avg_loss:.4f}.pt"
+                f"ep{epoch + 1}_step{global_step}_loss{avg_metrics['loss']:.4f}.pt"
             )
-            save_ckpt(model, optimizer, epoch + 1, global_step, avg_loss, ckpt_path, scheduler)
+            save_ckpt(model, optimizer, epoch + 1, global_step, avg_metrics["loss"], ckpt_path, scheduler)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -406,10 +434,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     args = parser.parse_args()
-
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
-
     run_ddp(
         int(os.environ["RANK"]),
         int(os.environ["WORLD_SIZE"]),

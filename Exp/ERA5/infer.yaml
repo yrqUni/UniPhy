@@ -17,6 +17,7 @@ inference:
   ckpt_path: "./uniphy/ckpt/ckpt_epoch100.pt"
   data_root: "/nfs/ERA5_data/data_norm"
   save_dir: "./uniphy/results"
+  max_vis_samples: 5
   batch_size: 1
   year_range: [2021, 2021]
   cond_frames: 4

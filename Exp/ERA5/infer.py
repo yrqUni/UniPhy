@@ -65,23 +65,18 @@ def save_all_channels_gif(target, pred, sample_dir):
         
         im0 = axes[0].imshow(target_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
         axes[0].set_title(f"Target Ch{c} (t=0)")
-        plt.colorbar(im0, ax=axes[0], fraction=0.035, pad=0.04)
+        fig.colorbar(im0, ax=axes[0], fraction=0.035, pad=0.04)
         
         im1 = axes[1].imshow(pred_np[0], vmin=vmin, vmax=vmax, cmap='RdBu_r')
         axes[1].set_title(f"Prediction Ch{c} (t=0)")
-        plt.colorbar(im1, ax=axes[1], fraction=0.035, pad=0.04)
+        fig.colorbar(im1, ax=axes[1], fraction=0.035, pad=0.04)
         
         def update(t):
-            axes[0].clear()
-            axes[1].clear()
-            
-            axes[0].imshow(target_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            im0.set_data(target_np[t])
             axes[0].set_title(f"Target Ch{c} (t={t+1})")
-            plt.colorbar(im0, ax=axes[0], fraction=0.035, pad=0.04)
             
-            axes[1].imshow(pred_np[t], vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            im1.set_data(pred_np[t])
             axes[1].set_title(f"Prediction Ch{c} (t={t+1})")
-            plt.colorbar(im1, ax=axes[1], fraction=0.035, pad=0.04)
             
         ani = animation.FuncAnimation(fig, update, frames=T, interval=500)
         save_path = os.path.join(sample_dir, f"channel_{c:02d}.gif")
