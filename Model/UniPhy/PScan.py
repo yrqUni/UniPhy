@@ -5,16 +5,25 @@ import triton.language as tl
 
 @triton.jit
 def batch_matmul_real(ar, ai, br, bi):
+    # ar, ai: [BLOCK, D, D] (A)
+    # br, bi: [BLOCK, D, D] (B)
+    # Target: C[b, i, j] = sum_k A[b, i, k] * B[b, k, j]
+    
+    # Expand A to [BLOCK, D, D, 1] -> (b, i, k, 1)
     ar_ = tl.expand_dims(ar, 3)
     ai_ = tl.expand_dims(ai, 3)
-    br_ = tl.expand_dims(br, 2)
-    bi_ = tl.expand_dims(bi, 2)
     
+    # Expand B to [BLOCK, 1, D, D] -> (b, 1, k, j)
+    br_ = tl.expand_dims(br, 1)
+    bi_ = tl.expand_dims(bi, 1)
+    
+    # Multiply: (b, i, k, 1) * (b, 1, k, j) -> (b, i, k, j)
     rr = ar_ * br_
     ri = ar_ * bi_
     ir = ai_ * br_
     ii = ai_ * bi_
     
+    # Sum over k (axis 2)
     cr = tl.sum(rr - ii, axis=2)
     ci = tl.sum(ri + ir, axis=2)
     return cr, ci
@@ -31,16 +40,12 @@ def scan_combine_diag(ar, ai, xr, xi, br, bi, yr, yi):
 
 @triton.jit
 def scan_combine_mat(ar, ai, xr, xi, br, bi, yr, yi):
+    # Matrix multiplication for A_new = B @ A
     new_ar, new_ai = batch_matmul_real(br, bi, ar, ai)
     
-    # xr, xi are now matrices [BLOCK, D, D] but only represent vectors
-    # We perform "Matrix * Vector" but using the broadcasted dimensions
-    # Effectively: B * x + y
-    # Since xr is [D, D] (broadcasted or padded), we need to ensure matmul logic holds.
-    # We use batch_matmul_real because inputs are now all [D, D].
-    # But semantically x is a vector.
-    # If we broadcasted x along the last dim, then A @ x is standard matmul.
-    
+    # Matrix multiplication for X_new = B @ X + Y
+    # Note: X and Y are loaded as [BLOCK, D, D] (broadcasted vectors)
+    # So B @ X implies applying B to every column of X identicaly.
     bx_r, bx_i = batch_matmul_real(br, bi, xr, xi)
     
     new_xr = bx_r + yr
@@ -49,7 +54,6 @@ def scan_combine_mat(ar, ai, xr, xi, br, bi, yr, yi):
 
 def get_configs():
     return [
-        triton.Config({}, num_warps=2),
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ]
@@ -99,26 +103,25 @@ def pscan_mat_kernel(
     mask = offs < L
     
     A_ptr_base = A_ptr + pid * stride_batch_a + offs[:, None, None] * stride_time_a
-    X_ptr_base = X_ptr + pid * stride_batch_x + offs[:, None] * stride_time_x
+    X_ptr_base = X_ptr + pid * stride_batch_x + offs[:, None, None] * stride_time_x
     Y_ptr_base = Y_ptr + pid * stride_batch_x + offs[:, None] * stride_time_x
     
     a_ptrs = A_ptr_base + row_offs[None, :, None] * stride_row_a + col_offs[None, None, :] * stride_col_a
-    x_ptrs = X_ptr_base + row_offs[None, :] * stride_dim_x
+    
+    # Broadcast X vector to Matrix shape [BLOCK, D, D]
+    # stride_col is 0, so every column gets the same vector value
+    x_ptrs = X_ptr_base + row_offs[None, :, None] * stride_dim_x + col_offs[None, None, :] * 0
     
     ar = tl.load(a_ptrs, mask=mask[:, None, None], other=0.0)
     ai = tl.load(a_ptrs + 1, mask=mask[:, None, None], other=0.0)
-    
-    xr_vec = tl.load(x_ptrs, mask=mask[:, None], other=0.0)
-    xi_vec = tl.load(x_ptrs + 1, mask=mask[:, None], other=0.0)
-    
-    xr = tl.expand_dims(xr_vec, 2) + tl.zeros([1, 1, D], dtype=xr_vec.dtype)
-    xi = tl.expand_dims(xi_vec, 2) + tl.zeros([1, 1, D], dtype=xi_vec.dtype)
+    xr = tl.load(x_ptrs, mask=mask[:, None, None], other=0.0)
+    xi = tl.load(x_ptrs + 1, mask=mask[:, None, None], other=0.0)
 
     _, _, acc_xr, acc_xi = tl.associative_scan(
         (ar, ai, xr, xi), axis=0, combine_fn=scan_combine_mat
     )
     
-    final_xr = tl.sum(acc_xr, axis=2) / D 
+    # Output is technically [BLOCK, D, D] (replicated columns), take column 0
     final_xr = acc_xr[:, :, 0]
     final_xi = acc_xi[:, :, 0]
     
