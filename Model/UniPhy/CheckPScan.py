@@ -55,9 +55,9 @@ def check_consistency():
     print(f"Backward dA Diff: {diff_da.item()}")
     print(f"Backward dX Diff: {diff_dx.item()}")
     
-    assert diff < 1e-4
-    assert diff_da < 1e-4
-    assert diff_dx < 1e-4
+    assert diff < 1e-4, "Forward Diag Fail"
+    assert diff_da < 1e-4, "Backward Diag dA Fail"
+    assert diff_dx < 1e-4, "Backward Diag dX Fail"
 
     print(f"\n--- Testing Matrix A (BLCRR) ---")
     A_mat = torch.randn(B, L, C, R, R, device=device, requires_grad=True) * 0.1
@@ -85,9 +85,9 @@ def check_consistency():
     print(f"Backward dA Diff: {diff_da.item()}")
     print(f"Backward dX Diff: {diff_dx.item()}")
 
-    assert diff < 1e-4
-    assert diff_da < 1e-3
-    assert diff_dx < 1e-3
+    assert diff < 1e-4, "Forward Matrix Fail"
+    assert diff_da < 1e-3, "Backward Matrix dA Fail"
+    assert diff_dx < 1e-3, "Backward Matrix dX Fail"
 
 if __name__ == "__main__":
     check_consistency()

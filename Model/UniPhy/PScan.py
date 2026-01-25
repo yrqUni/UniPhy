@@ -9,6 +9,24 @@ def get_autotune_configs():
         triton.Config({}, num_warps=8),
     ]
 
+@triton.jit
+def scan_combine_matrix(a_prev, x_prev, a_curr, x_curr):
+    R = a_prev.shape[1]
+    a_new = tl.zeros_like(a_prev)
+    x_new = tl.zeros_like(x_prev)
+    for k in range(R):
+        a_ik = a_curr[:, :, k, None]
+        a_new += a_ik * a_prev[:, k, None, :]
+        x_new += a_ik * x_prev[:, k, None, :]
+    x_new += x_curr
+    return a_new, x_new
+
+@triton.jit
+def scan_combine_diag(a_prev, x_prev, a_curr, x_curr):
+    a_new = a_curr * a_prev
+    x_new = (a_curr[:, :, None] * x_prev) + x_curr
+    return a_new, x_new
+
 @triton.autotune(configs=get_autotune_configs(), key=["L", "R"])
 @triton.jit
 def pscan_fwd_kernel(
@@ -45,26 +63,10 @@ def pscan_fwd_kernel(
     x_ptrs = X_base + (offs[:, None, None] * stride_time) + (x_row[None, :, :] * R + x_col[None, :, :])
     x_vals = tl.load(x_ptrs, mask=mask[:, None, None], other=0.0)
 
-    def combine_matrix(a_prev, x_prev, a_curr, x_curr):
-        a_new = tl.zeros((R, R), dtype=tl.float32)
-        x_new = tl.zeros((R, R), dtype=tl.float32)
-        for i in range(R):
-            for k in range(R):
-                a_ik = a_curr[:, i, k]
-                a_new[:, i, :] += a_ik[:, None] * a_prev[:, k, :]
-                x_new[:, i, :] += a_ik[:, None] * x_prev[:, k, :]
-        x_new += x_curr
-        return a_new, x_new
-
-    def combine_diag(a_prev, x_prev, a_curr, x_curr):
-        a_new = a_curr * a_prev
-        x_new = (a_curr[:, :, None] * x_prev) + x_curr
-        return a_new, x_new
-
     if A_IS_DIAG:
-        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, combine_diag)
+        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, scan_combine_diag)
     else:
-        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, combine_matrix)
+        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, scan_combine_matrix)
 
     tl.store(Y_base + (offs[:, None, None] * stride_time) + (x_row[None, :, :] * R + x_col[None, :, :]), acc_x, mask=mask[:, None, None])
 
@@ -84,7 +86,6 @@ def pscan_bwd_kernel(
     offset_base = pid * stride_batch
     
     read_offs = L - 1 - offs
-    read_mask = read_offs >= 0
     
     r_idx = tl.arange(0, R)
     r_row = r_idx[:, None]
@@ -107,26 +108,10 @@ def pscan_bwd_kernel(
     x_g_ptrs = X_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
     x_g_vals = tl.load(x_g_ptrs, mask=mask[:, None, None], other=0.0)
 
-    def combine_matrix(a_prev, x_prev, a_curr, x_curr):
-        a_new = tl.zeros((R, R), dtype=tl.float32)
-        x_new = tl.zeros((R, R), dtype=tl.float32)
-        for i in range(R):
-            for k in range(R):
-                a_ik = a_curr[:, i, k]
-                a_new[:, i, :] += a_ik[:, None] * a_prev[:, k, :]
-                x_new[:, i, :] += a_ik[:, None] * x_prev[:, k, :]
-        x_new += x_curr
-        return a_new, x_new
-
-    def combine_diag(a_prev, x_prev, a_curr, x_curr):
-        a_new = a_curr * a_prev
-        x_new = (a_curr[:, :, None] * x_prev) + x_curr
-        return a_new, x_new
-
     if A_IS_DIAG:
-        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, combine_diag)
+        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, scan_combine_diag)
     else:
-        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, combine_matrix)
+        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, scan_combine_matrix)
 
     tl.store(X_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :]), dY_acc, mask=mask[:, None, None])
 
@@ -161,7 +146,6 @@ class PScanTritonFunction(torch.autograd.Function):
             A_in = A.permute(0, 2, 1, 3).reshape(B*C, L, R).contiguous()
         else:
             R = R1
-            R2 = A.shape[4]
             A_in = A.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
 
         X_in = X.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
@@ -222,9 +206,6 @@ class PScanTritonFunction(torch.autograd.Function):
         return dA, dX
 
 class PScan(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        
     def forward(self, A, X):
         return PScanTritonFunction.apply(A, X)
     
