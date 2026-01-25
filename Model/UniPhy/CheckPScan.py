@@ -31,12 +31,7 @@ def check_diagonal_mode():
     torch.manual_seed(42)
     B, L, C = 2, 64, 4
     
-    # Init A with small magnitude to prevent fp32 explosion
     A = torch.randn(B, L, C, 2, device='cuda') * 0.5 
-    # Or normalize to unit circle:
-    # A_raw = torch.randn(B, L, C, 2, device='cuda')
-    # A = A_raw / A_raw.norm(dim=-1, keepdim=True)
-    
     X = torch.randn(B, L, C, 2, device='cuda')
     
     A.requires_grad = True

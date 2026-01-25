@@ -17,10 +17,7 @@ def complex_combine(ar, ai, xr, xi, br, bi, yr, yi):
 
 @triton.jit
 def matrix_combine(a, x, b, y):
-    new_a = tl.dot(b, a)
-    bx = tl.dot(b, x)
-    new_x = bx + y
-    return new_a, new_x
+    return tl.dot(b, a), tl.dot(b, x) + y
 
 def get_configs():
     return [
@@ -77,6 +74,7 @@ def pscan_matrix_kernel(
     read_offs_t = tl.where(REVERSE, (L - 1 - offs_t), offs_t)
     
     r = tl.arange(0, DIM)
+    c = tl.arange(0, DIM)
     
     ptr_A = A_ptr + pid * stride_batch_A + read_offs_t[:, None, None] * stride_time_A
     offs_A = r[None, :, None] * DIM + r[None, None, :]
@@ -90,17 +88,21 @@ def pscan_matrix_kernel(
     mask_X = mask_t[:, None]
     
     eye = (r[:, None] == r[None, :]).to(tl.float32)
-        
+    
     a_block = tl.load(ptrs_A, mask=mask_A, other=eye)
-    x_block = tl.load(ptrs_X, mask=mask_X, other=0.0)
+    x_vec = tl.load(ptrs_X, mask=mask_X, other=0.0)
+    
+    x_mat = tl.where((c[None, None, :] == 0), x_vec[:, :, None], 0.0)
     
     acc_a, acc_x = tl.associative_scan(
-        (a_block, x_block), axis=0, combine_fn=matrix_combine
+        (a_block, x_mat), axis=0, combine_fn=matrix_combine
     )
+    
+    final_x = acc_x[:, :, 0]
     
     ptr_Y = Y_ptr + pid * stride_batch_Y + read_offs_t[:, None] * stride_time_Y
     ptrs_Y = ptr_Y + offs_X
-    tl.store(ptrs_Y, acc_x, mask=mask_X)
+    tl.store(ptrs_Y, final_x, mask=mask_X)
 
 def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
