@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from pscan_module import pscan
+from PScan import pscan
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
