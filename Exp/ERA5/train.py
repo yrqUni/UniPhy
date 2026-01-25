@@ -166,7 +166,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
         max_growth_rate=cfg["model"]["max_growth_rate"],
     ).cuda()
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     train_dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -178,15 +178,20 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
         dt_ref=cfg["data"]["dt_ref"],
     )
 
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    train_sampler = DistributedSampler(
+        train_dataset, 
+        num_replicas=world_size, 
+        rank=rank, 
+        shuffle=False, 
+        drop_last=True
+    )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg["train"]["batch_size"],
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
-        drop_last=True,
     )
 
     optimizer = torch.optim.AdamW(
