@@ -135,8 +135,8 @@ class UniPhyBlock(nn.Module):
         x_eigen = self.prop.basis.encode(x_perm)
         x_mean = x_eigen.mean(dim=(1, 2))
         
-        # [FIX]: Use x_perm instead of x_eigen here to avoid double encoding.
-        # self.prop.forward_step performs encoding internally.
+        # FIX: Pass x_perm (unencoded) instead of x_eigen (encoded)
+        # TemporalPropagator.forward_step applies encoding internally.
         h_tilde_next, flux_next = self.prop.forward_step(
             h_prev, x_perm.reshape(B * H * W, D), x_mean, dt, flux_prev
         )
@@ -268,4 +268,4 @@ class UniPhyModel(nn.Module):
             )
             predictions.append(pred_pixel)
         return torch.stack(predictions, dim=1)
-        
+    
