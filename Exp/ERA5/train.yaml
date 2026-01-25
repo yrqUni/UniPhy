@@ -10,7 +10,7 @@ model:
   img_width: 1440
   dt_ref: 6.0
   sde_mode: "sde"
-  init_noise_scale: 0.01
+  init_noise_scale: 1.0
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"

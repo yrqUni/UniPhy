@@ -141,7 +141,10 @@ class TemporalPropagator(nn.Module):
         self.dim = dim
         self.dt_ref = dt_ref
         self.sde_mode = sde_mode
-        self.noise_scale = nn.Parameter(torch.tensor(float(init_noise_scale))) if sde_mode=="sde" else None
+        if sde_mode=="sde":
+            self.noise_scale = nn.Parameter(torch.tensor(float(init_noise_scale))) 
+        else:
+            self.register_buffer("noise_scale", torch.tensor(0.0))
         self.basis = ComplexSVDTransform(dim)
         self.flux_tracker = GlobalFluxTracker(dim)
         self.ld = nn.Parameter(torch.randn(dim) * 0.5 - 2.0)
