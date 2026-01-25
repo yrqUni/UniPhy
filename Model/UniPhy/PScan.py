@@ -20,20 +20,6 @@ def batch_matmul_real(ar, ai, br, bi):
     return cr, ci
 
 @triton.jit
-def batch_matvec_real(ar, ai, xr, xi):
-    xr_ = tl.expand_dims(xr, 2)
-    xi_ = tl.expand_dims(xi, 2)
-    
-    rr = ar * xr_
-    ri = ar * xi_
-    ir = ai * xr_
-    ii = ai * xi_
-    
-    yr = tl.sum(rr - ii, axis=2)
-    yi = tl.sum(ri + ir, axis=2)
-    return yr, yi
-
-@triton.jit
 def scan_combine_diag(ar, ai, xr, xi, br, bi, yr, yi):
     new_ar = ar * br - ai * bi
     new_ai = ar * bi + ai * br
@@ -46,7 +32,17 @@ def scan_combine_diag(ar, ai, xr, xi, br, bi, yr, yi):
 @triton.jit
 def scan_combine_mat(ar, ai, xr, xi, br, bi, yr, yi):
     new_ar, new_ai = batch_matmul_real(br, bi, ar, ai)
-    bx_r, bx_i = batch_matvec_real(br, bi, xr, xi)
+    
+    # xr, xi are now matrices [BLOCK, D, D] but only represent vectors
+    # We perform "Matrix * Vector" but using the broadcasted dimensions
+    # Effectively: B * x + y
+    # Since xr is [D, D] (broadcasted or padded), we need to ensure matmul logic holds.
+    # We use batch_matmul_real because inputs are now all [D, D].
+    # But semantically x is a vector.
+    # If we broadcasted x along the last dim, then A @ x is standard matmul.
+    
+    bx_r, bx_i = batch_matmul_real(br, bi, xr, xi)
+    
     new_xr = bx_r + yr
     new_xi = bx_i + yi
     return new_ar, new_ai, new_xr, new_xi
@@ -111,16 +107,24 @@ def pscan_mat_kernel(
     
     ar = tl.load(a_ptrs, mask=mask[:, None, None], other=0.0)
     ai = tl.load(a_ptrs + 1, mask=mask[:, None, None], other=0.0)
-    xr = tl.load(x_ptrs, mask=mask[:, None], other=0.0)
-    xi = tl.load(x_ptrs + 1, mask=mask[:, None], other=0.0)
+    
+    xr_vec = tl.load(x_ptrs, mask=mask[:, None], other=0.0)
+    xi_vec = tl.load(x_ptrs + 1, mask=mask[:, None], other=0.0)
+    
+    xr = tl.expand_dims(xr_vec, 2) + tl.zeros([1, 1, D], dtype=xr_vec.dtype)
+    xi = tl.expand_dims(xi_vec, 2) + tl.zeros([1, 1, D], dtype=xi_vec.dtype)
 
     _, _, acc_xr, acc_xi = tl.associative_scan(
         (ar, ai, xr, xi), axis=0, combine_fn=scan_combine_mat
     )
     
+    final_xr = tl.sum(acc_xr, axis=2) / D 
+    final_xr = acc_xr[:, :, 0]
+    final_xi = acc_xi[:, :, 0]
+    
     y_ptrs = Y_ptr_base + row_offs[None, :] * stride_dim_x
-    tl.store(y_ptrs, acc_xr, mask=mask[:, None])
-    tl.store(y_ptrs + 1, acc_xi, mask=mask[:, None])
+    tl.store(y_ptrs, final_xr, mask=mask[:, None])
+    tl.store(y_ptrs + 1, final_xi, mask=mask[:, None])
 
 def next_power_of_2(n):
     return 1 << (n - 1).bit_length()
@@ -189,10 +193,12 @@ class _PScanFunction(torch.autograd.Function):
         
         if is_matrix:
             B, L, D, _ = A.shape
+            
             A_H = A.conj().permute(0, 1, 3, 2)
             A_shifted = A_H[:, 1:]
             A_rev_part = torch.flip(A_shifted, [1])
             A_rev = torch.cat([torch.zeros_like(A_H[:, 0:1]), A_rev_part], dim=1).contiguous()
+            
             X_rev = torch.flip(grad_output, [1]).contiguous()
             
             A_real = torch.view_as_real(A_rev)
