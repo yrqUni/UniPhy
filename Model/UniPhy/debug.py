@@ -95,19 +95,18 @@ class InstrumentedUniPhyBlock(UniPhyBlock):
         A_time_raw = op_decay.expand(B, T, H, W, D)
         self._log(mode, None, "5_A_time_raw", A_time_raw)
 
-        # Original problematic code (replicated for debugging)
-        # Or patched code if you changed it. We keep the logic as is to find error.
-        A_time = A_time_raw.reshape(B * H * W, T, D, 1) 
+        # Correct logic from fixed ModelUniPhy.py
+        A_time = A_time_raw.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X_time = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         
         Y_time = self._run_pscan(A_time, X_time)
         
         # 6. Time PScan Output
-        self._log(mode, None, "6_pscan_out", Y_time.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)) # Match B, T, D, H, W
+        # Reshape back for logging: (B, H, W, T, D) -> (B, T, D, H, W)
+        self._log(mode, None, "6_pscan_out", Y_time.reshape(B, H, W, T, D).permute(0, 3, 4, 1, 2)) 
 
         u_t = Y_time.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
         
-        # Noise (skipped for consistency check usually, or fixed seed)
         noise = self.prop.generate_stochastic_term(
             u_t.shape, dt_expanded, u_t.dtype, h_state=u_t
         )
@@ -138,7 +137,7 @@ class InstrumentedUniPhyBlock(UniPhyBlock):
     def forward_step(self, x_curr, h_prev, dt, flux_prev):
         # --- Serial Step Forward ---
         mode = "serial"
-        step = 0 # Placeholder
+        step = 0 # Placeholder, we use append list
         
         # 1. Input (Partial)
         self._log(mode, step, "0_input", x_curr)
@@ -169,10 +168,9 @@ class InstrumentedUniPhyBlock(UniPhyBlock):
         # 4. Flux Output
         self._log(mode, step, "3_flux_seq", flux_next)
         
-        # Note: forcing/A_time are internal to prop.forward_step, capturing h_tilde_next is equivalent to pscan_out
-        
         # 6. PScan Equivalent (Hidden State)
-        # h_tilde_next is (B*H*W, D)
+        # h_tilde_next is (B*H*W, 1, D)
+        # Reshape to (B, H, W, D) for logging
         h_log = h_tilde_next.reshape(B, H, W, D).permute(0, 3, 1, 2) # -> B, D, H, W
         self._log(mode, step, "6_pscan_out", h_log) 
 
@@ -229,9 +227,9 @@ def run_debug():
     
     # --- Run Serial ---
     print("Running Serial Forward...")
-    # Clean up hooks/logs for serial run (not needed, handled by key appending)
     
-    h_state = torch.zeros(B * H * W, D, device=device, dtype=torch.cdouble)
+    # FIX: Initialize h_state with shape (B*H*W, 1, D) to match forward_step expectation
+    h_state = torch.zeros(B * H * W, 1, D, device=device, dtype=torch.cdouble)
     flux_state = torch.zeros(B, D, device=device, dtype=torch.cdouble)
     out_serial_list = []
     
@@ -267,17 +265,19 @@ def run_debug():
             continue
             
         # Stack serial list to match parallel: (B, T, ...)
-        # Usually Serial items are (B, ...), stack on dim 1
         try:
             val_s = torch.stack(val_s_list, dim=1)
         except:
-            # Special case handling if needed
              val_s = torch.stack(val_s_list, dim=1)
 
-        # Align shapes if necessary (e.g. permutes)
+        # Align shapes if necessary
         if val_p.shape != val_s.shape:
-             print(f"{k:<20} | {str(tuple(val_p.shape)):<20} | {'Shape Mismatch':<15} | Serial: {tuple(val_s.shape)}")
-             continue
+             # Try to reshape if element count matches
+             if val_p.numel() == val_s.numel():
+                 val_s = val_s.reshape(val_p.shape)
+             else:
+                 print(f"{k:<20} | {str(tuple(val_p.shape)):<20} | {'Shape Mismatch':<15} | Serial: {tuple(val_s.shape)}")
+                 continue
              
         diff = (val_p - val_s).abs().max().item()
         status = "OK" if diff < 1e-5 else "FAIL"
@@ -286,7 +286,6 @@ def run_debug():
 
         if status == "FAIL" and first_fail:
             print("\n>>> FIRST FAILURE DETECTED AT: ", k)
-            print("Analyze the code immediately preceding this step.")
             first_fail = False
 
     print("-" * 70)
