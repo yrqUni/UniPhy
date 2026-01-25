@@ -143,7 +143,7 @@ class ComplexSVDTransform(nn.Module):
         h_learned = h * (1 - alpha)
         h_dft = h * alpha
 
-        learned_out = torch.einsum("...d, de -> ...e", h_learned / S_diag, U.conj())
+        learned_out = torch.einsum("...d, de -> ...e", h_learned / S_diag, V.conj().T)
         dft_out = torch.einsum("...d, de -> ...e", h_dft, self.dft_basis.conj().T)
 
         return learned_out + dft_out

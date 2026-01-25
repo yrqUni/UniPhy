@@ -252,7 +252,7 @@ def pscan(A, X):
     is_diag = (A.ndim == X.ndim - 1)
 
     if is_diag:
-        D = X.shape[-1]
+        D = X.shape[-2]
         A_mat = expand_diag_to_matrix(A, D)
     else:
         A_mat = A
