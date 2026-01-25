@@ -17,7 +17,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from rich.console import Console
-from rich.logging import RichHandler
 from rich.progress import (
     Progress,
     TextColumn,
@@ -26,7 +25,6 @@ from rich.progress import (
     TimeRemainingColumn,
     TaskProgressColumn,
 )
-from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
 
@@ -82,18 +80,28 @@ def load_ckpt(model, optimizer, path, scheduler=None):
 
 
 def compute_spectral_loss(pred, target):
-    pred_fft = torch.fft.rfft2(pred.real, norm="ortho")
-    target_fft = torch.fft.rfft2(target.real, norm="ortho")
+    if pred.is_complex():
+        pred_real = pred.real
+        target_real = target.real
+    else:
+        pred_real = pred
+        target_real = target
+    pred_fft = torch.fft.rfft2(pred_real, norm="ortho")
+    target_fft = torch.fft.rfft2(target_real, norm="ortho")
     return F.l1_loss(pred_fft.abs(), target_fft.abs())
 
 
 def compute_energy_penalty(pred, target):
-    pred_energy = (pred.abs() ** 2).mean(dim=(-2, -1))
-    target_energy = (target.abs() ** 2).mean(dim=(-2, -1))
+    if pred.is_complex():
+        pred_energy = (pred.abs() ** 2).mean(dim=(-2, -1))
+        target_energy = (target.abs() ** 2).mean(dim=(-2, -1))
+    else:
+        pred_energy = (pred ** 2).mean(dim=(-2, -1))
+        target_energy = (target ** 2).mean(dim=(-2, -1))
     return F.mse_loss(pred_energy, target_energy)
 
 
-def train_step(model, batch, optimizer, cfg, scaler, grad_accum_steps, step_in_accum):
+def train_step(model, batch, optimizer, cfg, grad_accum_steps, step_in_accum):
     data, dt = batch
     data = data.cuda(non_blocking=True)
     dt = dt.cuda(non_blocking=True)
@@ -105,24 +113,20 @@ def train_step(model, batch, optimizer, cfg, scaler, grad_accum_steps, step_in_a
 
     dt_input = dt[:, :-1] if dt.ndim > 1 else dt[:-1]
 
-    with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-        x_pred = model(x_input, dt_input)
+    x_pred = model(x_input, dt_input)
 
-        loss_mse = F.mse_loss(x_pred.real, x_target.real) + F.mse_loss(x_pred.imag, x_target.imag)
+    loss_mse = F.mse_loss(x_pred.real, x_target.real) + F.mse_loss(x_pred.imag, x_target.imag)
+    loss_spectral = compute_spectral_loss(x_pred, x_target) * cfg["train"]["spectral_loss_weight"]
+    loss_energy = compute_energy_penalty(x_pred, x_target) * cfg["train"]["energy_penalty_weight"]
 
-        loss_spectral = compute_spectral_loss(x_pred, x_target) * cfg["train"]["spectral_loss_weight"]
-        loss_energy = compute_energy_penalty(x_pred, x_target) * cfg["train"]["energy_penalty_weight"]
+    loss = loss_mse + loss_spectral + loss_energy
+    loss = loss / grad_accum_steps
 
-        loss = loss_mse + loss_spectral + loss_energy
-        loss = loss / grad_accum_steps
-
-    scaler.scale(loss).backward()
+    loss.backward()
 
     if (step_in_accum + 1) % grad_accum_steps == 0:
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
     return {
@@ -203,8 +207,6 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
             epochs=epochs,
         )
 
-    scaler = torch.amp.GradScaler("cuda")
-
     start_epoch = 0
     global_step = 0
 
@@ -254,7 +256,7 @@ def run_ddp(rank, world_size, local_rank, master_addr, master_port, cfg):
 
         for batch_idx, batch in enumerate(train_loader):
             metrics = train_step(
-                model, batch, optimizer, cfg, scaler, grad_accum_steps, batch_idx
+                model, batch, optimizer, cfg, grad_accum_steps, batch_idx
             )
 
             epoch_loss += metrics["loss"]
