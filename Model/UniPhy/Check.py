@@ -1,6 +1,5 @@
 import torch
-import torch.nn.functional as F
-from ModelUniPhy import UniPhyModel, UniPhyBlock
+from ModelUniPhy import UniPhyModel
 from UniPhyOps import (
     ComplexSVDTransform,
     GlobalFluxTracker,
@@ -9,7 +8,7 @@ from UniPhyOps import (
 )
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyFFN import UniPhyFeedForwardNetwork
-from pscan_module import pscan
+from PScan import pscan
 
 
 def check_basis_invertibility():
