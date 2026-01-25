@@ -1,5 +1,5 @@
 import torch
-from PScan import PScan, pscan
+from PScan import pscan
 
 
 def sequential_pscan_diag(A, X):
