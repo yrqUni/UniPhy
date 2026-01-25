@@ -7,8 +7,8 @@ import triton.language as tl
 def batch_matmul_real(ar, ai, br, bi):
     ar_ = tl.expand_dims(ar, 3)
     ai_ = tl.expand_dims(ai, 3)
-    br_ = tl.expand_dims(br, 2)
-    bi_ = tl.expand_dims(bi, 2)
+    br_ = tl.expand_dims(br, 1)
+    bi_ = tl.expand_dims(bi, 1)
     
     rr = ar_ * br_
     ri = ar_ * bi_
@@ -92,16 +92,14 @@ def pscan_mat_kernel(
     Y_ptr_base = Y_ptr + pid * stride_batch_x + offs[:, None] * stride_time_x
     
     a_ptrs = A_ptr_base + row_offs[None, :, None] * stride_row_a + col_offs[None, None, :] * stride_col_a
-    x_ptrs = X_ptr_base + row_offs[None, :] * stride_dim_x
+    
+    x_ptrs = X_ptr_base + row_offs[None, :, None] * stride_dim_x + col_offs[None, None, :] * 0
     
     ar = tl.load(a_ptrs, mask=mask[:, None, None], other=0.0)
     ai = tl.load(a_ptrs + 1, mask=mask[:, None, None], other=0.0)
     
-    xr_vec = tl.load(x_ptrs, mask=mask[:, None], other=0.0)
-    xi_vec = tl.load(x_ptrs + 1, mask=mask[:, None], other=0.0)
-    
-    xr = tl.expand_dims(xr_vec, 2) + tl.zeros([1, 1, D], dtype=xr_vec.dtype)
-    xi = tl.expand_dims(xi_vec, 2) + tl.zeros([1, 1, D], dtype=xi_vec.dtype)
+    xr = tl.load(x_ptrs, mask=mask[:, None, None], other=0.0)
+    xi = tl.load(x_ptrs + 1, mask=mask[:, None, None], other=0.0)
 
     _, _, acc_xr, acc_xi = tl.associative_scan(
         (ar, ai, xr, xi), axis=0, combine_fn=scan_combine_mat
