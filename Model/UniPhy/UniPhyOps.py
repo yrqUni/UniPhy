@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(
         self,
@@ -84,11 +83,9 @@ class RiemannianCliffordConv2d(nn.Module):
         x_evolved = x_scaled + diffusion - anti_diff_weight * diffusion * 0.5 + dispersion
 
         x_final = x_evolved * inv_scale
-
         out = self.conv(x_final)
 
         return out
-
 
 class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
@@ -139,15 +136,16 @@ class ComplexSVDTransform(nn.Module):
         U, S_mat, V = self._get_basis()
         S_diag = torch.diag(S_mat)
         alpha = torch.sigmoid(self.dft_weight)
-
-        h_learned = h * (1 - alpha)
-        h_dft = h * alpha
-
-        learned_out = torch.einsum("...d, de -> ...e", h_learned / S_diag, V.conj().T)
-        dft_out = torch.einsum("...d, de -> ...e", h_dft, self.dft_basis.conj().T)
-
-        return learned_out + dft_out
-
+        
+        W_learned = V * S_diag.unsqueeze(0) * (1 - alpha)
+        W_dft = self.dft_basis * alpha
+        W_total = W_learned + W_dft
+        
+        if h.is_complex() and not W_total.is_complex():
+            W_total = W_total.to(h.dtype)
+            
+        x_rec = torch.linalg.solve(W_total.T, h.unsqueeze(-1)).squeeze(-1)
+        return x_rec
 
 class GlobalFluxTracker(nn.Module):
     def __init__(self, dim):
@@ -209,7 +207,6 @@ class GlobalFluxTracker(nn.Module):
 
         return new_state, source, gate
 
-
 class TemporalPropagator(nn.Module):
     def __init__(
         self,
@@ -251,7 +248,6 @@ class TemporalPropagator(nn.Module):
         l_total = l_phys + l_law
 
         bounded_re = torch.tanh(l_total.real) * self.max_growth_rate
-
         return torch.complex(bounded_re, l_total.imag)
 
     def get_transition_operators(self, dt):
@@ -296,7 +292,6 @@ class TemporalPropagator(nn.Module):
 
         std = torch.sqrt(dynamic_var).to(dtype)
         noise = torch.randn(target_shape, device=self.ld.device, dtype=dtype)
-
         return noise * std
 
     def forward_step(self, h_prev_latent, x_input, x_global_mean_encoded, dt, flux_state):
@@ -329,7 +324,6 @@ class TemporalPropagator(nn.Module):
         )
 
         forcing_term = x_tilde * gate_expanded + source_expanded * (1 - gate_expanded)
-
         h_tilde_next = h_prev_latent * op_decay + forcing_term * op_forcing
 
         h_tilde_next = h_tilde_next + self.generate_stochastic_term(
