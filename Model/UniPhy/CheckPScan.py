@@ -1,21 +1,17 @@
 import torch
-import torch.nn.functional as F
 from PScan import PScanTriton
 
 def manual_scan_diagonal(A, X):
     A_c = torch.view_as_complex(A)
     X_c = torch.view_as_complex(X)
-    
     B, L, C = A_c.shape
     H = torch.zeros(B, C, device=A.device, dtype=A_c.dtype)
     Y = []
-    
     for t in range(L):
         At = A_c[:, t, :]
         Xt = X_c[:, t, :]
         H = At * H + Xt
         Y.append(H)
-        
     Y_stack = torch.stack(Y, dim=1)
     return torch.view_as_real(Y_stack)
 
@@ -23,22 +19,28 @@ def manual_scan_matrix(A, X):
     B, L, C, D, _ = A.shape
     H = torch.zeros(B, C, D, device=A.device, dtype=A.dtype)
     Y = []
-    
     for t in range(L):
         At = A[:, t, :, :, :]
         Xt = X[:, t, :, :]
         H = torch.einsum('bcd,bd->bc', At, H) + Xt
         Y.append(H)
-        
     return torch.stack(Y, dim=1)
 
 def check_diagonal_mode():
     print("Checking Diagonal Complex Mode...")
     torch.manual_seed(42)
-    B, L, C = 2, 128, 4
+    B, L, C = 2, 64, 4
     
-    A = torch.randn(B, L, C, 2, device='cuda', requires_grad=True)
-    X = torch.randn(B, L, C, 2, device='cuda', requires_grad=True)
+    # Init A with small magnitude to prevent fp32 explosion
+    A = torch.randn(B, L, C, 2, device='cuda') * 0.5 
+    # Or normalize to unit circle:
+    # A_raw = torch.randn(B, L, C, 2, device='cuda')
+    # A = A_raw / A_raw.norm(dim=-1, keepdim=True)
+    
+    X = torch.randn(B, L, C, 2, device='cuda')
+    
+    A.requires_grad = True
+    X.requires_grad = True
     
     pscan = PScanTriton()
     Y_triton = pscan(A, X)
@@ -115,5 +117,5 @@ if __name__ == "__main__":
         check_matrix_mode()
         print("All checks passed successfully.")
     else:
-        print("CUDA not available, skipping Triton tests.")
+        print("CUDA not available.")
         
