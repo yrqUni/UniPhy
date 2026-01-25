@@ -110,6 +110,7 @@ class ERA5_Dataset(Dataset):
         return self._get_data_ptr(f_idx)[off]
 
     def __getitem__(self, idx):
+        idx = int(idx)
         if self.is_train:
             offsets = sorted(random.sample(range(self.window_size), self.sample_k))
         else:
@@ -130,6 +131,6 @@ class ERA5_Dataset(Dataset):
                 frames.append(torch.from_numpy(frame_data.copy()))
         data = torch.stack(frames, dim=0)
         offsets_tensor = torch.tensor(offsets, dtype=torch.float32)
-        dt = (offsets_tensor[1:] - offsets_tensor[:-1]) * self.dt_ref
+        dt = (offsets_tensor[1:] - offsets_tensor[:-1]) * float(self.dt_ref)
         return data, dt
     
