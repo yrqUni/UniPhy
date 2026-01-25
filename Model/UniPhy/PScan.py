@@ -1,213 +1,123 @@
 import torch
+import torch.nn as nn
 import triton
 import triton.language as tl
 
-def get_autotune_configs():
-    return [
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ]
-
 @triton.jit
-def scan_combine_matrix(a_prev, x_prev, a_curr, x_curr):
-    R = a_prev.shape[1]
-    a_new = tl.zeros_like(a_prev)
-    x_new = tl.zeros_like(x_prev)
-    for k in range(R):
-        a_ik = a_curr[:, :, k, None]
-        a_new += a_ik * a_prev[:, k, None, :]
-        x_new += a_ik * x_prev[:, k, None, :]
-    x_new += x_curr
-    return a_new, x_new
+def scan_combine(ar, ai, xr, xi, br, bi, yr, yi, R: tl.constexpr):
+    br = tl.reshape(br, (R, R))
+    bi = tl.reshape(bi, (R, R))
+    ar = tl.reshape(ar, (R, R))
+    ai = tl.reshape(ai, (R, R))
+    xr = tl.reshape(xr, (R, 1))
+    xi = tl.reshape(xi, (R, 1))
+    yr = tl.reshape(yr, (R, 1))
+    yi = tl.reshape(yi, (R, 1))
 
-@triton.jit
-def scan_combine_diag(a_prev, x_prev, a_curr, x_curr):
-    a_new = a_curr * a_prev
-    x_new = a_curr * x_prev + x_curr
-    return a_new, x_new
+    nar = tl.dot(br, ar) - tl.dot(bi, ai)
+    nai = tl.dot(br, ai) + tl.dot(bi, ar)
+    
+    nxr = tl.dot(br, xr) - tl.dot(bi, xi) + yr
+    nxi = tl.dot(br, xi) + tl.dot(bi, xr) + yi
 
-@triton.autotune(configs=get_autotune_configs(), key=["L", "R"])
+    return tl.ravel(nar), tl.ravel(nai), tl.ravel(nxr), tl.ravel(nxi)
+
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=w) for w in [4, 8, 16]],
+    key=["L", "R"],
+)
 @triton.jit
-def pscan_fwd_kernel(
+def pscan_kernel(
     A_ptr, X_ptr, Y_ptr,
-    stride_batch, stride_time,
-    L, R: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    A_IS_DIAG: tl.constexpr
+    stride_ab, stride_al, stride_ac,
+    stride_xb, stride_xl, stride_xc,
+    L, R: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    REVERSE: tl.constexpr
 ):
-    pid = tl.program_id(axis=0)
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < L
-
-    A_base = A_ptr + pid * stride_batch
-    X_base = X_ptr + pid * stride_batch
-    Y_base = Y_ptr + pid * stride_batch
-
-    r_idx = tl.arange(0, R)
+    pid_batch = tl.program_id(axis=0)
+    pid_chan = tl.program_id(axis=1)
     
-    if A_IS_DIAG:
-        a_ptrs = A_base + (offs[:, None] * stride_time) + r_idx[None, :]
-        a_vals_diag = tl.load(a_ptrs, mask=mask[:, None], other=1.0)
-        a_vals = tl.broadcast_to(a_vals_diag[:, :, None], (BLOCK_SIZE, R, R))
-    else:
-        r_row = r_idx[:, None]
-        r_col = r_idx[None, :]
-        a_ptrs = A_base + (offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
-        a_vals = tl.load(a_ptrs, mask=mask[:, None, None], other=0.0)
-        eye = tl.zeros((R, R), dtype=tl.float32)
-        for i in range(R): eye[i, i] = 1.0
-        a_vals = tl.where(mask[:, None, None], a_vals, eye[None, :, :])
+    offs_l = tl.arange(0, BLOCK_SIZE)
+    mask_l = offs_l < L
+    idx_l = (L - 1 - offs_l) if REVERSE else offs_l
 
-    x_row = r_idx[:, None]
-    x_col = r_idx[None, :]
-    x_ptrs = X_base + (offs[:, None, None] * stride_time) + (x_row[None, :, :] * R + x_col[None, :, :])
-    x_vals = tl.load(x_ptrs, mask=mask[:, None, None], other=0.0)
+    offs_r = tl.arange(0, R)
+    offs_mat = tl.arange(0, R * R)
 
-    if A_IS_DIAG:
-        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, scan_combine_diag)
-    else:
-        acc_a, acc_x = tl.associative_scan((a_vals, x_vals), 0, scan_combine_matrix)
-
-    tl.store(Y_base + (offs[:, None, None] * stride_time) + (x_row[None, :, :] * R + x_col[None, :, :]), acc_x, mask=mask[:, None, None])
-
-@triton.autotune(configs=get_autotune_configs(), key=["L", "R"])
-@triton.jit
-def pscan_bwd_kernel(
-    A_ptr, X_grad_ptr, Y_grad_ptr, A_grad_ptr, Y_curr_ptr,
-    stride_batch, stride_time,
-    L, R: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    A_IS_DIAG: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < L
-
-    offset_base = pid * stride_batch
+    a_base = A_ptr + pid_batch * stride_ab + pid_chan * stride_ac
+    x_base = X_ptr + pid_batch * stride_xb + pid_chan * stride_xc
     
-    read_offs = L - 1 - offs
+    a_r = tl.load(a_base + idx_l[:, None] * stride_al + offs_mat[None, :], mask=mask_l[:, None], other=0.0)
+    a_i = tl.load(a_base + idx_l[:, None] * stride_al + offs_mat[None, :] + (R*R), mask=mask_l[:, None], other=0.0)
     
-    r_idx = tl.arange(0, R)
-    r_row = r_idx[:, None]
-    r_col = r_idx[None, :]
-    
-    a_read_offs = read_offs + 1
-    a_mask = (a_read_offs < L) & mask
+    x_r = tl.load(x_base + idx_l[:, None] * stride_xl + offs_r[None, :], mask=mask_l[:, None], other=0.0)
+    x_i = tl.load(x_base + idx_l[:, None] * stride_xl + offs_r[None, :] + R, mask=mask_l[:, None], other=0.0)
 
-    if A_IS_DIAG:
-        a_ptrs = A_ptr + offset_base + (a_read_offs[:, None] * stride_time) + r_idx[None, :]
-        a_vals_diag = tl.load(a_ptrs, mask=a_mask[:, None], other=0.0) 
-        a_vals_diag = tl.where(a_mask[:, None], a_vals_diag, 1.0)
-        a_vals = tl.broadcast_to(a_vals_diag[:, :, None], (BLOCK_SIZE, R, R))
-    else:
-        a_ptrs_T = A_ptr + offset_base + (a_read_offs[:, None, None] * stride_time) + (r_col[None, :, :] * R + r_row[None, :, :])
-        a_vals = tl.load(a_ptrs_T, mask=a_mask[:, None, None], other=0.0)
-        eye = tl.zeros((R, R), dtype=tl.float32)
-        for i in range(R): eye[i, i] = 1.0
-        a_vals = tl.where(a_mask[:, None, None], a_vals, eye[None, :, :])
+    if REVERSE:
+        a_r = tl.where(offs_l[:, None] == 0, tl.where(offs_mat[None, :] // R == offs_mat[None, :] % R, 1.0, 0.0), a_r)
+        a_i = tl.where(offs_l[:, None] == 0, 0.0, a_i)
 
-    x_g_ptrs = X_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
-    x_g_vals = tl.load(x_g_ptrs, mask=mask[:, None, None], other=0.0)
+    res_ar, res_ai, res_xr, res_xi = tl.associative_scan(
+        (a_r, a_i, x_r, x_i), axis=0, 
+        combine_fn=lambda ar, ai, xr, xi, br, bi, yr, yi: scan_combine(ar, ai, xr, xi, br, bi, yr, yi, R)
+    )
 
-    if A_IS_DIAG:
-        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, scan_combine_diag)
-    else:
-        _, dY_acc = tl.associative_scan((a_vals, x_g_vals), 0, scan_combine_matrix)
+    y_base = Y_ptr + pid_batch * stride_xb + pid_chan * stride_xc
+    tl.store(y_base + idx_l[:, None] * stride_xl + offs_r[None, :], res_xr, mask=mask_l[:, None])
+    tl.store(y_base + idx_l[:, None] * stride_xl + offs_r[None, :] + R, res_xi, mask=mask_l[:, None])
 
-    tl.store(X_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :]), dY_acc, mask=mask[:, None, None])
-
-    y_read_offs = read_offs - 1
-    y_mask = (y_read_offs >= 0) & mask
-    
-    y_ptrs = Y_curr_ptr + offset_base + (y_read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
-    y_vals = tl.load(y_ptrs, mask=y_mask[:, None, None], other=0.0)
-
-    if A_IS_DIAG:
-        da_val = tl.sum(dY_acc * y_vals, axis=2)
-        da_ptrs = A_grad_ptr + offset_base + (read_offs[:, None] * stride_time) + r_idx[None, :]
-        tl.store(da_ptrs, da_val, mask=mask[:, None])
-    else:
-        da_mat = tl.zeros((R, R), dtype=tl.float32)
-        for k in range(R):
-            da_mat += dY_acc[:, :, k, None] * y_vals[:, None, k, :]
-        da_ptrs = A_grad_ptr + offset_base + (read_offs[:, None, None] * stride_time) + (r_row[None, :, :] * R + r_col[None, :, :])
-        tl.store(da_ptrs, da_mat, mask=mask[:, None, None])
-
-def next_power_of_2(n: int) -> int:
-    return 1 << (n - 1).bit_length()
-
-class PScanTritonFunction(torch.autograd.Function):
+class _PScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X):
-        B, L, C, R1 = A.shape[:4]
-        is_diag = (A.ndim == 4)
+        if A.ndim == 4:
+            B, L, C, R = A.shape
+            A = torch.diag_embed(A)
+        B, L, C, R, _ = A.shape
         
-        if is_diag:
-            R = R1
-            A_in = A.permute(0, 2, 1, 3).reshape(B*C, L, R).contiguous()
-        else:
-            R = R1
-            A_in = A.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
-
-        X_in = X.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
-        Y = torch.empty_like(X_in)
+        A = A.contiguous()
+        X = X.contiguous()
+        Y = torch.empty_like(X)
         
-        BLOCK_SIZE = next_power_of_2(L)
-        if BLOCK_SIZE < 16: BLOCK_SIZE = 16
+        BLOCK_SIZE = triton.next_power_of_2(L)
+        grid = (B, C)
         
-        grid = (B * C, )
-        
-        pscan_fwd_kernel[grid](
-            A_in, X_in, Y,
-            A_in.stride(0), A_in.stride(1),
-            L, R, BLOCK_SIZE,
-            is_diag
+        pscan_kernel[grid](
+            torch.view_as_real(A), torch.view_as_real(X), torch.view_as_real(Y),
+            A.stride(0), A.stride(1), A.stride(2),
+            X.stride(0), X.stride(1), X.stride(2),
+            L, R, BLOCK_SIZE, False
         )
-        
-        Y_out = Y.view(B, C, L, R, R).permute(0, 2, 1, 3, 4)
-        ctx.save_for_backward(A, X, Y_out)
-        ctx.is_diag = is_diag
-        
-        return Y_out
+        ctx.save_for_backward(A, X, Y)
+        return Y
 
     @staticmethod
     def backward(ctx, grad_output):
         A, X, Y = ctx.saved_tensors
-        is_diag = ctx.is_diag
+        B, L, C, R, _ = A.shape
         
-        B, L, C, R = X.shape[0], X.shape[1], X.shape[2], X.shape[3]
+        A_conj_trans = A.conj().transpose(-1, -2).contiguous()
+        A_prep = torch.zeros_like(A_conj_trans)
+        A_prep[:, :-1] = A_conj_trans[:, 1:]
+        A_prep[:, -1] = torch.eye(R, device=A.device, dtype=A.dtype)
+
+        grad_output = grad_output.contiguous()
+        dX = torch.empty_like(grad_output)
+        BLOCK_SIZE = triton.next_power_of_2(L)
         
-        X_grad = grad_output.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
-        Y_curr = Y.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
-        
-        if is_diag:
-            A_in = A.permute(0, 2, 1, 3).reshape(B*C, L, R).contiguous()
-            A_grad = torch.empty_like(A_in)
-        else:
-            A_in = A.permute(0, 2, 1, 3, 4).reshape(B*C, L, R*R).contiguous()
-            A_grad = torch.empty_like(A_in)
-            
-        BLOCK_SIZE = next_power_of_2(L)
-        if BLOCK_SIZE < 16: BLOCK_SIZE = 16
-        grid = (B * C, )
-        
-        pscan_bwd_kernel[grid](
-            A_in, X_grad, None, A_grad, Y_curr,
-            A_in.stride(0), A_in.stride(1),
-            L, R, BLOCK_SIZE,
-            is_diag
+        pscan_kernel[(B, C)](
+            torch.view_as_real(A_prep), torch.view_as_real(grad_output), torch.view_as_real(dX),
+            A_prep.stride(0), A_prep.stride(1), A_prep.stride(2),
+            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
+            L, R, BLOCK_SIZE, True
         )
         
-        dX = X_grad.view(B, C, L, R, R).permute(0, 2, 1, 3, 4)
-        if is_diag:
-            dA = A_grad.view(B, C, L, R).permute(0, 2, 1, 3)
-        else:
-            dA = A_grad.view(B, C, L, R, R).permute(0, 2, 1, 3, 4)
-            
+        Y_prev = torch.zeros_like(Y)
+        Y_prev[:, 1:] = Y[:, :-1]
+        dA = torch.matmul(dX.unsqueeze(-1), Y_prev.conj().unsqueeze(-2))
+        
         return dA, dX
 
-class PScan(torch.nn.Module):
+class PScanTriton(nn.Module):
     def forward(self, A, X):
-        return PScanTritonFunction.apply(A, X)
+        return _PScanFunction.apply(A, X)
     

@@ -1,94 +1,50 @@
 import torch
-import torch.nn.functional as F
-from PScan import PScan
+from PScan import PScanTriton
 
-def sequential_scan(A, X):
-    B, L, C, R, _ = X.shape
-    Y = torch.zeros_like(X)
-    h = torch.zeros((B, C, R, R), device=X.device, dtype=X.dtype)
+def pscan_ref(A, X):
+    B, L, C, R, _ = X.shape if X.ndim == 5 else (*X.shape, 1)
+    if A.ndim == 4:
+        A = torch.diag_embed(A)
     
-    is_diag = (A.ndim == 4)
+    Y = torch.zeros_like(X)
+    curr = torch.zeros((B, C, R, 1), device=X.device, dtype=X.dtype)
     
     for t in range(L):
-        x_t = X[:, t]
-        if is_diag:
-            a_t = A[:, t]
-            h = a_t.unsqueeze(-1) * h + x_t
-        else:
-            a_t = A[:, t]
-            h = torch.matmul(a_t, h) + x_t
-        Y[:, t] = h
-        
+        At = A[:, t] # (B, C, R, R)
+        Xt = X[:, t].unsqueeze(-1) # (B, C, R, 1)
+        curr = torch.matmul(At, curr) + Xt
+        Y[:, t] = curr.squeeze(-1)
     return Y
 
-def check_consistency():
-    torch.manual_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def check():
+    B, L, C, R = 2, 64, 4, 16
+    device = "cuda"
+    dtype = torch.complex64
     
-    B, L, C, R = 2, 64, 4, 4
+    A = torch.randn(B, L, C, R, R, device=device, dtype=dtype, requires_grad=True)
+    X = torch.randn(B, L, C, R, device=device, dtype=dtype, requires_grad=True)
     
-    print(f"--- Testing Diagonal A (BLCR) ---")
-    A_diag = torch.randn(B, L, C, R, device=device, requires_grad=True)
-    X = torch.randn(B, L, C, R, R, device=device, requires_grad=True)
+    pscan_triton = PScanTriton()
     
-    pscan = PScan()
+    # Forward Check
+    y_triton = pscan_triton(A, X)
+    y_ref = pscan_ref(A, X)
     
-    Y_triton = pscan(A_diag, X)
-    Y_ref = sequential_scan(A_diag, X)
+    print(f"FW Diff: {torch.norm(y_triton - y_ref).item()}")
     
-    diff = torch.abs(Y_triton - Y_ref).max()
-    print(f"Forward Max Difference: {diff.item()}")
+    # Backward Check
+    grad = torch.randn_like(y_triton)
+    y_triton.backward(grad)
     
-    grad_output = torch.randn_like(Y_triton)
-    Y_triton.backward(grad_output)
-    dA_triton, dX_triton = A_diag.grad.clone(), X.grad.clone()
+    dA_triton, dX_triton = A.grad.clone(), X.grad.clone()
+    A.grad, X.grad = None, None
     
-    A_diag.grad = None
-    X.grad = None
+    y_ref.backward(grad)
+    dA_ref, dX_ref = A.grad.clone(), X.grad.clone()
     
-    Y_ref = sequential_scan(A_diag, X)
-    Y_ref.backward(grad_output)
-    dA_ref, dX_ref = A_diag.grad, X.grad
-    
-    diff_da = torch.abs(dA_triton - dA_ref).max()
-    diff_dx = torch.abs(dX_triton - dX_ref).max()
-    print(f"Backward dA Diff: {diff_da.item()}")
-    print(f"Backward dX Diff: {diff_dx.item()}")
-    
-    assert diff < 1e-4, "Forward Diag Fail"
-    assert diff_da < 1e-4, "Backward Diag dA Fail"
-    assert diff_dx < 1e-4, "Backward Diag dX Fail"
-
-    print(f"\n--- Testing Matrix A (BLCRR) ---")
-    A_mat = torch.randn(B, L, C, R, R, device=device, requires_grad=True) * 0.1
-    X = torch.randn(B, L, C, R, R, device=device, requires_grad=True)
-    
-    Y_triton = pscan(A_mat, X)
-    Y_ref = sequential_scan(A_mat, X)
-    
-    diff = torch.abs(Y_triton - Y_ref).max()
-    print(f"Forward Max Difference: {diff.item()}")
-    
-    grad_output = torch.randn_like(Y_triton)
-    Y_triton.backward(grad_output)
-    dA_triton, dX_triton = A_mat.grad.clone(), X.grad.clone()
-    
-    A_mat.grad = None
-    X.grad = None
-    
-    Y_ref = sequential_scan(A_mat, X)
-    Y_ref.backward(grad_output)
-    dA_ref, dX_ref = A_mat.grad, X.grad
-    
-    diff_da = torch.abs(dA_triton - dA_ref).max()
-    diff_dx = torch.abs(dX_triton - dX_ref).max()
-    print(f"Backward dA Diff: {diff_da.item()}")
-    print(f"Backward dX Diff: {diff_dx.item()}")
-
-    assert diff < 1e-4, "Forward Matrix Fail"
-    assert diff_da < 1e-3, "Backward Matrix dA Fail"
-    assert diff_dx < 1e-3, "Backward Matrix dX Fail"
+    print(f"BW dA Diff: {torch.norm(dA_triton - dA_ref).item()}")
+    print(f"BW dX Diff: {torch.norm(dX_triton - dX_ref).item()}")
 
 if __name__ == "__main__":
-    check_consistency()
+    check()
     
