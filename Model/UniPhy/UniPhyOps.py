@@ -68,9 +68,11 @@ class RiemannianCliffordConv2d(nn.Module):
         inv_scale = 1.0 / scale
 
         x_scaled = x * scale
+        
+        laplacian_kernel = self.laplacian_kernel.to(dtype=x.dtype)
 
         diffusion_term = F.conv2d(
-            x_scaled, self.laplacian_kernel, padding=1, groups=self.groups
+            x_scaled, laplacian_kernel, padding=1, groups=self.groups
         )
 
         local_viscosity = self.viscosity_gate(x) * inv_scale
@@ -127,7 +129,8 @@ class ComplexSVDTransform(nn.Module):
         learned_path = torch.einsum("...d, de -> ...e", x, V) * S_diag
 
         x_complex = x if x.is_complex() else torch.complex(x, torch.zeros_like(x))
-        dft_path = torch.einsum("...d, de -> ...e", x_complex, self.dft_basis)
+        dft_basis = self.dft_basis.to(dtype=x_complex.dtype)
+        dft_path = torch.einsum("...d, de -> ...e", x_complex, dft_basis)
 
         alpha = torch.sigmoid(self.dft_weight)
         return learned_path * (1 - alpha) + dft_path * alpha
@@ -138,7 +141,9 @@ class ComplexSVDTransform(nn.Module):
         alpha = torch.sigmoid(self.dft_weight)
         
         W_learned = V * S_diag.unsqueeze(0) * (1 - alpha)
-        W_dft = self.dft_basis * alpha
+        
+        dft_basis = self.dft_basis.to(dtype=h.dtype)
+        W_dft = dft_basis * alpha
         W_total = W_learned + W_dft
         
         if h.is_complex() and not W_total.is_complex():
