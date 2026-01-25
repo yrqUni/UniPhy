@@ -24,7 +24,7 @@ def scan_combine_matrix(a_prev, x_prev, a_curr, x_curr):
 @triton.jit
 def scan_combine_diag(a_prev, x_prev, a_curr, x_curr):
     a_new = a_curr * a_prev
-    x_new = (a_curr[:, :, None] * x_prev) + x_curr
+    x_new = a_curr * x_prev + x_curr
     return a_new, x_new
 
 @triton.autotune(configs=get_autotune_configs(), key=["L", "R"])
@@ -48,7 +48,8 @@ def pscan_fwd_kernel(
     
     if A_IS_DIAG:
         a_ptrs = A_base + (offs[:, None] * stride_time) + r_idx[None, :]
-        a_vals = tl.load(a_ptrs, mask=mask[:, None], other=1.0)
+        a_vals_diag = tl.load(a_ptrs, mask=mask[:, None], other=1.0)
+        a_vals = tl.broadcast_to(a_vals_diag[:, :, None], (BLOCK_SIZE, R, R))
     else:
         r_row = r_idx[:, None]
         r_col = r_idx[None, :]
@@ -96,8 +97,9 @@ def pscan_bwd_kernel(
 
     if A_IS_DIAG:
         a_ptrs = A_ptr + offset_base + (a_read_offs[:, None] * stride_time) + r_idx[None, :]
-        a_vals = tl.load(a_ptrs, mask=a_mask[:, None], other=0.0) 
-        a_vals = tl.where(a_mask[:, None], a_vals, 1.0)
+        a_vals_diag = tl.load(a_ptrs, mask=a_mask[:, None], other=0.0) 
+        a_vals_diag = tl.where(a_mask[:, None], a_vals_diag, 1.0)
+        a_vals = tl.broadcast_to(a_vals_diag[:, :, None], (BLOCK_SIZE, R, R))
     else:
         a_ptrs_T = A_ptr + offset_base + (a_read_offs[:, None, None] * stride_time) + (r_col[None, :, :] * R + r_row[None, :, :])
         a_vals = tl.load(a_ptrs_T, mask=a_mask[:, None, None], other=0.0)
