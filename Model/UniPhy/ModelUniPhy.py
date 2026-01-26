@@ -46,8 +46,6 @@ class UniPhyBlock(nn.Module):
         )
 
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
-        self.last_h_state = None
-        self.last_flux_state = None
 
     def _spatial_process(self, x):
         is_5d = x.ndim == 5
@@ -149,14 +147,14 @@ class UniPhyBlock(nn.Module):
             h_contrib = h_reshaped * op_decay
             u_out = u_out + h_contrib
 
-        self.last_h_state = u_out[:, -1].detach().reshape(B * H * W, 1, D)
-        self.last_flux_state = flux_seq[:, -1].detach()
+        h_out = u_out[:, -1].reshape(B * H * W, 1, D)
+        flux_out = flux_seq[:, -1]
 
         x_out = self.prop.basis.decode(u_out)
         x_out = x_out.permute(0, 1, 4, 2, 3)
         x_out = self._temporal_decode(x_out)
 
-        return x + x_out, self.last_h_state, self.last_flux_state
+        return x + x_out, h_out, flux_out
 
     def forward_step(self, x_curr, h_prev, dt, flux_prev):
         B, D, H, W = x_curr.shape
@@ -187,12 +185,6 @@ class UniPhyBlock(nn.Module):
 
         h_prev_reshaped = h_prev.reshape(B, H, W, D)
         h_next = h_prev_reshaped * op_decay + forcing * op_forcing
-
-        dt_for_noise = torch.as_tensor(dt, device=device).view(1, 1, 1, 1)
-        noise = self.prop.generate_stochastic_term(
-            h_next.shape, dt_for_noise, h_next.dtype, h_state=h_next
-        )
-        h_next = h_next + noise
 
         x_out = self.prop.basis.decode(h_next)
         x_out = x_out.permute(0, 3, 1, 2)
@@ -303,18 +295,12 @@ class UniPhyModel(nn.Module):
         z = self.encoder(x)
         dtype = z.dtype if z.dtype.is_complex else torch.complex64
 
-        h_prev, flux_prev = None, None
+        states = self._init_states(B, device, dtype)
 
         for i, block in enumerate(self.blocks):
-            if i == 0:
-                h_init = torch.zeros(
-                    B * self.h_patches * self.w_patches, 1, self.embed_dim,
-                    device=device, dtype=dtype
-                )
-                flux_init = torch.zeros(B, self.embed_dim, device=device, dtype=dtype)
-                z, h_prev, flux_prev = block(z, h_init, dt, flux_init)
-            else:
-                z, h_prev, flux_prev = block(z, h_prev, dt, flux_prev)
+            h_prev, flux_prev = states[i]
+            z, h_next, flux_next = block(z, h_prev, dt, flux_prev)
+            states[i] = (h_next, flux_next)
 
         out = self.decoder(z)
 
