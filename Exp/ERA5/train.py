@@ -25,9 +25,13 @@ from rich.progress import (
     TaskProgressColumn,
     TimeRemainingColumn,
 )
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
+sys.path.append("/nfs/UniPhy/Exp/ERA5")
+from ERA5 import ERA5_Dataset
+from ModelUniPhy import UniPhyModel
 
-from model import UniPhyModel
-from dataset import ERA5_Dataset
+warnings.filterwarnings("ignore")
 
 custom_theme = Theme({
     "info": "cyan",
