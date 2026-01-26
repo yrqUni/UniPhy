@@ -270,6 +270,55 @@ def debug_correct_parallel_implementation():
     print("  - For each t: Block0(z[t]) -> Block1(z[t]), states accumulate correctly")
 
 
+def debug_model_with_same_input():
+    sep("Model with Same Input Sequence")
+    torch.manual_seed(42)
+
+    model = UniPhyModel(
+        in_channels=2, out_channels=2, embed_dim=32,
+        expand=2, num_experts=4, depth=2, patch_size=8,
+        img_height=33, img_width=33, sde_mode="ode"
+    ).cuda().eval()
+
+    x = torch.randn(1, 4, 2, 33, 33, device="cuda") * 0.1
+    dt = torch.ones(4, device="cuda")
+
+    print("\n--- Parallel Mode (Standard forward) ---")
+    with torch.no_grad():
+        out_par = model(x, dt)
+
+    print(f"Parallel output shape: {out_par.shape}")
+
+    print("\n--- Serial Mode (Modified to use same input) ---")
+    with torch.no_grad():
+        # 关键修复：使用完整输入序列，而不是只用第一帧
+        z_seq = model.encoder(x)  # (1, 4, 32, 5, 5)
+        
+        B, T = 1, 4
+        dtype = z_seq.dtype
+        states = model._init_states(B, z_seq.device, dtype)
+        
+        out_ser_list = []
+        
+        for t in range(T):
+            z_t = z_seq[:, t]  # 使用编码后的输入，而不是上一步的输出
+            
+            for i, block in enumerate(model.blocks):
+                h_prev, flux_prev = states[i]
+                z_t, h_next, flux_next = block.forward_step(z_t, h_prev, dt[t], flux_prev)
+                states[i] = (h_next, flux_next)
+            
+            pred_t = model.decoder(z_t.unsqueeze(1)).squeeze(1)
+            out_ser_list.append(pred_t)
+        
+        out_ser = torch.stack(out_ser_list, dim=1)
+
+    print(f"Serial output shape: {out_ser.shape}")
+
+    print("\n--- Comparison ---")
+    for t in range(T):
+        cmp(f"out[{t}]", out_par[:, t], out_ser_list[t])
+
 def main():
     print("=" * 70)
     print("  Detailed State Propagation Debug")
@@ -279,7 +328,8 @@ def main():
     debug_multi_block_state_flow()
     debug_state_between_blocks()
     debug_correct_parallel_implementation()
-
+    debug_model_with_same_input()
+    
     print("\n" + "=" * 70)
     print("  Debug Complete")
     print("=" * 70)
