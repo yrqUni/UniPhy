@@ -44,12 +44,12 @@ warnings.filterwarnings("ignore")
 console = Console()
 
 def setup_logging(log_path, rank):
-    os.makedirs(log_path, exist_ok=True)
     logger = logging.getLogger("train")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     
     if rank == 0:
+        os.makedirs(log_path, exist_ok=True)
         fh = logging.FileHandler(os.path.join(log_path, "train.log"))
         fh.setLevel(logging.INFO)
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -325,7 +325,8 @@ def train(cfg):
     log_every = cfg["logging"]["log_every"]
     save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
     
-    os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
+    if rank == 0:
+        os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
     
     last_msg = "Initializing..."
     
@@ -460,4 +461,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+
