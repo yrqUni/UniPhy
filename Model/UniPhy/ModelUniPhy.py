@@ -1,10 +1,8 @@
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from PScan import pscan
-from UniPhyIO import UniPhyEncoder, UniPhyDecoder
+from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
@@ -13,92 +11,118 @@ class UniPhyBlock(nn.Module):
     def __init__(
         self,
         dim,
-        expand=4,
-        num_experts=8,
+        expand,
+        num_experts,
+        img_height,
+        img_width,
+        kernel_size=3,
         dt_ref=1.0,
-        sde_mode="sde",
         init_noise_scale=0.01,
+        sde_mode="sde",
         max_growth_rate=0.3,
-        img_height=64,
-        img_width=64,
     ):
         super().__init__()
         self.dim = dim
-        self.dt_ref = dt_ref
         self.img_height = img_height
         self.img_width = img_width
 
+        self.norm_spatial = nn.LayerNorm(dim * 2)
+        self.spatial_cliff = RiemannianCliffordConv2d(
+            dim * 2,
+            dim * 2,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            img_height=img_height,
+            img_width=img_width,
+        )
+
+        self.norm_temporal = nn.LayerNorm(dim * 2)
         self.prop = TemporalPropagator(
-            dim=dim,
+            dim,
             dt_ref=dt_ref,
             sde_mode=sde_mode,
             init_noise_scale=init_noise_scale,
             max_growth_rate=max_growth_rate,
         )
 
-        self.norm_spatial = nn.LayerNorm(dim * 2)
-        self.norm_temporal = nn.LayerNorm(dim * 2)
-
-        self.spatial_conv = RiemannianCliffordConv2d(
-            in_channels=dim * 2,
-            out_channels=dim * 2,
-            kernel_size=3,
-            padding=1,
-            img_height=img_height,
-            img_width=img_width,
-        )
-
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
-
         self.last_h_state = None
         self.last_flux_state = None
 
-    def _run_pscan(self, A, X):
-        return pscan(A, X)
+    def _spatial_process(self, x_curr):
+        if x_curr.ndim == 5:
+            B, T, D, H, W = x_curr.shape
+            x_flat = x_curr.reshape(B * T, D, H, W)
+        else:
+            x_flat = x_curr
+            B, D, H, W = x_flat.shape
+            T = None
+
+        x_real = torch.cat([x_flat.real, x_flat.imag], dim=1)
+        x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_spatial = self.spatial_cliff(x_norm)
+
+        x_s_re, x_s_im = torch.chunk(x_spatial, 2, dim=1)
+        x_out = x_flat + torch.complex(x_s_re, x_s_im)
+
+        if T is not None:
+            x_out = x_out.reshape(B, T, D, H, W)
+
+        return x_out
+
+    def _temporal_decode(self, x_out):
+        if x_out.ndim == 5:
+            B, T, D, H, W = x_out.shape
+            x_flat = x_out.reshape(B * T, D, H, W)
+        else:
+            x_flat = x_out
+            T = None
+
+        x_real = torch.cat([x_flat.real, x_flat.imag], dim=1)
+        x_norm = self.norm_temporal(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_re, x_im = torch.chunk(x_norm, 2, dim=1)
+        x_complex = torch.complex(x_re, x_im)
+
+        delta = self.ffn(x_complex)
+        x_complex = x_complex + delta
+
+        if T is not None:
+            B = x_out.shape[0]
+            x_complex = x_complex.reshape(B, T, -1, x_complex.shape[2], x_complex.shape[3])
+
+        return x_complex
 
     def forward(self, x, h_prev, dt, flux_prev):
         B, T, D, H, W = x.shape
         device = x.device
 
-        x_real = torch.cat([x.real, x.imag], dim=2)
-        x_flat = x_real.reshape(B * T, D * 2, H, W)
-        x_norm = self.norm_spatial(x_flat.permute(0, 2, 3, 1))
-        x_spatial = self.spatial_conv(x_norm.permute(0, 3, 1, 2))
+        x = self._spatial_process(x)
 
-        x_s_re, x_s_im = torch.chunk(x_spatial, 2, dim=1)
-        x_spatial_complex = torch.complex(x_s_re, x_s_im)
-        x_spatial_complex = x_spatial_complex.reshape(B, T, D, H, W)
-        x_enhanced = x + x_spatial_complex
-
-        x_perm = x_enhanced.permute(0, 1, 3, 4, 2).contiguous()
+        x_perm = x.permute(0, 1, 3, 4, 2)
         x_eigen = self.prop.basis.encode(x_perm)
-
         x_mean = x_eigen.mean(dim=(2, 3))
 
         if flux_prev is None:
-            flux_prev = torch.zeros(B, self.dim, device=device, dtype=x.dtype)
+            flux_prev = torch.zeros(B, D, device=device, dtype=x.dtype)
 
-        flux_seq = []
-        source_seq = []
-        current_flux = flux_prev.clone()
+        flux_list = []
+        source_list = []
+        gate_list = []
+        current_flux = flux_prev
 
         for t in range(T):
             x_mean_t = x_mean[:, t]
-            flux_next, source, _ = self.prop.flux_tracker.forward_step(current_flux, x_mean_t)
-            flux_seq.append(flux_next)
-            source_seq.append(source)
-            current_flux = flux_next.clone()
+            new_flux, source, gate = self.prop.flux_tracker.forward_step(current_flux, x_mean_t)
+            flux_list.append(new_flux)
+            source_list.append(source)
+            gate_list.append(gate)
+            current_flux = new_flux
 
-        flux_seq = torch.stack(flux_seq, dim=1)
-        source_seq = torch.stack(source_seq, dim=1)
+        flux_seq = torch.stack(flux_list, dim=1)
+        source_seq = torch.stack(source_list, dim=1)
+        gate_seq = torch.stack(gate_list, dim=1)
 
         source_expanded = source_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
-
-        gate_seq = torch.sigmoid(
-            self.prop.flux_tracker.gate_net(
-                torch.cat([flux_seq.real, flux_seq.imag], dim=-1)
-            )
-        )
         gate_expanded = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
 
         forcing = x_eigen * gate_expanded + source_expanded * (1 - gate_expanded)
@@ -114,12 +138,18 @@ class UniPhyBlock(nn.Module):
 
         u_t = forcing * op_forcing
 
-        A_time = op_decay.expand(B, T, H, W, D).permute(0, 2, 3, 1, 4).contiguous().reshape(B * H * W, T, D, 1)
-        X_time = u_t.permute(0, 2, 3, 1, 4).contiguous().reshape(B * H * W, T, D, 1)
+        h_prev_reshaped = h_prev.reshape(B, H, W, D) if h_prev is not None else torch.zeros(B, H, W, D, device=device, dtype=x.dtype)
+        h_prev_expanded = h_prev_reshaped.unsqueeze(1)
 
-        Y_time = self._run_pscan(A_time, X_time)
+        A_time = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
+        X_time = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
+
+        Y_time = pscan(A_time, X_time)
 
         u_out = Y_time.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
+
+        h_init_contrib = h_prev_expanded * op_decay
+        u_out = u_out + h_init_contrib
 
         self.last_h_state = u_out[:, -1].detach().reshape(B * H * W, 1, D)
         self.last_flux_state = flux_seq[:, -1].detach()
@@ -127,18 +157,9 @@ class UniPhyBlock(nn.Module):
         x_out = self.prop.basis.decode(u_out)
         x_out = x_out.permute(0, 1, 4, 2, 3)
 
-        x_out_flat = x_out.reshape(B * T, D, H, W)
-        x_out_real = torch.cat([x_out_flat.real, x_out_flat.imag], dim=1)
-        x_out_norm = self.norm_temporal(x_out_real.permute(0, 2, 3, 1))
-        x_out_norm = x_out_norm.permute(0, 3, 1, 2)
-        x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=1)
-        x_out_complex = torch.complex(x_out_re, x_out_im)
+        x_out = self._temporal_decode(x_out)
 
-        delta = self.ffn(x_out_complex)
-        x_out_complex = x_out_complex + delta
-        x_out_complex = x_out_complex.reshape(B, T, D, H, W)
-
-        z_out = x + x_out_complex
+        z_out = x + x_out
 
         return z_out, self.last_h_state, self.last_flux_state
 
@@ -146,14 +167,9 @@ class UniPhyBlock(nn.Module):
         B, D, H, W = x_curr.shape
         device = x_curr.device
 
-        x_real = torch.cat([x_curr.real, x_curr.imag], dim=1)
-        x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1))
-        x_spatial = self.spatial_conv(x_norm.permute(0, 3, 1, 2))
+        x_curr = self._spatial_process(x_curr)
 
-        x_s_re, x_s_im = torch.chunk(x_spatial, 2, dim=1)
-        x_curr = x_curr + torch.complex(x_s_re, x_s_im)
-
-        x_perm = x_curr.permute(0, 2, 3, 1).contiguous()
+        x_perm = x_curr.permute(0, 2, 3, 1)
         x_eigen = self.prop.basis.encode(x_perm)
         x_mean = x_eigen.mean(dim=(1, 2))
 
@@ -181,15 +197,9 @@ class UniPhyBlock(nn.Module):
         x_out = self.prop.basis.decode(h_next)
         x_out = x_out.permute(0, 3, 1, 2)
 
-        x_out_real = torch.cat([x_out.real, x_out.imag], dim=1)
-        x_out_norm = self.norm_temporal(x_out_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=1)
-        x_out_complex = torch.complex(x_out_re, x_out_im)
+        x_out = self._temporal_decode(x_out)
 
-        delta = self.ffn(x_out_complex)
-        x_out_complex = x_out_complex + delta
-
-        z_next = x_curr + x_out_complex
+        z_next = x_curr + x_out
         h_next_flat = h_next.reshape(B * H * W, 1, D)
 
         self.last_h_state = h_next_flat.detach()
@@ -238,11 +248,12 @@ class UniPhyModel(nn.Module):
             img_width=img_width,
         )
 
-        self.decoder = UniPhyDecoder(
+        self.decoder = UniPhyEnsembleDecoder(
             out_ch=out_channels,
             latent_dim=embed_dim,
             patch_size=patch_size,
             model_channels=embed_dim,
+            ensemble_size=1,
             img_height=img_height,
             img_width=img_width,
         )
@@ -252,12 +263,12 @@ class UniPhyModel(nn.Module):
                 dim=embed_dim,
                 expand=expand,
                 num_experts=num_experts,
+                img_height=self.h_patches,
+                img_width=self.w_patches,
                 dt_ref=dt_ref,
                 sde_mode=sde_mode,
                 init_noise_scale=init_noise_scale,
                 max_growth_rate=max_growth_rate,
-                img_height=self.h_patches,
-                img_width=self.w_patches,
             )
             for _ in range(depth)
         ])
@@ -310,9 +321,7 @@ class UniPhyModel(nn.Module):
                     B * self.h_patches * self.w_patches, 1, self.embed_dim,
                     device=device, dtype=base_dtype
                 )
-                flux_init = torch.zeros(
-                    B, self.embed_dim, device=device, dtype=base_dtype
-                )
+                flux_init = torch.zeros(B, self.embed_dim, device=device, dtype=base_dtype)
                 z, h_prev, flux_prev = block(z, h_init, dt, flux_init)
             else:
                 z, h_prev, flux_prev = block(z, h_prev, dt, flux_prev)
@@ -335,7 +344,7 @@ class UniPhyModel(nn.Module):
         else:
             base_dtype = torch.complex64
 
-        states = self._init_states(B, "cpu", base_dtype)
+        states = self._init_states(B, device, base_dtype)
         predictions = []
 
         for k in range(num_steps):
@@ -345,22 +354,16 @@ class UniPhyModel(nn.Module):
             new_states = []
 
             for i, block in enumerate(self.blocks):
-                h_prev = states[i][0].to(device, non_blocking=True)
-                flux_prev = states[i][1].to(device, non_blocking=True)
+                h_prev, flux_prev = states[i]
 
                 z_next, h_next, flux_next = block.forward_step(z_next, h_prev, dt_k, flux_prev)
 
-                new_states.append((
-                    h_next.to("cpu", non_blocking=True),
-                    flux_next.to("cpu", non_blocking=True),
-                ))
-
-                del h_prev, flux_prev
+                new_states.append((h_next.detach(), flux_next.detach()))
 
             states = new_states
             z_curr = z_next
 
-            pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1).to("cpu", non_blocking=True)
+            pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1)
             predictions.append(pred)
 
         return torch.stack(predictions, dim=1)
@@ -386,9 +389,7 @@ class UniPhyModel(nn.Module):
                     B * self.h_patches * self.w_patches, 1, self.embed_dim,
                     device=device, dtype=base_dtype
                 )
-                flux_init = torch.zeros(
-                    B, self.embed_dim, device=device, dtype=base_dtype
-                )
+                flux_init = torch.zeros(B, self.embed_dim, device=device, dtype=base_dtype)
                 z, h_prev, flux_prev = block(z, h_init, dt_cond, flux_init)
             else:
                 z, h_prev, flux_prev = block(z, h_prev, dt_cond, flux_prev)
@@ -402,7 +403,7 @@ class UniPhyModel(nn.Module):
             flux_state = block.last_flux_state if block.last_flux_state is not None else torch.zeros(
                 B, self.embed_dim, device=device, dtype=base_dtype
             )
-            states.append((h_state.to("cpu"), flux_state.to("cpu")))
+            states.append((h_state, flux_state))
 
         z_curr = z[:, -1].detach()
         del z
@@ -422,25 +423,16 @@ class UniPhyModel(nn.Module):
 
             for i, block in enumerate(self.blocks):
                 h_prev, flux_prev = states[i]
-                h_prev = h_prev.to(device)
-                flux_prev = flux_prev.to(device)
 
                 z_next, h_next, flux_next = block.forward_step(z_next, h_prev, dt_k, flux_prev)
 
-                new_states.append((
-                    h_next.to("cpu"),
-                    flux_next.to("cpu")
-                ))
-
-                del h_prev, flux_prev
+                new_states.append((h_next.detach(), flux_next.detach()))
 
             states = new_states
             z_curr = z_next
 
             pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1)
-            predictions.append(pred.cpu())
-
-            del pred
+            predictions.append(pred)
 
             if k % 10 == 0:
                 torch.cuda.empty_cache()
