@@ -44,12 +44,12 @@ custom_theme = Theme({
 console = Console(theme=custom_theme)
 
 
-def setup_logging(cfg, rank):
-    log_path = cfg["logging"]["log_path"]
+def setup_logging(log_path, rank):
     os.makedirs(log_path, exist_ok=True)
     
     logger = logging.getLogger("train")
     logger.setLevel(logging.INFO if rank == 0 else logging.WARNING)
+    logger.handlers.clear()
     
     if rank == 0:
         fh = logging.FileHandler(os.path.join(log_path, "train.log"))
@@ -89,6 +89,16 @@ def format_params(n):
     return str(n)
 
 
+def print_model_summary(model, cfg, rank):
+    if rank != 0:
+        return
+    total, trainable, frozen = get_model_info(model)
+    console.print(f"[bold cyan]Model Summary[/bold cyan]")
+    console.print(f"  Total Parameters: {format_params(total)}")
+    console.print(f"  Trainable: {format_params(trainable)}")
+    console.print(f"  Frozen: {format_params(frozen)}")
+
+
 def get_lat_weights(H, W, device):
     lat = torch.linspace(-90, 90, H, device=device)
     weights = torch.cos(torch.deg2rad(lat))
@@ -97,15 +107,10 @@ def get_lat_weights(H, W, device):
 
 
 def compute_crps(pred_ensemble, target):
-    if pred_ensemble.is_complex():
-        pred_ensemble = pred_ensemble.real.clone()
-    if target.is_complex():
-        target = target.real.clone()
-    
     M = pred_ensemble.shape[0]
     mae = (pred_ensemble - target.unsqueeze(0)).abs().mean(dim=0)
     
-    diff = torch.tensor(0.0, device=pred_ensemble.device)
+    diff = torch.tensor(0.0, device=pred_ensemble.device, dtype=pred_ensemble.dtype)
     for i in range(M):
         for j in range(i + 1, M):
             diff = diff + (pred_ensemble[i] - pred_ensemble[j]).abs().mean()
@@ -120,24 +125,24 @@ def compute_crps(pred_ensemble, target):
 def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     device = next(model.parameters()).device
     data, dt_data = batch
-    data = data.to(device).float()
-    dt_data = dt_data.to(device).float()
+    data = data.to(device, non_blocking=True).float()
+    dt_data = dt_data.to(device, non_blocking=True).float()
     
     B, T, C, H, W = data.shape
     
     ensemble_size = cfg["train"]["ensemble_size"]
     ensemble_weight = cfg["train"]["ensemble_weight"]
     
-    x_input = data[:, :-1].clone().contiguous()
-    x_target = data[:, 1:].clone().contiguous()
-    dt_input = dt_data[:, :-1].clone().contiguous()
+    x_input = data[:, :-1].detach().clone()
+    x_target = data[:, 1:].detach().clone()
+    dt_input = dt_data[:, :-1].detach().clone()
     
     out = model(x_input, dt_input)
     
     if out.is_complex():
-        out_real = out.real.clone().contiguous()
+        out_real = out.real.contiguous()
     else:
-        out_real = out.clone().contiguous()
+        out_real = out.contiguous()
     
     lat_weights = get_lat_weights(H, W, device)
     
@@ -145,20 +150,21 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     mse_loss = ((out_real - x_target) ** 2 * lat_weights).mean()
     
     if ensemble_size > 1 and ensemble_weight > 0:
-        ensemble_preds = [out_real]
-        for _ in range(ensemble_size - 1):
-            with torch.no_grad():
-                out_ens = model(x_input.clone(), dt_input.clone())
-            if out_ens.is_complex():
-                ensemble_preds.append(out_ens.real.clone().contiguous())
-            else:
-                ensemble_preds.append(out_ens.clone().contiguous())
+        ensemble_preds = [out_real.detach()]
+        
+        with torch.no_grad():
+            for _ in range(ensemble_size - 1):
+                out_ens = model(x_input, dt_input)
+                if out_ens.is_complex():
+                    ensemble_preds.append(out_ens.real.contiguous())
+                else:
+                    ensemble_preds.append(out_ens.contiguous())
         
         ensemble_stack = torch.stack(ensemble_preds, dim=0)
         crps_loss = compute_crps(ensemble_stack, x_target)
         ensemble_std = ensemble_stack.std(dim=0).mean()
         
-        loss = (1 - ensemble_weight) * l1_loss + ensemble_weight * crps_loss
+        loss = l1_loss + ensemble_weight * crps_loss.detach()
     else:
         crps_loss = torch.tensor(0.0, device=device)
         ensemble_std = torch.tensor(0.0, device=device)
@@ -167,14 +173,13 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     loss_scaled = loss / grad_accum_steps
     loss_scaled.backward()
     
+    grad_norm = 0.0
     if (batch_idx + 1) % grad_accum_steps == 0:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg["train"]["grad_clip"]
-        )
+        ).item()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-    else:
-        grad_norm = torch.tensor(0.0, device=device)
     
     with torch.no_grad():
         rmse = torch.sqrt(mse_loss)
@@ -187,7 +192,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         "mse": mse_loss.item(),
         "rmse": rmse.item(),
         "mae": mae.item(),
-        "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+        "grad_norm": grad_norm,
         "ensemble_std": ensemble_std.item() if isinstance(ensemble_std, torch.Tensor) else ensemble_std,
     }
     
@@ -238,16 +243,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
 
 
-def print_model_summary(model, cfg, rank):
-    if rank != 0:
-        return
-    total, trainable, frozen = get_model_info(model)
-    console.print(f"[bold cyan]Model Summary[/bold cyan]")
-    console.print(f"  Total Parameters: {format_params(total)}")
-    console.print(f"  Trainable: {format_params(trainable)}")
-    console.print(f"  Frozen: {format_params(frozen)}")
-
-
 def train(cfg):
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -255,12 +250,14 @@ def train(cfg):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     
-    logger = setup_logging(cfg, rank)
     set_seed(42 + rank)
+    
+    logger = setup_logging(cfg["logging"]["log_path"], rank)
     
     if rank == 0:
         logger.info("=" * 70)
         logger.info("UniPhy Training")
+        logger.info(f"World Size: {world_size}")
         logger.info("=" * 70)
     
     if cfg["train"]["use_tf32"]:
@@ -296,6 +293,8 @@ def train(cfg):
     
     if rank == 0:
         print_model_summary(model.module, cfg, rank)
+        total_params, trainable_params, _ = get_model_info(model.module)
+        logger.info(f"Model Parameters: {format_params(total_params)} (Trainable: {format_params(trainable_params)})")
     
     train_dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -322,6 +321,7 @@ def train(cfg):
         num_workers=4,
         pin_memory=True,
         prefetch_factor=2,
+        drop_last=True,
     )
     
     if rank == 0:
@@ -431,7 +431,7 @@ def train(cfg):
                         "train/epoch": epoch,
                     }, step=global_step)
                 
-                if (batch_idx + 1) % save_interval == 0:
+                if save_interval > 0 and (batch_idx + 1) % save_interval == 0:
                     ckpt_path = os.path.join(
                         cfg["logging"]["ckpt_dir"],
                         f"ckpt_e{epoch + 1}_s{global_step}.pt"
