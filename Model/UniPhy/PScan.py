@@ -164,9 +164,8 @@ def expand_diag_to_matrix(A_diag, D):
 
 class _PScanFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, A, X):
+    def forward(ctx, A, X, is_diag):
         B, L, C, D1, D2_x = X.shape
-        is_diag = (A.ndim == 4)
         pad_d2 = (D2_x == 1)
         pad_d1 = (D1 == 1)
 
@@ -253,17 +252,17 @@ class _PScanFunction(torch.autograd.Function):
             grad_A_full = grad_A_full[..., :D1_orig, :D1_orig]
 
         grad_A = grad_A_full.diagonal(dim1=-2, dim2=-1) if ctx.is_diag else grad_A_full
-        return grad_A, grad_X
+        return grad_A, grad_X, None
 
 
 def pscan(A, X):
-    is_diag = (A.ndim == X.ndim - 1) or (A.ndim == X.ndim and A.shape[-1] != X.shape[-1])
     squeeze_output = X.ndim == 4
 
     if squeeze_output:
         X = X.unsqueeze(-1)
 
-    A_mat = expand_diag_to_matrix(A, X.shape[-2]) if is_diag else A
-    Y = _PScanFunction.apply(A_mat, X)
+    is_diag = (A.ndim == 4)
+
+    Y = _PScanFunction.apply(A, X, is_diag)
 
     return Y.squeeze(-1) if squeeze_output else Y
