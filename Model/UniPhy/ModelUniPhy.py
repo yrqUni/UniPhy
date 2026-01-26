@@ -84,7 +84,15 @@ class MomentumAdvection(nn.Module):
             momentum_new = torch.complex(mom_re, mom_im)
 
             advection_term = momentum_new.unsqueeze(-1).unsqueeze(-1) * self.advection_weight
-            z = z + advection_term * dt.view(1, T, 1, 1, 1)
+
+            if dt.ndim == 2:
+                dt_view = dt.view(B, T, 1, 1, 1)
+            elif dt.ndim == 1:
+                dt_view = dt.view(1, T, 1, 1, 1)
+            else:
+                dt_view = dt.view(1, 1, 1, 1, 1)
+
+            z = z + advection_term * dt_view
 
             momentum_out = 0.9 * momentum + 0.1 * z_mean
         else:
@@ -97,7 +105,13 @@ class MomentumAdvection(nn.Module):
             momentum_new = torch.complex(mom_re, mom_im)
 
             advection_term = momentum_new.unsqueeze(-1).unsqueeze(-1) * self.advection_weight
-            z = z + advection_term * dt
+
+            if isinstance(dt, torch.Tensor):
+                dt_val = dt.mean() if dt.numel() > 1 else dt
+            else:
+                dt_val = dt
+
+            z = z + advection_term * dt_val
 
             momentum_out = 0.9 * momentum + 0.1 * z_mean
 
