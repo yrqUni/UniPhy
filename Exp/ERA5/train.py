@@ -43,7 +43,6 @@ custom_theme = Theme({
 })
 console = Console(theme=custom_theme)
 
-
 def setup_logging(log_path, rank):
     os.makedirs(log_path, exist_ok=True)
     
@@ -65,19 +64,16 @@ def setup_logging(log_path, rank):
     
     return logger
 
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def get_model_info(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable, total - trainable
-
 
 def format_params(n):
     if n >= 1e9:
@@ -88,7 +84,6 @@ def format_params(n):
         return f"{n/1e3:.2f}K"
     return str(n)
 
-
 def print_model_summary(model, cfg, rank):
     if rank != 0:
         return
@@ -98,13 +93,11 @@ def print_model_summary(model, cfg, rank):
     console.print(f"  Trainable: {format_params(trainable)}")
     console.print(f"  Frozen: {format_params(frozen)}")
 
-
 def get_lat_weights(H, W, device):
     lat = torch.linspace(-90, 90, H, device=device)
     weights = torch.cos(torch.deg2rad(lat))
     weights = weights / weights.mean()
     return weights.view(1, 1, 1, H, 1)
-
 
 def compute_crps(pred_ensemble, target):
     M = pred_ensemble.shape[0]
@@ -120,7 +113,6 @@ def compute_crps(pred_ensemble, target):
     
     crps = mae.mean() - 0.5 * diff
     return crps
-
 
 def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     device = next(model.parameters()).device
@@ -200,7 +192,6 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     
     return metrics
 
-
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
     state = {
         "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
@@ -227,7 +218,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
     }
     torch.save(state, path)
 
-
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu")
     
@@ -243,7 +233,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
         scheduler.load_state_dict(ckpt["scheduler"])
     
     return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
-
 
 def train(cfg):
     dist.init_process_group(backend="nccl")
@@ -474,12 +463,10 @@ def train(cfg):
     train_dataset.cleanup()
     dist.destroy_process_group()
 
-
 def main():
     with open("train.yaml", "r") as f:
         cfg = yaml.safe_load(f)
     train(cfg)
-
 
 if __name__ == "__main__":
     main()
