@@ -37,33 +37,25 @@ class EnergyProjection(nn.Module):
         self.dim = dim
         self.scale = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, x, dt):
-        input_energy = (x ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=(1, 2), keepdim=True)
-        
-        z = self.encoder(x)
-        
-        B, T, D, H, W = z.shape
-        energy = (z.abs() ** 2).mean(dim=(-2, -1)) if z.is_complex() else (z ** 2).mean(dim=(-2, -1))
-        momentum = z.mean(dim=(-2, -1))
-        flux = torch.zeros(B, D, device=z.device, dtype=z.dtype)
-        
-        state = PhysicalState(z, energy, momentum, flux)
-        
-        for block in self.blocks:
-            state = block(state, dt)
-        
-        out = self.decoder(state.z)
-        
-        if out.is_complex():
-            output_energy = (out.abs() ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=(1, 2), keepdim=True)
+    def forward(self, z, target_energy):
+        if z.is_complex():
+            current_energy = (z.abs() ** 2).mean(dim=(-2, -1))
         else:
-            output_energy = (out ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=(1, 2), keepdim=True)
-        
-        energy_ratio = (input_energy / (output_energy + 1e-8)).sqrt()
-        energy_ratio = torch.clamp(energy_ratio, 0.5, 2.0)
-        out = out * energy_ratio
-        
-        return out
+            current_energy = (z ** 2).mean(dim=(-2, -1))
+
+        target_energy_real = target_energy.abs() if target_energy.is_complex() else target_energy
+        current_energy_real = current_energy.abs() if current_energy.is_complex() else current_energy
+
+        energy_ratio = target_energy_real / (current_energy_real + 1e-8)
+
+        if z.ndim == 5:
+            scale_factor = energy_ratio.unsqueeze(-1).unsqueeze(-1).sqrt()
+        else:
+            scale_factor = energy_ratio.unsqueeze(-1).unsqueeze(-1).sqrt()
+
+        z_scaled = z * scale_factor * self.scale
+
+        return z_scaled
 
 
 class MomentumAdvection(nn.Module):
@@ -405,19 +397,32 @@ class UniPhyModel(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, x, dt):
+        input_energy = (x ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=(1, 2), keepdim=True)
+        
         z = self.encoder(x)
-
+        
         B, T, D, H, W = z.shape
         energy = (z.abs() ** 2).mean(dim=(-2, -1)) if z.is_complex() else (z ** 2).mean(dim=(-2, -1))
         momentum = z.mean(dim=(-2, -1))
         flux = torch.zeros(B, D, device=z.device, dtype=z.dtype)
-
+        
         state = PhysicalState(z, energy, momentum, flux)
-
+        
         for block in self.blocks:
             state = block(state, dt)
-
-        return self.decoder(state.z)
+        
+        out = self.decoder(state.z)
+        
+        if out.is_complex():
+            output_energy = (out.abs() ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=(1, 2), keepdim=True)
+        else:
+            output_energy = (out ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=(1, 2), keepdim=True)
+        
+        energy_ratio = (input_energy / (output_energy + 1e-8)).sqrt()
+        energy_ratio = torch.clamp(energy_ratio, 0.5, 2.0)
+        out = out * energy_ratio
+        
+        return out
 
     @torch.no_grad()
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
