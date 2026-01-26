@@ -138,9 +138,6 @@ class GlobalFluxTracker(nn.Module):
         gate = self.gate_net(gate_input)
         gate = gate * (self.gate_max - self.gate_min) + self.gate_min
 
-        if source.is_complex() and not gate.is_complex():
-            gate = torch.complex(gate, torch.zeros_like(gate))
-
         return new_state, source, gate
 
 
