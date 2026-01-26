@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 
-from ModelUniPhy import UniPhyModel, UniPhyBlock, PhysicalState, EnergyProjection, MomentumAdvection
+from ModelUniPhy import UniPhyModel, UniPhyBlock
 from UniPhyOps import TemporalPropagator, ComplexSVDTransform, GlobalFluxTracker, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
@@ -16,104 +16,6 @@ def print_section(title):
     print("=" * 60)
     print(title)
     print("=" * 60)
-
-
-def check_physical_state():
-    print_section("Testing PhysicalState Class")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, D, H, W = 2, 4, 32, 8, 8
-
-    z = torch.randn(B, T, D, H, W, device=device, dtype=torch.cdouble)
-    energy = torch.randn(B, T, D, device=device, dtype=torch.cdouble)
-    momentum = torch.randn(B, T, D, device=device, dtype=torch.cdouble)
-    flux = torch.randn(B, D, device=device, dtype=torch.cdouble)
-
-    state = PhysicalState(z, energy, momentum, flux)
-
-    print(f"z shape: {state.z.shape}")
-    print(f"energy shape: {state.energy.shape}")
-    print(f"momentum shape: {state.momentum.shape}")
-    print(f"flux shape: {state.flux.shape}")
-
-    state_detached = state.detach()
-    detach_ok = not state_detached.z.requires_grad
-
-    state_cpu = state.to("cpu")
-    device_ok = state_cpu.z.device.type == "cpu"
-
-    passed = detach_ok and device_ok
-    print(f"Detach works: {detach_ok}")
-    print(f"Device transfer works: {device_ok}")
-    print(f"Test Passed: {passed}")
-    print()
-
-    return passed
-
-
-def check_energy_projection():
-    print_section("Testing EnergyProjection")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dim = 32
-    B, T, H, W = 2, 4, 8, 8
-
-    proj = EnergyProjection(dim).to(device).double()
-
-    z = torch.randn(B, T, dim, H, W, device=device, dtype=torch.cdouble) * 2.0
-    target_energy = torch.ones(B, T, dim, device=device, dtype=torch.cdouble) * 0.5
-
-    z_proj = proj(z, target_energy)
-
-    input_energy = (z.abs() ** 2).mean(dim=(-2, -1))
-    output_energy = (z_proj.abs() ** 2).mean(dim=(-2, -1))
-
-    print(f"Input shape: {z.shape}")
-    print(f"Output shape: {z_proj.shape}")
-    print(f"Input energy mean: {input_energy.abs().mean().item():.4f}")
-    print(f"Output energy mean: {output_energy.abs().mean().item():.4f}")
-    print(f"Target energy mean: {target_energy.abs().mean().item():.4f}")
-
-    energy_ratio = output_energy.abs().mean() / input_energy.abs().mean()
-    passed = z_proj.shape == z.shape and energy_ratio < 1.0
-    print(f"Energy reduced: {energy_ratio.item():.4f}")
-    print(f"Test Passed: {passed}")
-    print()
-
-    return passed
-
-
-def check_momentum_advection():
-    print_section("Testing MomentumAdvection")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dim = 32
-    B, T, H, W = 2, 4, 8, 8
-
-    advection = MomentumAdvection(dim).to(device).double()
-
-    z = torch.randn(B, T, dim, H, W, device=device, dtype=torch.cdouble)
-    momentum = torch.randn(B, T, dim, device=device, dtype=torch.cdouble)
-    dt = torch.ones(B, T, device=device, dtype=torch.float64)
-
-    z_out, momentum_out = advection(z, momentum, dt)
-
-    print(f"Input z shape: {z.shape}")
-    print(f"Output z shape: {z_out.shape}")
-    print(f"Input momentum shape: {momentum.shape}")
-    print(f"Output momentum shape: {momentum_out.shape}")
-
-    z_changed = (z_out - z).abs().max().item() > 1e-10
-    momentum_changed = (momentum_out - momentum).abs().max().item() > 1e-10
-
-    passed = z_out.shape == z.shape and momentum_out.shape == momentum.shape
-    print(f"z modified by advection: {z_changed}")
-    print(f"momentum updated: {momentum_changed}")
-    print(f"Test Passed: {passed}")
-    print()
-
-    return passed
-
 
 def check_basis_invertibility():
     print_section("Testing Basis Invertibility (with DFT Residual)")
