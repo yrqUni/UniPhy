@@ -334,59 +334,56 @@ class UniPhyModel(nn.Module):
 
         return out
 
-    def forward_rollout(self, x_init, dt_list, num_steps=None):
-        if num_steps is None:
-            num_steps = len(dt_list)
-
-        B, C, H, W = x_init.shape
-        device = x_init.device
-
-        z_curr = self.encoder(x_init.unsqueeze(1)).squeeze(1)
-
-        if z_curr.dtype.is_complex:
-            base_dtype = z_curr.dtype
-        else:
-            base_dtype = torch.complex64
-
-        states = self._init_states(B, "cpu", base_dtype)
+    @torch.no_grad()
+    def forecast(self, x_cond, dt_cond, k_steps, dt_future):
+        device = next(self.parameters()).device
+        z = self.encoder(x_cond)
+        
+        for block in self.blocks:
+            z = block(z, dt_cond)
+        
+        B = z.shape[0]
+        states = []
+        for block in self.blocks:
+            h_state = block.last_h_state if block.last_h_state is not None else torch.zeros(
+                B * block.img_height * block.img_width, 1, block.dim,
+                device=device, dtype=z.dtype
+            )
+            flux_state = block.last_flux_state if block.last_flux_state is not None else torch.zeros(
+                B, block.dim, device=device, dtype=z.dtype
+            )
+            states.append((h_state.to("cpu"), flux_state.to("cpu")))
+            block.last_h_state = None
+            block.last_flux_state = None
+        
+        z_curr = z[:, -1].detach()
+        del z
         predictions = []
-
-        for k in range(num_steps):
-            dt_k = dt_list[k] if k < len(dt_list) else dt_list[-1]
-
-            z_next = z_curr.clone()
+        
+        for k in range(k_steps):
+            dt_k = dt_future[:, k] if dt_future.ndim > 1 else dt_future[k] if dt_future.ndim == 1 else dt_future
+            z_next = z_curr
             new_states = []
-
+            
             for i, block in enumerate(self.blocks):
-                h_prev = states[i][0].to(device, non_blocking=True)
-                flux_prev = states[i][1].to(device, non_blocking=True)
-
-                z_next, h_next, flux_next = block.forward_step(
-                    z_next, h_prev, dt_k, flux_prev
-                )
-
+                h_prev, flux_prev = states[i]
+                h_prev = h_prev.to(device)
+                flux_prev = flux_prev.to(device)
+                
+                z_next = block.forward_step(z_next, h_prev, flux_prev, dt_k)
+                
                 new_states.append((
-                    h_next.detach().clone().to("cpu", non_blocking=True),
-                    flux_next.detach().clone().to("cpu", non_blocking=True),
+                    block.last_h_state.to("cpu"),
+                    block.last_flux_state.to("cpu")
                 ))
-
-                del h_prev, flux_prev
-
+            
             states = new_states
-            z_curr = z_next.clone()
-
+            z_curr = z_next
+            
             pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1)
-            pred_cpu = pred.detach().clone().to("cpu", non_blocking=True)
-            predictions.append(pred_cpu)
-
-            del pred
-
-            if k % 10 == 0:
-                torch.cuda.empty_cache()
-
-        result = torch.stack(predictions, dim=1)
-
-        return result
+            predictions.append(pred.cpu())
+        
+        return torch.stack(predictions, dim=1)
 
     def get_initial_states(self, batch_size, device):
         return self._init_states(batch_size, device, torch.complex64)
