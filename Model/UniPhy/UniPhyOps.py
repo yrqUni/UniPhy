@@ -9,17 +9,14 @@ class ComplexSVDTransform(nn.Module):
         super().__init__()
         self.dim = dim
 
-        q_re, _ = torch.linalg.qr(torch.randn(dim, dim))
-        q_im, _ = torch.linalg.qr(torch.randn(dim, dim))
-
-        self.u_raw_re = nn.Parameter(q_re * 0.1)
-        self.u_raw_im = nn.Parameter(q_im * 0.1)
-        self.v_raw_re = nn.Parameter(q_re.T * 0.1)
-        self.v_raw_im = nn.Parameter(q_im.T * 0.1)
+        self.u_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
+        self.u_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
+        self.v_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
+        self.v_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
         self.log_sigma = nn.Parameter(torch.zeros(dim))
 
-        n = torch.arange(dim)
-        k = torch.arange(dim).reshape(-1, 1)
+        n = torch.arange(dim).float()
+        k = torch.arange(dim).float().reshape(-1, 1)
         dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
         self.register_buffer("dft_basis", dft_matrix)
         self.dft_weight = nn.Parameter(torch.tensor(0.0))
@@ -34,133 +31,117 @@ class ComplexSVDTransform(nn.Module):
     def _get_basis(self):
         U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
         V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
-        S = torch.exp(self.log_sigma).to(U.dtype)
+        S = torch.exp(self.log_sigma)
         return U, S, V
 
-    def encode(self, x):
+    def _get_transform_matrix(self, dtype):
         U, S, V = self._get_basis()
+        alpha = torch.sigmoid(self.dft_weight)
 
+        V_scaled = V @ torch.diag(S.to(V.dtype))
+        dft_basis = self.dft_basis.to(dtype=dtype)
+
+        W = V_scaled * (1 - alpha) + dft_basis * alpha
+        return W
+
+    def encode(self, x):
         if not x.is_complex():
             x = torch.complex(x, torch.zeros_like(x))
 
-        learned = torch.einsum("...d,de->...e", x, V.conj().T) * S
+        W = self._get_transform_matrix(x.dtype)
+        h = torch.einsum("...d,de->...e", x, W)
+        return h
 
-        alpha = torch.sigmoid(self.dft_weight)
-        dft_basis = self.dft_basis.to(dtype=x.dtype)
-        dft = torch.einsum("...d,de->...e", x, dft_basis.T.conj())
+    def decode(self, h):
+        W = self._get_transform_matrix(h.dtype)
+        W_inv = torch.linalg.inv(W)
+        x = torch.einsum("...d,de->...e", h, W_inv)
+        return x
 
-        return alpha * dft + (1 - alpha) * learned
+
+class LearnableSpectralBasis(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.transform = ComplexSVDTransform(dim)
+
+    def encode(self, x):
+        return self.transform.encode(x)
 
     def decode(self, z):
-        U, S, V = self._get_basis()
-
-        S_inv = 1.0 / (S + 1e-8)
-        learned = torch.einsum("...d,de->...e", z * S_inv, V)
-
-        alpha = torch.sigmoid(self.dft_weight)
-        dft_basis = self.dft_basis.to(dtype=z.dtype)
-        idft = torch.einsum("...d,de->...e", z, dft_basis.conj())
-
-        return alpha * idft + (1 - alpha) * learned
+        return self.transform.decode(z)
 
 
 class GlobalFluxTracker(nn.Module):
-    def __init__(self, dim, hidden_dim=None):
+    def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        hidden_dim = hidden_dim or dim * 2
 
-        self.flux_update = nn.Sequential(
-            nn.Linear(dim * 4, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim),
-        )
+        self.decay_re = nn.Parameter(torch.randn(dim) * 0.1 - 1.0)
+        self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
 
-        self.source_net = nn.Sequential(
-            nn.Linear(dim * 4, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim),
-        )
+        self.input_mix = nn.Linear(dim * 2, dim * 2)
+        self.output_proj = nn.Linear(dim * 2, dim * 2)
+
+        nn.init.xavier_uniform_(self.input_mix.weight)
+        nn.init.zeros_(self.input_mix.bias)
+        nn.init.xavier_uniform_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
 
         self.gate_net = nn.Sequential(
-            nn.Linear(dim * 4, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim),
-            nn.Sigmoid(),
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid()
         )
 
-        self.decay = nn.Parameter(torch.tensor(0.9))
+        self.gate_min = 0.01
+        self.gate_max = 0.99
 
-    def forward(self, x, flux_prev):
-        if x.is_complex():
-            x_real = torch.cat([x.real, x.imag], dim=-1)
-        else:
-            x_real = torch.cat([x, torch.zeros_like(x)], dim=-1)
+    def _get_decay(self):
+        return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
 
-        if flux_prev.is_complex():
-            flux_real = torch.cat([flux_prev.real, flux_prev.imag], dim=-1)
-        else:
-            flux_real = torch.cat([flux_prev, torch.zeros_like(flux_prev)], dim=-1)
+    def get_operators(self, x_mean_seq):
+        B, T, D = x_mean_seq.shape
+        decay = self._get_decay()
 
-        B = x.shape[0]
-        if x.ndim == 4:
-            x_mean = x_real.mean(dim=(1, 2))
-        elif x.ndim == 3:
-            x_mean = x_real.mean(dim=1)
-        else:
-            x_mean = x_real
+        x_flat = x_mean_seq.reshape(B * T, D)
+        x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
+        x_in = self.input_mix(x_cat)
+        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
 
-        if flux_real.ndim == 1:
-            flux_real = flux_real.unsqueeze(0).expand(B, -1)
+        X = torch.complex(x_re, x_im).reshape(B, T, D).contiguous()
+        A = decay.unsqueeze(0).unsqueeze(0).expand(B, T, D).contiguous()
 
-        combined = torch.cat([x_mean, flux_real], dim=-1)
+        return A, X
 
-        flux_delta = self.flux_update(combined)
+    def project(self, state):
+        s_cat = torch.cat([state.real, state.imag], dim=-1)
+        out = self.output_proj(s_cat)
+        out_re, out_im = torch.chunk(out, 2, dim=-1)
+        return torch.complex(out_re, out_im)
 
-        decay_factor = torch.sigmoid(self.decay)
-        if flux_prev.is_complex():
-            flux_next = torch.complex(
-                flux_prev.real * decay_factor + flux_delta,
-                flux_prev.imag * decay_factor
-            )
-        else:
-            flux_next = flux_prev * decay_factor + flux_delta
+    def forward_step(self, prev_state, x_t):
+        decay = self._get_decay()
 
-        gate = self.gate_net(combined)
+        if not x_t.is_complex():
+            x_t = torch.complex(x_t, torch.zeros_like(x_t))
 
-        return flux_next, gate
+        x_cat = torch.cat([x_t.real, x_t.imag], dim=-1)
+        x_in = self.input_mix(x_cat)
+        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
+        x_mixed = torch.complex(x_re, x_im)
 
-    def forward_step(self, flux_prev, x_mean):
-        if x_mean.is_complex():
-            x_real = torch.cat([x_mean.real, x_mean.imag], dim=-1)
-        else:
-            x_real = torch.cat([x_mean, torch.zeros_like(x_mean)], dim=-1)
+        new_state = prev_state * decay + x_mixed
 
-        if flux_prev.is_complex():
-            flux_real = torch.cat([flux_prev.real, flux_prev.imag], dim=-1)
-        else:
-            flux_real = torch.cat([flux_prev, torch.zeros_like(flux_prev)], dim=-1)
+        source = self.project(new_state)
 
-        combined = torch.cat([x_real, flux_real], dim=-1)
+        gate_input = torch.cat([new_state.real, new_state.imag], dim=-1)
+        gate = self.gate_net(gate_input)
+        gate = gate * (self.gate_max - self.gate_min) + self.gate_min
 
-        flux_delta = self.flux_update(combined)
+        if source.is_complex() and not gate.is_complex():
+            gate = torch.complex(gate, torch.zeros_like(gate))
 
-        decay_factor = torch.sigmoid(self.decay)
-        if flux_prev.is_complex():
-            flux_next = torch.complex(
-                flux_prev.real * decay_factor + flux_delta,
-                flux_prev.imag * decay_factor
-            )
-        else:
-            flux_next = flux_prev * decay_factor + flux_delta
-
-        source = self.source_net(combined)
-        gate = self.gate_net(combined)
-
-        if x_mean.is_complex():
-            source = torch.complex(source, torch.zeros_like(source))
-
-        return flux_next, source, gate
+        return new_state, source, gate
 
 
 class TemporalPropagator(nn.Module):
@@ -286,6 +267,8 @@ class RiemannianCliffordConv2d(nn.Module):
         self.register_buffer("cos_lat", torch.cos(lat).view(1, 1, -1, 1))
 
         self.metric_scale = nn.Parameter(torch.ones(1, out_channels, 1, 1))
+        self.viscosity_scale = nn.Parameter(torch.ones(1, out_channels, 1, 1) * 0.1)
+        self.dispersion_scale = nn.Parameter(torch.ones(1, out_channels, 1, 1) * 0.01)
 
     def forward(self, x):
         B, C, H, W = x.shape
