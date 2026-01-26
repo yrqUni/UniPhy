@@ -35,11 +35,7 @@ class EnergyProjection(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.energy_gate = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.Sigmoid(),
-        )
-        self.scale = nn.Parameter(torch.tensor(0.1))
+        self.scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, z, target_energy):
         if z.is_complex():
@@ -51,14 +47,13 @@ class EnergyProjection(nn.Module):
         current_energy_real = current_energy.abs() if current_energy.is_complex() else current_energy
 
         energy_ratio = target_energy_real / (current_energy_real + 1e-8)
-        energy_ratio = torch.clamp(energy_ratio, 0.5, 2.0)
 
         if z.ndim == 5:
             scale_factor = energy_ratio.unsqueeze(-1).unsqueeze(-1).sqrt()
         else:
             scale_factor = energy_ratio.unsqueeze(-1).unsqueeze(-1).sqrt()
 
-        z_scaled = z * (1 + self.scale * (scale_factor - 1))
+        z_scaled = z * scale_factor * self.scale
 
         return z_scaled
 
