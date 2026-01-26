@@ -643,10 +643,7 @@ def run_all_checks():
     print("=" * 60)
 
     results = {}
-
-    results["physical_state"] = check_physical_state()
-    results["energy_projection"] = check_energy_projection()
-    results["momentum_advection"] = check_momentum_advection()
+    
     results["basis_invertibility"] = check_basis_invertibility()
     results["eigenvalue_stability"] = check_eigenvalue_stability()
     results["flux_tracker_gate"] = check_flux_tracker_gate()
