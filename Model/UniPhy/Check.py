@@ -26,7 +26,7 @@ def check_forecast_mode():
         k_steps = 5
         
         x_cond = torch.randn(B, C, H, W, device=device)
-        dt_future = [torch.ones(B, device=device) for _ in range(k_steps)]
+        dt_future = [torch.tensor(1.0, device=device) for _ in range(k_steps)]
         
         with torch.no_grad():
             pred_forecast_1 = model.forward_rollout(x_cond, dt_future, k_steps)
@@ -86,7 +86,7 @@ def check_forecast_forward_consistency():
             out_forward = model(x, dt)
         
         x_init = x[:, 0]
-        dt_list = [dt[:, t] for t in range(T)]
+        dt_list = [torch.tensor(1.0, device=device) for _ in range(T)]
         
         with torch.no_grad():
             out_rollout = model.forward_rollout(x_init, dt_list, T)
@@ -151,12 +151,54 @@ def check_model_consistency():
         return False
 
 
+def check_single_step():
+    print("=" * 60)
+    print("Testing Single Step Forward")
+    print("=" * 60)
+    
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        model = UniPhyModel(
+            in_channels=4,
+            out_channels=4,
+            embed_dim=64,
+            depth=2,
+            patch_size=4,
+            img_height=32,
+            img_width=32,
+        ).to(device)
+        model.eval()
+        
+        B, T, C, H, W = 2, 1, 4, 32, 32
+        x = torch.randn(B, T, C, H, W, device=device)
+        dt = torch.ones(B, T, device=device)
+        
+        with torch.no_grad():
+            out = model(x, dt)
+        
+        print(f"Input shape: {x.shape}")
+        print(f"Output shape: {out.shape}")
+        
+        passed = out.shape == (B, T, C, H, W)
+        print(f"Test Passed: {passed}")
+        print()
+        return passed
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        print()
+        return False
+
+
 def run_all_checks():
     results = {}
     
+    results["single_step"] = check_single_step()
+    results["model_consistency"] = check_model_consistency()
     results["forecast_mode"] = check_forecast_mode()
     results["forecast_forward_consistency"] = check_forecast_forward_consistency()
-    results["model_consistency"] = check_model_consistency()
     
     print("=" * 60)
     print("Summary")
@@ -173,4 +215,4 @@ def run_all_checks():
 if __name__ == "__main__":
     success = run_all_checks()
     exit(0 if success else 1)
-    
+
