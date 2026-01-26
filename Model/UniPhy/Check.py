@@ -15,6 +15,7 @@ def sequential_forward(model, x, dt):
         
         for i, block in enumerate(model.blocks):
             h_prev, flux_prev = states[i]
+            # Use the block's forward method on a single time step
             z, h_next, flux_next = block(z, h_prev, dt[:, t:t+1] if dt.ndim > 1 else dt, flux_prev)
             states[i] = (h_next, flux_next)
         
@@ -33,6 +34,7 @@ def check_forward_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
     
+    # Set sde_mode="det" to ensure deterministic output for consistency check
     model = UniPhyModel(
         in_channels=4,
         out_channels=4,
@@ -41,6 +43,7 @@ def check_forward_consistency():
         patch_size=4,
         img_height=32,
         img_width=32,
+        sde_mode="det",
     ).to(device)
     model.eval()
     
@@ -79,6 +82,7 @@ def check_long_sequence():
         patch_size=4,
         img_height=32,
         img_width=32,
+        sde_mode="det",
     ).to(device)
     model.eval()
     
@@ -118,6 +122,7 @@ def check_variable_dt():
         patch_size=4,
         img_height=32,
         img_width=32,
+        sde_mode="det",
     ).to(device)
     model.eval()
     
@@ -156,6 +161,7 @@ def check_batch_consistency():
         patch_size=4,
         img_height=32,
         img_width=32,
+        sde_mode="det",
     ).to(device)
     model.eval()
     
@@ -201,4 +207,4 @@ def run_all_checks():
 if __name__ == "__main__":
     success = run_all_checks()
     exit(0 if success else 1)
-
+    
