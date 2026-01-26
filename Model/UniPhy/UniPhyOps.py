@@ -46,7 +46,8 @@ class ComplexSVDTransform(nn.Module):
         learned = torch.einsum("...d,de->...e", x, V.conj().T) * S
 
         alpha = torch.sigmoid(self.dft_weight)
-        dft = torch.einsum("...d,de->...e", x, self.dft_basis.T.conj())
+        dft_basis = self.dft_basis.to(dtype=x.dtype)
+        dft = torch.einsum("...d,de->...e", x, dft_basis.T.conj())
 
         return alpha * dft + (1 - alpha) * learned
 
@@ -57,7 +58,8 @@ class ComplexSVDTransform(nn.Module):
         learned = torch.einsum("...d,de->...e", z * S_inv, V)
 
         alpha = torch.sigmoid(self.dft_weight)
-        idft = torch.einsum("...d,de->...e", z, self.dft_basis.conj())
+        dft_basis = self.dft_basis.to(dtype=z.dtype)
+        idft = torch.einsum("...d,de->...e", z, dft_basis.conj())
 
         return alpha * idft + (1 - alpha) * learned
 
