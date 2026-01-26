@@ -6,290 +6,340 @@ sys.path.append("/nfs/UniPhy/Model/UniPhy")
 
 from ModelUniPhy import UniPhyModel, UniPhyBlock
 from UniPhyOps import TemporalPropagator, GlobalFluxTracker, ComplexSVDTransform
-from UniPhyOps import RiemannianCliffordConv2d
-from UniPhyFFN import UniPhyFeedForwardNetwork
 from PScan import pscan
 
 
 def sep(title):
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print(f"  {title}")
-    print("=" * 60)
+    print("=" * 70)
 
 
 def cmp(name, t1, t2, atol=1e-5):
     diff = (t1 - t2).abs().max().item()
     ok = diff < atol
     print(f"{name}: diff={diff:.2e} [{'PASS' if ok else 'FAIL'}]")
-    if not ok:
-        print(f"  t1: mean={t1.real.mean().item():.4f} std={t1.real.std().item():.4f}")
-        print(f"  t2: mean={t2.real.mean().item():.4f} std={t2.real.std().item():.4f}")
-    return ok
+    return ok, diff
 
 
-def debug_basis():
-    sep("Basis Transform")
+def debug_block_state_propagation():
+    sep("Block State Propagation Analysis")
     torch.manual_seed(42)
-    
-    basis = ComplexSVDTransform(32).cuda()
-    x = torch.randn(2, 4, 8, 8, 32, dtype=torch.complex64, device="cuda")
-    
-    h = basis.encode(x)
-    x_rec = basis.decode(h)
-    
-    cmp("Invertibility", x, x_rec, atol=1e-4)
 
-
-def debug_pscan():
-    sep("PScan")
-    torch.manual_seed(42)
-    B, L, C, D = 2, 8, 4, 2
-    
-    A = torch.randn(B, L, C, D, dtype=torch.complex64, device="cuda") * 0.5
-    X = torch.randn(B, L, C, D, 1, dtype=torch.complex64, device="cuda")
-    
-    Y_pscan = pscan(A, X)
-    
-    Y_loop = torch.zeros_like(X)
-    acc = torch.zeros(B, C, D, 1, dtype=torch.complex64, device="cuda")
-    for t in range(L):
-        acc = acc * A[:, t].unsqueeze(-1) + X[:, t]
-        Y_loop[:, t] = acc
-    
-    passed = cmp("PScan vs Loop", Y_pscan, Y_loop)
-    
-    if not passed:
-        print("\n  Per-timestep:")
-        for t in range(min(4, L)):
-            d = (Y_pscan[:, t] - Y_loop[:, t]).abs().max().item()
-            print(f"    t={t}: {d:.2e}")
-
-
-def debug_flux_tracker():
-    sep("FluxTracker")
-    torch.manual_seed(42)
-    
-    tracker = GlobalFluxTracker(32).cuda()
-    
-    flux = torch.zeros(2, 32, dtype=torch.complex64, device="cuda")
-    x_seq = torch.randn(2, 4, 32, dtype=torch.complex64, device="cuda")
-    
-    flux_list = []
-    gate_list = []
-    for t in range(4):
-        flux, _, gate = tracker.forward_step(flux, x_seq[:, t])
-        flux_list.append(flux.clone())
-        gate_list.append(gate.clone())
-    
-    print(f"Flux shape: {flux.shape}")
-    print(f"Gate shape: {gate.shape}")
-    print(f"Gate range: [{gate_list[-1].min():.4f}, {gate_list[-1].max():.4f}]")
-    print(f"Gate is real: {not gate_list[-1].is_complex()}")
-
-
-def debug_block_interface():
-    sep("Block Interface Check")
-    
-    block = UniPhyBlock(
-        dim=32, expand=2, num_experts=4,
-        img_height=8, img_width=8,
-        dt_ref=1.0, sde_mode="ode"
-    ).cuda()
-    
-    import inspect
-    
-    forward_sig = inspect.signature(block.forward)
-    step_sig = inspect.signature(block.forward_step)
-    
-    print(f"forward() params: {list(forward_sig.parameters.keys())}")
-    print(f"forward_step() params: {list(step_sig.parameters.keys())}")
-    
-    forward_params = len(forward_sig.parameters)
-    step_params = len(step_sig.parameters)
-    
-    print(f"\nforward() has {forward_params} params")
-    print(f"forward_step() has {step_params} params")
-    
-    if forward_params != step_params:
-        print("\n!!! MISMATCH: forward() and forward_step() have different signatures !!!")
-        print("This is likely the root cause of parallel/serial inconsistency")
-
-
-def debug_block_detailed():
-    sep("Block Detailed Analysis")
-    torch.manual_seed(42)
-    
     B, T, D, H, W = 1, 4, 32, 8, 8
-    
+
     block = UniPhyBlock(
         dim=D, expand=2, num_experts=4,
         img_height=H, img_width=W,
         dt_ref=1.0, sde_mode="ode"
     ).cuda().eval()
-    
+
     x = torch.randn(B, T, D, H, W, dtype=torch.complex64, device="cuda") * 0.1
     dt = torch.ones(T, device="cuda")
     h_init = torch.zeros(B * H * W, 1, D, dtype=torch.complex64, device="cuda")
     flux_init = torch.zeros(B, D, dtype=torch.complex64, device="cuda")
-    
-    print(f"Input x shape: {x.shape}")
-    print(f"dt shape: {dt.shape}")
-    print(f"h_init shape: {h_init.shape}")
-    print(f"flux_init shape: {flux_init.shape}")
-    
-    try:
-        with torch.no_grad():
-            result = block(x, h_init, dt, flux_init)
-        
-        if isinstance(result, tuple):
-            print(f"\nforward() returns tuple of {len(result)} elements")
-            for i, r in enumerate(result):
-                if isinstance(r, torch.Tensor):
-                    print(f"  [{i}]: shape={r.shape}, dtype={r.dtype}")
-                else:
-                    print(f"  [{i}]: {type(r)}")
-            z_par = result[0]
-        else:
-            print(f"\nforward() returns single tensor: {result.shape}")
-            z_par = result
-            
-    except TypeError as e:
-        print(f"\nforward() call failed: {e}")
-        print("Trying with 2 arguments (z, dt)...")
-        
-        with torch.no_grad():
-            result = block(x, dt)
-        
-        if isinstance(result, tuple):
-            z_par = result[0]
-        else:
-            z_par = result
-        print(f"Result shape: {z_par.shape}")
-    
-    print("\n--- Serial Mode ---")
-    z_ser_list = []
-    h, flux = h_init.clone(), flux_init.clone()
-    
+
+    print("\n--- Parallel Mode Internal States ---")
     with torch.no_grad():
+        x_spatial = block._spatial_process(x)
+        x_perm = x_spatial.permute(0, 1, 3, 4, 2)
+        x_eigen_par = block.prop.basis.encode(x_perm)
+        x_mean_par = x_eigen_par.mean(dim=(2, 3))
+
+        flux_list_par = []
+        source_list_par = []
+        gate_list_par = []
+        current_flux = flux_init.clone()
+
         for t in range(T):
-            z_t, h, flux = block.forward_step(x[:, t], h, dt[t], flux)
-            z_ser_list.append(z_t)
-            print(f"  t={t}: z_t shape={z_t.shape}")
-    
-    z_ser = torch.stack(z_ser_list, dim=1)
-    print(f"\nSerial output shape: {z_ser.shape}")
-    
-    if z_par.shape == z_ser.shape:
-        cmp("Block parallel vs serial", z_par, z_ser, atol=1e-3)
-    else:
-        print(f"Shape mismatch: parallel={z_par.shape}, serial={z_ser.shape}")
+            new_flux, source, gate = block.prop.flux_tracker.forward_step(
+                current_flux, x_mean_par[:, t]
+            )
+            flux_list_par.append(new_flux.clone())
+            source_list_par.append(source.clone())
+            gate_list_par.append(gate.clone())
+            current_flux = new_flux
+
+        flux_seq_par = torch.stack(flux_list_par, dim=1)
+        source_seq_par = torch.stack(source_list_par, dim=1)
+        gate_seq_par = torch.stack(gate_list_par, dim=1)
+
+        dt_exp = dt.unsqueeze(0).expand(B, T)
+        op_decay_par, op_forcing_par = block.prop.get_transition_operators(dt_exp)
+
+        print(f"x_eigen_par shape: {x_eigen_par.shape}")
+        print(f"flux_seq_par shape: {flux_seq_par.shape}")
+        print(f"op_decay_par shape: {op_decay_par.shape}")
+
+    print("\n--- Serial Mode Internal States ---")
+    with torch.no_grad():
+        flux_list_ser = []
+        source_list_ser = []
+        gate_list_ser = []
+        h_list_ser = []
+        x_eigen_list_ser = []
+
+        h_prev = h_init.clone()
+        flux_prev = flux_init.clone()
+
+        for t in range(T):
+            x_t = x[:, t]
+
+            x_real = torch.cat([x_t.real, x_t.imag], dim=1)
+            x_norm = block.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            x_spatial_t = block.spatial_cliff(x_norm)
+            x_s_re, x_s_im = torch.chunk(x_spatial_t, 2, dim=1)
+            x_t = x_t + torch.complex(x_s_re, x_s_im)
+
+            x_perm_t = x_t.permute(0, 2, 3, 1)
+            x_eigen_t = block.prop.basis.encode(x_perm_t)
+            x_mean_t = x_eigen_t.mean(dim=(1, 2))
+
+            x_eigen_list_ser.append(x_eigen_t.clone())
+
+            flux_next, source, gate = block.prop.flux_tracker.forward_step(flux_prev, x_mean_t)
+
+            flux_list_ser.append(flux_next.clone())
+            source_list_ser.append(source.clone())
+            gate_list_ser.append(gate.clone())
+
+            source_exp = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+            gate_exp = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+
+            forcing = x_eigen_t * gate_exp + source_exp * (1 - gate_exp)
+
+            op_decay_t, op_forcing_t = block.prop.get_transition_operators(dt[t])
+
+            h_prev_reshaped = h_prev.reshape(B, H, W, D)
+            h_next = h_prev_reshaped * op_decay_t + forcing * op_forcing_t
+
+            h_list_ser.append(h_next.clone())
+
+            h_prev = h_next.reshape(B * H * W, 1, D)
+            flux_prev = flux_next
+
+        flux_seq_ser = torch.stack(flux_list_ser, dim=1)
+        source_seq_ser = torch.stack(source_list_ser, dim=1)
+        gate_seq_ser = torch.stack(gate_list_ser, dim=1)
+
+    print("\n--- Compare Intermediate States ---")
+
+    print("\nFlux comparison per timestep:")
+    for t in range(T):
+        cmp(f"  flux[{t}]", flux_list_par[t], flux_list_ser[t])
+
+    print("\nSource comparison per timestep:")
+    for t in range(T):
+        cmp(f"  source[{t}]", source_list_par[t], source_list_ser[t])
+
+    print("\nGate comparison per timestep:")
+    for t in range(T):
+        cmp(f"  gate[{t}]", gate_list_par[t], gate_list_ser[t])
+
+    print("\nx_eigen comparison per timestep:")
+    for t in range(T):
+        cmp(f"  x_eigen[{t}]", x_eigen_par[:, t], x_eigen_list_ser[t])
+
+    print("\n--- Analyze PScan vs Serial h_next ---")
+    with torch.no_grad():
+        source_exp_par = source_seq_par.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        gate_exp_par = gate_seq_par.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+
+        forcing_par = x_eigen_par * gate_exp_par + source_exp_par * (1 - gate_exp_par)
+
+        op_decay_exp = op_decay_par.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        op_forcing_exp = op_forcing_par.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+
+        u_t_par = forcing_par * op_forcing_exp
+
+        print(f"\nu_t_par shape: {u_t_par.shape}")
+        print(f"op_decay_exp shape: {op_decay_exp.shape}")
+
+        A = op_decay_exp.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
+        X = u_t_par.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
+
+        print(f"A shape for pscan: {A.shape}")
+        print(f"X shape for pscan: {X.shape}")
+
+        Y_pscan = pscan(A, X)
+        u_out_par = Y_pscan.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
+
+        print(f"\nu_out_par (from PScan) shape: {u_out_par.shape}")
+
+    print("\nCompare PScan output vs Serial h_next:")
+    for t in range(T):
+        u_par_t = u_out_par[:, t]
+        h_ser_t = h_list_ser[t]
+        cmp(f"  h[{t}]", u_par_t, h_ser_t)
+
+    print("\n--- Analyze PScan Behavior ---")
+    print("\nManual loop to verify PScan semantics:")
+    with torch.no_grad():
+        Y_manual = torch.zeros_like(X)
+        acc = torch.zeros(B * H * W, D, 1, dtype=X.dtype, device=X.device)
+
+        for t in range(T):
+            acc = acc * A[:, t] + X[:, t]
+            Y_manual[:, t] = acc
+
+        u_out_manual = Y_manual.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
+
+    print("\nCompare PScan vs Manual loop:")
+    cmp("PScan vs Manual", u_out_par, u_out_manual)
+
+    print("\nCompare Manual loop vs Serial h_next:")
+    for t in range(T):
+        u_manual_t = u_out_manual[:, t]
+        h_ser_t = h_list_ser[t]
+        _, diff = cmp(f"  manual[{t}] vs serial[{t}]", u_manual_t, h_ser_t)
+
+        if diff > 1e-4:
+            print(f"    Investigating t={t}...")
+            print(f"    u_manual_t mean: {u_manual_t.real.mean():.6f}")
+            print(f"    h_ser_t mean: {h_ser_t.real.mean():.6f}")
+
+            if t == 0:
+                expected = X[:, 0].reshape(B, H, W, D)
+                print(f"    X[0] mean: {expected.real.mean():.6f}")
+
+                forcing_ser_0 = x_eigen_list_ser[0] * gate_list_ser[0].unsqueeze(1).unsqueeze(2).expand(B, H, W, D) + \
+                                source_list_ser[0].unsqueeze(1).unsqueeze(2).expand(B, H, W, D) * \
+                                (1 - gate_list_ser[0].unsqueeze(1).unsqueeze(2).expand(B, H, W, D))
+                op_decay_0, op_forcing_0 = block.prop.get_transition_operators(dt[0])
+                expected_h0 = forcing_ser_0 * op_forcing_0
+                print(f"    expected h[0] from serial: {expected_h0.real.mean():.6f}")
 
 
-def debug_model_forward():
-    sep("Model Forward Analysis")
+def debug_model_state_flow():
+    sep("Model State Flow Analysis")
     torch.manual_seed(42)
-    
+
     model = UniPhyModel(
         in_channels=2, out_channels=2, embed_dim=32,
         expand=2, num_experts=4, depth=2, patch_size=8,
         img_height=33, img_width=33, sde_mode="ode"
     ).cuda().eval()
-    
+
     x = torch.randn(1, 4, 2, 33, 33, device="cuda") * 0.1
     dt = torch.ones(4, device="cuda")
-    
-    print(f"Input shape: {x.shape}")
-    print(f"dt shape: {dt.shape}")
-    print(f"h_patches: {model.h_patches}, w_patches: {model.w_patches}")
-    print(f"embed_dim: {model.embed_dim}")
-    print(f"depth: {model.depth}")
-    
+
+    B, T = 1, 4
+    H_p, W_p, D = model.h_patches, model.w_patches, model.embed_dim
+
+    print(f"\nModel config: h_patches={H_p}, w_patches={W_p}, embed_dim={D}, depth={model.depth}")
+
     with torch.no_grad():
         z = model.encoder(x)
+        dtype = z.dtype
+
         print(f"\nEncoder output shape: {z.shape}")
-        print(f"Encoder output dtype: {z.dtype}")
-        
+
+        states_par = model._init_states(B, z.device, dtype)
+        z_par = z.clone()
+
+        all_h_par = []
+        all_flux_par = []
+
         for i, block in enumerate(model.blocks):
-            print(f"\n--- Block {i} ---")
-            
-            import inspect
-            sig = inspect.signature(block.forward)
-            params = list(sig.parameters.keys())
-            print(f"forward() params: {params}")
-            
-            if len(params) == 2:
-                z = block(z, dt)
-            elif len(params) == 4:
-                B = z.shape[0]
-                h_init = torch.zeros(
-                    B * model.h_patches * model.w_patches, 1, model.embed_dim,
-                    device="cuda", dtype=z.dtype
-                )
-                flux_init = torch.zeros(B, model.embed_dim, device="cuda", dtype=z.dtype)
-                z, _, _ = block(z, h_init, dt, flux_init)
-            
-            if isinstance(z, tuple):
-                z = z[0]
-            print(f"Block {i} output shape: {z.shape}")
-        
-        out = model.decoder(z)
-        print(f"\nDecoder output shape: {out.shape}")
+            h_prev, flux_prev = states_par[i]
+            z_par, h_next, flux_next = block(z_par, h_prev, dt, flux_prev)
+            states_par[i] = (h_next, flux_next)
+            all_h_par.append(h_next.clone())
+            all_flux_par.append(flux_next.clone())
+            print(f"Block {i} parallel: z shape={z_par.shape}, h shape={h_next.shape}")
+
+        out_par = model.decoder(z_par)
+
+    with torch.no_grad():
+        z_ser = model.encoder(x[:, 0:1]).squeeze(1)
+
+        print(f"\nSerial initial z shape: {z_ser.shape}")
+
+        states_ser = model._init_states(B, z_ser.device, dtype)
+
+        all_z_ser = []
+        all_h_ser = []
+        all_flux_ser = []
+
+        for t in range(T):
+            dt_t = dt[t]
+            new_states = []
+
+            z_t = z_ser if t == 0 else all_z_ser[-1]
+
+            for i, block in enumerate(model.blocks):
+                h_prev, flux_prev = states_ser[i]
+                z_t, h_next, flux_next = block.forward_step(z_t, h_prev, dt_t, flux_prev)
+                new_states.append((h_next, flux_next))
+
+            states_ser = new_states
+            all_z_ser.append(z_t.clone())
+            all_h_ser.append([s[0].clone() for s in states_ser])
+            all_flux_ser.append([s[1].clone() for s in states_ser])
+
+            print(f"t={t}: z shape={z_t.shape}")
+
+    print("\n--- Compare States at Each Timestep ---")
+
+    z_par_per_t = z_par
+
+    for t in range(T):
+        print(f"\nTimestep {t}:")
+
+        z_par_t = z_par[:, t]
+        z_ser_t = all_z_ser[t]
+        cmp(f"  z[{t}]", z_par_t, z_ser_t)
+
+        for i in range(model.depth):
+            if t == T - 1:
+                h_par_i = all_h_par[i]
+                h_ser_i = all_h_ser[t][i]
+                cmp(f"  block{i} h[{t}]", h_par_i, h_ser_i)
 
 
-def debug_model_comparison():
-    sep("Model Parallel vs Serial")
+def debug_encoder_decoder():
+    sep("Encoder/Decoder Consistency")
     torch.manual_seed(42)
-    
+
     model = UniPhyModel(
         in_channels=2, out_channels=2, embed_dim=32,
         expand=2, num_experts=4, depth=2, patch_size=8,
         img_height=33, img_width=33, sde_mode="ode"
     ).cuda().eval()
-    
-    x = torch.randn(1, 4, 2, 33, 33, device="cuda") * 0.1
-    dt = torch.ones(4, device="cuda")
-    
+
+    x_5d = torch.randn(1, 4, 2, 33, 33, device="cuda")
+    x_4d = x_5d[:, 0]
+
     with torch.no_grad():
-        out_par = model(x, dt)
-    
-    print(f"Parallel output shape: {out_par.shape}")
-    print(f"Parallel mean: {out_par.mean().item():.4f}")
-    print(f"Parallel std: {out_par.std().item():.4f}")
-    
-    with torch.no_grad():
-        out_ser = model.forward_rollout(x[:, 0], [1.0] * 4)
-    
-    print(f"\nSerial output shape: {out_ser.shape}")
-    print(f"Serial mean: {out_ser.mean().item():.4f}")
-    print(f"Serial std: {out_ser.std().item():.4f}")
-    
-    if out_par.shape == out_ser.shape:
-        cmp("Model parallel vs serial", out_par, out_ser, atol=1e-2)
-        
-        print("\nPer-timestep analysis:")
-        for t in range(out_par.shape[1]):
-            d = (out_par[:, t] - out_ser[:, t]).abs().max().item()
-            print(f"  t={t}: diff={d:.2e}")
-    else:
-        print(f"\nShape mismatch!")
+        z_5d = model.encoder(x_5d)
+        z_4d = model.encoder(x_4d.unsqueeze(1)).squeeze(1)
+
+        print(f"z_5d shape: {z_5d.shape}")
+        print(f"z_4d shape: {z_4d.shape}")
+
+        cmp("Encoder z[0] 5D vs 4D", z_5d[:, 0], z_4d)
+
+        out_5d = model.decoder(z_5d)
+        out_4d = model.decoder(z_4d.unsqueeze(1)).squeeze(1)
+
+        print(f"\nout_5d shape: {out_5d.shape}")
+        print(f"out_4d shape: {out_4d.shape}")
+
+        cmp("Decoder out[0] 5D vs 4D", out_5d[:, 0], out_4d)
 
 
 def main():
-    print("=" * 60)
-    print("  UniPhy Debug Suite")
-    print("=" * 60)
-    
-    debug_basis()
-    debug_pscan()
-    debug_flux_tracker()
-    debug_block_interface()
-    debug_block_detailed()
-    debug_model_forward()
-    debug_model_comparison()
-    
-    print("\n" + "=" * 60)
+    print("=" * 70)
+    print("  Detailed State Propagation Debug")
+    print("=" * 70)
+
+    debug_encoder_decoder()
+    debug_block_state_propagation()
+    debug_model_state_flow()
+
+    print("\n" + "=" * 70)
     print("  Debug Complete")
-    print("=" * 60)
+    print("=" * 70)
 
 
 if __name__ == "__main__":
