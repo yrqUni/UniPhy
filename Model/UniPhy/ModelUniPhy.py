@@ -1,125 +1,10 @@
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from PScan import pscan
 from UniPhyIO import UniPhyEncoder, UniPhyDecoder
-from UniPhyOps import LearnableSpectralBasis, GlobalFluxTracker
+from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
-
-
-class StochasticPropagator(nn.Module):
-    def __init__(
-        self,
-        dim,
-        dt_ref=1.0,
-        sde_mode="sde",
-        init_noise_scale=0.01,
-        max_growth_rate=0.3,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.dt_ref = dt_ref
-        self.sde_mode = sde_mode
-        self.init_noise_scale = init_noise_scale
-        self.max_growth_rate = max_growth_rate
-
-        self.basis = LearnableSpectralBasis(dim)
-        self.flux_tracker = GlobalFluxTracker(dim)
-
-        self.lambda_re = nn.Parameter(torch.randn(dim) * 0.1 - 0.5)
-        self.lambda_im = nn.Parameter(torch.randn(dim) * 0.1)
-
-        self.noise_scale_base = nn.Parameter(torch.ones(dim) * init_noise_scale)
-        self.noise_gate = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim),
-            nn.Sigmoid(),
-        )
-
-    def get_eigenvalues(self):
-        re_part = -F.softplus(self.lambda_re)
-        im_part = self.lambda_im
-        return torch.complex(re_part, im_part)
-
-    def get_transition_operators(self, dt):
-        eigenvalues = self.get_eigenvalues()
-        dt_ratio = dt / self.dt_ref
-
-        if dt_ratio.ndim == 0:
-            dt_ratio = dt_ratio.unsqueeze(0)
-        while dt_ratio.ndim < 2:
-            dt_ratio = dt_ratio.unsqueeze(-1)
-
-        dt_ratio = dt_ratio.to(eigenvalues.device)
-        exp_term = torch.exp(eigenvalues.unsqueeze(0).unsqueeze(0) * dt_ratio.unsqueeze(-1))
-
-        decay_op = exp_term
-        forcing_op = (1.0 - exp_term) / (eigenvalues.unsqueeze(0).unsqueeze(0) + 1e-8)
-
-        return decay_op, forcing_op
-
-    def generate_stochastic_term(self, shape, dt, dtype, h_state=None):
-        if self.sde_mode == "ode":
-            return torch.zeros(shape, device=self.lambda_re.device, dtype=dtype)
-
-        device = self.lambda_re.device
-        dt_val = dt.mean().item() if isinstance(dt, torch.Tensor) else dt
-
-        noise_real = torch.randn(shape, device=device)
-        noise_imag = torch.randn(shape, device=device)
-        noise = torch.complex(noise_real, noise_imag)
-
-        base_scale = self.noise_scale_base.view(1, 1, 1, -1)
-        scaled_noise = noise * base_scale * math.sqrt(dt_val)
-
-        if h_state is not None:
-            h_mag = h_state.abs().mean(dim=(1, 2), keepdim=True).clamp(min=1e-6)
-            h_real = h_state.real.mean(dim=-1)
-            gate = self.noise_gate(h_real).unsqueeze(-1)
-            max_noise = h_mag * self.max_growth_rate
-            scaled_noise = scaled_noise * gate
-            noise_mag = scaled_noise.abs()
-            scale_factor = torch.where(
-                noise_mag > max_noise,
-                max_noise / noise_mag.clamp(min=1e-8),
-                torch.ones_like(noise_mag),
-            )
-            scaled_noise = scaled_noise * scale_factor
-
-        return scaled_noise
-
-    def forward(self, x_input, h_prev, flux_prev, dt, source=None):
-        B, H, W, D = x_input.shape
-        device = x_input.device
-        spatial_size = H * W
-
-        x_tilde = self.basis.encode(x_input)
-
-        h_prev_latent = h_prev.view(B, spatial_size, 1, D)
-        x_tilde_flat = x_tilde.view(B, spatial_size, 1, D)
-
-        if source is not None:
-            source_tilde = self.basis.encode(source)
-            source_flat = source_tilde.view(B, spatial_size, 1, D)
-        else:
-            source_flat = torch.zeros_like(x_tilde_flat)
-
-        flux_next, gate = self.flux_tracker(x_tilde_flat, flux_prev.unsqueeze(1))
-        flux_next = flux_next.squeeze(1)
-
-        gate_expanded = gate.view(B, 1, 1, D).expand(B, spatial_size, 1, D)
-        forcing_term = x_tilde_flat * gate_expanded + source_flat * (1.0 - gate_expanded)
-
-        op_decay, op_forcing = self.get_transition_operators(dt)
-        op_decay = op_decay.view(B, 1, 1, D)
-        op_forcing = op_forcing.view(B, 1, 1, D)
-
-        h_next_latent = h_prev_latent * op_decay + forcing_term * op_forcing
-
-        return h_next_latent.view(B, H, W, D), flux_next
 
 
 class UniPhyBlock(nn.Module):
@@ -132,12 +17,14 @@ class UniPhyBlock(nn.Module):
         sde_mode="sde",
         init_noise_scale=0.01,
         max_growth_rate=0.3,
+        img_height=64,
+        img_width=64,
     ):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
 
-        self.prop = StochasticPropagator(
+        self.prop = TemporalPropagator(
             dim=dim,
             dt_ref=dt_ref,
             sde_mode=sde_mode,
@@ -147,36 +34,74 @@ class UniPhyBlock(nn.Module):
 
         self.norm_spatial = nn.LayerNorm(dim * 2)
         self.norm_temporal = nn.LayerNorm(dim * 2)
+
+        self.spatial_cliff = RiemannianCliffordConv2d(
+            in_channels=dim * 2,
+            out_channels=dim * 2,
+            kernel_size=3,
+            padding=1,
+            img_height=img_height,
+            img_width=img_width,
+        )
+
         self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
 
-    def _run_pscan(self, A, X):
-        return pscan(A, X)
+        self.last_h_state = None
+        self.last_flux_state = None
 
     def forward(self, x, h_prev, dt, flux_prev):
         B, T, D, H, W = x.shape
         device = x.device
 
-        x_seq = x.permute(0, 1, 3, 4, 2).contiguous()
+        x_real = torch.cat([x.real, x.imag], dim=2)
+        x_flat = x_real.reshape(B * T, D * 2, H, W)
+        x_norm = self.norm_spatial(x_flat.permute(0, 2, 3, 1))
+        x_spatial = self.spatial_cliff(x_norm.permute(0, 3, 1, 2))
 
-        x_eigen = self.prop.basis.encode(x_seq)
+        x_s_re, x_s_im = torch.chunk(x_spatial, 2, dim=1)
+        x_spatial_complex = torch.complex(x_s_re, x_s_im)
+        x_spatial_complex = x_spatial_complex.reshape(B, T, D, H, W)
+        x_enhanced = x + x_spatial_complex
 
-        source_seq = x_eigen.clone()
-        flux_seq, gate_seq = self.prop.flux_tracker(
-            x_eigen.view(B * T, H * W, 1, D),
-            flux_prev.unsqueeze(1).expand(B, T, -1).reshape(B * T, D),
-        )
-        flux_seq = flux_seq.view(B, T, D)
-        gate_seq = gate_seq.view(B, T, D)
+        x_perm = x_enhanced.permute(0, 1, 3, 4, 2).contiguous()
+        x_eigen = self.prop.basis.encode(x_perm)
 
+        x_mean = x_eigen.mean(dim=(2, 3))
+
+        if flux_prev is None:
+            flux_prev = torch.zeros(B, self.dim, device=device, dtype=x.dtype)
+
+        flux_seq = []
+        gate_seq = []
+        source_seq = []
+
+        current_flux = flux_prev.clone()
+        for t in range(T):
+            x_mean_t = x_mean[:, t]
+            flux_next, source, gate = self.prop.flux_tracker.forward_step(
+                current_flux, x_mean_t
+            )
+            flux_seq.append(flux_next)
+            source_seq.append(source)
+            gate_seq.append(gate)
+            current_flux = flux_next.clone()
+
+        flux_seq = torch.stack(flux_seq, dim=1)
+        source_seq = torch.stack(source_seq, dim=1)
+        gate_seq = torch.stack(gate_seq, dim=1)
+
+        source_expanded = source_seq.view(B, T, 1, 1, D).expand(B, T, H, W, D)
         gate_expanded = gate_seq.view(B, T, 1, 1, D).expand(B, T, H, W, D)
-        source_expanded = source_seq
 
         forcing = x_eigen * gate_expanded + source_expanded * (1.0 - gate_expanded)
 
-        if dt.ndim == 1:
-            dt_expanded = dt.unsqueeze(0).expand(B, T)
+        if isinstance(dt, torch.Tensor):
+            if dt.ndim == 1:
+                dt_expanded = dt.unsqueeze(0).expand(B, T)
+            else:
+                dt_expanded = dt
         else:
-            dt_expanded = dt
+            dt_expanded = torch.full((B, T), dt, device=device, dtype=torch.float32)
 
         op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded)
         op_decay = op_decay.view(B, T, 1, 1, D)
@@ -196,27 +121,32 @@ class UniPhyBlock(nn.Module):
             .reshape(B * H * W, T, D, 1)
         )
 
-        Y_time = self._run_pscan(A_time, X_time)
+        Y_time = pscan(A_time, X_time)
 
         u_out = Y_time.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
 
         self.last_h_state = u_out[:, -1].detach().clone().reshape(B * H * W, 1, D)
         self.last_flux_state = flux_seq[:, -1].detach().clone()
 
+        dt_for_noise = dt_expanded.view(B, T, 1, 1, 1).expand(B, T, H, W, 1)
+        noise = self.prop.generate_stochastic_term(
+            u_out.shape, dt_for_noise, u_out.dtype, h_state=u_out
+        )
+        u_out = u_out + noise
+
         x_out = self.prop.basis.decode(u_out)
         x_out = x_out.permute(0, 1, 4, 2, 3)
 
-        x_out_real = torch.cat([x_out.real, x_out.imag], dim=2)
-        x_out_flat = x_out_real.reshape(B * T, D * 2, H, W)
-        x_out_norm = self.norm_spatial(x_out_flat.permute(0, 2, 3, 1))
-        x_out_norm = x_out_norm.permute(0, 3, 1, 2).reshape(B, T, D * 2, H, W)
-        x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=2)
+        x_out_flat = x_out.reshape(B * T, D, H, W)
+        x_out_real = torch.cat([x_out_flat.real, x_out_flat.imag], dim=1)
+        x_out_norm = self.norm_temporal(x_out_real.permute(0, 2, 3, 1))
+        x_out_norm = x_out_norm.permute(0, 3, 1, 2)
+        x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=1)
         x_out_complex = torch.complex(x_out_re, x_out_im)
 
-        x_out_ffn = x_out_complex.reshape(B * T, D, H, W)
-        delta = self.ffn(x_out_ffn)
-        delta = delta.reshape(B, T, D, H, W)
+        delta = self.ffn(x_out_complex)
         x_out_complex = x_out_complex + delta
+        x_out_complex = x_out_complex.reshape(B, T, D, H, W)
 
         z_out = x + x_out_complex
         h_next = self.last_h_state
@@ -228,33 +158,33 @@ class UniPhyBlock(nn.Module):
         B, D, H, W = x_curr.shape
         device = x_curr.device
 
-        x_spatial = x_curr.permute(0, 2, 3, 1).contiguous()
+        x_real = torch.cat([x_curr.real, x_curr.imag], dim=1)
+        x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1))
+        x_spatial = self.spatial_cliff(x_norm.permute(0, 3, 1, 2))
 
-        x_eigen = self.prop.basis.encode(x_spatial)
+        x_s_re, x_s_im = torch.chunk(x_spatial, 2, dim=1)
+        x_curr = x_curr + torch.complex(x_s_re, x_s_im)
 
-        h_prev_reshaped = h_prev.view(B, H, W, D)
+        x_perm = x_curr.permute(0, 2, 3, 1).contiguous()
+        x_eigen = self.prop.basis.encode(x_perm)
+        x_mean = x_eigen.mean(dim=(1, 2))
 
-        flux_next, gate = self.prop.flux_tracker(
-            x_eigen.view(B, H * W, 1, D),
-            flux_prev,
-        )
-        flux_next = flux_next.squeeze(1)
-        gate = gate.squeeze(1)
+        if flux_prev is None:
+            flux_prev = torch.zeros(B, D, device=device, dtype=x_curr.dtype)
 
-        source = x_eigen.clone()
-        gate_expanded = gate.view(B, 1, 1, D).expand(B, H, W, D)
-        forcing = x_eigen * gate_expanded + source * (1.0 - gate_expanded)
+        flux_next, source, gate = self.prop.flux_tracker.forward_step(flux_prev, x_mean)
 
-        dt_tensor = torch.as_tensor(dt, device=device, dtype=x_curr.dtype)
-        if dt_tensor.is_complex():
-            dt_tensor = dt_tensor.real
+        source_expanded = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+        gate_expanded = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
 
-        op_decay, op_forcing = self.prop.get_transition_operators(dt_tensor)
-        op_decay = op_decay.view(1, 1, 1, D).expand(B, H, W, D)
-        op_forcing = op_forcing.view(1, 1, 1, D).expand(B, H, W, D)
+        forcing = x_eigen * gate_expanded + source_expanded * (1.0 - gate_expanded)
 
+        op_decay, op_forcing = self.prop.get_transition_operators(dt)
+
+        h_prev_reshaped = h_prev.reshape(B, H, W, D)
         h_next = h_prev_reshaped * op_decay + forcing * op_forcing
 
+        dt_tensor = torch.as_tensor(dt, device=device, dtype=torch.float32)
         dt_for_noise = dt_tensor.view(1, 1, 1, 1)
         noise = self.prop.generate_stochastic_term(
             h_next.shape, dt_for_noise, h_next.dtype, h_state=h_next
@@ -306,8 +236,10 @@ class UniPhyModel(nn.Module):
         self.img_width = img_width
         self.dt_ref = dt_ref
 
-        self.h_patches = (img_height + patch_size - 1) // patch_size
-        self.w_patches = (img_width + patch_size - 1) // patch_size
+        pad_h = (patch_size - img_height % patch_size) % patch_size
+        pad_w = (patch_size - img_width % patch_size) % patch_size
+        self.h_patches = (img_height + pad_h) // patch_size
+        self.w_patches = (img_width + pad_w) // patch_size
 
         self.encoder = UniPhyEncoder(
             in_ch=in_channels,
@@ -319,8 +251,9 @@ class UniPhyModel(nn.Module):
 
         self.decoder = UniPhyDecoder(
             out_ch=out_channels,
-            embed_dim=embed_dim,
+            latent_dim=embed_dim,
             patch_size=patch_size,
+            model_channels=embed_dim,
             img_height=img_height,
             img_width=img_width,
         )
@@ -334,6 +267,8 @@ class UniPhyModel(nn.Module):
                 sde_mode=sde_mode,
                 init_noise_scale=init_noise_scale,
                 max_growth_rate=max_growth_rate,
+                img_height=self.h_patches,
+                img_width=self.w_patches,
             )
             for _ in range(depth)
         ])
@@ -360,7 +295,9 @@ class UniPhyModel(nn.Module):
 
         states = []
         for _ in range(self.depth):
-            h_init = torch.zeros(batch_size * H_p * W_p, 1, D, device=device, dtype=dtype)
+            h_init = torch.zeros(
+                batch_size * H_p * W_p, 1, D, device=device, dtype=dtype
+            )
             flux_init = torch.zeros(batch_size, D, device=device, dtype=dtype)
             states.append((h_init, flux_init))
 
@@ -373,9 +310,9 @@ class UniPhyModel(nn.Module):
         z = self.encoder(x)
 
         if z.dtype.is_complex:
-            base_dtype = torch.complex64
-        else:
             base_dtype = z.dtype
+        else:
+            base_dtype = torch.complex64
 
         h_prev = None
         flux_prev = None
@@ -386,7 +323,9 @@ class UniPhyModel(nn.Module):
                     B * self.h_patches * self.w_patches, 1, self.embed_dim,
                     device=device, dtype=base_dtype
                 )
-                flux_init = torch.zeros(B, self.embed_dim, device=device, dtype=base_dtype)
+                flux_init = torch.zeros(
+                    B, self.embed_dim, device=device, dtype=base_dtype
+                )
                 z, h_prev, flux_prev = block(z, h_init, dt, flux_init)
             else:
                 z, h_prev, flux_prev = block(z, h_prev, dt, flux_prev)
@@ -405,9 +344,9 @@ class UniPhyModel(nn.Module):
         z_curr = self.encoder(x_init.unsqueeze(1)).squeeze(1)
 
         if z_curr.dtype.is_complex:
-            base_dtype = torch.complex64
-        else:
             base_dtype = z_curr.dtype
+        else:
+            base_dtype = torch.complex64
 
         states = self._init_states(B, "cpu", base_dtype)
         predictions = []
@@ -458,4 +397,3 @@ class UniPhyModel(nn.Module):
                 block.last_h_state = None
             if hasattr(block, "last_flux_state"):
                 block.last_flux_state = None
-                
