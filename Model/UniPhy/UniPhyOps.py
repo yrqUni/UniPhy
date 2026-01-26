@@ -244,52 +244,28 @@ class RiemannianCliffordConv2d(nn.Module):
         self,
         in_channels,
         out_channels,
-        kernel_size,
-        padding,
-        img_height,
-        img_width
+        kernel_size=3,
+        padding=1,
+        img_height=64,
+        img_width=64,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.groups = in_channels
 
-        self.conv = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
-        )
+        self.conv_e0 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        self.conv_e1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        self.conv_e2 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        self.conv_e12 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
 
-        self.log_metric_param = nn.Parameter(torch.zeros(1, 1, img_height, img_width))
+        self.bias = nn.Parameter(torch.zeros(out_channels))
 
-        self.metric_refiner = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels, 1),
-            nn.Tanh()
-        )
+        lat = torch.linspace(-math.pi / 2, math.pi / 2, img_height)
+        self.register_buffer("cos_lat", torch.cos(lat).view(1, 1, -1, 1))
 
-        self.viscosity_gate = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 1),
-            nn.Sigmoid()
-        )
-
-        laplacian_init = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32
-        )
-        self.register_buffer(
-            "laplacian_kernel",
-            laplacian_init.reshape(1, 1, 3, 3).repeat(in_channels, 1, 1, 1)
-        )
-
-        self.metric_scale = nn.Parameter(torch.tensor(0.1))
-        self.viscosity_scale = nn.Parameter(torch.tensor(0.01))
-        self.diffusion_scale = nn.Parameter(torch.tensor(0.01))
+        self.metric_scale = nn.Parameter(torch.tensor(1.0))
+        self.viscosity_scale = nn.Parameter(torch.tensor(0.1))
         self.dispersion_scale = nn.Parameter(torch.tensor(0.01))
-
-        self.anti_diffusion_gate = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 4, 1),
-            nn.SiLU(),
-            nn.Conv2d(in_channels // 4, in_channels, 1),
-            nn.Sigmoid()
-        )
 
     def forward(self, x):
         B, C, H, W = x.shape
