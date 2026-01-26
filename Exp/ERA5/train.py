@@ -264,7 +264,7 @@ def train(cfg):
         max_growth_rate=cfg["model"]["max_growth_rate"],
     ).cuda()
     
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
     train_dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
