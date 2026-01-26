@@ -26,9 +26,11 @@ from rich.progress import (
     TaskProgressColumn,
     TimeRemainingColumn,
 )
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
+
 from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhyModel
 
@@ -44,6 +46,28 @@ custom_theme = Theme({
 console = Console(theme=custom_theme)
 
 
+def setup_logging(cfg, rank):
+    log_path = cfg["logging"]["log_path"]
+    os.makedirs(log_path, exist_ok=True)
+    
+    logger = logging.getLogger("train")
+    logger.setLevel(logging.INFO if rank == 0 else logging.WARNING)
+    
+    if rank == 0:
+        fh = logging.FileHandler(os.path.join(log_path, "train.log"))
+        fh.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+        
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+    
+    return logger
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -51,226 +75,164 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def format_params(num):
-    if num >= 1e9:
-        return f"{num / 1e9:.2f}B"
-    elif num >= 1e6:
-        return f"{num / 1e6:.2f}M"
-    elif num >= 1e3:
-        return f"{num / 1e3:.2f}K"
-    return str(num)
+def get_lat_weights(H, W, device):
+    lat = torch.linspace(-90, 90, H, device=device)
+    weights = torch.cos(torch.deg2rad(lat))
+    weights = weights / weights.mean()
+    return weights.view(1, 1, 1, H, 1)
 
 
-def get_model_info(model):
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total_params, trainable_params, total_params - trainable_params
-
-
-def print_model_summary(model, cfg, rank):
-    if rank != 0:
-        return
-    total_params, trainable_params, non_trainable_params = get_model_info(model)
-    table = Table(title="Model Configuration", header_style="bold magenta")
-    table.add_column("Parameter", style="cyan")
-    table.add_column("Value", style="green")
-    table.add_row("Total Parameters", format_params(total_params))
-    table.add_row("Trainable Parameters", format_params(trainable_params))
-    table.add_row("Embed Dim", str(cfg["model"]["embed_dim"]))
-    table.add_row("Depth", str(cfg["model"]["depth"]))
-    table.add_row("Num Experts", str(cfg["model"]["num_experts"]))
-    table.add_row("Patch Size", str(cfg["model"]["patch_size"]))
-    console.print(table)
-
-
-def setup_logging(log_path, rank):
-    logger = logging.getLogger("train")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+def compute_crps(pred_ensemble, target):
+    if pred_ensemble.is_complex():
+        pred_ensemble = pred_ensemble.real
+    if target.is_complex():
+        target = target.real
     
-    if rank == 0:
-        os.makedirs(log_path, exist_ok=True)
-        
-        log_file = os.path.join(
-            log_path,
-            f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        )
-        
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(logging.INFO)
-        
-        formatter = logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-        
-        logger.info(f"Log file created: {log_file}")
+    M = pred_ensemble.shape[0]
+    mae = (pred_ensemble - target.unsqueeze(0)).abs().mean(dim=0)
     
-    return logger
-
-
-def save_ckpt(model, optimizer, scheduler, epoch, global_step, path):
-    state = {
-        "epoch": epoch,
-        "global_step": global_step,
-        "model_state_dict": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }
-    if scheduler is not None:
-        state["scheduler_state_dict"] = scheduler.state_dict()
-    torch.save(state, path)
-
-
-def load_ckpt(model, optimizer, path, scheduler=None):
-    checkpoint = torch.load(path, map_location="cpu")
-    if hasattr(model, "module"):
-        model.module.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if scheduler is not None and "scheduler_state_dict" in checkpoint:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    return checkpoint["epoch"], checkpoint["global_step"]
-
-
-def save_metrics(log_path, epoch, metrics):
-    metrics_file = os.path.join(log_path, "metrics.jsonl")
-    record = {
-        "epoch": epoch,
-        "timestamp": datetime.datetime.now().isoformat(),
-        **metrics
-    }
-    with open(metrics_file, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def compute_l1_loss(pred, target):
-    if pred.is_complex():
-        pred = pred.real
-    return F.l1_loss(pred, target)
-
-
-def compute_crps_loss(ensemble_preds, target):
-    B, E, T, C, H, W = ensemble_preds.shape
+    diff = 0.0
+    for i in range(M):
+        for j in range(i + 1, M):
+            diff += (pred_ensemble[i] - pred_ensemble[j]).abs()
     
-    target_expanded = target.unsqueeze(1)
-    mae_term = (ensemble_preds - target_expanded).abs().mean()
+    if M > 1:
+        diff = diff / (M * (M - 1) / 2)
     
-    if E > 1:
-        idx1 = torch.randperm(E, device=ensemble_preds.device)[:E // 2]
-        idx2 = torch.randperm(E, device=ensemble_preds.device)[:E // 2]
-        spread_term = (ensemble_preds[:, idx1] - ensemble_preds[:, idx2]).abs().mean()
-    else:
-        spread_term = torch.tensor(0.0, device=ensemble_preds.device)
-    
-    crps = mae_term - 0.5 * spread_term
-    return crps
+    crps = mae - 0.5 * diff
+    return crps.mean()
 
 
-def compute_ensemble_loss(ensemble_preds, target):
-    ensemble_mean = ensemble_preds.mean(dim=1)
-    mean_loss = F.l1_loss(ensemble_mean, target)
+def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
+    device = next(model.parameters()).device
+    data, dt_data = batch
+    data = data.to(device).float()
+    dt_data = dt_data.to(device).float()
     
-    ensemble_std = ensemble_preds.std(dim=1)
-    actual_error = (ensemble_mean - target).abs()
-    spread_loss = F.mse_loss(ensemble_std, actual_error.detach())
+    B, T, C, H, W = data.shape
     
-    return mean_loss, spread_loss
-
-
-def compute_metrics(pred, target):
-    if pred.is_complex():
-        pred = pred.real
-    
-    mse = F.mse_loss(pred, target)
-    rmse = torch.sqrt(mse)
-    mae = F.l1_loss(pred, target)
-    
-    return {
-        "mse": mse.item(),
-        "rmse": rmse.item(),
-        "mae": mae.item(),
-    }
-
-
-def train_step(model, batch, optimizer, cfg, grad_accum_steps, step_idx):
-    data, dt = batch
-    data = data.cuda(non_blocking=True)
-    dt = dt.cuda(non_blocking=True)
+    ensemble_size = cfg["train"]["ensemble_size"]
+    ensemble_weight = cfg["train"]["ensemble_weight"]
     
     x_input = data[:, :-1]
     x_target = data[:, 1:]
-    dt_input = dt[:, :-1] if dt.ndim > 1 else dt[:-1]
+    dt_input = dt_data[:, :-1]
     
-    ensemble_size = cfg["train"]["ensemble_size"]
+    out = model(x_input, dt_input)
     
-    ensemble_preds = []
-    for _ in range(ensemble_size):
-        pred = model(x_input, dt_input)
-        if pred.is_complex():
-            pred = pred.real
-        ensemble_preds.append(pred)
+    if out.is_complex():
+        out_real = out.real
+    else:
+        out_real = out
     
-    ensemble_preds = torch.stack(ensemble_preds, dim=1)
-    ensemble_mean = ensemble_preds.mean(dim=1)
+    lat_weights = get_lat_weights(H, W, device)
     
-    l1_loss = compute_l1_loss(ensemble_mean, x_target)
-    crps_loss = compute_crps_loss(ensemble_preds, x_target)
+    l1_loss = (out_real - x_target).abs().mean()
+    mse_loss = ((out_real - x_target) ** 2 * lat_weights).mean()
     
-    ensemble_weight = cfg["train"].get("ensemble_weight", 0.5)
-    loss = l1_loss + ensemble_weight * crps_loss
+    if ensemble_size > 1 and ensemble_weight > 0:
+        ensemble_preds = [out_real]
+        for _ in range(ensemble_size - 1):
+            out_ens = model(x_input, dt_input)
+            if out_ens.is_complex():
+                ensemble_preds.append(out_ens.real)
+            else:
+                ensemble_preds.append(out_ens)
+        
+        ensemble_stack = torch.stack(ensemble_preds, dim=0)
+        crps_loss = compute_crps(ensemble_stack, x_target)
+        ensemble_std = ensemble_stack.std(dim=0).mean()
+        
+        loss = (1 - ensemble_weight) * l1_loss + ensemble_weight * crps_loss
+    else:
+        crps_loss = torch.tensor(0.0, device=device)
+        ensemble_std = torch.tensor(0.0, device=device)
+        loss = l1_loss
     
-    loss_scaled = loss / grad_accum_steps
-    loss_scaled.backward()
+    loss = loss / grad_accum_steps
+    loss.backward()
     
-    grad_norm = 0.0
-    if (step_idx + 1) % grad_accum_steps == 0:
+    if (batch_idx + 1) % grad_accum_steps == 0:
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            cfg["train"]["grad_clip"]
-        ).item()
+            model.parameters(), cfg["train"]["grad_clip"]
+        )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+    else:
+        grad_norm = torch.tensor(0.0, device=device)
     
-    metrics = compute_metrics(ensemble_mean, x_target)
-    metrics.update({
-        "loss": loss.item(),
+    with torch.no_grad():
+        rmse = torch.sqrt(mse_loss)
+        mae = l1_loss
+    
+    metrics = {
+        "loss": loss.item() * grad_accum_steps,
         "l1_loss": l1_loss.item(),
         "crps_loss": crps_loss.item(),
-        "grad_norm": grad_norm,
-        "ensemble_std": ensemble_preds.std(dim=1).mean().item(),
-    })
+        "mse": mse_loss.item(),
+        "rmse": rmse.item(),
+        "mae": mae.item(),
+        "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+        "ensemble_std": ensemble_std.item(),
+    }
     
     return metrics
 
 
-def train(cfg):
+def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
+    state = {
+        "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "epoch": epoch,
+        "global_step": global_step,
+        "cfg": cfg,
+    }
+    torch.save(state, path)
+
+
+def load_checkpoint(path, model, optimizer=None, scheduler=None):
+    ckpt = torch.load(path, map_location="cpu")
+    
+    if hasattr(model, "module"):
+        model.module.load_state_dict(ckpt["model"])
+    else:
+        model.load_state_dict(ckpt["model"])
+    
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    
+    if scheduler is not None and ckpt.get("scheduler") is not None:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    
+    return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
+
+
+def main():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     
+    with open("train.yaml", "r") as f:
+        cfg = yaml.safe_load(f)
+    
+    logger = setup_logging(cfg, rank)
     set_seed(42 + rank)
-    
-    logger = setup_logging(cfg["logging"]["log_path"], rank)
-    
-    if rank == 0:
-        logger.info("=" * 70)
-        logger.info("Training Started")
-        logger.info(f"World Size: {world_size}")
-        logger.info("=" * 70)
     
     if cfg["train"]["use_tf32"]:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    
+    if rank == 0 and cfg["logging"]["use_wandb"]:
+        run_name = cfg["logging"]["wandb_run_name"] or f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        wandb.init(
+            project=cfg["logging"]["wandb_project"],
+            entity=cfg["logging"]["wandb_entity"],
+            name=run_name,
+            config=cfg,
+        )
     
     model = UniPhyModel(
         in_channels=cfg["model"]["in_channels"],
@@ -282,14 +244,13 @@ def train(cfg):
         patch_size=cfg["model"]["patch_size"],
         img_height=cfg["model"]["img_height"],
         img_width=cfg["model"]["img_width"],
+        dt_ref=cfg["model"]["dt_ref"],
+        sde_mode=cfg["model"]["sde_mode"],
+        init_noise_scale=cfg["model"]["init_noise_scale"],
+        max_growth_rate=cfg["model"]["max_growth_rate"],
     ).cuda()
     
-    model = DDP(model, device_ids=[local_rank])
-    
-    if rank == 0:
-        print_model_summary(model.module, cfg, rank)
-        total_params, trainable_params, _ = get_model_info(model.module)
-        logger.info(f"Model Parameters: {format_params(total_params)} (Trainable: {format_params(trainable_params)})")
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
     train_dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -301,13 +262,7 @@ def train(cfg):
         dt_ref=cfg["data"]["dt_ref"],
     )
     
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True,
-    )
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     
     train_loader = DataLoader(
         train_dataset,
@@ -315,57 +270,41 @@ def train(cfg):
         sampler=train_sampler,
         num_workers=4,
         pin_memory=True,
-        prefetch_factor=2,
+        drop_last=True,
     )
-    
-    if rank == 0:
-        logger.info(f"Dataset Size: {len(train_dataset)} samples")
-        logger.info(f"Batches per Epoch: {len(train_loader)}")
     
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(cfg["train"]["lr"]),
+        lr=cfg["train"]["lr"],
         weight_decay=cfg["train"]["weight_decay"],
     )
     
-    grad_accum_steps = cfg["train"]["grad_accum_steps"]
-    epochs = cfg["train"]["epochs"]
-    
-    scheduler = None
     if cfg["train"]["use_scheduler"]:
-        scheduler = lr_scheduler.OneCycleLR(
+        scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
-            max_lr=float(cfg["train"]["lr"]),
-            steps_per_epoch=len(train_loader) // grad_accum_steps,
-            epochs=epochs,
+            T_max=cfg["train"]["epochs"] * len(train_loader),
+            eta_min=cfg["train"]["lr"] * 0.01,
         )
+    else:
+        scheduler = None
     
     start_epoch = 0
     global_step = 0
     
     if cfg["logging"]["ckpt"]:
-        start_epoch, global_step = load_ckpt(
-            model, optimizer, cfg["logging"]["ckpt"], scheduler
+        start_epoch, global_step = load_checkpoint(
+            cfg["logging"]["ckpt"], model, optimizer, scheduler
         )
         if rank == 0:
-            logger.info(f"Resumed from checkpoint: epoch {start_epoch}, step {global_step}")
+            logger.info(f"Resumed from checkpoint: {cfg['logging']['ckpt']}")
     
-    if cfg["logging"]["use_wandb"] and rank == 0:
-        run_name = cfg["logging"]["wandb_run_name"] or f"uniphy_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        total_params, _, _ = get_model_info(model.module)
-        wandb.init(
-            project=cfg["logging"]["wandb_project"],
-            entity=cfg["logging"]["wandb_entity"],
-            name=run_name,
-            config={**cfg, "total_params": total_params},
-        )
-    
-    save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
+    epochs = cfg["train"]["epochs"]
+    grad_accum_steps = cfg["train"]["grad_accum_steps"]
     log_every = cfg["logging"]["log_every"]
+    save_interval = int(len(train_loader) * cfg["logging"]["ckpt_step"])
     
-    if rank == 0:
-        os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
-        os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
+    os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
+    os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
     
     for epoch in range(start_epoch, epochs):
         train_sampler.set_epoch(epoch)
@@ -421,28 +360,28 @@ def train(cfg):
                         f"RMSE: {metrics['rmse']:.4f} | "
                         f"LR: {current_lr:.2e}"
                     )
-                    
-                    if cfg["logging"]["use_wandb"]:
-                        wandb.log({
-                            "train/loss": metrics["loss"],
-                            "train/l1_loss": metrics["l1_loss"],
-                            "train/crps_loss": metrics["crps_loss"],
-                            "train/mse": metrics["mse"],
-                            "train/rmse": metrics["rmse"],
-                            "train/mae": metrics["mae"],
-                            "train/ensemble_std": metrics["ensemble_std"],
-                            "train/grad_norm": metrics["grad_norm"],
-                            "train/lr": current_lr,
-                            "train/epoch": epoch,
-                        }, step=global_step)
+                
+                if cfg["logging"]["use_wandb"]:
+                    wandb.log({
+                        "train/loss": metrics["loss"],
+                        "train/l1_loss": metrics["l1_loss"],
+                        "train/crps_loss": metrics["crps_loss"],
+                        "train/mse": metrics["mse"],
+                        "train/rmse": metrics["rmse"],
+                        "train/mae": metrics["mae"],
+                        "train/ensemble_std": metrics["ensemble_std"],
+                        "train/grad_norm": metrics["grad_norm"],
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/epoch": epoch,
+                    }, step=global_step)
                 
                 if (batch_idx + 1) % save_interval == 0:
                     ckpt_path = os.path.join(
                         cfg["logging"]["ckpt_dir"],
                         f"ckpt_e{epoch + 1}_s{global_step}.pt"
                     )
-                    save_ckpt(model, optimizer, scheduler, epoch, global_step, ckpt_path)
-                    logger.info(f"Checkpoint saved: {ckpt_path}")
+                    save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, ckpt_path)
+                    logger.info(f"Saved checkpoint: {ckpt_path}")
         
         if rank == 0:
             progress.stop()
@@ -450,55 +389,34 @@ def train(cfg):
             for key in epoch_metrics:
                 epoch_metrics[key] /= max(num_batches, 1)
             
-            logger.info("=" * 70)
-            logger.info(f"Epoch {epoch + 1}/{epochs} Completed")
-            logger.info(f"  Avg Loss: {epoch_metrics['loss']:.4f}")
-            logger.info(f"  Avg L1 Loss: {epoch_metrics['l1_loss']:.4f}")
-            logger.info(f"  Avg CRPS Loss: {epoch_metrics['crps_loss']:.4f}")
-            logger.info(f"  Avg RMSE: {epoch_metrics['rmse']:.4f}")
-            logger.info(f"  Avg MAE: {epoch_metrics['mae']:.4f}")
-            logger.info(f"  Avg Ensemble Std: {epoch_metrics['ensemble_std']:.4f}")
-            logger.info("=" * 70)
-            
-            save_metrics(cfg["logging"]["log_path"], epoch + 1, epoch_metrics)
-            
-            if cfg["logging"]["use_wandb"]:
-                wandb.log({
-                    "epoch/loss": epoch_metrics["loss"],
-                    "epoch/l1_loss": epoch_metrics["l1_loss"],
-                    "epoch/crps_loss": epoch_metrics["crps_loss"],
-                    "epoch/rmse": epoch_metrics["rmse"],
-                    "epoch/mae": epoch_metrics["mae"],
-                    "epoch": epoch + 1,
-                }, step=global_step)
+            logger.info(
+                f"Epoch {epoch + 1}/{epochs} Summary: "
+                f"Loss: {epoch_metrics['loss']:.4f} | "
+                f"RMSE: {epoch_metrics['rmse']:.4f} | "
+                f"MAE: {epoch_metrics['mae']:.4f}"
+            )
             
             ckpt_path = os.path.join(
                 cfg["logging"]["ckpt_dir"],
                 f"ckpt_epoch{epoch + 1}.pt"
             )
-            save_ckpt(model, optimizer, scheduler, epoch + 1, global_step, ckpt_path)
-            logger.info(f"Epoch checkpoint saved: {ckpt_path}")
+            save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, ckpt_path)
+            logger.info(f"Saved epoch checkpoint: {ckpt_path}")
+        
+        dist.barrier()
     
     if rank == 0:
-        logger.info("Training Completed!")
+        final_ckpt_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
+        save_checkpoint(model, optimizer, scheduler, epochs, global_step, cfg, final_ckpt_path)
+        logger.info(f"Training completed. Final checkpoint: {final_ckpt_path}")
+        
         if cfg["logging"]["use_wandb"]:
             wandb.finish()
     
+    train_dataset.cleanup()
     dist.destroy_process_group()
-
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="train.yaml")
-    args = parser.parse_args()
-    
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    
-    train(cfg)
 
 
 if __name__ == "__main__":
     main()
-
+    
