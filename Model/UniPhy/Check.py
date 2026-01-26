@@ -427,12 +427,11 @@ def check_forecast_mode():
     ).to(device)
 
     x_cond = torch.randn(B, T, C, H, W, device=device)
-    dt_cond = torch.ones(T, device=device) * 6.0
     dt_future = torch.ones(k_steps, device=device) * 6.0
 
     model.eval()
     with torch.no_grad():
-        predictions = model.forward_rollout(x_cond, dt_cond, k_steps, dt_future)
+        predictions = model.forward_rollout(x_cond, k_steps, dt_future)
 
     print(f"Conditioning Input Shape: {x_cond.shape}")
     print(f"Forecast Steps: {k_steps}")
