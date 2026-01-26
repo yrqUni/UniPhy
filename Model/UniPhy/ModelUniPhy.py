@@ -47,7 +47,10 @@ class EnergyProjection(nn.Module):
         else:
             current_energy = (z ** 2).mean(dim=(-2, -1))
 
-        energy_ratio = target_energy / (current_energy + 1e-8)
+        target_energy_real = target_energy.abs() if target_energy.is_complex() else target_energy
+        current_energy_real = current_energy.abs() if current_energy.is_complex() else current_energy
+
+        energy_ratio = target_energy_real / (current_energy_real + 1e-8)
         energy_ratio = torch.clamp(energy_ratio, 0.5, 2.0)
 
         if z.ndim == 5:
