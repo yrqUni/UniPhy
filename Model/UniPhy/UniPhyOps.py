@@ -9,80 +9,57 @@ class ComplexSVDTransform(nn.Module):
         super().__init__()
         self.dim = dim
 
-        self.u_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.u_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.v_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.v_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
+        q_re, _ = torch.linalg.qr(torch.randn(dim, dim))
+        q_im, _ = torch.linalg.qr(torch.randn(dim, dim))
+
+        self.u_raw_re = nn.Parameter(q_re * 0.1)
+        self.u_raw_im = nn.Parameter(q_im * 0.1)
+        self.v_raw_re = nn.Parameter(q_re.T * 0.1)
+        self.v_raw_im = nn.Parameter(q_im.T * 0.1)
         self.log_sigma = nn.Parameter(torch.zeros(dim))
 
-        n = torch.arange(dim).unsqueeze(1).float()
-        k = torch.arange(dim).unsqueeze(0).float()
+        n = torch.arange(dim)
+        k = torch.arange(dim).reshape(-1, 1)
         dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
         self.register_buffer("dft_basis", dft_matrix)
-        self.dft_weight = nn.Parameter(torch.tensor(0.2))
+        self.dft_weight = nn.Parameter(torch.tensor(0.0))
 
     def _cayley_orthogonalize(self, raw_re, raw_im):
         A = torch.complex(raw_re, raw_im)
         A_skew = A - A.T.conj()
         I = torch.eye(self.dim, device=A.device, dtype=A.dtype)
-        I_reg = I * 1e-6
-        Q = torch.linalg.solve(I + A_skew + I_reg, I - A_skew)
+        Q = torch.linalg.solve(I + A_skew, I - A_skew)
         return Q
 
     def _get_basis(self):
         U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
         V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
-        S = torch.diag(torch.exp(self.log_sigma).to(U.dtype))
+        S = torch.exp(self.log_sigma).to(U.dtype)
         return U, S, V
 
     def encode(self, x):
-        U, S_mat, V = self._get_basis()
-        S_diag = torch.diag(S_mat)
+        U, S, V = self._get_basis()
 
-        learned_path = torch.einsum("...d, de -> ...e", x, V) * S_diag
+        if not x.is_complex():
+            x = torch.complex(x, torch.zeros_like(x))
 
-        if x.is_complex():
-            x_complex = x
-        else:
-            x_complex = torch.complex(x, torch.zeros_like(x))
-
-        dft_basis = self.dft_basis.to(dtype=x_complex.dtype)
-        dft_path = torch.einsum("...d, de -> ...e", x_complex, dft_basis)
+        learned = torch.einsum("...d,de->...e", x, V.conj().T) * S
 
         alpha = torch.sigmoid(self.dft_weight)
-        combined = alpha * dft_path + (1 - alpha) * learned_path
+        dft = torch.einsum("...d,de->...e", x, self.dft_basis.T.conj())
 
-        return combined
+        return alpha * dft + (1 - alpha) * learned
 
     def decode(self, z):
-        U, S_mat, V = self._get_basis()
-        S_diag = torch.diag(S_mat)
+        U, S, V = self._get_basis()
 
-        S_inv = 1.0 / (S_diag + 1e-8)
-        V_H = V.conj().T
-
-        learned_path = torch.einsum("...d, de -> ...e", z * S_inv, V_H)
-
-        dft_basis_H = self.dft_basis.conj().T.to(dtype=z.dtype)
-        dft_path = torch.einsum("...d, de -> ...e", z, dft_basis_H)
+        S_inv = 1.0 / (S + 1e-8)
+        learned = torch.einsum("...d,de->...e", z * S_inv, V)
 
         alpha = torch.sigmoid(self.dft_weight)
-        combined = alpha * dft_path + (1 - alpha) * learned_path
+        idft = torch.einsum("...d,de->...e", z, self.dft_basis.conj())
 
-        return combined
-
-
-class LearnableSpectralBasis(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.transform = ComplexSVDTransform(dim)
-
-    def encode(self, x):
-        return self.transform.encode(x)
-
-    def decode(self, z):
-        return self.transform.decode(z)
+        return alpha * idft + (1 - alpha) * learned
 
 
 class GlobalFluxTracker(nn.Module):
@@ -98,13 +75,13 @@ class GlobalFluxTracker(nn.Module):
         )
 
         self.source_net = nn.Sequential(
-            nn.Linear(dim * 2, hidden_dim),
+            nn.Linear(dim * 4, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, dim),
         )
 
         self.gate_net = nn.Sequential(
-            nn.Linear(dim * 2, hidden_dim),
+            nn.Linear(dim * 4, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, dim),
             nn.Sigmoid(),
@@ -126,24 +103,28 @@ class GlobalFluxTracker(nn.Module):
         B = x.shape[0]
         if x.ndim == 4:
             x_mean = x_real.mean(dim=(1, 2))
+        elif x.ndim == 3:
+            x_mean = x_real.mean(dim=1)
         else:
-            x_mean = x_real.mean(dim=1) if x_real.ndim > 2 else x_real
+            x_mean = x_real
 
         if flux_real.ndim == 1:
             flux_real = flux_real.unsqueeze(0).expand(B, -1)
 
-        flux_input = torch.cat([x_mean, flux_real], dim=-1)
-        flux_delta = self.flux_update(flux_input)
+        combined = torch.cat([x_mean, flux_real], dim=-1)
+
+        flux_delta = self.flux_update(combined)
 
         decay_factor = torch.sigmoid(self.decay)
         if flux_prev.is_complex():
-            flux_next_real = flux_prev.real * decay_factor + flux_delta
-            flux_next = torch.complex(flux_next_real, flux_prev.imag * decay_factor)
+            flux_next = torch.complex(
+                flux_prev.real * decay_factor + flux_delta,
+                flux_prev.imag * decay_factor
+            )
         else:
             flux_next = flux_prev * decay_factor + flux_delta
 
-        gate_input = torch.cat([x_mean, flux_real], dim=-1)
-        gate = self.gate_net(gate_input)
+        gate = self.gate_net(combined)
 
         return flux_next, gate
 
@@ -158,21 +139,21 @@ class GlobalFluxTracker(nn.Module):
         else:
             flux_real = torch.cat([flux_prev, torch.zeros_like(flux_prev)], dim=-1)
 
-        flux_input = torch.cat([x_real, flux_real], dim=-1)
-        flux_delta = self.flux_update(flux_input)
+        combined = torch.cat([x_real, flux_real], dim=-1)
+
+        flux_delta = self.flux_update(combined)
 
         decay_factor = torch.sigmoid(self.decay)
         if flux_prev.is_complex():
-            flux_next_real = flux_prev.real * decay_factor + flux_delta
-            flux_next = torch.complex(flux_next_real, flux_prev.imag * decay_factor)
+            flux_next = torch.complex(
+                flux_prev.real * decay_factor + flux_delta,
+                flux_prev.imag * decay_factor
+            )
         else:
             flux_next = flux_prev * decay_factor + flux_delta
 
-        source_input = torch.cat([x_real, flux_real], dim=-1)
-        source = self.source_net(source_input)
-
-        gate_input = torch.cat([x_real, flux_real], dim=-1)
-        gate = self.gate_net(gate_input)
+        source = self.source_net(combined)
+        gate = self.gate_net(combined)
 
         if x_mean.is_complex():
             source = torch.complex(source, torch.zeros_like(source))
@@ -220,18 +201,13 @@ class TemporalPropagator(nn.Module):
 
     def get_transition_operators(self, dt):
         lam = self._get_effective_lambda()
-
-        if isinstance(dt, torch.Tensor):
-            dt_tensor = dt
-        else:
-            dt_tensor = torch.tensor(dt, device=lam.device, dtype=torch.float32)
+        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(dt, device=lam.device)
 
         if dt_tensor.is_complex():
             dt_tensor = dt_tensor.real
 
         if dt_tensor.ndim == 0:
             dt_ratio = dt_tensor / self.dt_ref
-            dt_ratio = dt_ratio.unsqueeze(0).unsqueeze(0)
         elif dt_tensor.ndim == 1:
             dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
         elif dt_tensor.ndim == 2:
@@ -239,7 +215,6 @@ class TemporalPropagator(nn.Module):
         else:
             dt_ratio = dt_tensor / self.dt_ref
 
-        dt_ratio = dt_ratio.to(lam.device)
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
 
@@ -253,45 +228,35 @@ class TemporalPropagator(nn.Module):
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
 
         device = self.lam_re.device
-
-        if isinstance(dt, torch.Tensor):
-            dt_tensor = dt.to(device)
-        else:
-            dt_tensor = torch.tensor(dt, device=device, dtype=torch.float32)
+        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(dt, device=device)
 
         if dt_tensor.is_complex():
             dt_tensor = dt_tensor.real
 
         base_scale = self.base_noise.abs() * torch.sqrt(dt_tensor.abs().float() + 1e-8)
 
-        noise_real = torch.randn(shape, device=device, dtype=torch.float32)
-        noise_imag = torch.randn(shape, device=device, dtype=torch.float32)
+        noise_re = torch.randn(shape, device=device, dtype=torch.float32)
+        noise_im = torch.randn(shape, device=device, dtype=torch.float32)
 
         if h_state is not None and self.uncertainty_net is not None:
             h_flat = h_state.reshape(-1, self.dim)
             if h_flat.is_complex():
-                h_real = torch.cat([h_flat.real, h_flat.imag], dim=-1)
+                h_real = h_flat.abs()
             else:
-                h_real = h_flat
-            h_mag = h_real.abs().mean(dim=-1, keepdim=True)
+                h_real = h_flat.abs()
+            h_mag = h_real.mean(dim=-1, keepdim=True)
             uncertainty = self.uncertainty_net(h_mag.expand(-1, self.dim))
             uncertainty = uncertainty.reshape(shape)
             scale = base_scale * (1 + uncertainty)
         else:
             scale = base_scale
 
-        while scale.ndim < noise_real.ndim:
+        while scale.ndim < noise_re.ndim:
             scale = scale.unsqueeze(0)
 
-        scaled_real = noise_real * scale
-        scaled_imag = noise_imag * scale
-
         if dtype.is_complex:
-            noise = torch.complex(scaled_real, scaled_imag)
-        else:
-            noise = scaled_real
-
-        return noise
+            return torch.complex(noise_re * scale, noise_im * scale)
+        return noise_re * scale
 
 
 class RiemannianCliffordConv2d(nn.Module):
@@ -307,23 +272,11 @@ class RiemannianCliffordConv2d(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.padding = padding
-        self.img_height = img_height
-        self.img_width = img_width
 
-        self.conv_e0 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
-        )
-        self.conv_e1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
-        )
-        self.conv_e2 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
-        )
-        self.conv_e12 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
-        )
+        self.conv_e0 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        self.conv_e1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        self.conv_e2 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        self.conv_e12 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
 
         self.bias = nn.Parameter(torch.zeros(out_channels))
 
@@ -341,10 +294,8 @@ class RiemannianCliffordConv2d(nn.Module):
         y_e12 = self.conv_e12(x)
 
         cos_lat = self.cos_lat
-        if H != self.img_height:
-            cos_lat = F.interpolate(
-                cos_lat, size=(H, 1), mode="bilinear", align_corners=False
-            )
+        if H != self.cos_lat.shape[2]:
+            cos_lat = F.interpolate(cos_lat, size=(H, 1), mode="bilinear", align_corners=False)
         cos_lat = cos_lat.expand(B, -1, H, W)
 
         y_e1_scaled = y_e1 * cos_lat
@@ -385,12 +336,8 @@ class SphericalPositionEmbedding(nn.Module):
         lon_emb = self.lon_emb
 
         if H != self.h_dim or W != self.w_dim:
-            lat_emb = F.interpolate(
-                lat_emb, size=(H, 1), mode="bilinear", align_corners=False
-            )
-            lon_emb = F.interpolate(
-                lon_emb, size=(1, W), mode="bilinear", align_corners=False
-            )
+            lat_emb = F.interpolate(lat_emb, size=(H, 1), mode="bilinear", align_corners=False)
+            lon_emb = F.interpolate(lon_emb, size=(1, W), mode="bilinear", align_corners=False)
 
         pos_emb = torch.cat([
             lat_emb.expand(B, -1, H, W),
@@ -408,71 +355,9 @@ class SphericalPositionEmbedding(nn.Module):
             cos_lon = F.interpolate(cos_lon, size=(H, W), mode="bilinear", align_corners=False)
             sin_lon = F.interpolate(sin_lon, size=(H, W), mode="bilinear", align_corners=False)
 
-        geo_features = torch.cat([cos_lat, sin_lat, cos_lon, sin_lon], dim=1)
-        geo_features = geo_features.expand(B, -1, -1, -1)
-        geo_emb = self.geo_proj(geo_features)
+        geo_feat = torch.cat([cos_lat, sin_lat, cos_lon, sin_lon], dim=1)
+        geo_feat = geo_feat.expand(B, -1, -1, -1)
+        geo_emb = self.geo_proj(geo_feat)
 
-        out = x + pos_emb + geo_emb
-
-        return out
-
-
-class AdaptiveLayerNorm(nn.Module):
-    def __init__(self, dim, cond_dim=None):
-        super().__init__()
-        self.dim = dim
-        cond_dim = cond_dim or dim
-
-        self.norm = nn.LayerNorm(dim)
-        self.scale_proj = nn.Linear(cond_dim, dim)
-        self.shift_proj = nn.Linear(cond_dim, dim)
-
-        nn.init.zeros_(self.scale_proj.weight)
-        nn.init.ones_(self.scale_proj.bias)
-        nn.init.zeros_(self.shift_proj.weight)
-        nn.init.zeros_(self.shift_proj.bias)
-
-    def forward(self, x, cond=None):
-        x_norm = self.norm(x)
-
-        if cond is not None:
-            scale = self.scale_proj(cond)
-            shift = self.shift_proj(cond)
-
-            while scale.ndim < x_norm.ndim:
-                scale = scale.unsqueeze(1)
-                shift = shift.unsqueeze(1)
-
-            x_norm = x_norm * scale + shift
-
-        return x_norm
-
-
-class ComplexLayerNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-
-        self.weight_re = nn.Parameter(torch.ones(dim))
-        self.weight_im = nn.Parameter(torch.zeros(dim))
-        self.bias_re = nn.Parameter(torch.zeros(dim))
-        self.bias_im = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x):
-        if not x.is_complex():
-            x = torch.complex(x, torch.zeros_like(x))
-
-        mean = x.mean(dim=-1, keepdim=True)
-        x_centered = x - mean
-
-        var = (x_centered * x_centered.conj()).real.mean(dim=-1, keepdim=True)
-        x_norm = x_centered / torch.sqrt(var + self.eps)
-
-        weight = torch.complex(self.weight_re, self.weight_im)
-        bias = torch.complex(self.bias_re, self.bias_im)
-
-        out = x_norm * weight + bias
-
-        return out
+        return x + pos_emb + geo_emb
     
