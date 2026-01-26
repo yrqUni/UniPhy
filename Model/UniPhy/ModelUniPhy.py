@@ -55,7 +55,6 @@ class UniPhyBlock(nn.Module):
             B, T, D, H, W = x.shape
             x_flat = x.reshape(B * T, D, H, W)
         else:
-            B, D, H, W = x.shape
             x_flat = x
 
         x_real = torch.cat([x_flat.real, x_flat.imag], dim=1)
@@ -163,7 +162,12 @@ class UniPhyBlock(nn.Module):
         B, D, H, W = x_curr.shape
         device = x_curr.device
 
-        x_curr = self._spatial_process(x_curr)
+        x_real = torch.cat([x_curr.real, x_curr.imag], dim=1)
+        x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_spatial = self.spatial_cliff(x_norm)
+
+        x_s_re, x_s_im = torch.chunk(x_spatial, 2, dim=1)
+        x_curr = x_curr + torch.complex(x_s_re, x_s_im)
 
         x_perm = x_curr.permute(0, 2, 3, 1)
         x_eigen = self.prop.basis.encode(x_perm)
@@ -174,26 +178,37 @@ class UniPhyBlock(nn.Module):
 
         flux_next, source, gate = self.prop.flux_tracker.forward_step(flux_prev, x_mean)
 
-        source_exp = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
-        gate_exp = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+        source_expanded = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+        gate_expanded = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
 
-        forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
+        forcing = x_eigen * gate_expanded + source_expanded * (1 - gate_expanded)
 
         op_decay, op_forcing = self.prop.get_transition_operators(dt)
 
-        h_reshaped = h_prev.reshape(B, H, W, D)
-        h_next = h_reshaped * op_decay + forcing * op_forcing
+        h_prev_reshaped = h_prev.reshape(B, H, W, D)
+        h_next = h_prev_reshaped * op_decay + forcing * op_forcing
+
+        dt_for_noise = torch.as_tensor(dt, device=device).view(1, 1, 1, 1)
+        noise = self.prop.generate_stochastic_term(
+            h_next.shape, dt_for_noise, h_next.dtype, h_state=h_next
+        )
+        h_next = h_next + noise
 
         x_out = self.prop.basis.decode(h_next)
         x_out = x_out.permute(0, 3, 1, 2)
-        x_out = self._temporal_decode(x_out)
 
-        z_next = x_curr + x_out
+        x_out_real = torch.cat([x_out.real, x_out.imag], dim=1)
+        x_out_norm = self.norm_temporal(x_out_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=1)
+        x_out_complex = torch.complex(x_out_re, x_out_im)
 
-        self.last_h_state = h_next.reshape(B * H * W, 1, D).detach()
-        self.last_flux_state = flux_next.detach()
+        delta = self.ffn(x_out_complex)
+        x_out_complex = x_out_complex + delta
 
-        return z_next, self.last_h_state, self.last_flux_state
+        z_next = x_curr + x_out_complex
+        h_next_flat = h_next.reshape(B * H * W, 1, D)
+
+        return z_next, h_next_flat, flux_next
 
 
 class UniPhyModel(nn.Module):
@@ -216,6 +231,8 @@ class UniPhyModel(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.depth = depth
+        self.img_height = img_height
+        self.img_width = img_width
 
         pad_h = (patch_size - img_height % patch_size) % patch_size
         pad_w = (patch_size - img_width % patch_size) % patch_size
@@ -299,28 +316,25 @@ class UniPhyModel(nn.Module):
             else:
                 z, h_prev, flux_prev = block(z, h_prev, dt, flux_prev)
 
-        return self.decoder(z)
+        out = self.decoder(z)
 
-    @torch.no_grad()
+        if out.shape[-2] != H or out.shape[-1] != W:
+            out = out[..., :H, :W]
+
+        return out
+
     def forward_rollout(self, x_init, dt_list, num_steps=None):
         if num_steps is None:
             num_steps = len(dt_list)
 
         B = x_init.shape[0]
         device = x_init.device
+        target_h, target_w = x_init.shape[-2:]
 
         z = self.encoder(x_init.unsqueeze(1)).squeeze(1)
         dtype = z.dtype if z.dtype.is_complex else torch.complex64
 
-        states = []
-        for _ in range(self.depth):
-            h_init = torch.zeros(
-                B * self.h_patches * self.w_patches, 1, self.embed_dim,
-                device=device, dtype=dtype
-            )
-            flux_init = torch.zeros(B, self.embed_dim, device=device, dtype=dtype)
-            states.append((h_init, flux_init))
-
+        states = self._init_states(B, device, dtype)
         preds = []
 
         for k in range(num_steps):
@@ -333,12 +347,11 @@ class UniPhyModel(nn.Module):
                 new_states.append((h_next, flux_next))
 
             states = new_states
-            
             pred = self.decoder(z.unsqueeze(1)).squeeze(1)
-            
-            if pred.shape[-2:] != x_init.shape[-2:]:
-                pred = pred[..., :x_init.shape[-2], :x_init.shape[-1]]
-            
+
+            if pred.shape[-2] != target_h or pred.shape[-1] != target_w:
+                pred = pred[..., :target_h, :target_w]
+
             preds.append(pred)
 
         return torch.stack(preds, dim=1)
