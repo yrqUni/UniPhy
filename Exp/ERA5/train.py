@@ -5,8 +5,6 @@ import datetime
 import logging
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -14,16 +12,24 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim import lr_scheduler
 import wandb
 import yaml
+import time
+
 from rich.console import Console
-from rich.theme import Theme
+from rich.table import Table
+from rich.live import Live
+from rich.panel import Panel
 from rich.progress import (
     Progress,
-    TextColumn,
+    SpinnerColumn,
     BarColumn,
-    MofNCompleteColumn,
-    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.layout import Layout
+from rich.console import Group
+from rich.style import Style
+from rich.text import Text
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
@@ -35,19 +41,12 @@ from ModelUniPhy import UniPhyModel
 import warnings
 warnings.filterwarnings("ignore")
 
-custom_theme = Theme({
-    "info": "cyan",
-    "warning": "yellow",
-    "error": "red bold",
-    "success": "green bold",
-})
-console = Console(theme=custom_theme)
+console = Console()
 
 def setup_logging(log_path, rank):
     os.makedirs(log_path, exist_ok=True)
-    
     logger = logging.getLogger("train")
-    logger.setLevel(logging.INFO if rank == 0 else logging.WARNING)
+    logger.setLevel(logging.INFO)
     logger.handlers.clear()
     
     if rank == 0:
@@ -56,11 +55,8 @@ def setup_logging(log_path, rank):
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         fh.setFormatter(formatter)
         logger.addHandler(fh)
-        
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
+    else:
+        logger.addHandler(logging.NullHandler())
     
     return logger
 
@@ -69,29 +65,6 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-def get_model_info(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total, trainable, total - trainable
-
-def format_params(n):
-    if n >= 1e9:
-        return f"{n/1e9:.2f}B"
-    elif n >= 1e6:
-        return f"{n/1e6:.2f}M"
-    elif n >= 1e3:
-        return f"{n/1e3:.2f}K"
-    return str(n)
-
-def print_model_summary(model, cfg, rank):
-    if rank != 0:
-        return
-    total, trainable, frozen = get_model_info(model)
-    console.print(f"[bold cyan]Model Summary[/bold cyan]")
-    console.print(f"  Total Parameters: {format_params(total)}")
-    console.print(f"  Trainable: {format_params(trainable)}")
-    console.print(f"  Frozen: {format_params(frozen)}")
 
 def get_lat_weights(H, W, device):
     lat = torch.linspace(-90, 90, H, device=device)
@@ -143,7 +116,6 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     
     if ensemble_size > 1 and ensemble_weight > 0:
         ensemble_preds = [out_real.detach()]
-        
         infer_model = model.module if hasattr(model, "module") else model
         
         with torch.no_grad():
@@ -200,39 +172,55 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
         "epoch": epoch,
         "global_step": global_step,
         "cfg": cfg,
-        "model_args": {
-            "in_channels": cfg["model"]["in_channels"],
-            "out_channels": cfg["model"]["out_channels"],
-            "embed_dim": cfg["model"]["embed_dim"],
-            "expand": cfg["model"]["expand"],
-            "num_experts": cfg["model"]["num_experts"],
-            "depth": cfg["model"]["depth"],
-            "patch_size": cfg["model"]["patch_size"],
-            "img_height": cfg["model"]["img_height"],
-            "img_width": cfg["model"]["img_width"],
-            "dt_ref": cfg["model"]["dt_ref"],
-            "sde_mode": cfg["model"]["sde_mode"],
-            "init_noise_scale": cfg["model"]["init_noise_scale"],
-            "max_growth_rate": cfg["model"]["max_growth_rate"],
-        },
     }
     torch.save(state, path)
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu")
-    
     if hasattr(model, "module"):
         model.module.load_state_dict(ckpt["model"])
     else:
         model.load_state_dict(ckpt["model"])
-    
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
-    
     if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
-    
     return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
+
+def create_dashboard(progress, metrics, epoch, max_epoch, last_msg):
+    table = Table(show_header=True, header_style="bold magenta", expand=True)
+    table.add_column("Metric", style="cyan", no_wrap=True)
+    table.add_column("Value", justify="right", style="green")
+    table.add_column("Epoch Avg", justify="right", style="yellow")
+
+    keys = ["loss", "rmse", "l1_loss", "crps_loss", "grad_norm", "lr"]
+    display_names = ["Total Loss", "RMSE", "L1 Loss", "CRPS", "Grad Norm", "Learning Rate"]
+
+    for key, name in zip(keys, display_names):
+        curr_val = metrics.get(key, 0.0)
+        avg_val = metrics.get(f"avg_{key}", 0.0)
+        
+        fmt = "{:.6f}" if key == "lr" else "{:.4f}"
+        table.add_row(name, fmt.format(curr_val), fmt.format(avg_val))
+
+    status_panel = Panel(
+        Text(last_msg, style="bold white"),
+        title="[bold blue]System Status",
+        border_style="blue",
+        padding=(1, 2)
+    )
+
+    metrics_panel = Panel(
+        table,
+        title=f"[bold cyan]Training Metrics (Epoch {epoch}/{max_epoch})",
+        border_style="cyan"
+    )
+
+    return Group(
+        Panel(progress, title="[bold green]Progress", border_style="green"),
+        metrics_panel,
+        status_panel
+    )
 
 def train(cfg):
     dist.init_process_group(backend="nccl")
@@ -242,15 +230,11 @@ def train(cfg):
     torch.cuda.set_device(local_rank)
     
     set_seed(42 + rank)
-    
     logger = setup_logging(cfg["logging"]["log_path"], rank)
     
     if rank == 0:
-        logger.info("=" * 70)
-        logger.info("UniPhy Training")
-        logger.info(f"World Size: {world_size}")
-        logger.info("=" * 70)
-    
+        logger.info(f"Training started on {world_size} GPUs")
+
     if cfg["train"]["use_tf32"]:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -280,12 +264,7 @@ def train(cfg):
         max_growth_rate=cfg["model"]["max_growth_rate"],
     ).cuda()
     
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    
-    if rank == 0:
-        print_model_summary(model.module, cfg, rank)
-        total_params, trainable_params, _ = get_model_info(model.module)
-        logger.info(f"Model Parameters: {format_params(total_params)} (Trainable: {format_params(trainable_params)})")
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
     train_dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -314,10 +293,6 @@ def train(cfg):
         prefetch_factor=2,
         drop_last=True,
     )
-    
-    if rank == 0:
-        logger.info(f"Dataset Size: {len(train_dataset)} samples")
-        logger.info(f"Batches per Epoch: {len(train_loader)}")
     
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -351,114 +326,129 @@ def train(cfg):
     save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
     
     os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
-    os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
     
-    for epoch in range(start_epoch, epochs):
-        train_sampler.set_epoch(epoch)
-        model.train()
-        
-        if rank == 0:
-            progress = Progress(
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TaskProgressColumn(),
-                TimeRemainingColumn(),
-                console=console,
-            )
-            task = progress.add_task(f"Epoch {epoch + 1}/{epochs}", total=len(train_loader))
-            progress.start()
-        
-        epoch_metrics = {
-            "loss": 0.0,
-            "l1_loss": 0.0,
-            "crps_loss": 0.0,
-            "mse": 0.0,
-            "rmse": 0.0,
-            "mae": 0.0,
-            "grad_norm": 0.0,
-            "ensemble_std": 0.0,
-        }
-        num_batches = 0
-        optimizer.zero_grad(set_to_none=True)
-        
-        for batch_idx, batch in enumerate(train_loader):
-            metrics = train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
-            
-            for key in epoch_metrics:
-                if key in metrics:
-                    epoch_metrics[key] += metrics[key]
-            num_batches += 1
-            global_step += 1
-            
-            if scheduler is not None and (batch_idx + 1) % grad_accum_steps == 0:
-                scheduler.step()
-            
-            if rank == 0:
-                progress.update(task, advance=1)
-                
-                if (batch_idx + 1) % log_every == 0:
-                    current_lr = optimizer.param_groups[0]["lr"]
-                    logger.info(
-                        f"[{epoch + 1}/{epochs}][{batch_idx + 1}/{len(train_loader)}] "
-                        f"Loss: {metrics['loss']:.4f} | "
-                        f"L1: {metrics['l1_loss']:.4f} | "
-                        f"CRPS: {metrics['crps_loss']:.4f} | "
-                        f"RMSE: {metrics['rmse']:.4f} | "
-                        f"LR: {current_lr:.2e}"
-                    )
-                
-                if cfg["logging"]["use_wandb"]:
-                    wandb.log({
-                        "train/loss": metrics["loss"],
-                        "train/l1_loss": metrics["l1_loss"],
-                        "train/crps_loss": metrics["crps_loss"],
-                        "train/mse": metrics["mse"],
-                        "train/rmse": metrics["rmse"],
-                        "train/mae": metrics["mae"],
-                        "train/ensemble_std": metrics["ensemble_std"],
-                        "train/grad_norm": metrics["grad_norm"],
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/epoch": epoch,
-                    }, step=global_step)
-                
-                if save_interval > 0 and (batch_idx + 1) % save_interval == 0:
-                    ckpt_path = os.path.join(
-                        cfg["logging"]["ckpt_dir"],
-                        f"ckpt_e{epoch + 1}_s{global_step}.pt"
-                    )
-                    save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, ckpt_path)
-                    logger.info(f"Saved checkpoint: {ckpt_path}")
-        
-        if rank == 0:
-            progress.stop()
-            
-            for key in epoch_metrics:
-                epoch_metrics[key] /= max(num_batches, 1)
-            
-            logger.info(
-                f"Epoch {epoch + 1}/{epochs} Summary: "
-                f"Loss: {epoch_metrics['loss']:.4f} | "
-                f"RMSE: {epoch_metrics['rmse']:.4f} | "
-                f"MAE: {epoch_metrics['mae']:.4f}"
-            )
-            
-            ckpt_path = os.path.join(
-                cfg["logging"]["ckpt_dir"],
-                f"ckpt_epoch{epoch + 1}.pt"
-            )
-            save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, ckpt_path)
-            logger.info(f"Saved epoch checkpoint: {ckpt_path}")
-        
-        dist.barrier()
+    last_msg = "Initializing..."
     
     if rank == 0:
-        final_ckpt_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
-        save_checkpoint(model, optimizer, scheduler, epochs, global_step, cfg, final_ckpt_path)
-        logger.info(f"Training completed. Final checkpoint: {final_ckpt_path}")
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=None),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        )
+        task_epoch = progress.add_task("[bold]Training...", total=len(train_loader) * epochs)
+    
+    display_metrics = {}
+
+    if rank == 0:
+        live = Live(
+            create_dashboard(progress, display_metrics, start_epoch + 1, epochs, last_msg),
+            refresh_per_second=10,
+            console=console
+        )
+        live.start()
+
+    try:
+        for epoch in range(start_epoch, epochs):
+            train_sampler.set_epoch(epoch)
+            model.train()
+            
+            epoch_accum = {
+                "loss": 0.0, "l1_loss": 0.0, "crps_loss": 0.0,
+                "rmse": 0.0, "grad_norm": 0.0
+            }
+            num_batches = 0
+            optimizer.zero_grad(set_to_none=True)
+            
+            for batch_idx, batch in enumerate(train_loader):
+                metrics = train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
+                
+                for key in epoch_accum:
+                    if key in metrics:
+                        epoch_accum[key] += metrics[key]
+                num_batches += 1
+                global_step += 1
+                
+                if scheduler is not None and (batch_idx + 1) % grad_accum_steps == 0:
+                    scheduler.step()
+                
+                if rank == 0:
+                    progress.update(task_epoch, advance=1, description=f"Epoch {epoch + 1}/{epochs}")
+                    
+                    if (batch_idx + 1) % log_every == 0:
+                        current_lr = optimizer.param_groups[0]["lr"]
+                        display_metrics = {
+                            "loss": metrics["loss"],
+                            "l1_loss": metrics["l1_loss"],
+                            "crps_loss": metrics["crps_loss"],
+                            "rmse": metrics["rmse"],
+                            "grad_norm": metrics["grad_norm"],
+                            "lr": current_lr,
+                            "avg_loss": epoch_accum["loss"] / num_batches,
+                            "avg_l1_loss": epoch_accum["l1_loss"] / num_batches,
+                            "avg_crps_loss": epoch_accum["crps_loss"] / num_batches,
+                            "avg_rmse": epoch_accum["rmse"] / num_batches,
+                            "avg_grad_norm": epoch_accum["grad_norm"] / num_batches,
+                        }
+                        
+                        live.update(create_dashboard(progress, display_metrics, epoch + 1, epochs, last_msg))
+
+                        logger.info(
+                            f"E{epoch+1} B{batch_idx+1} | "
+                            f"Loss: {metrics['loss']:.4f} | "
+                            f"L1: {metrics['l1_loss']:.4f} | "
+                            f"RMSE: {metrics['rmse']:.4f}"
+                        )
+                    
+                    if cfg["logging"]["use_wandb"]:
+                        wandb.log({
+                            "train/loss": metrics["loss"],
+                            "train/l1_loss": metrics["l1_loss"],
+                            "train/crps_loss": metrics["crps_loss"],
+                            "train/mse": metrics["mse"],
+                            "train/rmse": metrics["rmse"],
+                            "train/mae": metrics["mae"],
+                            "train/ensemble_std": metrics["ensemble_std"],
+                            "train/grad_norm": metrics["grad_norm"],
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/epoch": epoch,
+                        }, step=global_step)
+                    
+                    if save_interval > 0 and (batch_idx + 1) % save_interval == 0:
+                        ckpt_path = os.path.join(
+                            cfg["logging"]["ckpt_dir"],
+                            f"ckpt_e{epoch + 1}_s{global_step}.pt"
+                        )
+                        save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, ckpt_path)
+                        last_msg = f"Checkpointed: {os.path.basename(ckpt_path)} at Step {global_step}"
+                        logger.info(f"Saved checkpoint: {ckpt_path}")
+            
+            if rank == 0:
+                epoch_path = os.path.join(cfg["logging"]["ckpt_dir"], f"ckpt_epoch{epoch + 1}.pt")
+                save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, epoch_path)
+                last_msg = f"Epoch {epoch + 1} Completed. Saved: {os.path.basename(epoch_path)}"
+                logger.info(f"Epoch {epoch + 1} finished. Saved checkpoint.")
+
+            dist.barrier()
         
-        if cfg["logging"]["use_wandb"]:
-            wandb.finish()
+        if rank == 0:
+            final_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
+            save_checkpoint(model, optimizer, scheduler, epochs, global_step, cfg, final_path)
+            last_msg = "Training Completed Successfully."
+            live.update(create_dashboard(progress, display_metrics, epochs, epochs, last_msg))
+            logger.info("Training completed.")
+            if cfg["logging"]["use_wandb"]:
+                wandb.finish()
+            live.stop()
+
+    except Exception as e:
+        if rank == 0:
+            live.stop()
+            console.print_exception()
+            logger.error(f"Exception: {str(e)}", exc_info=True)
+        raise e
     
     train_dataset.cleanup()
     dist.destroy_process_group()
