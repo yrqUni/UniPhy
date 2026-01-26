@@ -133,23 +133,20 @@ class UniPhyBlock(nn.Module):
             dt_expanded = dt
 
         op_decay, op_forcing = self.prop.get_transition_operators(dt_expanded)
-        op_decay = op_decay.view(B, T, 1, 1, D)
-        op_forcing = op_forcing.view(B, T, 1, 1, D)
-
-        u_t = forcing * op_forcing
-
-        h_prev_reshaped = h_prev.reshape(B, H, W, D) if h_prev is not None else torch.zeros(B, H, W, D, device=device, dtype=x.dtype)
-        h_prev_expanded = h_prev_reshaped.unsqueeze(1)
-
-        A_time = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
+        op_decay_expanded = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        op_forcing_expanded = op_forcing.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        
+        u_t = forcing * op_forcing_expanded
+        A_time = op_decay_expanded.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X_time = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
-
+        
         Y_time = pscan(A_time, X_time)
-
         u_out = Y_time.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
 
-        h_init_contrib = h_prev_expanded * op_decay
-        u_out = u_out + h_init_contrib
+        if h_prev is not None:
+            h_prev_reshaped = h_prev.reshape(B, H, W, D)
+            h_init_contrib = h_prev_reshaped.unsqueeze(1) * op_decay_expanded
+            u_out = u_out + h_init_contrib
 
         self.last_h_state = u_out[:, -1].detach().reshape(B * H * W, 1, D)
         self.last_flux_state = flux_seq[:, -1].detach()
