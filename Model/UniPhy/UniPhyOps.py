@@ -291,6 +291,28 @@ class RiemannianCliffordConv2d(nn.Module):
             nn.Sigmoid()
         )
 
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        y_e0 = self.conv_e0(x)
+        y_e1 = self.conv_e1(x)
+        y_e2 = self.conv_e2(x)
+        y_e12 = self.conv_e12(x)
+
+        cos_lat = self.cos_lat
+        if H != self.cos_lat.shape[2]:
+            cos_lat = F.interpolate(cos_lat, size=(H, 1), mode="bilinear", align_corners=False)
+        cos_lat = cos_lat.expand(B, -1, H, W)
+
+        y_e1_scaled = y_e1 * cos_lat
+        y_e12_scaled = y_e12 * cos_lat
+
+        out = y_e0 + y_e1_scaled + y_e2 + y_e12_scaled
+        out = out * self.metric_scale
+        out = out + self.bias.view(1, -1, 1, 1)
+
+        return out
+
 
 class SphericalPositionEmbedding(nn.Module):
     def __init__(self, dim, h_dim, w_dim):
