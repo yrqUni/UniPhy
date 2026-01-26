@@ -29,10 +29,9 @@ train:
   grad_clip: 1.0
   grad_accum_steps: 1
   ensemble_size: 3
+  ensemble_weight: 0.5
   use_scheduler: false
   use_tf32: true
-  energy_penalty_weight: 0.1
-  spectral_loss_weight: 0.05
 
 logging:
   log_every: 1
@@ -45,4 +44,4 @@ logging:
   wandb_project: "ERA5"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
-  
+
