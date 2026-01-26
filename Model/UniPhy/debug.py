@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import sys
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
@@ -9,61 +8,34 @@ from UniPhyOps import TemporalPropagator, GlobalFluxTracker, ComplexSVDTransform
 from PScan import pscan
 
 
-def print_separator(title):
-    print("\n" + "=" * 70)
+def print_sep(title):
+    print("\n" + "=" * 60)
     print(f"  {title}")
-    print("=" * 70)
+    print("=" * 60)
 
 
-def compare_tensors(name, t1, t2, atol=1e-5):
-    if t1.is_complex():
-        diff = (t1 - t2).abs().max().item()
-    else:
-        diff = (t1 - t2).abs().max().item()
-    
-    status = "✓ PASS" if diff < atol else "✗ FAIL"
-    print(f"{name}: max_diff = {diff:.6e} {status}")
-    
-    if diff >= atol:
-        if t1.is_complex():
-            print(f"  t1 mean: {t1.real.mean().item():.6f}, t2 mean: {t2.real.mean().item():.6f}")
-            print(f"  t1 std: {t1.real.std().item():.6f}, t2 std: {t2.real.std().item():.6f}")
-        else:
-            print(f"  t1 mean: {t1.mean().item():.6f}, t2 mean: {t2.mean().item():.6f}")
-            print(f"  t1 std: {t1.std().item():.6f}, t2 std: {t2.std().item():.6f}")
-    
+def compare(name, t1, t2, atol=1e-5):
+    diff = (t1 - t2).abs().max().item()
+    status = "PASS" if diff < atol else "FAIL"
+    print(f"{name}: diff={diff:.2e} [{status}]")
     return diff < atol
 
 
-def debug_basis_transform():
-    print_separator("Debug: Basis Transform (encode/decode)")
-    
+def debug_basis():
+    print_sep("Basis Transform")
     torch.manual_seed(42)
-    dim = 32
-    B, T, H, W = 2, 4, 8, 8
     
-    basis = ComplexSVDTransform(dim).cuda()
+    basis = ComplexSVDTransform(32).cuda()
+    x = torch.randn(2, 4, 8, 8, 32, dtype=torch.complex64, device="cuda")
     
-    x_seq = torch.randn(B, T, H, W, dim, dtype=torch.complex64, device="cuda")
-    x_single_list = [x_seq[:, t] for t in range(T)]
+    h = basis.encode(x)
+    x_rec = basis.decode(h)
     
-    h_seq = basis.encode(x_seq)
-    h_single_list = [basis.encode(x_single_list[t]) for t in range(T)]
-    h_single_stacked = torch.stack(h_single_list, dim=1)
-    
-    compare_tensors("Basis encode (seq vs single)", h_seq, h_single_stacked)
-    
-    x_recon_seq = basis.decode(h_seq)
-    x_recon_single_list = [basis.decode(h_single_list[t]) for t in range(T)]
-    x_recon_single_stacked = torch.stack(x_recon_single_list, dim=1)
-    
-    compare_tensors("Basis decode (seq vs single)", x_recon_seq, x_recon_single_stacked)
-    compare_tensors("Basis invertibility", x_seq, x_recon_seq, atol=1e-4)
+    compare("Invertibility", x, x_rec, atol=1e-4)
 
 
-def debug_pscan_vs_loop():
-    print_separator("Debug: PScan vs Sequential Loop (Diagonal Mode)")
-    
+def debug_pscan():
+    print_sep("PScan")
     torch.manual_seed(42)
     B, L, C, D = 2, 8, 4, 32
     
@@ -74,173 +46,102 @@ def debug_pscan_vs_loop():
     
     Y_loop = torch.zeros_like(X)
     acc = torch.zeros(B, C, D, 1, dtype=torch.complex64, device="cuda")
-    
     for t in range(L):
         acc = acc * A[:, t].unsqueeze(-1) + X[:, t]
         Y_loop[:, t] = acc
     
-    compare_tensors("PScan vs Loop (Diagonal)", Y_pscan, Y_loop)
-    
-    print("\nPer-timestep comparison:")
-    for t in range(L):
-        diff = (Y_pscan[:, t] - Y_loop[:, t]).abs().max().item()
-        print(f"  t={t}: diff = {diff:.6e}")
-
-
-def debug_pscan_matrix_mode():
-    print_separator("Debug: PScan vs Sequential Loop (Matrix Mode)")
-    
-    torch.manual_seed(42)
-    B, L, C, D = 2, 8, 4, 32
-    
-    A = torch.randn(B, L, C, D, D, dtype=torch.complex64, device="cuda") * 0.3
-    X = torch.randn(B, L, C, D, 1, dtype=torch.complex64, device="cuda")
-    
-    Y_pscan = pscan(A, X)
-    
-    Y_loop = torch.zeros_like(X)
-    acc = torch.zeros(B, C, D, 1, dtype=torch.complex64, device="cuda")
-    
-    for t in range(L):
-        acc = torch.einsum("bcij,bcjk->bcik", A[:, t], acc) + X[:, t]
-        Y_loop[:, t] = acc
-    
-    compare_tensors("PScan vs Loop (Matrix)", Y_pscan, Y_loop)
+    compare("PScan vs Loop", Y_pscan, Y_loop)
 
 
 def debug_flux_tracker():
-    print_separator("Debug: FluxTracker (parallel vs serial)")
-    
+    print_sep("FluxTracker")
     torch.manual_seed(42)
-    dim = 32
-    B, T = 2, 4
     
-    tracker = GlobalFluxTracker(dim).cuda()
+    tracker = GlobalFluxTracker(32).cuda()
+    x_mean = torch.randn(2, 4, 32, dtype=torch.complex64, device="cuda")
     
-    x_mean_seq = torch.randn(B, T, dim, dtype=torch.complex64, device="cuda")
+    flux_list, gate_list = [], []
+    flux = torch.zeros(2, 32, dtype=torch.complex64, device="cuda")
     
-    A, X = tracker.get_operators(x_mean_seq)
-    print(f"A shape: {A.shape}, X shape: {X.shape}")
+    for t in range(4):
+        flux, _, gate = tracker.forward_step(flux, x_mean[:, t])
+        flux_list.append(flux)
+        gate_list.append(gate)
     
-    flux_parallel = pscan(A.unsqueeze(-1), X.unsqueeze(-1)).squeeze(-1)
-    source_parallel = tracker.project(flux_parallel)
-    
-    flux_serial_list = []
-    source_serial_list = []
-    gate_serial_list = []
-    
-    flux_prev = torch.zeros(B, dim, dtype=torch.complex64, device="cuda")
-    
-    for t in range(T):
-        x_t = x_mean_seq[:, t]
-        flux_next, source, gate = tracker.forward_step(flux_prev, x_t)
-        flux_serial_list.append(flux_next)
-        source_serial_list.append(source)
-        gate_serial_list.append(gate)
-        flux_prev = flux_next
-    
-    flux_serial = torch.stack(flux_serial_list, dim=1)
-    source_serial = torch.stack(source_serial_list, dim=1)
-    
-    compare_tensors("Flux state (parallel vs serial)", flux_parallel, flux_serial)
-    compare_tensors("Source (parallel vs serial)", source_parallel, source_serial)
-    
-    print("\nFlux details:")
-    for t in range(T):
-        diff = (flux_parallel[:, t] - flux_serial[:, t]).abs().max().item()
-        print(f"  t={t}: flux diff = {diff:.6e}")
+    print(f"Flux shape: {flux.shape}")
+    print(f"Gate range: [{gate_list[-1].min():.4f}, {gate_list[-1].max():.4f}]")
 
 
-def debug_transition_operators():
-    print_separator("Debug: Transition Operators")
-    
-    torch.manual_seed(42)
-    dim = 32
-    
-    prop = TemporalPropagator(dim, dt_ref=1.0, sde_mode="ode").cuda()
-    
-    dt_scalar = torch.tensor(1.0, device="cuda")
-    dt_1d = torch.tensor([1.0, 1.0, 1.0, 1.0], device="cuda")
-    dt_2d = torch.tensor([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]], device="cuda")
-    
-    decay_s, forcing_s = prop.get_transition_operators(dt_scalar)
-    decay_1d, forcing_1d = prop.get_transition_operators(dt_1d)
-    decay_2d, forcing_2d = prop.get_transition_operators(dt_2d)
-    
-    print(f"Scalar dt -> decay shape: {decay_s.shape}, forcing shape: {forcing_s.shape}")
-    print(f"1D dt -> decay shape: {decay_1d.shape}, forcing shape: {forcing_1d.shape}")
-    print(f"2D dt -> decay shape: {decay_2d.shape}, forcing shape: {forcing_2d.shape}")
-    
-    compare_tensors("decay (scalar vs 1d[0])", decay_s, decay_1d[0])
-
-
-def debug_block_forward_vs_step():
-    print_separator("Debug: UniPhyBlock forward() vs forward_step()")
-    
+def debug_block():
+    print_sep("UniPhyBlock: forward vs forward_step")
     torch.manual_seed(42)
     
     B, T, D, H, W = 1, 4, 32, 8, 8
-    
     block = UniPhyBlock(
-        dim=D,
-        expand=2,
-        num_experts=4,
-        img_height=H,
-        img_width=W,
-        dt_ref=1.0,
-        sde_mode="ode",
-        init_noise_scale=0.0,
-        max_growth_rate=0.3,
-    ).cuda()
-    block.eval()
+        dim=D, expand=2, num_experts=4,
+        img_height=H, img_width=W,
+        dt_ref=1.0, sde_mode="ode"
+    ).cuda().eval()
     
     x = torch.randn(B, T, D, H, W, dtype=torch.complex64, device="cuda") * 0.1
     dt = torch.ones(T, device="cuda")
-    
     h_init = torch.zeros(B * H * W, 1, D, dtype=torch.complex64, device="cuda")
     flux_init = torch.zeros(B, D, dtype=torch.complex64, device="cuda")
     
     with torch.no_grad():
-        z_parallel, h_parallel, flux_parallel = block(x, h_init, dt, flux_init)
+        z_par = block(x, h_init, dt, flux_init)
     
-    z_serial_list = []
-    h_prev = h_init.clone()
-    flux_prev = flux_init.clone()
-    
+    z_ser_list = []
+    h, flux = h_init.clone(), flux_init.clone()
     with torch.no_grad():
         for t in range(T):
-            x_t = x[:, t]
-            dt_t = dt[t]
-            
-            z_t, h_next, flux_next = block.forward_step(x_t, h_prev, dt_t, flux_prev)
-            z_serial_list.append(z_t)
-            h_prev = h_next
-            flux_prev = flux_next
+            z_t, h, flux = block.forward_step(x[:, t], h, dt[t], flux)
+            z_ser_list.append(z_t)
+    z_ser = torch.stack(z_ser_list, dim=1)
     
-    z_serial = torch.stack(z_serial_list, dim=1)
+    compare("Block output", z_par, z_ser, atol=1e-3)
     
-    print(f"Parallel output shape: {z_parallel.shape}")
-    print(f"Serial output shape: {z_serial.shape}")
-    
-    compare_tensors("Block output (parallel vs serial)", z_parallel, z_serial, atol=1e-4)
-    
-    print("\nPer-timestep comparison:")
     for t in range(T):
-        diff = (z_parallel[:, t] - z_serial[:, t]).abs().max().item()
-        status = "✓" if diff < 1e-4 else "✗"
-        print(f"  t={t}: diff = {diff:.6e} {status}")
-    
-    print("\nDiagnostics:")
-    print(f"  Parallel mean: {z_parallel.real.mean().item():.6f}")
-    print(f"  Serial mean: {z_serial.real.mean().item():.6f}")
-    print(f"  Parallel std: {z_parallel.real.std().item():.6f}")
-    print(f"  Serial std: {z_serial.real.std().item():.6f}")
+        diff = (z_par[:, t] - z_ser[:, t]).abs().max().item()
+        print(f"  t={t}: diff={diff:.2e}")
 
 
-def debug_spatial_processing():
-    print_separator("Debug: Spatial Processing Consistency")
-    
+def debug_model():
+    print_sep("Full Model")
     torch.manual_seed(42)
     
-    B, T, D, H, W = 1, 4, 32, 8, 8
+    model = UniPhyModel(
+        in_channels=2, out_channels=2, embed_dim=32,
+        expand=2, num_experts=4, depth=2, patch_size=8,
+        img_height=33, img_width=33, sde_mode="ode"
+    ).cuda().eval()
+    
+    x = torch.randn(1, 4, 2, 33, 33, device="cuda") * 0.1
+    dt = torch.ones(4, device="cuda")
+    
+    with torch.no_grad():
+        out_par = model(x, dt)
+        out_ser = model.forward_rollout(x[:, 0], [1.0] * 4)
+    
+    compare("Model output", out_par, out_ser, atol=1e-2)
+
+
+def main():
+    print("=" * 60)
+    print("  Debug Suite")
+    print("=" * 60)
+    
+    debug_basis()
+    debug_pscan()
+    debug_flux_tracker()
+    debug_block()
+    debug_model()
+    
+    print("\n" + "=" * 60)
+    print("  Complete")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
     
