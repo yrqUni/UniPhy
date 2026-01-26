@@ -18,6 +18,9 @@ def compare(name, t1, t2, atol=1e-5):
     diff = (t1 - t2).abs().max().item()
     status = "PASS" if diff < atol else "FAIL"
     print(f"{name}: diff={diff:.2e} [{status}]")
+    if diff >= atol:
+        print(f"  t1: mean={t1.real.mean():.4f}, std={t1.real.std():.4f}")
+        print(f"  t2: mean={t2.real.mean():.4f}, std={t2.real.std():.4f}")
     return diff < atol
 
 
@@ -50,7 +53,13 @@ def debug_pscan():
         acc = acc * A[:, t].unsqueeze(-1) + X[:, t]
         Y_loop[:, t] = acc
     
-    compare("PScan vs Loop", Y_pscan, Y_loop)
+    passed = compare("PScan vs Loop", Y_pscan, Y_loop)
+    
+    if not passed:
+        print("\n  Per-timestep analysis:")
+        for t in range(min(3, L)):
+            diff_t = (Y_pscan[:, t] - Y_loop[:, t]).abs().max().item()
+            print(f"    t={t}: diff={diff_t:.2e}")
 
 
 def debug_flux_tracker():
@@ -89,7 +98,7 @@ def debug_block():
     flux_init = torch.zeros(B, D, dtype=torch.complex64, device="cuda")
     
     with torch.no_grad():
-        z_par = block(x, h_init, dt, flux_init)
+        z_par, _, _ = block(x, h_init, dt, flux_init)
     
     z_ser_list = []
     h, flux = h_init.clone(), flux_init.clone()
@@ -99,11 +108,13 @@ def debug_block():
             z_ser_list.append(z_t)
     z_ser = torch.stack(z_ser_list, dim=1)
     
-    compare("Block output", z_par, z_ser, atol=1e-3)
+    passed = compare("Block output", z_par, z_ser, atol=1e-3)
     
-    for t in range(T):
-        diff = (z_par[:, t] - z_ser[:, t]).abs().max().item()
-        print(f"  t={t}: diff={diff:.2e}")
+    if not passed:
+        print("\n  Per-timestep analysis:")
+        for t in range(T):
+            diff = (z_par[:, t] - z_ser[:, t]).abs().max().item()
+            print(f"    t={t}: diff={diff:.2e}")
 
 
 def debug_model():
