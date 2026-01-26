@@ -152,9 +152,11 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     if ensemble_size > 1 and ensemble_weight > 0:
         ensemble_preds = [out_real.detach()]
         
+        infer_model = model.module if hasattr(model, "module") else model
+        
         with torch.no_grad():
             for _ in range(ensemble_size - 1):
-                out_ens = model(x_input, dt_input)
+                out_ens = infer_model(x_input, dt_input)
                 if out_ens.is_complex():
                     ensemble_preds.append(out_ens.real.contiguous())
                 else:
