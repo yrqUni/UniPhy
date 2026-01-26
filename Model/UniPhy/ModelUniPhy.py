@@ -311,6 +311,7 @@ class UniPhyModel(nn.Module):
 
         return out
 
+    @torch.no_grad()
     def forward_rollout(self, x_init, dt_list, num_steps=None):
         if num_steps is None:
             num_steps = len(dt_list)

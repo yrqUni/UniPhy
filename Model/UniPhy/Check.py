@@ -432,7 +432,7 @@ def check_forecast_mode():
 
     model.eval()
     with torch.no_grad():
-        predictions = model.forecast(x_cond, dt_cond, k_steps, dt_future)
+        predictions = model.forward_rollout(x_cond, dt_cond, k_steps, dt_future)
 
     print(f"Conditioning Input Shape: {x_cond.shape}")
     print(f"Forecast Steps: {k_steps}")
