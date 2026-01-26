@@ -101,7 +101,9 @@ class UniPhyBlock(nn.Module):
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=device, dtype=x.dtype)
 
-        flux_list, source_list, gate_list = [], [], []
+        flux_list = []
+        source_list = []
+        gate_list = []
         current_flux = flux_prev
 
         for t in range(T):
@@ -136,7 +138,9 @@ class UniPhyBlock(nn.Module):
         if h_prev is not None:
             h_reshaped = h_prev.reshape(B, H, W, D)
             h_contrib_t0 = h_reshaped * op_decay[:, 0]
-            u_t[:, 0] = u_t[:, 0] + h_contrib_t0
+            u_t_list = list(torch.unbind(u_t, dim=1))
+            u_t_list[0] = u_t_list[0] + h_contrib_t0
+            u_t = torch.stack(u_t_list, dim=1)
 
         A = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
