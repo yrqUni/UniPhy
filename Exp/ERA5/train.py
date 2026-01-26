@@ -280,7 +280,7 @@ def train(cfg):
         max_growth_rate=cfg["model"]["max_growth_rate"],
     ).cuda()
     
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
     if rank == 0:
         print_model_summary(model.module, cfg, rank)
