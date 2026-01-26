@@ -659,6 +659,81 @@ def check_energy_conservation():
 
     return passed
 
+def check_forecast_forward_consistency():
+    print_section("Testing Forecast vs Forward Consistency")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    B, T, C, H, W = 1, 6, 2, 32, 32
+    cond_frames = 4
+    pred_frames = 2
+    dt_ref = 6.0
+
+    model = UniPhyModel(
+        in_channels=C,
+        out_channels=C,
+        embed_dim=16,
+        expand=2,
+        num_experts=2,
+        depth=2,
+        patch_size=8,
+        img_height=H,
+        img_width=W,
+        dt_ref=dt_ref,
+        sde_mode="det",
+        max_growth_rate=0.3,
+    ).to(device)
+
+    model.eval()
+
+    x_full = torch.randn(B, T, C, H, W, device=device)
+    x_cond = x_full[:, :cond_frames]
+    x_future_target = x_full[:, cond_frames:]
+
+    dt_full = torch.ones(T, device=device) * dt_ref
+    dt_cond = torch.ones(cond_frames, device=device) * dt_ref
+    dt_future = torch.ones(pred_frames, device=device) * dt_ref
+
+    with torch.no_grad():
+        out_forward = model(x_full, dt_full)
+
+        pred_forecast = model.forecast(x_cond, dt_cond, pred_frames, dt_future)
+
+    print(f"Forward Input Shape: {x_full.shape}")
+    print(f"Forward Output Shape: {out_forward.shape}")
+    print(f"Forecast Cond Shape: {x_cond.shape}")
+    print(f"Forecast Output Shape: {pred_forecast.shape}")
+    print(f"Expected Forecast Shape: ({B}, {pred_frames}, {C}, {H}, {W})")
+
+    shape_ok = pred_forecast.shape == (B, pred_frames, C, H, W)
+
+    with torch.no_grad():
+        pred_forecast_2 = model.forecast(x_cond, dt_cond, pred_frames, dt_future)
+
+    if pred_forecast.is_complex():
+        diff_deterministic = (pred_forecast.real - pred_forecast_2.real).abs().max().item()
+    else:
+        diff_deterministic = (pred_forecast - pred_forecast_2).abs().max().item()
+
+    print(f"Deterministic Check (same input twice): {diff_deterministic:.2e}")
+
+    deterministic_ok = diff_deterministic < 1e-5
+
+    has_nan = torch.isnan(pred_forecast.real if pred_forecast.is_complex() else pred_forecast).any().item()
+    has_inf = torch.isinf(pred_forecast.real if pred_forecast.is_complex() else pred_forecast).any().item()
+
+    print(f"Forecast has NaN: {has_nan}")
+    print(f"Forecast has Inf: {has_inf}")
+
+    numerical_ok = not has_nan and not has_inf
+
+    passed = shape_ok and deterministic_ok and numerical_ok
+    print(f"Shape OK: {shape_ok}")
+    print(f"Deterministic OK: {deterministic_ok}")
+    print(f"Numerical OK: {numerical_ok}")
+    print(f"Test Passed: {passed}")
+    print()
+
+    return passed
 
 def run_all_checks():
     print("=" * 60)
@@ -682,6 +757,7 @@ def run_all_checks():
     results["full_model_forward"] = check_full_model_forward()
     results["gradient_flow"] = check_gradient_flow()
     results["forecast_mode"] = check_forecast_mode()
+    results["forecast_forward_consistency"] = check_forecast_forward_consistency()
     results["model_consistency"] = check_model_consistency()
     results["energy_conservation"] = check_energy_conservation()
 
@@ -703,7 +779,6 @@ def run_all_checks():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
 
 if __name__ == "__main__":
     run_all_checks()
