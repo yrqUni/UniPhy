@@ -301,6 +301,7 @@ class UniPhyModel(nn.Module):
 
         return self.decoder(z)
 
+    @torch.no_grad()
     def forward_rollout(self, x_init, dt_list, num_steps=None):
         if num_steps is None:
             num_steps = len(dt_list)
@@ -311,7 +312,15 @@ class UniPhyModel(nn.Module):
         z = self.encoder(x_init.unsqueeze(1)).squeeze(1)
         dtype = z.dtype if z.dtype.is_complex else torch.complex64
 
-        states = self._init_states(B, device, dtype)
+        states = []
+        for _ in range(self.depth):
+            h_init = torch.zeros(
+                B * self.h_patches * self.w_patches, 1, self.embed_dim,
+                device=device, dtype=dtype
+            )
+            flux_init = torch.zeros(B, self.embed_dim, device=device, dtype=dtype)
+            states.append((h_init, flux_init))
+
         preds = []
 
         for k in range(num_steps):
@@ -324,7 +333,13 @@ class UniPhyModel(nn.Module):
                 new_states.append((h_next, flux_next))
 
             states = new_states
-            preds.append(self.decoder(z.unsqueeze(1)).squeeze(1))
+            
+            pred = self.decoder(z.unsqueeze(1)).squeeze(1)
+            
+            if pred.shape[-2:] != x_init.shape[-2:]:
+                pred = pred[..., :x_init.shape[-2], :x_init.shape[-1]]
+            
+            preds.append(pred)
 
         return torch.stack(preds, dim=1)
     
