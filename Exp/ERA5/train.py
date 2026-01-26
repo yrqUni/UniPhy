@@ -15,21 +15,15 @@ import yaml
 import time
 
 from rich.console import Console
-from rich.table import Table
-from rich.live import Live
-from rich.panel import Panel
 from rich.progress import (
     Progress,
-    SpinnerColumn,
-    BarColumn,
     TextColumn,
+    BarColumn,
+    TaskProgressColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
+    MofNCompleteColumn,
 )
-from rich.layout import Layout
-from rich.console import Group
-from rich.style import Style
-from rich.text import Text
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
@@ -187,41 +181,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
         scheduler.load_state_dict(ckpt["scheduler"])
     return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
 
-def create_dashboard(progress, metrics, epoch, max_epoch, last_msg):
-    table = Table(show_header=True, header_style="bold magenta", expand=True)
-    table.add_column("Metric", style="cyan", no_wrap=True)
-    table.add_column("Value", justify="right", style="green")
-    table.add_column("Epoch Avg", justify="right", style="yellow")
-
-    keys = ["loss", "rmse", "l1_loss", "crps_loss", "grad_norm", "lr"]
-    display_names = ["Total Loss", "RMSE", "L1 Loss", "CRPS", "Grad Norm", "Learning Rate"]
-
-    for key, name in zip(keys, display_names):
-        curr_val = metrics.get(key, 0.0)
-        avg_val = metrics.get(f"avg_{key}", 0.0)
-        
-        fmt = "{:.6f}" if key == "lr" else "{:.4f}"
-        table.add_row(name, fmt.format(curr_val), fmt.format(avg_val))
-
-    status_panel = Panel(
-        Text(last_msg, style="bold white"),
-        title="[bold blue]System Status",
-        border_style="blue",
-        padding=(1, 2)
-    )
-
-    metrics_panel = Panel(
-        table,
-        title=f"[bold cyan]Training Metrics (Epoch {epoch}/{max_epoch})",
-        border_style="cyan"
-    )
-
-    return Group(
-        Panel(progress, title="[bold green]Progress", border_style="green"),
-        metrics_panel,
-        status_panel
-    )
-
 def train(cfg):
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -328,80 +287,52 @@ def train(cfg):
     if rank == 0:
         os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
     
-    last_msg = "Initializing..."
-    
+    progress = None
     if rank == 0:
         progress = Progress(
-            SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=None),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
-        )
-        task_epoch = progress.add_task("[bold]Training...", total=len(train_loader) * epochs)
-    
-    display_metrics = {}
-
-    if rank == 0:
-        live = Live(
-            create_dashboard(progress, display_metrics, start_epoch + 1, epochs, last_msg),
-            refresh_per_second=10,
+            TextColumn("{task.speed:.2f} it/s"),
             console=console
         )
-        live.start()
+        progress.start()
+        # 总步数为 epoch * batches
+        task_id = progress.add_task("Training", total=len(train_loader) * epochs, completed=global_step)
 
     try:
         for epoch in range(start_epoch, epochs):
             train_sampler.set_epoch(epoch)
             model.train()
             
-            epoch_accum = {
-                "loss": 0.0, "l1_loss": 0.0, "crps_loss": 0.0,
-                "rmse": 0.0, "grad_norm": 0.0
-            }
-            num_batches = 0
             optimizer.zero_grad(set_to_none=True)
             
             for batch_idx, batch in enumerate(train_loader):
                 metrics = train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
                 
-                for key in epoch_accum:
-                    if key in metrics:
-                        epoch_accum[key] += metrics[key]
-                num_batches += 1
                 global_step += 1
                 
                 if scheduler is not None and (batch_idx + 1) % grad_accum_steps == 0:
                     scheduler.step()
                 
                 if rank == 0:
-                    progress.update(task_epoch, advance=1, description=f"Epoch {epoch + 1}/{epochs}")
+                    progress.update(task_id, advance=1)
                     
                     if (batch_idx + 1) % log_every == 0:
                         current_lr = optimizer.param_groups[0]["lr"]
-                        display_metrics = {
-                            "loss": metrics["loss"],
-                            "l1_loss": metrics["l1_loss"],
-                            "crps_loss": metrics["crps_loss"],
-                            "rmse": metrics["rmse"],
-                            "grad_norm": metrics["grad_norm"],
-                            "lr": current_lr,
-                            "avg_loss": epoch_accum["loss"] / num_batches,
-                            "avg_l1_loss": epoch_accum["l1_loss"] / num_batches,
-                            "avg_crps_loss": epoch_accum["crps_loss"] / num_batches,
-                            "avg_rmse": epoch_accum["rmse"] / num_batches,
-                            "avg_grad_norm": epoch_accum["grad_norm"] / num_batches,
-                        }
-                        
-                        live.update(create_dashboard(progress, display_metrics, epoch + 1, epochs, last_msg))
-
-                        logger.info(
-                            f"E{epoch+1} B{batch_idx+1} | "
+                        log_msg = (
+                            f"[E{epoch+1:03d} B{batch_idx+1:04d}] "
                             f"Loss: {metrics['loss']:.4f} | "
                             f"L1: {metrics['l1_loss']:.4f} | "
-                            f"RMSE: {metrics['rmse']:.4f}"
+                            f"CRPS: {metrics['crps_loss']:.4f} | "
+                            f"RMSE: {metrics['rmse']:.4f} | "
+                            f"LR: {current_lr:.2e}"
                         )
+                        progress.console.print(log_msg)
+                        logger.info(log_msg)
                     
                     if cfg["logging"]["use_wandb"]:
                         wandb.log({
@@ -423,13 +354,11 @@ def train(cfg):
                             f"ckpt_e{epoch + 1}_s{global_step}.pt"
                         )
                         save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, ckpt_path)
-                        last_msg = f"Checkpointed: {os.path.basename(ckpt_path)} at Step {global_step}"
                         logger.info(f"Saved checkpoint: {ckpt_path}")
             
             if rank == 0:
                 epoch_path = os.path.join(cfg["logging"]["ckpt_dir"], f"ckpt_epoch{epoch + 1}.pt")
                 save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, epoch_path)
-                last_msg = f"Epoch {epoch + 1} Completed. Saved: {os.path.basename(epoch_path)}"
                 logger.info(f"Epoch {epoch + 1} finished. Saved checkpoint.")
 
             dist.barrier()
@@ -437,16 +366,14 @@ def train(cfg):
         if rank == 0:
             final_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
             save_checkpoint(model, optimizer, scheduler, epochs, global_step, cfg, final_path)
-            last_msg = "Training Completed Successfully."
-            live.update(create_dashboard(progress, display_metrics, epochs, epochs, last_msg))
-            logger.info("Training completed.")
+            progress.console.print(f"[bold green]Training Completed. Final checkpoint: {final_path}")
             if cfg["logging"]["use_wandb"]:
                 wandb.finish()
-            live.stop()
+            progress.stop()
 
     except Exception as e:
-        if rank == 0:
-            live.stop()
+        if rank == 0 and progress is not None:
+            progress.stop()
             console.print_exception()
             logger.error(f"Exception: {str(e)}", exc_info=True)
         raise e
