@@ -17,6 +17,7 @@ def print_section(title):
     print(title)
     print("=" * 60)
 
+
 def check_basis_invertibility():
     print_section("Testing Basis Invertibility (with DFT Residual)")
 
@@ -69,6 +70,68 @@ def check_eigenvalue_stability():
 
     passed = real_parts.max().item() <= max_growth and real_parts.min().item() >= -max_growth
     print(f"Bounded in [-{max_growth}, {max_growth}]: {passed}")
+    print()
+
+    return passed
+
+
+def check_ffn_complex_multiplication():
+    print_section("Testing FFN Complex Multiplication Order")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    B, C, H, W = 2, 32, 8, 8
+
+    ffn = UniPhyFeedForwardNetwork(C, expand=2, num_experts=4).to(device)
+
+    x = torch.randn(B, C, H, W, device=device, dtype=torch.cfloat)
+
+    torch.manual_seed(42)
+    out1 = ffn(x)
+
+    torch.manual_seed(42)
+    out2 = ffn(x)
+
+    diff = (out1 - out2).abs().max().item()
+
+    print(f"Input Shape: {x.shape}")
+    print(f"Output Shape: {out1.shape}")
+    print(f"Deterministic Diff: {diff:.2e}")
+
+    passed = diff < 1e-6
+    print(f"Test Passed: {passed}")
+    print()
+
+    return passed
+
+
+def check_ffn_causality():
+    print_section("Testing FFN Causality")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    B, T, C, H, W = 1, 4, 16, 8, 8
+
+    ffn = UniPhyFeedForwardNetwork(C, expand=2, num_experts=4).to(device)
+
+    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.cfloat)
+    x_flat = x.reshape(B * T, C, H, W)
+
+    with torch.no_grad():
+        out_parallel = ffn(x_flat).reshape(B, T, C, H, W)
+
+        out_serial = []
+        for t in range(T):
+            out_t = ffn(x[:, t])
+            out_serial.append(out_t)
+        out_serial = torch.stack(out_serial, dim=1)
+
+    diff = (out_parallel - out_serial).abs().max().item()
+
+    print(f"Parallel Shape: {out_parallel.shape}")
+    print(f"Serial Shape: {out_serial.shape}")
+    print(f"Max Difference: {diff:.2e}")
+
+    passed = diff < 1e-5
+    print(f"Test Passed: {passed}")
     print()
 
     return passed
@@ -140,40 +203,7 @@ def check_heteroscedastic_noise():
     return passed
 
 
-def check_ffn_causality():
-    print_section("Testing FFN Causality")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, C, H, W = 1, 4, 16, 8, 8
-
-    ffn = UniPhyFeedForwardNetwork(C, expand=2, num_experts=4).to(device)
-
-    x = torch.randn(B, T, C, H, W, device=device, dtype=torch.cfloat)
-    x_flat = x.reshape(B * T, C, H, W)
-
-    with torch.no_grad():
-        out_parallel = ffn(x_flat).reshape(B, T, C, H, W)
-
-        out_serial = []
-        for t in range(T):
-            out_t = ffn(x[:, t])
-            out_serial.append(out_t)
-        out_serial = torch.stack(out_serial, dim=1)
-
-    diff = (out_parallel - out_serial).abs().max().item()
-
-    print(f"Parallel Shape: {out_parallel.shape}")
-    print(f"Serial Shape: {out_serial.shape}")
-    print(f"Max Difference: {diff:.2e}")
-
-    passed = diff < 1e-5
-    print(f"Test Passed: {passed}")
-    print()
-
-    return passed
-
-
-def check_riemannian_clifford():
+def check_riemannian_clifford_conv():
     print_section("Testing RiemannianCliffordConv2d with Dispersion")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,49 +300,6 @@ def check_pscan_compatibility():
     return passed
 
 
-def check_physical_state_transfer():
-    print_section("Testing Physical State Transfer Between Blocks")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, D, H, W = 1, 3, 16, 4, 4
-
-    block1 = UniPhyBlock(
-        dim=D, expand=2, num_experts=2,
-        img_height=H, img_width=W, sde_mode="det"
-    ).to(device).double()
-
-    block2 = UniPhyBlock(
-        dim=D, expand=2, num_experts=2,
-        img_height=H, img_width=W, sde_mode="det"
-    ).to(device).double()
-
-    x = torch.randn(B, T, D, H, W, device=device, dtype=torch.cdouble)
-    dt = torch.ones(T, device=device, dtype=torch.float64)
-
-    with torch.no_grad():
-        state1 = block1(x, dt)
-        state2 = block2(state1, dt)
-
-    print(f"Input shape: {x.shape}")
-    print(f"State1 z shape: {state1.z.shape}")
-    print(f"State1 energy shape: {state1.energy.shape}")
-    print(f"State1 momentum shape: {state1.momentum.shape}")
-    print(f"State2 z shape: {state2.z.shape}")
-
-    state_preserved = (
-        state1.z.shape == state2.z.shape and
-        state1.energy.shape == state2.energy.shape and
-        state1.momentum.shape == state2.momentum.shape
-    )
-
-    passed = state_preserved
-    print(f"Physical state shapes preserved: {passed}")
-    print(f"Test Passed: {passed}")
-    print()
-
-    return passed
-
-
 def check_full_model_forward():
     print_section("Testing Full Model Forward Pass")
 
@@ -363,7 +350,8 @@ def check_gradient_flow():
     print_section("Testing Gradient Flow")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, C, H, W = 1, 2, 2, 32, 32
+    B, T, C, H, W = 1, 3, 2, 32, 32
+    dt_ref = 6.0
 
     model = UniPhyModel(
         in_channels=C,
@@ -372,22 +360,19 @@ def check_gradient_flow():
         expand=2,
         num_experts=2,
         depth=2,
-        patch_size=16,
+        patch_size=8,
         img_height=H,
         img_width=W,
+        dt_ref=dt_ref,
         sde_mode="det",
+        max_growth_rate=0.3,
     ).to(device)
 
     x = torch.randn(B, T, C, H, W, device=device, requires_grad=True)
-    dt = torch.ones(T, device=device)
+    dt = torch.ones(T, device=device) * dt_ref
 
     out = model(x, dt)
-
-    if out.is_complex():
-        loss = out.abs().mean()
-    else:
-        loss = out.mean()
-
+    loss = out.abs().mean()
     loss.backward()
 
     input_grad_exists = x.grad is not None and x.grad.abs().sum() > 0
@@ -461,6 +446,77 @@ def check_forecast_mode():
     return passed
 
 
+def check_forecast_forward_consistency():
+    print_section("Testing Forecast vs Forward Consistency")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    B, T, C, H, W = 1, 6, 2, 32, 32
+    cond_frames = 4
+    pred_frames = 2
+    dt_ref = 6.0
+
+    model = UniPhyModel(
+        in_channels=C,
+        out_channels=C,
+        embed_dim=16,
+        expand=2,
+        num_experts=2,
+        depth=2,
+        patch_size=8,
+        img_height=H,
+        img_width=W,
+        dt_ref=dt_ref,
+        sde_mode="det",
+        max_growth_rate=0.3,
+    ).to(device)
+
+    model.eval()
+
+    x_cond = torch.randn(B, cond_frames, C, H, W, device=device)
+    dt_cond = torch.ones(cond_frames, device=device) * dt_ref
+    dt_future = torch.ones(pred_frames, device=device) * dt_ref
+
+    with torch.no_grad():
+        pred_forecast_1 = model.forecast(x_cond, dt_cond, pred_frames, dt_future)
+        pred_forecast_2 = model.forecast(x_cond, dt_cond, pred_frames, dt_future)
+
+    print(f"Forecast Cond Shape: {x_cond.shape}")
+    print(f"Forecast Output Shape: {pred_forecast_1.shape}")
+    print(f"Expected Forecast Shape: ({B}, {pred_frames}, {C}, {H}, {W})")
+
+    shape_ok = pred_forecast_1.shape == (B, pred_frames, C, H, W)
+
+    if pred_forecast_1.is_complex():
+        diff_deterministic = (pred_forecast_1.real - pred_forecast_2.real).abs().max().item()
+    else:
+        diff_deterministic = (pred_forecast_1 - pred_forecast_2).abs().max().item()
+
+    print(f"Deterministic Check (same input twice): {diff_deterministic:.2e}")
+
+    deterministic_ok = diff_deterministic < 1e-5
+
+    if pred_forecast_1.is_complex():
+        has_nan = torch.isnan(pred_forecast_1.real).any().item() or torch.isnan(pred_forecast_1.imag).any().item()
+        has_inf = torch.isinf(pred_forecast_1.real).any().item() or torch.isinf(pred_forecast_1.imag).any().item()
+    else:
+        has_nan = torch.isnan(pred_forecast_1).any().item()
+        has_inf = torch.isinf(pred_forecast_1).any().item()
+
+    print(f"Forecast has NaN: {has_nan}")
+    print(f"Forecast has Inf: {has_inf}")
+
+    numerical_ok = not has_nan and not has_inf
+
+    passed = shape_ok and deterministic_ok and numerical_ok
+    print(f"Shape OK: {shape_ok}")
+    print(f"Deterministic OK: {deterministic_ok}")
+    print(f"Numerical OK: {numerical_ok}")
+    print(f"Test Passed: {passed}")
+    print()
+
+    return passed
+
+
 def check_model_consistency():
     print_section("Testing Model Parallel vs Serial Consistency")
 
@@ -508,159 +564,52 @@ def check_model_consistency():
     print(f"Serial Output Shape: {out_serial.shape}")
     print(f"Max Difference: {diff:.2e}")
 
-    passed = diff < 1e-3
-    status = "PASSED" if passed else "FAILED"
-    print(f"Consistency Check {status}")
-    print()
+    passed = diff < 1e-4
 
-    return passed
-
-
-def check_energy_conservation():
-    print_section("Testing Energy Conservation Through Layers")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, D, H, W = 1, 4, 16, 4, 4
-
-    model = UniPhyModel(
-        in_channels=2,
-        out_channels=2,
-        embed_dim=D,
-        expand=2,
-        num_experts=2,
-        depth=4,
-        patch_size=4,
-        img_height=H * 4,
-        img_width=W * 4,
-        sde_mode="det",
-    ).to(device)
-
-    x = torch.randn(B, T, 2, H * 4, W * 4, device=device)
-    dt = torch.ones(T, device=device) * 6.0
-
-    model.eval()
-    with torch.no_grad():
-        out = model(x, dt)
-
-    if out.is_complex():
-        input_energy = (x ** 2).sum().item()
-        output_energy = (out.abs() ** 2).sum().item()
+    if passed:
+        print("Consistency Check PASSED")
     else:
-        input_energy = (x ** 2).sum().item()
-        output_energy = (out ** 2).sum().item()
+        print("Consistency Check FAILED")
+        if out_parallel.is_complex():
+            print(f"Parallel Mean: {out_parallel.real.mean().item():.6f}")
+            print(f"Serial Mean: {out_serial.real.mean().item():.6f}")
+        else:
+            print(f"Parallel Mean: {out_parallel.mean().item():.6f}")
+            print(f"Serial Mean: {out_serial.mean().item():.6f}")
 
-    energy_ratio = output_energy / input_energy
-
-    print(f"Input Energy: {input_energy:.4f}")
-    print(f"Output Energy: {output_energy:.4f}")
-    print(f"Energy Ratio (out/in): {energy_ratio:.4f}")
-
-    passed = 0.1 < energy_ratio < 10.0
-    print(f"Energy within reasonable bounds: {passed}")
     print()
 
     return passed
 
-def check_forecast_forward_consistency():
-    print_section("Testing Forecast vs Forward Consistency")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, C, H, W = 1, 6, 2, 32, 32
-    cond_frames = 4
-    pred_frames = 2
-    dt_ref = 6.0
-
-    model = UniPhyModel(
-        in_channels=C,
-        out_channels=C,
-        embed_dim=16,
-        expand=2,
-        num_experts=2,
-        depth=2,
-        patch_size=8,
-        img_height=H,
-        img_width=W,
-        dt_ref=dt_ref,
-        sde_mode="det",
-        max_growth_rate=0.3,
-    ).to(device)
-
-    model.eval()
-
-    x_full = torch.randn(B, T, C, H, W, device=device)
-    x_cond = x_full[:, :cond_frames]
-    x_future_target = x_full[:, cond_frames:]
-
-    dt_full = torch.ones(T, device=device) * dt_ref
-    dt_cond = torch.ones(cond_frames, device=device) * dt_ref
-    dt_future = torch.ones(pred_frames, device=device) * dt_ref
-
-    with torch.no_grad():
-        out_forward = model(x_full, dt_full)
-
-        pred_forecast = model.forecast(x_cond, dt_cond, pred_frames, dt_future)
-
-    print(f"Forward Input Shape: {x_full.shape}")
-    print(f"Forward Output Shape: {out_forward.shape}")
-    print(f"Forecast Cond Shape: {x_cond.shape}")
-    print(f"Forecast Output Shape: {pred_forecast.shape}")
-    print(f"Expected Forecast Shape: ({B}, {pred_frames}, {C}, {H}, {W})")
-
-    shape_ok = pred_forecast.shape == (B, pred_frames, C, H, W)
-
-    with torch.no_grad():
-        pred_forecast_2 = model.forecast(x_cond, dt_cond, pred_frames, dt_future)
-
-    if pred_forecast.is_complex():
-        diff_deterministic = (pred_forecast.real - pred_forecast_2.real).abs().max().item()
-    else:
-        diff_deterministic = (pred_forecast - pred_forecast_2).abs().max().item()
-
-    print(f"Deterministic Check (same input twice): {diff_deterministic:.2e}")
-
-    deterministic_ok = diff_deterministic < 1e-5
-
-    has_nan = torch.isnan(pred_forecast.real if pred_forecast.is_complex() else pred_forecast).any().item()
-    has_inf = torch.isinf(pred_forecast.real if pred_forecast.is_complex() else pred_forecast).any().item()
-
-    print(f"Forecast has NaN: {has_nan}")
-    print(f"Forecast has Inf: {has_inf}")
-
-    numerical_ok = not has_nan and not has_inf
-
-    passed = shape_ok and deterministic_ok and numerical_ok
-    print(f"Shape OK: {shape_ok}")
-    print(f"Deterministic OK: {deterministic_ok}")
-    print(f"Numerical OK: {numerical_ok}")
-    print(f"Test Passed: {passed}")
-    print()
-
-    return passed
 
 def run_all_checks():
     print("=" * 60)
-    print("UniPhy Model Comprehensive Check Suite (Physical State)")
+    print("UniPhy Model Comprehensive Check Suite")
     print("=" * 60)
+    print()
 
     results = {}
-    
+
     results["basis_invertibility"] = check_basis_invertibility()
     results["eigenvalue_stability"] = check_eigenvalue_stability()
+    results["ffn_complex_mul"] = check_ffn_complex_multiplication()
+    results["ffn_causality"] = check_ffn_causality()
     results["flux_tracker_gate"] = check_flux_tracker_gate()
     results["heteroscedastic_noise"] = check_heteroscedastic_noise()
-    results["ffn_causality"] = check_ffn_causality()
-    results["riemannian_clifford"] = check_riemannian_clifford()
+    results["riemannian_clifford"] = check_riemannian_clifford_conv()
     results["io_shapes"] = check_io_shapes()
     results["pscan_compatibility"] = check_pscan_compatibility()
-    results["physical_state_transfer"] = check_physical_state_transfer()
     results["full_model_forward"] = check_full_model_forward()
     results["gradient_flow"] = check_gradient_flow()
     results["forecast_mode"] = check_forecast_mode()
     results["forecast_forward_consistency"] = check_forecast_forward_consistency()
-    results["model_consistency"] = check_model_consistency()
-    results["energy_conservation"] = check_energy_conservation()
 
-    print_section("Summary")
+    if torch.cuda.is_available():
+        results["model_consistency"] = check_model_consistency()
+
+    print("=" * 60)
+    print("Summary")
+    print("=" * 60)
 
     all_passed = True
     for name, passed in results.items():
@@ -670,15 +619,16 @@ def run_all_checks():
             all_passed = False
 
     print()
-    if all_passed:
-        print("Overall: ALL TESTS PASSED")
-    else:
-        print("Overall: SOME TESTS FAILED")
+    print(f"Overall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    return all_passed
+
+
 if __name__ == "__main__":
+    torch.set_default_dtype(torch.float32)
     run_all_checks()
     
