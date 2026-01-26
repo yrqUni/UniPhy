@@ -427,8 +427,10 @@ class UniPhyModel(nn.Module):
     @torch.no_grad()
     def forecast(self, x_cond, dt_cond, k_steps, dt_future):
         device = next(self.parameters()).device
+        
+        input_energy = (x_cond ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=(1, 2), keepdim=True)
+        
         z = self.encoder(x_cond)
-
         B, T, D, H, W = z.shape
         energy = (z.abs() ** 2).mean(dim=(-2, -1)) if z.is_complex() else (z ** 2).mean(dim=(-2, -1))
         momentum = z.mean(dim=(-2, -1))
@@ -487,8 +489,18 @@ class UniPhyModel(nn.Module):
             momentum_curr = current_state.momentum
             flux_curr = current_state.flux
 
-            pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1).to("cpu", non_blocking=True)
-            predictions.append(pred)
+            pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1)
+            
+            if pred.is_complex():
+                output_energy = (pred.abs() ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=1, keepdim=True)
+            else:
+                output_energy = (pred ** 2).sum(dim=(-2, -1), keepdim=True).mean(dim=1, keepdim=True)
+            
+            energy_ratio = (input_energy[:, 0, 0] / (output_energy + 1e-8)).sqrt()
+            energy_ratio = torch.clamp(energy_ratio, 0.5, 2.0)
+            pred = pred * energy_ratio
+            
+            predictions.append(pred.to("cpu", non_blocking=True))
 
-        return torch.stack(predictions, dim=1)
+        return torch.stack(predictions, dim=1)    
     
