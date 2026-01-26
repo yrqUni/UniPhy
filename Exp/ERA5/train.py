@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import random
 import datetime
 import logging
@@ -17,7 +16,6 @@ import wandb
 import yaml
 from rich.console import Console
 from rich.theme import Theme
-from rich.table import Table
 from rich.progress import (
     Progress,
     TextColumn,
@@ -75,6 +73,22 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def get_model_info(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable, total - trainable
+
+
+def format_params(n):
+    if n >= 1e9:
+        return f"{n/1e9:.2f}B"
+    elif n >= 1e6:
+        return f"{n/1e6:.2f}M"
+    elif n >= 1e3:
+        return f"{n/1e3:.2f}K"
+    return str(n)
+
+
 def get_lat_weights(H, W, device):
     lat = torch.linspace(-90, 90, H, device=device)
     weights = torch.cos(torch.deg2rad(lat))
@@ -84,23 +98,23 @@ def get_lat_weights(H, W, device):
 
 def compute_crps(pred_ensemble, target):
     if pred_ensemble.is_complex():
-        pred_ensemble = pred_ensemble.real
+        pred_ensemble = pred_ensemble.real.clone()
     if target.is_complex():
-        target = target.real
+        target = target.real.clone()
     
     M = pred_ensemble.shape[0]
     mae = (pred_ensemble - target.unsqueeze(0)).abs().mean(dim=0)
     
-    diff = 0.0
+    diff = torch.tensor(0.0, device=pred_ensemble.device)
     for i in range(M):
         for j in range(i + 1, M):
-            diff += (pred_ensemble[i] - pred_ensemble[j]).abs()
+            diff = diff + (pred_ensemble[i] - pred_ensemble[j]).abs().mean()
     
     if M > 1:
         diff = diff / (M * (M - 1) / 2)
     
-    crps = mae - 0.5 * diff
-    return crps.mean()
+    crps = mae.mean() - 0.5 * diff
+    return crps
 
 
 def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
@@ -114,16 +128,16 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     ensemble_size = cfg["train"]["ensemble_size"]
     ensemble_weight = cfg["train"]["ensemble_weight"]
     
-    x_input = data[:, :-1]
-    x_target = data[:, 1:]
-    dt_input = dt_data[:, :-1]
+    x_input = data[:, :-1].clone().contiguous()
+    x_target = data[:, 1:].clone().contiguous()
+    dt_input = dt_data[:, :-1].clone().contiguous()
     
     out = model(x_input, dt_input)
     
     if out.is_complex():
-        out_real = out.real
+        out_real = out.real.clone().contiguous()
     else:
-        out_real = out
+        out_real = out.clone().contiguous()
     
     lat_weights = get_lat_weights(H, W, device)
     
@@ -133,11 +147,12 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     if ensemble_size > 1 and ensemble_weight > 0:
         ensemble_preds = [out_real]
         for _ in range(ensemble_size - 1):
-            out_ens = model(x_input, dt_input)
+            with torch.no_grad():
+                out_ens = model(x_input.clone(), dt_input.clone())
             if out_ens.is_complex():
-                ensemble_preds.append(out_ens.real)
+                ensemble_preds.append(out_ens.real.clone().contiguous())
             else:
-                ensemble_preds.append(out_ens)
+                ensemble_preds.append(out_ens.clone().contiguous())
         
         ensemble_stack = torch.stack(ensemble_preds, dim=0)
         crps_loss = compute_crps(ensemble_stack, x_target)
@@ -149,8 +164,8 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         ensemble_std = torch.tensor(0.0, device=device)
         loss = l1_loss
     
-    loss = loss / grad_accum_steps
-    loss.backward()
+    loss_scaled = loss / grad_accum_steps
+    loss_scaled.backward()
     
     if (batch_idx + 1) % grad_accum_steps == 0:
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -166,14 +181,14 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         mae = l1_loss
     
     metrics = {
-        "loss": loss.item() * grad_accum_steps,
+        "loss": loss.item(),
         "l1_loss": l1_loss.item(),
-        "crps_loss": crps_loss.item(),
+        "crps_loss": crps_loss.item() if isinstance(crps_loss, torch.Tensor) else crps_loss,
         "mse": mse_loss.item(),
         "rmse": rmse.item(),
         "mae": mae.item(),
         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-        "ensemble_std": ensemble_std.item(),
+        "ensemble_std": ensemble_std.item() if isinstance(ensemble_std, torch.Tensor) else ensemble_std,
     }
     
     return metrics
@@ -187,6 +202,21 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
         "epoch": epoch,
         "global_step": global_step,
         "cfg": cfg,
+        "model_args": {
+            "in_channels": cfg["model"]["in_channels"],
+            "out_channels": cfg["model"]["out_channels"],
+            "embed_dim": cfg["model"]["embed_dim"],
+            "expand": cfg["model"]["expand"],
+            "num_experts": cfg["model"]["num_experts"],
+            "depth": cfg["model"]["depth"],
+            "patch_size": cfg["model"]["patch_size"],
+            "img_height": cfg["model"]["img_height"],
+            "img_width": cfg["model"]["img_width"],
+            "dt_ref": cfg["model"]["dt_ref"],
+            "sde_mode": cfg["model"]["sde_mode"],
+            "init_noise_scale": cfg["model"]["init_noise_scale"],
+            "max_growth_rate": cfg["model"]["max_growth_rate"],
+        },
     }
     torch.save(state, path)
 
@@ -208,18 +238,30 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
 
 
-def main():
+def print_model_summary(model, cfg, rank):
+    if rank != 0:
+        return
+    total, trainable, frozen = get_model_info(model)
+    console.print(f"[bold cyan]Model Summary[/bold cyan]")
+    console.print(f"  Total Parameters: {format_params(total)}")
+    console.print(f"  Trainable: {format_params(trainable)}")
+    console.print(f"  Frozen: {format_params(frozen)}")
+
+
+def train(cfg):
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     
-    with open("train.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-    
     logger = setup_logging(cfg, rank)
     set_seed(42 + rank)
+    
+    if rank == 0:
+        logger.info("=" * 70)
+        logger.info("UniPhy Training")
+        logger.info("=" * 70)
     
     if cfg["train"]["use_tf32"]:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -252,6 +294,9 @@ def main():
     
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
+    if rank == 0:
+        print_model_summary(model.module, cfg, rank)
+    
     train_dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
         year_range=cfg["data"]["year_range"],
@@ -262,7 +307,13 @@ def main():
         dt_ref=cfg["data"]["dt_ref"],
     )
     
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=True,
+    )
     
     train_loader = DataLoader(
         train_dataset,
@@ -270,23 +321,30 @@ def main():
         sampler=train_sampler,
         num_workers=4,
         pin_memory=True,
-        drop_last=True,
+        prefetch_factor=2,
     )
+    
+    if rank == 0:
+        logger.info(f"Dataset Size: {len(train_dataset)} samples")
+        logger.info(f"Batches per Epoch: {len(train_loader)}")
     
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=cfg["train"]["lr"],
+        lr=float(cfg["train"]["lr"]),
         weight_decay=cfg["train"]["weight_decay"],
     )
     
+    grad_accum_steps = cfg["train"]["grad_accum_steps"]
+    epochs = cfg["train"]["epochs"]
+    
+    scheduler = None
     if cfg["train"]["use_scheduler"]:
-        scheduler = lr_scheduler.CosineAnnealingLR(
+        scheduler = lr_scheduler.OneCycleLR(
             optimizer,
-            T_max=cfg["train"]["epochs"] * len(train_loader),
-            eta_min=cfg["train"]["lr"] * 0.01,
+            max_lr=float(cfg["train"]["lr"]),
+            steps_per_epoch=len(train_loader) // grad_accum_steps,
+            epochs=epochs,
         )
-    else:
-        scheduler = None
     
     start_epoch = 0
     global_step = 0
@@ -298,10 +356,8 @@ def main():
         if rank == 0:
             logger.info(f"Resumed from checkpoint: {cfg['logging']['ckpt']}")
     
-    epochs = cfg["train"]["epochs"]
-    grad_accum_steps = cfg["train"]["grad_accum_steps"]
     log_every = cfg["logging"]["log_every"]
-    save_interval = int(len(train_loader) * cfg["logging"]["ckpt_step"])
+    save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
     
     os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
     os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
@@ -415,6 +471,12 @@ def main():
     
     train_dataset.cleanup()
     dist.destroy_process_group()
+
+
+def main():
+    with open("train.yaml", "r") as f:
+        cfg = yaml.safe_load(f)
+    train(cfg)
 
 
 if __name__ == "__main__":
