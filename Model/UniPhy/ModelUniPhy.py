@@ -135,6 +135,16 @@ class UniPhyBlock(nn.Module):
 
         u_t = forcing * op_forcing
 
+        if self.prop.sde_mode == "sde":
+            dt_noise = dt_exp.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+            noise = self.prop.generate_stochastic_term(
+                shape=u_t.shape,
+                dt=dt_noise,
+                dtype=u_t.dtype,
+                h_state=x_eigen 
+            )
+            u_t = u_t + noise
+
         if h_prev is not None:
             h_reshaped = h_prev.reshape(B, H, W, D)
             h_contrib_t0 = h_reshaped * op_decay[:, 0]
@@ -186,7 +196,24 @@ class UniPhyBlock(nn.Module):
         op_decay, op_forcing = self.prop.get_transition_operators(dt)
 
         h_prev_reshaped = h_prev.reshape(B, H, W, D)
-        h_next = h_prev_reshaped * op_decay + forcing * op_forcing
+        
+        noise = 0
+        if self.prop.sde_mode == "sde":
+            if dt.ndim == 1:
+                dt_noise = dt.view(B, 1, 1, 1)
+            elif dt.ndim == 0:
+                dt_noise = dt
+            else:
+                dt_noise = dt.view(B, 1, 1, 1)
+
+            noise = self.prop.generate_stochastic_term(
+                shape=h_prev_reshaped.shape,
+                dt=dt_noise,
+                dtype=h_prev_reshaped.dtype,
+                h_state=x_eigen 
+            )
+
+        h_next = h_prev_reshaped * op_decay + forcing * op_forcing + noise
 
         x_out = self.prop.basis.decode(h_next)
         x_out = x_out.permute(0, 3, 1, 2)
@@ -344,4 +371,4 @@ class UniPhyModel(nn.Module):
             preds.append(pred)
 
         return torch.stack(preds, dim=1)
-    
+        
