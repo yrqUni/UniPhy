@@ -2,203 +2,190 @@ import torch
 import torch.nn as nn
 from ModelUniPhy import UniPhyModel
 
+def sequential_forward(model, x, dt):
+    B, T, C, H, W = x.shape
+    device = x.device
+    
+    outputs = []
+    states = model._init_states(B, device, torch.complex64)
+    
+    for t in range(T):
+        x_t = x[:, t:t+1]
+        z = model.encoder(x_t)
+        
+        for i, block in enumerate(model.blocks):
+            h_prev, flux_prev = states[i]
+            z, h_next, flux_next = block(z, h_prev, dt[:, t:t+1] if dt.ndim > 1 else dt, flux_prev)
+            states[i] = (h_next, flux_next)
+        
+        out = model.decoder(z)
+        if out.shape[-2] != H or out.shape[-1] != W:
+            out = out[..., :H, :W]
+        outputs.append(out.squeeze(1))
+    
+    return torch.stack(outputs, dim=1)
 
-def check_forecast_mode():
+def check_forward_consistency():
     print("=" * 60)
-    print("Testing Forecast Mode")
+    print("Testing Forward Consistency (Serial vs Parallel)")
     print("=" * 60)
     
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        model = UniPhyModel(
-            in_channels=4,
-            out_channels=4,
-            embed_dim=64,
-            depth=2,
-            patch_size=4,
-            img_height=32,
-            img_width=32,
-        ).to(device)
-        model.eval()
-        
-        B, C, H, W = 2, 4, 32, 32
-        k_steps = 5
-        
-        x_cond = torch.randn(B, C, H, W, device=device)
-        dt_future = [torch.tensor(1.0, device=device) for _ in range(k_steps)]
-        
-        with torch.no_grad():
-            pred_forecast_1 = model.forward_rollout(x_cond, dt_future, k_steps)
-            pred_forecast_2 = model.forward_rollout(x_cond, dt_future, k_steps)
-        
-        print(f"Input shape: {x_cond.shape}")
-        print(f"Forecast steps: {k_steps}")
-        print(f"Output shape: {pred_forecast_1.shape}")
-        
-        expected_shape = (B, k_steps, C, H, W)
-        shape_ok = pred_forecast_1.shape == expected_shape
-        
-        if pred_forecast_1.is_complex():
-            diff_deterministic = (pred_forecast_1 - pred_forecast_2).abs().max().item()
-        else:
-            diff_deterministic = (pred_forecast_1 - pred_forecast_2).abs().max().item()
-        
-        print(f"Shape OK: {shape_ok}")
-        print(f"Deterministic diff: {diff_deterministic:.2e}")
-        
-        passed = shape_ok and diff_deterministic < 1e-5
-        print(f"Test Passed: {passed}")
-        print()
-        return passed
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        print()
-        return False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+    
+    model = UniPhyModel(
+        in_channels=4,
+        out_channels=4,
+        embed_dim=64,
+        depth=2,
+        patch_size=4,
+        img_height=32,
+        img_width=32,
+    ).to(device)
+    model.eval()
+    
+    B, T, C, H, W = 2, 8, 4, 32, 32
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.ones(B, T, device=device) * 0.1
+    
+    with torch.no_grad():
+        out_parallel = model(x, dt)
+        out_serial = sequential_forward(model, x, dt)
+    
+    max_diff = (out_parallel - out_serial).abs().max().item()
+    mean_diff = (out_parallel - out_serial).abs().mean().item()
+    
+    print(f"Max Difference: {max_diff:.2e}")
+    print(f"Mean Difference: {mean_diff:.2e}")
+    
+    passed = max_diff < 1e-3
+    print(f"Test Passed: {passed}")
+    print()
+    return passed
 
-
-def check_forecast_forward_consistency():
+def check_long_sequence():
     print("=" * 60)
-    print("Testing Forecast Forward Consistency")
+    print("Testing Long Sequence Consistency")
     print("=" * 60)
     
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        model = UniPhyModel(
-            in_channels=4,
-            out_channels=4,
-            embed_dim=64,
-            depth=2,
-            patch_size=4,
-            img_height=32,
-            img_width=32,
-        ).to(device)
-        model.eval()
-        
-        B, T, C, H, W = 2, 4, 4, 32, 32
-        x = torch.randn(B, T, C, H, W, device=device)
-        dt = torch.ones(B, T, device=device)
-        
-        with torch.no_grad():
-            out_forward = model(x, dt)
-        
-        x_init = x[:, 0]
-        dt_list = [torch.tensor(1.0, device=device) for _ in range(T)]
-        
-        with torch.no_grad():
-            out_rollout = model.forward_rollout(x_init, dt_list, T)
-        
-        print(f"Forward output shape: {out_forward.shape}")
-        print(f"Rollout output shape: {out_rollout.shape}")
-        
-        passed = out_forward.shape[0] == out_rollout.shape[0]
-        print(f"Test Passed: {passed}")
-        print()
-        return passed
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        print()
-        return False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(123)
+    
+    model = UniPhyModel(
+        in_channels=4,
+        out_channels=4,
+        embed_dim=32,
+        depth=1,
+        patch_size=4,
+        img_height=32,
+        img_width=32,
+    ).to(device)
+    model.eval()
+    
+    B, T, C, H, W = 1, 32, 4, 32, 32
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.ones(B, T, device=device) * 0.05
+    
+    with torch.no_grad():
+        out_parallel = model(x, dt)
+        out_serial = sequential_forward(model, x, dt)
+    
+    max_diff = (out_parallel - out_serial).abs().max().item()
+    mean_diff = (out_parallel - out_serial).abs().mean().item()
+    
+    print(f"Sequence Length: {T}")
+    print(f"Max Difference: {max_diff:.2e}")
+    print(f"Mean Difference: {mean_diff:.2e}")
+    
+    passed = max_diff < 1e-3
+    print(f"Test Passed: {passed}")
+    print()
+    return passed
 
-
-def check_model_consistency():
+def check_variable_dt():
     print("=" * 60)
-    print("Testing Model Consistency")
+    print("Testing Variable dt Consistency")
     print("=" * 60)
     
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        model = UniPhyModel(
-            in_channels=4,
-            out_channels=4,
-            embed_dim=64,
-            depth=2,
-            patch_size=4,
-            img_height=32,
-            img_width=32,
-        ).to(device)
-        model.eval()
-        
-        B, T, C, H, W = 2, 4, 4, 32, 32
-        x = torch.randn(B, T, C, H, W, device=device)
-        dt = torch.ones(B, T, device=device)
-        
-        with torch.no_grad():
-            out1 = model(x, dt)
-            out2 = model(x, dt)
-        
-        if out1.is_complex():
-            diff = (out1 - out2).abs().max().item()
-        else:
-            diff = (out1 - out2).abs().max().item()
-        
-        passed = diff < 1e-5
-        print(f"Consistency diff: {diff:.2e}")
-        print(f"Test Passed: {passed}")
-        print()
-        return passed
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        print()
-        return False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(456)
+    
+    model = UniPhyModel(
+        in_channels=4,
+        out_channels=4,
+        embed_dim=64,
+        depth=2,
+        patch_size=4,
+        img_height=32,
+        img_width=32,
+    ).to(device)
+    model.eval()
+    
+    B, T, C, H, W = 2, 16, 4, 32, 32
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.rand(B, T, device=device) * 0.2 + 0.05
+    
+    with torch.no_grad():
+        out_parallel = model(x, dt)
+        out_serial = sequential_forward(model, x, dt)
+    
+    max_diff = (out_parallel - out_serial).abs().max().item()
+    mean_diff = (out_parallel - out_serial).abs().mean().item()
+    
+    print(f"Max Difference: {max_diff:.2e}")
+    print(f"Mean Difference: {mean_diff:.2e}")
+    
+    passed = max_diff < 1e-3
+    print(f"Test Passed: {passed}")
+    print()
+    return passed
 
-
-def check_single_step():
+def check_batch_consistency():
     print("=" * 60)
-    print("Testing Single Step Forward")
+    print("Testing Batch Consistency")
     print("=" * 60)
     
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        model = UniPhyModel(
-            in_channels=4,
-            out_channels=4,
-            embed_dim=64,
-            depth=2,
-            patch_size=4,
-            img_height=32,
-            img_width=32,
-        ).to(device)
-        model.eval()
-        
-        B, T, C, H, W = 2, 1, 4, 32, 32
-        x = torch.randn(B, T, C, H, W, device=device)
-        dt = torch.ones(B, T, device=device)
-        
-        with torch.no_grad():
-            out = model(x, dt)
-        
-        print(f"Input shape: {x.shape}")
-        print(f"Output shape: {out.shape}")
-        
-        passed = out.shape == (B, T, C, H, W)
-        print(f"Test Passed: {passed}")
-        print()
-        return passed
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        print()
-        return False
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(789)
+    
+    model = UniPhyModel(
+        in_channels=4,
+        out_channels=4,
+        embed_dim=64,
+        depth=2,
+        patch_size=4,
+        img_height=32,
+        img_width=32,
+    ).to(device)
+    model.eval()
+    
+    B, T, C, H, W = 8, 4, 4, 32, 32
+    x = torch.randn(B, T, C, H, W, device=device)
+    dt = torch.ones(B, T, device=device) * 0.1
+    
+    with torch.no_grad():
+        out_parallel = model(x, dt)
+        out_serial = sequential_forward(model, x, dt)
+    
+    max_diff = (out_parallel - out_serial).abs().max().item()
+    mean_diff = (out_parallel - out_serial).abs().mean().item()
+    
+    print(f"Batch Size: {B}")
+    print(f"Max Difference: {max_diff:.2e}")
+    print(f"Mean Difference: {mean_diff:.2e}")
+    
+    passed = max_diff < 1e-3
+    print(f"Test Passed: {passed}")
+    print()
+    return passed
 
 def run_all_checks():
     results = {}
     
-    results["single_step"] = check_single_step()
-    results["model_consistency"] = check_model_consistency()
-    results["forecast_mode"] = check_forecast_mode()
-    results["forecast_forward_consistency"] = check_forecast_forward_consistency()
+    results["forward_consistency"] = check_forward_consistency()
+    results["long_sequence"] = check_long_sequence()
+    results["variable_dt"] = check_variable_dt()
+    results["batch_consistency"] = check_batch_consistency()
     
     print("=" * 60)
     print("Summary")
@@ -210,7 +197,6 @@ def run_all_checks():
     
     all_passed = all(results.values())
     return all_passed
-
 
 if __name__ == "__main__":
     success = run_all_checks()
