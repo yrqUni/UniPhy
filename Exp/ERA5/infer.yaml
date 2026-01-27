@@ -1,37 +1,19 @@
-model:
-  in_channels: 20
-  out_channels: 20
-  embed_dim: 256
-  expand: 4
-  num_experts: 8
-  depth: 8
-  patch_size: 16
-  img_height: 64
-  img_width: 64
-  dt_ref: 1.0
-  sde_mode: "sde"
-  init_noise_scale: 0.01
-  max_growth_rate: 0.3
-
 data:
   input_dir: "/nfs/UniPhy/Data/ERA5"
   test_year_range: [2020, 2020]
   dt_ref: 1.0
 
 inference:
-  ckpt: "checkpoints/latest.pth"
+  ckpt: "checkpoints/ckpt_final.pt"
   batch_size: 1
   max_samples: 5
   output_dir: "results_viz"
-  
-  ensemble_mode: True
+  ensemble_mode: true
   ensemble_size: 10
-  
   input_len: 8
   input_dt: 6.0
   forecast_horizon: 12.0
-  
   strategies:
-    - {name: "dt=6.0 (Steps=2)", dt: 6.0}
-    - {name: "dt=1.0 (Steps=12)", dt: 1.0}
+    - {name: "dt=6.0", dt: 6.0}
+    - {name: "dt=1.0", dt: 1.0}
     
