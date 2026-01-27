@@ -1,5 +1,5 @@
 data:
-  input_dir: "/nfs/UniPhy/Data/ERA5"
+  input_dir: "/nfs/ERA5_data/data_norm"
   test_year_range: [2020, 2020]
   dt_ref: 6.0
 
