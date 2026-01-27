@@ -356,19 +356,25 @@ class UniPhyModel(nn.Module):
         for k in range(num_steps):
             dt_k = dt_list[k] if k < len(dt_list) else dt_list[-1]
             new_states = []
+            z_curr_layer = z
 
             for i, block in enumerate(self.blocks):
                 h_prev, flux_prev = states[i]
-                z, h_next, flux_next = block.forward_step(z, h_prev, dt_k, flux_prev)
+                z_curr_layer, h_next, flux_next = block.forward_step(
+                    z_curr_layer, h_prev, dt_k, flux_prev
+                )
                 new_states.append((h_next, flux_next))
 
             states = new_states
-            pred = self.decoder(z.unsqueeze(1)).squeeze(1)
+            pred = self.decoder(z_curr_layer.unsqueeze(1)).squeeze(1)
 
             if pred.shape[-2] != target_h or pred.shape[-1] != target_w:
                 pred = pred[..., :target_h, :target_w]
 
             preds.append(pred)
 
+            if k < num_steps - 1:
+                z = self.encoder(pred.unsqueeze(1)).squeeze(1)
+
         return torch.stack(preds, dim=1)
-        
+    
