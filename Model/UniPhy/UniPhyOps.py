@@ -91,19 +91,39 @@ class GlobalFluxTracker(nn.Module):
         self.gate_min = 0.01
         self.gate_max = 0.99
 
-    def _get_decay(self):
-        return torch.complex(torch.sigmoid(self.decay_re), self.decay_im)
+    def _get_continuous_params(self):
+        lam_re = -F.softplus(self.decay_re)
+        lam_im = self.decay_im
+        return torch.complex(lam_re, lam_im)
 
-    def get_scan_operators(self, x_mean_seq):
+    def get_transition(self, dt, dt_ref=6.0):
+        lam = self._get_continuous_params()
+        if isinstance(dt, torch.Tensor):
+            dt_ratio = dt / dt_ref
+            if dt_ratio.ndim == 1:
+                dt_ratio = dt_ratio.unsqueeze(-1)
+            elif dt_ratio.ndim >= 2:
+                dt_ratio = dt_ratio.unsqueeze(-1)
+        else:
+            dt_ratio = dt / dt_ref
+        return torch.exp(lam * dt_ratio)
+
+    def get_scan_operators(self, x_mean_seq, dt, dt_ref=6.0):
         B, T, D = x_mean_seq.shape
-        decay = self._get_decay()
+        decay = self.get_transition(dt, dt_ref)
+        if decay.ndim == 2:
+            decay = decay.unsqueeze(1).unsqueeze(-1)
+        elif decay.ndim == 3:
+            decay = decay.unsqueeze(-1)
+        
+        decay = decay.expand(B, T, D, 1)
+
         x_flat = x_mean_seq.reshape(B * T, D)
         x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
         x_in = self.input_mix(x_cat)
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
         X_scan = torch.complex(x_re, x_im).reshape(B, T, D, 1)
-        A_scan = decay.view(1, 1, D, 1).expand(B, T, D, 1)
-        return A_scan, X_scan
+        return decay, X_scan
 
     def compute_output(self, flux_seq):
         if flux_seq.ndim == 4:
@@ -116,8 +136,11 @@ class GlobalFluxTracker(nn.Module):
         gate_seq = gate * (self.gate_max - self.gate_min) + self.gate_min
         return source_seq, gate_seq
 
-    def forward_step(self, prev_state, x_t):
-        decay = self._get_decay()
+    def forward_step(self, prev_state, x_t, dt, dt_ref=6.0):
+        decay = self.get_transition(dt, dt_ref)
+        if decay.ndim > 1:
+            decay = decay.reshape(-1, self.dim)
+        
         if not x_t.is_complex():
             x_t = torch.complex(x_t, torch.zeros_like(x_t))
         x_cat = torch.cat([x_t.real, x_t.imag], dim=-1)
@@ -125,17 +148,8 @@ class GlobalFluxTracker(nn.Module):
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
         x_mixed = torch.complex(x_re, x_im)
         new_state = prev_state * decay + x_mixed
-        source = self.project(new_state)
-        gate_input = torch.cat([new_state.real, new_state.imag], dim=-1)
-        gate = self.gate_net(gate_input)
-        gate = gate * (self.gate_max - self.gate_min) + self.gate_min
-        return new_state, source, gate
-
-    def project(self, state):
-        s_cat = torch.cat([state.real, state.imag], dim=-1)
-        out = self.output_proj(s_cat)
-        out_re, out_im = torch.chunk(out, 2, dim=-1)
-        return torch.complex(out_re, out_im)
+        source_seq, gate_seq = self.compute_output(new_state)
+        return new_state, source_seq, gate_seq
 
 
 class TemporalPropagator(nn.Module):

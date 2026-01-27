@@ -50,47 +50,55 @@ class UniPhyBlock(nn.Module):
         x_perm = x.permute(0, 1, 3, 4, 2)
         x_eigen = self.prop.basis.encode(x_perm)
         x_mean = x_eigen.mean(dim=(2, 3))
-        
+
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=x.device, dtype=x.dtype)
-            
-        A_flux, X_flux = self.prop.flux_tracker.get_scan_operators(x_mean)
+
+        A_flux, X_flux = self.prop.flux_tracker.get_scan_operators(
+            x_mean, dt, self.prop.dt_ref
+        )
         flux_seq = pscan(A_flux, X_flux).squeeze(-1)
-        decay_val = self.prop.flux_tracker._get_decay()
-        decay_cum = torch.cumprod(decay_val.view(1, 1, D).expand(B, T, D), dim=1)
+        
+        decay_seq = A_flux.squeeze(-1)
+        decay_cum = torch.cumprod(decay_seq, dim=1)
         flux_seq = flux_seq + (flux_prev.unsqueeze(1) * decay_cum)
+        
         source_seq, gate_seq = self.prop.flux_tracker.compute_output(flux_seq)
         flux_out = flux_seq[:, -1]
-        
+
         source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
         gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
         forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
-        
+
         dt_exp = dt.unsqueeze(0).expand(B, T) if dt.ndim == 1 else dt
         op_decay, op_forcing = self.prop.get_transition_operators(dt_exp)
-        
+
         op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
         op_forcing = op_forcing.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
-        
+
         u_t = forcing * op_forcing
-        
+
         if self.prop.sde_mode == "sde":
             dt_noise = dt_exp.unsqueeze(2).unsqueeze(3).unsqueeze(4)
-            u_t = u_t + self.prop.generate_stochastic_term(u_t.shape, dt_noise, u_t.dtype, x_eigen)
-            
+            u_t = u_t + self.prop.generate_stochastic_term(
+                u_t.shape, dt_noise, u_t.dtype, x_eigen
+            )
+
         if h_prev is not None:
             h_contrib_t0 = h_prev.reshape(B, H, W, D) * op_decay[:, 0]
             u_t_list = list(torch.unbind(u_t, dim=1))
             u_t_list[0] = u_t_list[0] + h_contrib_t0
             u_t = torch.stack(u_t_list, dim=1)
-            
+
         A = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         u_out = pscan(A, X).reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
-        
+
         h_out = u_out[:, -1].reshape(B * H * W, 1, D)
-        x_out = self._temporal_decode(self.prop.basis.decode(u_out).permute(0, 1, 4, 2, 3))
-        
+        x_out = self._temporal_decode(
+            self.prop.basis.decode(u_out).permute(0, 1, 4, 2, 3)
+        )
+
         return x + x_out, h_out, flux_out
 
     def forward_step(self, x_curr, h_prev, dt, flux_prev):
