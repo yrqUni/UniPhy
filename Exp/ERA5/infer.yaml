@@ -6,14 +6,16 @@ data:
 inference:
   ckpt: "uniphy/ckpt/ckpt_e9_s8500.pt"
   batch_size: 1
-  max_samples: 5
+  max_samples: 2
   output_dir: "results_viz"
   ensemble_mode: true
   ensemble_size: 3
-  input_len: 8
+  input_len: 4
   input_dt: 6.0
   forecast_horizon: 12.0
   strategies:
     - {name: "dt=6.0", dt: 6.0}
     - {name: "dt=1.0", dt: 1.0}
+    - {name: "dt=3.0", dt: 3.0}
+    - {name: "dt=12.0", dt: 12.0}
     
