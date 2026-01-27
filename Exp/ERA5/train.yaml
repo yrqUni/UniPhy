@@ -28,8 +28,7 @@ train:
   epochs: 100
   grad_clip: 1.0
   grad_accum_steps: 1
-  ensemble_size: 10
-  ensemble_weight: 0.5
+  ensemble_size: 3
   use_scheduler: false
   use_tf32: true
 

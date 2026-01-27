@@ -93,7 +93,6 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     B, T, C, H, W = data.shape
     
     ensemble_size = cfg["train"]["ensemble_size"]
-    ensemble_weight = cfg["train"]["ensemble_weight"]
     
     x_input = data[:, :-1].detach().clone()
     x_target = data[:, 1:].detach().clone()
@@ -118,7 +117,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     
     aux_loss = sum(m.aux_loss for m in model.modules() if hasattr(m, "aux_loss"))
     
-    if ensemble_size > 1 and ensemble_weight > 0:
+    if ensemble_size > 1:
         ensemble_preds = [out_real.detach()]
         infer_model = model.module if hasattr(model, "module") else model
         
@@ -135,7 +134,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         crps_loss = compute_crps(ensemble_stack, x_target)
         ensemble_std = ensemble_stack.std(dim=0).mean()
         
-        loss = l1_loss + ensemble_weight * crps_loss.detach() + aux_loss
+        loss = l1_loss + crps_loss.detach() + aux_loss
     else:
         crps_loss = torch.tensor(0.0, device=device)
         ensemble_std = torch.tensor(0.0, device=device)
