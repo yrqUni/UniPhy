@@ -107,43 +107,47 @@ class UniPhyBlock(nn.Module):
         x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_s_re, x_s_im = torch.chunk(self.spatial_cliff(x_norm), 2, dim=1)
         x_curr = x_curr + torch.complex(x_s_re, x_s_im)
-        
+
         x_eigen = self.prop.basis.encode(x_curr.permute(0, 2, 3, 1))
         x_mean = x_eigen.mean(dim=(1, 2))
-        
+
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=x_curr.device, dtype=x_curr.dtype)
-            
-        decay_val = self.prop.flux_tracker._get_decay()
-        x_in = self.prop.flux_tracker.input_mix(torch.cat([x_mean.real, x_mean.imag], dim=-1))
-        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        flux_next = flux_prev * decay_val + torch.complex(x_re, x_im)
-        source, gate = self.prop.flux_tracker.compute_output(flux_next)
-        
+
+        flux_next, source, gate = self.prop.flux_tracker.forward_step(
+            flux_prev, x_mean, dt, self.prop.dt_ref
+        )
+
         source_exp = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
         gate_exp = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
         forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
-        
+
         op_decay, op_forcing = self.prop.get_transition_operators(dt)
-        if op_decay.ndim == 2: op_decay = op_decay.unsqueeze(1).unsqueeze(1)
-        if op_forcing.ndim == 2: op_forcing = op_forcing.unsqueeze(1).unsqueeze(1)
-        
+        if op_decay.ndim == 2:
+            op_decay = op_decay.unsqueeze(1).unsqueeze(1)
+        if op_forcing.ndim == 2:
+            op_forcing = op_forcing.unsqueeze(1).unsqueeze(1)
+
         h_prev_reshaped = h_prev.reshape(B, H, W, D)
         noise = 0
         if self.prop.sde_mode == "sde":
             dt_noise = dt.view(B, 1, 1, 1) if dt.ndim >= 1 else dt
-            noise = self.prop.generate_stochastic_term(h_prev_reshaped.shape, dt_noise, h_prev_reshaped.dtype, x_eigen)
-            
+            noise = self.prop.generate_stochastic_term(
+                h_prev_reshaped.shape, dt_noise, h_prev_reshaped.dtype, x_eigen
+            )
+
         h_next = h_prev_reshaped * op_decay + forcing * op_forcing + noise
         x_out = self.prop.basis.decode(h_next).permute(0, 3, 1, 2)
-        
+
         x_out_real = torch.cat([x_out.real, x_out.imag], dim=1)
         x_out_norm = self.norm_temporal(x_out_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=1)
+
         delta = self.ffn(torch.complex(x_out_re, x_out_im))
         z_next = x_curr + torch.complex(x_out_re, x_out_im) + delta
-        
+
         return z_next, h_next.reshape(B * H * W, 1, D), flux_next
+
 
 class UniPhyModel(nn.Module):
     def __init__(self, in_channels, out_channels, embed_dim, expand=4, num_experts=8, depth=8, patch_size=16, img_height=64, img_width=64, dt_ref=1.0, sde_mode="sde", init_noise_scale=0.01, max_growth_rate=0.3):
