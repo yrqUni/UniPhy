@@ -24,7 +24,7 @@ inference:
   pred_frames: 8
   dt_ref: 6.0
   num_ensemble: 3
-  eval_sample_num: 100
+  eval_sample_num: 1
   device: "cuda"
   use_tf32: true
   
