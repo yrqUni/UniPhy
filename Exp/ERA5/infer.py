@@ -47,7 +47,10 @@ def run_inference(cfg, model, device, console):
     console.print("\n" + "="*50 + "\nForecast Results (Horizon: 12h)\n" + "="*50)
     for s in strategies:
         res = results[s["name"]]
-        console.print(f"{s['name']}: RMSE {np.mean(res):.4f} ± {np.std(res):.4f}")
+        if len(res) > 0:
+            console.print(f"{s['name']}: RMSE {np.mean(res):.4f} +/- {np.std(res):.4f}")
+        else:
+            console.print(f"{s['name']}: No results")
 
 if __name__ == "__main__":
     with open("infer.yaml", "r") as f: cfg = yaml.safe_load(f)

@@ -50,8 +50,10 @@ class UniPhyBlock(nn.Module):
         x_perm = x.permute(0, 1, 3, 4, 2)
         x_eigen = self.prop.basis.encode(x_perm)
         x_mean = x_eigen.mean(dim=(2, 3))
+        
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+            
         A_flux, X_flux = self.prop.flux_tracker.get_scan_operators(x_mean)
         flux_seq = pscan(A_flux, X_flux).squeeze(-1)
         decay_val = self.prop.flux_tracker._get_decay()
@@ -59,23 +61,36 @@ class UniPhyBlock(nn.Module):
         flux_seq = flux_seq + (flux_prev.unsqueeze(1) * decay_cum)
         source_seq, gate_seq = self.prop.flux_tracker.compute_output(flux_seq)
         flux_out = flux_seq[:, -1]
-        forcing = x_eigen * gate_seq.unsqueeze(2).unsqueeze(3) + source_seq.unsqueeze(2).unsqueeze(3) * (1 - gate_seq.unsqueeze(2).unsqueeze(3))
+        
+        source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
+        
         dt_exp = dt.unsqueeze(0).expand(B, T) if dt.ndim == 1 else dt
         op_decay, op_forcing = self.prop.get_transition_operators(dt_exp)
-        op_decay, op_forcing = op_decay.unsqueeze(2).unsqueeze(3), op_forcing.unsqueeze(2).unsqueeze(3)
+        
+        op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        op_forcing = op_forcing.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        
         u_t = forcing * op_forcing
+        
         if self.prop.sde_mode == "sde":
-            u_t = u_t + self.prop.generate_stochastic_term(u_t.shape, dt_exp.unsqueeze(2).unsqueeze(3).unsqueeze(4), u_t.dtype, x_eigen)
+            dt_noise = dt_exp.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+            u_t = u_t + self.prop.generate_stochastic_term(u_t.shape, dt_noise, u_t.dtype, x_eigen)
+            
         if h_prev is not None:
             h_contrib_t0 = h_prev.reshape(B, H, W, D) * op_decay[:, 0]
             u_t_list = list(torch.unbind(u_t, dim=1))
             u_t_list[0] = u_t_list[0] + h_contrib_t0
             u_t = torch.stack(u_t_list, dim=1)
+            
         A = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         u_out = pscan(A, X).reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
+        
         h_out = u_out[:, -1].reshape(B * H * W, 1, D)
         x_out = self._temporal_decode(self.prop.basis.decode(u_out).permute(0, 1, 4, 2, 3))
+        
         return x + x_out, h_out, flux_out
 
     def forward_step(self, x_curr, h_prev, dt, flux_prev):
@@ -84,28 +99,42 @@ class UniPhyBlock(nn.Module):
         x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_s_re, x_s_im = torch.chunk(self.spatial_cliff(x_norm), 2, dim=1)
         x_curr = x_curr + torch.complex(x_s_re, x_s_im)
+        
         x_eigen = self.prop.basis.encode(x_curr.permute(0, 2, 3, 1))
         x_mean = x_eigen.mean(dim=(1, 2))
+        
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=x_curr.device, dtype=x_curr.dtype)
+            
         decay_val = self.prop.flux_tracker._get_decay()
         x_in = self.prop.flux_tracker.input_mix(torch.cat([x_mean.real, x_mean.imag], dim=-1))
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
         flux_next = flux_prev * decay_val + torch.complex(x_re, x_im)
         source, gate = self.prop.flux_tracker.compute_output(flux_next)
-        forcing = x_eigen * gate.unsqueeze(1).unsqueeze(2) + source.unsqueeze(1).unsqueeze(2) * (1 - gate.unsqueeze(1).unsqueeze(2))
+        
+        source_exp = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+        gate_exp = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+        forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
+        
         op_decay, op_forcing = self.prop.get_transition_operators(dt)
         if op_decay.ndim == 2: op_decay = op_decay.unsqueeze(1).unsqueeze(1)
         if op_forcing.ndim == 2: op_forcing = op_forcing.unsqueeze(1).unsqueeze(1)
+        
         h_prev_reshaped = h_prev.reshape(B, H, W, D)
-        noise = self.prop.generate_stochastic_term(h_prev_reshaped.shape, dt.view(B, 1, 1, 1) if dt.ndim >= 1 else dt, h_prev_reshaped.dtype, x_eigen) if self.prop.sde_mode == "sde" else 0
+        noise = 0
+        if self.prop.sde_mode == "sde":
+            dt_noise = dt.view(B, 1, 1, 1) if dt.ndim >= 1 else dt
+            noise = self.prop.generate_stochastic_term(h_prev_reshaped.shape, dt_noise, h_prev_reshaped.dtype, x_eigen)
+            
         h_next = h_prev_reshaped * op_decay + forcing * op_forcing + noise
         x_out = self.prop.basis.decode(h_next).permute(0, 3, 1, 2)
+        
         x_out_real = torch.cat([x_out.real, x_out.imag], dim=1)
         x_out_norm = self.norm_temporal(x_out_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=1)
         delta = self.ffn(torch.complex(x_out_re, x_out_im))
         z_next = x_curr + torch.complex(x_out_re, x_out_im) + delta
+        
         return z_next, h_next.reshape(B * H * W, 1, D), flux_next
 
 class UniPhyModel(nn.Module):
@@ -146,11 +175,20 @@ class UniPhyModel(nn.Module):
         B, T_in = x_context.shape[0], x_context.shape[1]
         z_ctx = self.encoder(x_context)
         states = self._init_states(B, x_context.device, z_ctx.dtype if z_ctx.dtype.is_complex else torch.complex64)
-        dt_ctx_tensor = torch.full((B, T_in), dt_context, device=x_context.device) if isinstance(dt_context, (float, int)) else dt_context
+        
+        if isinstance(dt_context, (float, int)):
+             dt_ctx_tensor = torch.full((B, T_in), float(dt_context), device=x_context.device)
+        elif dt_context.ndim == 0:
+             dt_ctx_tensor = dt_context.expand(B, T_in)
+        else:
+             dt_ctx_tensor = dt_context
+
         for i, block in enumerate(self.blocks):
             z_ctx, h_f, f_f = block(z_ctx, states[i][0], dt_ctx_tensor, states[i][1])
             states[i] = (h_f, f_f)
-        z_curr, preds = z_ctx[:, -1], []
+            
+        z_curr = z_ctx[:, -1]
+        preds = []
         for dt_k in dt_list:
             new_states = []
             for i, block in enumerate(self.blocks):
