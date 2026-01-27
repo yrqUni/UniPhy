@@ -6,6 +6,7 @@ import shutil
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 from torch.utils.data import DataLoader
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
 
@@ -46,29 +47,69 @@ def compute_metrics(pred, target, lat_weights):
     rmse = torch.sqrt(mse.mean()).item()
     return rmse
 
-def save_visualization(target, pred, save_dir, index):
-    os.makedirs(save_dir, exist_ok=True)
-    
+def save_static_summary(target, pred, save_path):
     if target.is_complex(): target = target.real
     if pred.is_complex(): pred = pred.real
 
     target = target.cpu().numpy()
     pred = pred.cpu().numpy()
 
-    fig, axes = plt.subplots(2, target.shape[0], figsize=(target.shape[0] * 4, 8))
+    T = target.shape[0]
     
-    for t in range(target.shape[0]):
-        im1 = axes[0, t].imshow(target[t, 0], cmap='RdBu_r')
+    fig, axes = plt.subplots(2, T, figsize=(T * 4, 8))
+    
+    # Visualizing Channel 0 for summary
+    for t in range(T):
+        vmin = min(target[t, 0].min(), pred[t, 0].min())
+        vmax = max(target[t, 0].max(), pred[t, 0].max())
+
+        im1 = axes[0, t].imshow(target[t, 0], cmap='RdBu_r', vmin=vmin, vmax=vmax)
         axes[0, t].set_title(f"Target T={t}")
         axes[0, t].axis('off')
         
-        im2 = axes[1, t].imshow(pred[t, 0], cmap='RdBu_r')
+        im2 = axes[1, t].imshow(pred[t, 0], cmap='RdBu_r', vmin=vmin, vmax=vmax)
         axes[1, t].set_title(f"Pred T={t}")
         axes[1, t].axis('off')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"sample_{index}.png"))
+    plt.savefig(save_path)
     plt.close()
+
+def save_sample_gifs(target, pred, base_dir):
+    if target.is_complex(): target = target.real
+    if pred.is_complex(): pred = pred.real
+
+    target = target.cpu().numpy()
+    pred = pred.cpu().numpy()
+
+    T, C, H, W = target.shape
+    
+    for c in range(C):
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        
+        t_data = target[:, c]
+        p_data = pred[:, c]
+        
+        vmin = min(t_data.min(), p_data.min())
+        vmax = max(t_data.max(), p_data.max())
+        
+        im0 = axes[0].imshow(t_data[0], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+        axes[0].set_title(f"Target Ch{c}")
+        axes[0].axis('off')
+        
+        im1 = axes[1].imshow(p_data[0], cmap='RdBu_r', vmin=vmin, vmax=vmax)
+        axes[1].set_title(f"Pred Ch{c}")
+        axes[1].axis('off')
+        
+        def update(t):
+            im0.set_data(t_data[t])
+            im1.set_data(p_data[t])
+            return [im0, im1]
+            
+        ani = animation.FuncAnimation(fig, update, frames=T, interval=200, blit=True)
+        save_path = os.path.join(base_dir, f"channel_{c}.gif")
+        ani.save(save_path, writer='pillow', fps=5)
+        plt.close(fig)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -176,7 +217,12 @@ def main():
                 all_rmses.append(rmse)
 
                 if num_vis_saved < max_vis:
-                    save_visualization(x_target[0], pred_final[0], save_dir, i)
+                    sample_dir = os.path.join(save_dir, f"sample_{i}")
+                    os.makedirs(sample_dir, exist_ok=True)
+                    
+                    save_static_summary(x_target[0], pred_final[0], os.path.join(sample_dir, "summary.png"))
+                    save_sample_gifs(x_target[0], pred_final[0], sample_dir)
+                    
                     num_vis_saved += 1
 
                 progress.advance(task)
