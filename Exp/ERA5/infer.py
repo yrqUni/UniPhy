@@ -100,11 +100,16 @@ def main():
     model.load_state_dict(new_state_dict)
     model.eval()
 
+    total_frames = cfg["inference"]["cond_frames"] + cfg["inference"]["pred_frames"]
+    
     test_dataset = ERA5_Dataset(
-        data_dir=cfg["inference"]["data_root"],
+        input_dir=cfg["inference"]["data_root"],
         year_range=cfg["inference"]["year_range"],
-        window_size=cfg["inference"]["cond_frames"] + cfg["inference"]["pred_frames"],
-        mode="test"
+        window_size=total_frames,
+        sample_k=total_frames,
+        look_ahead=0,
+        is_train=False,
+        dt_ref=cfg["inference"]["dt_ref"]
     )
 
     dataloader = DataLoader(
@@ -145,14 +150,14 @@ def main():
         task = progress.add_task("Inference...", total=len(dataloader))
 
         with torch.no_grad():
-            for i, batch in enumerate(dataloader):
+            for i, (data, _) in enumerate(dataloader):
                 if i >= cfg["inference"]["eval_sample_num"]:
                     break
 
-                batch = batch.to(device)
+                data = data.to(device)
                 
-                x_init = batch[:, cond_frames - 1]
-                x_target = batch[:, cond_frames : cond_frames + pred_frames]
+                x_init = data[:, cond_frames - 1]
+                x_target = data[:, cond_frames : cond_frames + pred_frames]
 
                 dt_list = [dt_ref] * pred_frames
                 
