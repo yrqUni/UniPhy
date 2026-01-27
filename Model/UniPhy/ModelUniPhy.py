@@ -101,12 +101,10 @@ class UniPhyBlock(nn.Module):
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=device, dtype=x.dtype)
 
-        # === Parallel Scan Flow for FluxTracker ===
         A_flux, X_flux = self.prop.flux_tracker.get_scan_operators(x_mean)
         flux_seq = pscan(A_flux, X_flux)
         flux_seq = flux_seq.squeeze(-1)
 
-        # Handle initial state contribution for Flux
         decay_val = self.prop.flux_tracker._get_decay() 
         decay_steps = decay_val.view(1, 1, D).expand(B, T, D)
         decay_cum = torch.cumprod(decay_steps, dim=1)
@@ -115,7 +113,6 @@ class UniPhyBlock(nn.Module):
 
         source_seq, gate_seq = self.prop.flux_tracker.compute_output(flux_seq)
         flux_out = flux_seq[:, -1]
-        # ==========================================
 
         source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
         gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
@@ -183,12 +180,9 @@ class UniPhyBlock(nn.Module):
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=device, dtype=x_curr.dtype)
 
-        # For single step, forward_step is still valid on FluxTracker
-        # But we must ensure UniPhyOps has this method or we implement it here manually
-        # Given your previous UniPhyOps update, let's use the explicit step logic:
         decay_val = self.prop.flux_tracker._get_decay()
         
-        x_mean_flat = x_mean # (B, D)
+        x_mean_flat = x_mean
         x_cat = torch.cat([x_mean_flat.real, x_mean_flat.imag], dim=-1)
         x_in = self.prop.flux_tracker.input_mix(x_cat)
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
@@ -204,12 +198,10 @@ class UniPhyBlock(nn.Module):
 
         op_decay, op_forcing = self.prop.get_transition_operators(dt)
         
-        # === CRITICAL FIX: Reshape operators for broadcasting ===
-        if op_decay.ndim == 2: # (B, D)
-            op_decay = op_decay.unsqueeze(1).unsqueeze(1) # -> (B, 1, 1, D)
+        if op_decay.ndim == 2:
+            op_decay = op_decay.unsqueeze(1).unsqueeze(1)
         if op_forcing.ndim == 2:
             op_forcing = op_forcing.unsqueeze(1).unsqueeze(1)
-        # ========================================================
 
         h_prev_reshaped = h_prev.reshape(B, H, W, D)
         
@@ -289,7 +281,7 @@ class UniPhyModel(nn.Module):
             latent_dim=embed_dim,
             patch_size=patch_size,
             model_channels=embed_dim,
-            ensemble_size=10, # Enabled ensemble
+            ensemble_size=10,
             img_height=img_height,
             img_width=img_width,
         )
@@ -373,8 +365,6 @@ class UniPhyModel(nn.Module):
             dt_k = dt_list[k] if k < len(dt_list) else dt_list[-1]
             new_states = []
             
-            # Re-encode is now handled outside the loop in previous step for z
-            # But inside loop, z is updated by blocks
             z_curr_layer = z
 
             for i, block in enumerate(self.blocks):
@@ -384,8 +374,6 @@ class UniPhyModel(nn.Module):
 
             states = new_states
             
-            # z_curr_layer is now the output of the last block (deep feature)
-            # Decoder takes this deep feature
             pred = self.decoder(z_curr_layer.unsqueeze(1)).squeeze(1)
 
             if pred.shape[-2] != target_h or pred.shape[-1] != target_w:
