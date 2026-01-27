@@ -5,7 +5,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
@@ -47,10 +47,9 @@ def get_dataloader(cfg):
 def save_visualization(tensor, output_dir, sample_idx, step_idx):
     os.makedirs(output_dir, exist_ok=True)
     img = tensor.cpu().numpy()
-    if img.ndim == 3:
-        img = img[0] 
+    if img.ndim == 3: img = img[0]
     
-    plt.figure(figsize=(8, 8))
+    plt.figure(figsize=(6, 6))
     plt.imshow(img, cmap='RdBu_r')
     plt.axis('off')
     plt.tight_layout()
@@ -60,21 +59,17 @@ def save_visualization(tensor, output_dir, sample_idx, step_idx):
 
 def run_inference(cfg, model, device, console):
     loader = get_dataloader(cfg)
+    strategies = cfg["inference"]["strategies"]
     
     input_len = cfg["inference"]["input_len"]
     input_dt = cfg["inference"]["input_dt"]
     horizon = cfg["inference"]["forecast_horizon"]
+    output_base_dir = cfg["inference"]["output_dir"]
     
     ensemble_mode = cfg["inference"].get("ensemble_mode", False)
     ensemble_size = cfg["inference"].get("ensemble_size", 10) if ensemble_mode else 1
-    output_base_dir = cfg["inference"]["output_dir"]
-    
     max_samples = cfg["inference"].get("max_samples", None)
     
-    dt_val = cfg["inference"]["strategies"][0]["dt"]
-    num_steps = int(horizon / dt_val)
-    dt_list = [torch.tensor(dt_val, device=device).float()] * num_steps
-
     processed_count = 0
     
     with Progress(
@@ -82,9 +77,10 @@ def run_inference(cfg, model, device, console):
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
         console=console
     ) as progress:
-        task = progress.add_task("Ensemble Inference", total=min(len(loader), max_samples) if max_samples else len(loader))
+        task = progress.add_task("Multi-Strategy Ensemble", total=min(len(loader), max_samples) if max_samples else len(loader))
 
         for batch_idx, batch in enumerate(loader):
             if max_samples and processed_count >= max_samples:
@@ -93,41 +89,42 @@ def run_inference(cfg, model, device, console):
             data = batch[0].to(device).float()
             x_context = data[:, :input_len]
             
-            ensemble_preds = []
-            
-            for m in range(ensemble_size):
-                seed = 42 + batch_idx * 100 + m
-                torch.manual_seed(seed)
+            for s in strategies:
+                dt_val = s["dt"]
+                strat_name = s["name"].replace(" ", "_").replace("=", "_").replace("(", "").replace(")", "")
+                num_steps = int(horizon / dt_val)
+                dt_list = [torch.tensor(dt_val, device=device).float()] * num_steps
                 
-                with torch.no_grad():
-                    preds = model.forward_rollout(x_context, input_dt, dt_list)
-                    ensemble_preds.append(preds)
+                strat_preds = []
+                
+                for m in range(ensemble_size):
+                    seed = 42 + batch_idx * 100 + m
+                    torch.manual_seed(seed)
                     
-                member_dir = os.path.join(output_base_dir, f"member_{m:02d}")
+                    with torch.no_grad():
+                        preds = model.forward_rollout(x_context, input_dt, dt_list)
+                        strat_preds.append(preds)
+                    
+                    member_dir = os.path.join(output_base_dir, strat_name, f"member_{m:02d}")
+                    for t in range(num_steps):
+                        save_visualization(preds[0, t], member_dir, processed_count, t + 1)
+                
+                ensemble_tensor = torch.stack(strat_preds, dim=0)
+                mean_pred = torch.mean(ensemble_tensor, dim=0)
+                
+                mean_dir = os.path.join(output_base_dir, strat_name, "mean")
                 for t in range(num_steps):
-                    save_visualization(preds[0, t], member_dir, processed_count, t + 1)
-            
-            ensemble_tensor = torch.stack(ensemble_preds, dim=0)
-            mean_pred = torch.mean(ensemble_tensor, dim=0)
-            
-            mean_dir = os.path.join(output_base_dir, "mean")
-            for t in range(num_steps):
-                save_visualization(mean_pred[0, t], mean_dir, processed_count, t + 1)
-            
+                    save_visualization(mean_pred[0, t], mean_dir, processed_count, t + 1)
+
             processed_count += 1
             progress.advance(task)
 
 def main():
-    with open("infer.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-
+    with open("infer.yaml", "r") as f: cfg = yaml.safe_load(f)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console = Console()
     
-    console.print(f"[bold green]Starting Inference on {device}[/bold green]")
-    if cfg["inference"].get("ensemble_mode"):
-        console.print(f"[cyan]Ensemble Mode: {cfg['inference']['ensemble_size']} members[/cyan]")
-
+    console.print(f"[bold blue]UniPhy Inference: {len(cfg['inference']['strategies'])} Strategies, {cfg['inference']['ensemble_size']} Members[/bold blue]")
     model = setup_model(cfg, device)
     run_inference(cfg, model, device, console)
 

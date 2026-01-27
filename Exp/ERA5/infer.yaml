@@ -22,7 +22,7 @@ inference:
   ckpt: "checkpoints/latest.pth"
   batch_size: 1
   max_samples: 5
-  output_dir: "results_vis"
+  output_dir: "results_viz"
   
   ensemble_mode: True
   ensemble_size: 10
@@ -32,5 +32,6 @@ inference:
   forecast_horizon: 12.0
   
   strategies:
-    - {name: "Standard", dt: 6.0}
+    - {name: "dt=6.0 (Steps=2)", dt: 6.0}
+    - {name: "dt=1.0 (Steps=12)", dt: 1.0}
     
