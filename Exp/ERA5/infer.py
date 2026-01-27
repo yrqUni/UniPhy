@@ -158,8 +158,9 @@ def main():
                 
                 x_init = data[:, cond_frames - 1]
                 x_target = data[:, cond_frames : cond_frames + pred_frames]
-
-                dt_list = [dt_ref] * pred_frames
+                
+                dt_val = torch.tensor(dt_ref, device=device, dtype=x_init.dtype)
+                dt_list = [dt_val] * pred_frames
                 
                 pred_final = model.forward_rollout(x_init, dt_list)
 
