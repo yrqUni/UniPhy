@@ -15,7 +15,7 @@ sys.path.append("/nfs/UniPhy/Exp/ERA5")
 from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhyModel
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 plt.switch_backend('Agg')
 
 def get_lat_weights(H, W, device):
@@ -85,7 +85,13 @@ def main():
     ckpt_path = cfg["inference"]["ckpt_path"]
     checkpoint = torch.load(ckpt_path, map_location=device)
     
-    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+    if "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    elif "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+
     new_state_dict = {}
     for k, v in state_dict.items():
         name = k[7:] if k.startswith("module.") else k
