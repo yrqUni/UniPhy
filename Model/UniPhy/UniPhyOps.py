@@ -275,10 +275,12 @@ class RiemannianCliffordConv2d(nn.Module):
         cos_lat = self.cos_lat
         if H != self.cos_lat.shape[2]:
             cos_lat = F.interpolate(cos_lat, size=(H, 1), mode="bilinear", align_corners=False)
+        
         cos_lat = cos_lat.expand(B, -1, H, W)
+        cos_lat_safe = torch.clamp(cos_lat, min=1e-6)
 
-        y_e1_scaled = y_e1 * cos_lat
-        y_e12_scaled = y_e12 * cos_lat
+        y_e1_scaled = y_e1 * cos_lat_safe
+        y_e12_scaled = y_e12 * cos_lat_safe
 
         out = y_e0 + y_e1_scaled + y_e2 + y_e12_scaled
         out = out * self.metric_scale

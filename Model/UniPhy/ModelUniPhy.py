@@ -264,7 +264,7 @@ class UniPhyModel(nn.Module):
             latent_dim=embed_dim,
             patch_size=patch_size,
             model_channels=embed_dim,
-            ensemble_size=1,
+            ensemble_size=10, 
             img_height=img_height,
             img_width=img_width,
         )
@@ -308,7 +308,7 @@ class UniPhyModel(nn.Module):
             states.append((h, f))
         return states
 
-    def forward(self, x, dt):
+    def forward(self, x, dt, member_idx=None):
         B, T, C, H, W = x.shape
         device = x.device
 
@@ -322,50 +322,10 @@ class UniPhyModel(nn.Module):
             z, h_next, flux_next = block(z, h_prev, dt, flux_prev)
             states[i] = (h_next, flux_next)
 
-        out = self.decoder(z)
+        out = self.decoder(z, member_idx=member_idx)
 
         if out.shape[-2] != H or out.shape[-1] != W:
             out = out[..., :H, :W]
 
         return out
-
-    @torch.no_grad()
-    def forward_rollout(self, x_init, dt_list, num_steps=None):
-        if num_steps is None:
-            num_steps = len(dt_list)
-
-        B = x_init.shape[0]
-        device = x_init.device
-        target_h, target_w = x_init.shape[-2:]
-
-        z = self.encoder(x_init.unsqueeze(1)).squeeze(1)
-        dtype = z.dtype if z.dtype.is_complex else torch.complex64
-
-        states = self._init_states(B, device, dtype)
-        preds = []
-
-        for k in range(num_steps):
-            dt_k = dt_list[k] if k < len(dt_list) else dt_list[-1]
-            new_states = []
-            z_curr_layer = z
-
-            for i, block in enumerate(self.blocks):
-                h_prev, flux_prev = states[i]
-                z_curr_layer, h_next, flux_next = block.forward_step(
-                    z_curr_layer, h_prev, dt_k, flux_prev
-                )
-                new_states.append((h_next, flux_next))
-
-            states = new_states
-            pred = self.decoder(z_curr_layer.unsqueeze(1)).squeeze(1)
-
-            if pred.shape[-2] != target_h or pred.shape[-1] != target_w:
-                pred = pred[..., :target_h, :target_w]
-
-            preds.append(pred)
-
-            if k < num_steps - 1:
-                z = self.encoder(pred.unsqueeze(1)).squeeze(1)
-
-        return torch.stack(preds, dim=1)
     

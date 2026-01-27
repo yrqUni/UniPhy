@@ -59,7 +59,8 @@ class ComplexDynamicFFN(nn.Module):
             nn.GELU(),
             nn.Conv2d(dim, num_experts, 1),
         )
-
+        
+        self.aux_loss = 0.0
         self._init_weights()
 
     def _init_weights(self):
@@ -86,7 +87,14 @@ class ComplexDynamicFFN(nn.Module):
         im_spatial = self.spatial_re(im) + self.spatial_im(re)
 
         router_input = torch.cat([re_spatial, im_spatial], dim=1)
-        route_weights = F.softmax(self.router(router_input), dim=1)
+        logits = self.router(router_input)
+        
+        route_weights = F.softmax(logits, dim=1)
+        
+        prob_mean = route_weights.mean(dim=(0, 2, 3))
+        logits_mean = F.softmax(logits, dim=1).mean(dim=(0, 2, 3))
+        self.aux_loss = (self.num_experts * (prob_mean * logits_mean).sum()) * 0.01
+
         route_weights = route_weights.view(B, self.num_experts, 1, H, W)
 
         up_re = self.experts_up_re(re_spatial) - self.experts_up_im(im_spatial)
