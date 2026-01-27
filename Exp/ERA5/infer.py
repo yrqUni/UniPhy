@@ -3,10 +3,9 @@ import sys
 import yaml
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
@@ -17,13 +16,11 @@ from ModelUniPhy import UniPhyModel
 def setup_model(cfg, device):
     model = UniPhyModel(**cfg["model"]).to(device)
     ckpt_path = cfg["inference"]["ckpt"]
-    
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         state_dict = ckpt["model"] if "model" in ckpt else ckpt
         clean_dict = {(k[7:] if k.startswith("module.") else k): v for k, v in state_dict.items()}
         model.load_state_dict(clean_dict)
-    
     model.eval()
     return model
 
@@ -31,7 +28,6 @@ def get_dataloader(cfg):
     i_len = cfg["inference"]["input_len"]
     f_hz = cfg["inference"]["forecast_horizon"]
     total_frames = i_len + int(f_hz / 6.0)
-    
     dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
         year_range=cfg["data"]["test_year_range"],
@@ -41,91 +37,99 @@ def get_dataloader(cfg):
         is_train=False,
         dt_ref=cfg["data"]["dt_ref"]
     )
-    
     return torch.utils.data.DataLoader(
         dataset, 
-        batch_size=cfg["inference"]["batch_size"], 
+        batch_size=1, 
         shuffle=False, 
         num_workers=4
     )
 
-def execute_inference(cfg, model, device, console):
+def save_visualization(tensor, output_dir, sample_idx, step_idx):
+    os.makedirs(output_dir, exist_ok=True)
+    img = tensor.cpu().numpy()
+    if img.ndim == 3:
+        img = img[0] 
+    
+    plt.figure(figsize=(8, 8))
+    plt.imshow(img, cmap='RdBu_r')
+    plt.axis('off')
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, f"sample_{sample_idx:03d}_step_{step_idx:02d}.png")
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+def run_inference(cfg, model, device, console):
     loader = get_dataloader(cfg)
-    strategies = cfg["inference"]["strategies"]
-    results = {s["name"]: [] for s in strategies}
     
     input_len = cfg["inference"]["input_len"]
     input_dt = cfg["inference"]["input_dt"]
     horizon = cfg["inference"]["forecast_horizon"]
-    max_samples = cfg["inference"].get("max_samples")
     
+    ensemble_mode = cfg["inference"].get("ensemble_mode", False)
+    ensemble_size = cfg["inference"].get("ensemble_size", 10) if ensemble_mode else 1
+    output_base_dir = cfg["inference"]["output_dir"]
+    
+    max_samples = cfg["inference"].get("max_samples", None)
+    
+    dt_val = cfg["inference"]["strategies"][0]["dt"]
+    num_steps = int(horizon / dt_val)
+    dt_list = [torch.tensor(dt_val, device=device).float()] * num_steps
+
     processed_count = 0
     
-    progress = Progress(
+    with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
         console=console
-    )
+    ) as progress:
+        task = progress.add_task("Ensemble Inference", total=min(len(loader), max_samples) if max_samples else len(loader))
 
-    with progress:
-        task_id = progress.add_task("Evaluating Rollout", total=len(loader))
-        
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             if max_samples and processed_count >= max_samples:
                 break
-                
+            
             data = batch[0].to(device).float()
             x_context = data[:, :input_len]
-            x_target = data[:, -1]
             
-            for s in strategies:
-                dt_val = s["dt"]
-                num_steps = int(horizon / dt_val)
-                dt_list = [torch.tensor(dt_val, device=device).float()] * num_steps
-                
-                preds = model.forward_rollout(x_context, input_dt, dt_list)
-                
-                rmse = torch.sqrt((preds[:, -1].real - x_target).pow(2).mean(dim=(1, 2, 3)))
-                results[s["name"]].extend(rmse.cpu().tolist())
+            ensemble_preds = []
             
-            processed_count += data.shape[0]
-            progress.advance(task_id)
-
-    return results
-
-def display_results(results, console):
-    table = Table(title="UniPhy Forecast Performance (12h Horizon)", show_header=True, header_style="bold magenta")
-    table.add_column("Strategy", style="dim", width=25)
-    table.add_column("Mean RMSE", justify="right", style="green")
-    table.add_column("Std Dev", justify="right", style="cyan")
-    table.add_column("Samples", justify="right")
-
-    for name, values in results.items():
-        if values:
-            table.add_row(
-                name, 
-                f"{np.mean(values):.4f}", 
-                f"{np.std(values):.4f}", 
-                str(len(values))
-            )
-    
-    console.print(Panel(table, expand=False, border_style="blue"))
+            for m in range(ensemble_size):
+                seed = 42 + batch_idx * 100 + m
+                torch.manual_seed(seed)
+                
+                with torch.no_grad():
+                    preds = model.forward_rollout(x_context, input_dt, dt_list)
+                    ensemble_preds.append(preds)
+                    
+                member_dir = os.path.join(output_base_dir, f"member_{m:02d}")
+                for t in range(num_steps):
+                    save_visualization(preds[0, t], member_dir, processed_count, t + 1)
+            
+            ensemble_tensor = torch.stack(ensemble_preds, dim=0)
+            mean_pred = torch.mean(ensemble_tensor, dim=0)
+            
+            mean_dir = os.path.join(output_base_dir, "mean")
+            for t in range(num_steps):
+                save_visualization(mean_pred[0, t], mean_dir, processed_count, t + 1)
+            
+            processed_count += 1
+            progress.advance(task)
 
 def main():
-    console = Console()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     with open("infer.yaml", "r") as f:
         cfg = yaml.safe_load(f)
 
-    console.print(f"[bold blue]Initializing UniPhy Inference on {device}...[/bold blue]")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    console = Console()
     
+    console.print(f"[bold green]Starting Inference on {device}[/bold green]")
+    if cfg["inference"].get("ensemble_mode"):
+        console.print(f"[cyan]Ensemble Mode: {cfg['inference']['ensemble_size']} members[/cyan]")
+
     model = setup_model(cfg, device)
-    raw_results = execute_inference(cfg, model, device, console)
-    display_results(raw_results, console)
+    run_inference(cfg, model, device, console)
 
 if __name__ == "__main__":
     main()
