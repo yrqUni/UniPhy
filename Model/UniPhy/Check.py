@@ -7,34 +7,36 @@ def sequential_forward(model, x, dt):
     device = x.device
     
     outputs = []
-    states = model._init_states(B, device, torch.complex64)
+    
+    z_all = model.encoder(x)
+    dtype = z_all.dtype if z_all.dtype.is_complex else torch.complex64
+    states = model._init_states(B, device, dtype)
     
     for t in range(T):
-        x_t = x[:, t:t+1]
-        z = model.encoder(x_t)
+        z_t = z_all[:, t]
+        
+        dt_t = dt[:, t] if dt.ndim > 1 else dt[t] if dt.ndim == 1 else dt
         
         for i, block in enumerate(model.blocks):
             h_prev, flux_prev = states[i]
-            # Use the block's forward method on a single time step
-            z, h_next, flux_next = block(z, h_prev, dt[:, t:t+1] if dt.ndim > 1 else dt, flux_prev)
+            z_t, h_next, flux_next = block.forward_step(z_t, h_prev, dt_t, flux_prev)
             states[i] = (h_next, flux_next)
         
-        out = model.decoder(z)
+        out = model.decoder(z_t.unsqueeze(1)).squeeze(1)
         if out.shape[-2] != H or out.shape[-1] != W:
             out = out[..., :H, :W]
-        outputs.append(out.squeeze(1))
+        outputs.append(out)
     
     return torch.stack(outputs, dim=1)
 
 def check_forward_consistency():
     print("=" * 60)
-    print("Testing Forward Consistency (Serial vs Parallel)")
+    print("Testing Forward Consistency (Serial Step vs Parallel Scan)")
     print("=" * 60)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
     
-    # Set sde_mode="det" to ensure deterministic output for consistency check
     model = UniPhyModel(
         in_channels=4,
         out_channels=4,
