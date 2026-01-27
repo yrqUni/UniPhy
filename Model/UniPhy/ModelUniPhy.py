@@ -93,7 +93,6 @@ class UniPhyBlock(nn.Module):
         device = x.device
 
         x = self._spatial_process(x)
-
         x_perm = x.permute(0, 1, 3, 4, 2)
         x_eigen = self.prop.basis.encode(x_perm)
         x_mean = x_eigen.mean(dim=(2, 3))
@@ -101,27 +100,22 @@ class UniPhyBlock(nn.Module):
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=device, dtype=x.dtype)
 
-        flux_list = []
-        source_list = []
-        gate_list = []
-        current_flux = flux_prev
+        A_flux, X_flux = self.prop.flux_tracker.get_scan_operators(x_mean)
+        flux_seq = pscan(A_flux, X_flux)
+        flux_seq = flux_seq.squeeze(-1)
 
-        for t in range(T):
-            new_flux, source, gate = self.prop.flux_tracker.forward_step(
-                current_flux, x_mean[:, t]
-            )
-            flux_list.append(new_flux)
-            source_list.append(source)
-            gate_list.append(gate)
-            current_flux = new_flux
+        decay_val = self.prop.flux_tracker._get_decay() 
+        decay_steps = decay_val.view(1, 1, D).expand(B, T, D)
+        decay_cum = torch.cumprod(decay_steps, dim=1)
+        
+        prev_contribution = flux_prev.unsqueeze(1) * decay_cum
+        flux_seq = flux_seq + prev_contribution
 
-        flux_seq = torch.stack(flux_list, dim=1)
-        source_seq = torch.stack(source_list, dim=1)
-        gate_seq = torch.stack(gate_list, dim=1)
+        source_seq, gate_seq = self.prop.flux_tracker.compute_output(flux_seq)
+        flux_out = flux_seq[:, -1]
 
         source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
         gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
-
         forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
 
         if dt.ndim == 1:
@@ -154,13 +148,10 @@ class UniPhyBlock(nn.Module):
 
         A = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
-
         Y = pscan(A, X)
 
         u_out = Y.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
-
         h_out = u_out[:, -1].reshape(B * H * W, 1, D)
-        flux_out = flux_seq[:, -1]
 
         x_out = self.prop.basis.decode(u_out)
         x_out = x_out.permute(0, 1, 4, 2, 3)
