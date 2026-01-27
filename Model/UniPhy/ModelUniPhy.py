@@ -93,6 +93,7 @@ class UniPhyBlock(nn.Module):
         device = x.device
 
         x = self._spatial_process(x)
+
         x_perm = x.permute(0, 1, 3, 4, 2)
         x_eigen = self.prop.basis.encode(x_perm)
         x_mean = x_eigen.mean(dim=(2, 3))
@@ -100,22 +101,25 @@ class UniPhyBlock(nn.Module):
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=device, dtype=x.dtype)
 
+        # === Parallel Scan Flow for FluxTracker ===
         A_flux, X_flux = self.prop.flux_tracker.get_scan_operators(x_mean)
         flux_seq = pscan(A_flux, X_flux)
         flux_seq = flux_seq.squeeze(-1)
 
+        # Handle initial state contribution for Flux
         decay_val = self.prop.flux_tracker._get_decay() 
         decay_steps = decay_val.view(1, 1, D).expand(B, T, D)
         decay_cum = torch.cumprod(decay_steps, dim=1)
-        
         prev_contribution = flux_prev.unsqueeze(1) * decay_cum
         flux_seq = flux_seq + prev_contribution
 
         source_seq, gate_seq = self.prop.flux_tracker.compute_output(flux_seq)
         flux_out = flux_seq[:, -1]
+        # ==========================================
 
         source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
         gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+
         forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
 
         if dt.ndim == 1:
@@ -148,11 +152,13 @@ class UniPhyBlock(nn.Module):
 
         A = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
         X = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
+
         Y = pscan(A, X)
 
         u_out = Y.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
-        h_out = u_out[:, -1].reshape(B * H * W, 1, D)
 
+        h_out = u_out[:, -1].reshape(B * H * W, 1, D)
+        
         x_out = self.prop.basis.decode(u_out)
         x_out = x_out.permute(0, 1, 4, 2, 3)
         x_out = self._temporal_decode(x_out)
@@ -177,7 +183,19 @@ class UniPhyBlock(nn.Module):
         if flux_prev is None:
             flux_prev = torch.zeros(B, D, device=device, dtype=x_curr.dtype)
 
-        flux_next, source, gate = self.prop.flux_tracker.forward_step(flux_prev, x_mean)
+        # For single step, forward_step is still valid on FluxTracker
+        # But we must ensure UniPhyOps has this method or we implement it here manually
+        # Given your previous UniPhyOps update, let's use the explicit step logic:
+        decay_val = self.prop.flux_tracker._get_decay()
+        
+        x_mean_flat = x_mean # (B, D)
+        x_cat = torch.cat([x_mean_flat.real, x_mean_flat.imag], dim=-1)
+        x_in = self.prop.flux_tracker.input_mix(x_cat)
+        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
+        x_mixed = torch.complex(x_re, x_im)
+        
+        flux_next = flux_prev * decay_val + x_mixed
+        source, gate = self.prop.flux_tracker.compute_output(flux_next)
 
         source_expanded = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
         gate_expanded = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
@@ -185,6 +203,13 @@ class UniPhyBlock(nn.Module):
         forcing = x_eigen * gate_expanded + source_expanded * (1 - gate_expanded)
 
         op_decay, op_forcing = self.prop.get_transition_operators(dt)
+        
+        # === CRITICAL FIX: Reshape operators for broadcasting ===
+        if op_decay.ndim == 2: # (B, D)
+            op_decay = op_decay.unsqueeze(1).unsqueeze(1) # -> (B, 1, 1, D)
+        if op_forcing.ndim == 2:
+            op_forcing = op_forcing.unsqueeze(1).unsqueeze(1)
+        # ========================================================
 
         h_prev_reshaped = h_prev.reshape(B, H, W, D)
         
@@ -264,7 +289,7 @@ class UniPhyModel(nn.Module):
             latent_dim=embed_dim,
             patch_size=patch_size,
             model_channels=embed_dim,
-            ensemble_size=10, 
+            ensemble_size=10, # Enabled ensemble
             img_height=img_height,
             img_width=img_width,
         )
@@ -328,4 +353,48 @@ class UniPhyModel(nn.Module):
             out = out[..., :H, :W]
 
         return out
+
+    @torch.no_grad()
+    def forward_rollout(self, x_init, dt_list, num_steps=None):
+        if num_steps is None:
+            num_steps = len(dt_list)
+
+        B = x_init.shape[0]
+        device = x_init.device
+        target_h, target_w = x_init.shape[-2:]
+
+        z = self.encoder(x_init.unsqueeze(1)).squeeze(1)
+        dtype = z.dtype if z.dtype.is_complex else torch.complex64
+
+        states = self._init_states(B, device, dtype)
+        preds = []
+
+        for k in range(num_steps):
+            dt_k = dt_list[k] if k < len(dt_list) else dt_list[-1]
+            new_states = []
+            
+            # Re-encode is now handled outside the loop in previous step for z
+            # But inside loop, z is updated by blocks
+            z_curr_layer = z
+
+            for i, block in enumerate(self.blocks):
+                h_prev, flux_prev = states[i]
+                z_curr_layer, h_next, flux_next = block.forward_step(z_curr_layer, h_prev, dt_k, flux_prev)
+                new_states.append((h_next, flux_next))
+
+            states = new_states
+            
+            # z_curr_layer is now the output of the last block (deep feature)
+            # Decoder takes this deep feature
+            pred = self.decoder(z_curr_layer.unsqueeze(1)).squeeze(1)
+
+            if pred.shape[-2] != target_h or pred.shape[-1] != target_w:
+                pred = pred[..., :target_h, :target_w]
+
+            preds.append(pred)
+
+            if k < num_steps - 1:
+                z = self.encoder(pred.unsqueeze(1)).squeeze(1)
+
+        return torch.stack(preds, dim=1)
     
