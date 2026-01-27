@@ -26,10 +26,7 @@ inference:
   input_dt: 6.0
   forecast_horizon: 12.0
   strategies:
-    - name: "dt=6.0 (2 steps)"
-      dt: 6.0
-    - name: "dt=3.0 (4 steps)"
-      dt: 3.0
-    - name: "dt=1.0 (12 steps)"
-      dt: 1.0
-      
+    - {name: "dt=6.0 (2 steps)", dt: 6.0}
+    - {name: "dt=3.0 (4 steps)", dt: 3.0}
+    - {name: "dt=1.0 (12 steps)", dt: 1.0}
+    
