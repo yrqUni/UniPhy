@@ -6,7 +6,6 @@ from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
-
 class UniPhyBlock(nn.Module):
     def __init__(
         self,
@@ -105,7 +104,7 @@ class UniPhyBlock(nn.Module):
         flux_seq = pscan(A_flux, X_flux)
         flux_seq = flux_seq.squeeze(-1)
 
-        decay_val = self.prop.flux_tracker._get_decay() 
+        decay_val = self.prop.flux_tracker._get_decay()
         decay_steps = decay_val.view(1, 1, D).expand(B, T, D)
         decay_cum = torch.cumprod(decay_steps, dim=1)
         prev_contribution = flux_prev.unsqueeze(1) * decay_cum
@@ -119,10 +118,7 @@ class UniPhyBlock(nn.Module):
 
         forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
 
-        if dt.ndim == 1:
-            dt_exp = dt.unsqueeze(0).expand(B, T)
-        else:
-            dt_exp = dt
+        dt_exp = dt.unsqueeze(0).expand(B, T) if dt.ndim == 1 else dt
 
         op_decay, op_forcing = self.prop.get_transition_operators(dt_exp)
         op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
@@ -136,7 +132,7 @@ class UniPhyBlock(nn.Module):
                 shape=u_t.shape,
                 dt=dt_noise,
                 dtype=u_t.dtype,
-                h_state=x_eigen 
+                h_state=x_eigen
             )
             u_t = u_t + noise
 
@@ -151,11 +147,9 @@ class UniPhyBlock(nn.Module):
         X = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
 
         Y = pscan(A, X)
-
         u_out = Y.reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
-
         h_out = u_out[:, -1].reshape(B * H * W, 1, D)
-        
+
         x_out = self.prop.basis.decode(u_out)
         x_out = x_out.permute(0, 1, 4, 2, 3)
         x_out = self._temporal_decode(x_out)
@@ -181,13 +175,11 @@ class UniPhyBlock(nn.Module):
             flux_prev = torch.zeros(B, D, device=device, dtype=x_curr.dtype)
 
         decay_val = self.prop.flux_tracker._get_decay()
-        
-        x_mean_flat = x_mean
-        x_cat = torch.cat([x_mean_flat.real, x_mean_flat.imag], dim=-1)
+        x_cat = torch.cat([x_mean.real, x_mean.imag], dim=-1)
         x_in = self.prop.flux_tracker.input_mix(x_cat)
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
         x_mixed = torch.complex(x_re, x_im)
-        
+
         flux_next = flux_prev * decay_val + x_mixed
         source, gate = self.prop.flux_tracker.compute_output(flux_next)
 
@@ -197,35 +189,26 @@ class UniPhyBlock(nn.Module):
         forcing = x_eigen * gate_expanded + source_expanded * (1 - gate_expanded)
 
         op_decay, op_forcing = self.prop.get_transition_operators(dt)
-        
+
         if op_decay.ndim == 2:
             op_decay = op_decay.unsqueeze(1).unsqueeze(1)
         if op_forcing.ndim == 2:
             op_forcing = op_forcing.unsqueeze(1).unsqueeze(1)
 
         h_prev_reshaped = h_prev.reshape(B, H, W, D)
-        
         noise = 0
         if self.prop.sde_mode == "sde":
-            if dt.ndim == 1:
-                dt_noise = dt.view(B, 1, 1, 1)
-            elif dt.ndim == 0:
-                dt_noise = dt
-            else:
-                dt_noise = dt.view(B, 1, 1, 1)
-
+            dt_noise = dt.view(B, 1, 1, 1) if dt.ndim >= 1 else dt
             noise = self.prop.generate_stochastic_term(
                 shape=h_prev_reshaped.shape,
                 dt=dt_noise,
                 dtype=h_prev_reshaped.dtype,
-                h_state=x_eigen 
+                h_state=x_eigen
             )
 
         h_next = h_prev_reshaped * op_decay + forcing * op_forcing + noise
 
-        x_out = self.prop.basis.decode(h_next)
-        x_out = x_out.permute(0, 3, 1, 2)
-
+        x_out = self.prop.basis.decode(h_next).permute(0, 3, 1, 2)
         x_out_real = torch.cat([x_out.real, x_out.imag], dim=1)
         x_out_norm = self.norm_temporal(x_out_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_out_re, x_out_im = torch.chunk(x_out_norm, 2, dim=1)
@@ -331,7 +314,6 @@ class UniPhyModel(nn.Module):
 
         z = self.encoder(x)
         dtype = z.dtype if z.dtype.is_complex else torch.complex64
-
         states = self._init_states(B, device, dtype)
 
         for i, block in enumerate(self.blocks):
@@ -357,14 +339,12 @@ class UniPhyModel(nn.Module):
 
         z = self.encoder(x_init.unsqueeze(1)).squeeze(1)
         dtype = z.dtype if z.dtype.is_complex else torch.complex64
-
         states = self._init_states(B, device, dtype)
         preds = []
 
         for k in range(num_steps):
             dt_k = dt_list[k] if k < len(dt_list) else dt_list[-1]
             new_states = []
-            
             z_curr_layer = z
 
             for i, block in enumerate(self.blocks):
@@ -373,7 +353,6 @@ class UniPhyModel(nn.Module):
                 new_states.append((h_next, flux_next))
 
             states = new_states
-            
             pred = self.decoder(z_curr_layer.unsqueeze(1)).squeeze(1)
 
             if pred.shape[-2] != target_h or pred.shape[-1] != target_w:
