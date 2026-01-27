@@ -9,22 +9,20 @@ model:
   img_height: 721
   img_width: 1440
   dt_ref: 6.0
-  sde_mode: "sde"
-  init_noise_scale: 1.0
+  sde_mode: "det"
+  init_noise_scale: 0.0
   max_growth_rate: 0.3
 
-inference:
-  ckpt_path: "./uniphy/ckpt/ckpt_epoch13.pt"
-  data_root: "/nfs/ERA5_data/data_norm"
-  save_dir: "./uniphy/results"
-  max_vis_samples: 5
-  batch_size: 1
-  year_range: [2021, 2021]
-  cond_frames: 4
-  pred_frames: 8
+data:
+  input_dir: "/nfs/ERA5_data/data_norm"
+  test_year_range: [2022, 2022]
+  input_steps: 1
+  pred_steps: 8
   dt_ref: 6.0
-  num_ensemble: 3
-  eval_sample_num: 1
-  device: "cuda"
-  use_tf32: true
+
+inference:
+  ckpt: "./uniphy/ckpt/ckpt_final.pt"
+  batch_size: 1
+  ensemble_size: 1
+  dt_comparison: true 
   
