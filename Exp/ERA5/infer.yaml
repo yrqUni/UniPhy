@@ -1,28 +1,35 @@
 model:
-  in_channels: 30
-  out_channels: 30
-  embed_dim: 512
+  in_channels: 20
+  out_channels: 20
+  embed_dim: 256
   expand: 4
   num_experts: 8
   depth: 8
-  patch_size: 32
-  img_height: 721
-  img_width: 1440
-  dt_ref: 6.0
-  sde_mode: "det"
-  init_noise_scale: 0.0
+  patch_size: 16
+  img_height: 64
+  img_width: 64
+  dt_ref: 1.0
+  sde_mode: "sde"
+  init_noise_scale: 0.01
   max_growth_rate: 0.3
 
 data:
-  input_dir: "/nfs/ERA5_data/data_norm"
-  test_year_range: [2022, 2022]
-  input_steps: 1
-  pred_steps: 8
-  dt_ref: 6.0
+  input_dir: "/nfs/UniPhy/Data/ERA5"
+  test_year_range: [2020, 2020]
+  dt_ref: 1.0
 
 inference:
-  ckpt: "./uniphy/ckpt/ckpt_final.pt"
-  batch_size: 1
-  ensemble_size: 1
-  dt_comparison: true 
-  
+  ckpt: "checkpoints/latest.pth"
+  batch_size: 4
+  max_samples: 20
+  input_len: 8
+  input_dt: 6.0
+  forecast_horizon: 12.0
+  strategies:
+    - name: "dt=6.0 (2 steps)"
+      dt: 6.0
+    - name: "dt=3.0 (4 steps)"
+      dt: 3.0
+    - name: "dt=1.0 (12 steps)"
+      dt: 1.0
+      
