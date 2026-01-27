@@ -220,7 +220,7 @@ class _PScanFunction(torch.autograd.Function):
         A_H_flat = A_H.permute(0, 2, 1, 3, 4).reshape(B * C, L, D1, D1)
         grad_Y_flat = grad_Y_in.permute(0, 2, 1, 3, 4).reshape(B * C, L, D1_pad, D2_pad)
 
-        A_H_real = torch.view_as_real(A_H_flat).contiguous()
+        A_H_real = torch.view_as_real(A_H_flat.resolve_conj()).contiguous()
         grad_Y_real = torch.view_as_real(grad_Y_flat).contiguous()
 
         grad_X_real = run_mat2x2_pscan(A_H_real, grad_Y_real, L, reverse=True)
