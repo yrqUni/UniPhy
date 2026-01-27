@@ -14,7 +14,7 @@ model:
   max_growth_rate: 0.3
 
 inference:
-  ckpt_path: "./uniphy/ckpt/ckpt_epoch100.pt"
+  ckpt_path: "./uniphy/ckpt/ckpt_epoch13.pt"
   data_root: "/nfs/ERA5_data/data_norm"
   save_dir: "./uniphy/results"
   max_vis_samples: 5
