@@ -9,7 +9,7 @@ inference:
   max_samples: 5
   output_dir: "results_viz"
   ensemble_mode: true
-  ensemble_size: 10
+  ensemble_size: 3
   input_len: 8
   input_dt: 6.0
   forecast_horizon: 12.0
