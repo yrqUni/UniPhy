@@ -16,7 +16,7 @@ data:
   input_dir: "/nfs/ERA5_data/data_norm"
   year_range: [2000, 2021]
   window_size: 20
-  sample_k: 9
+  sample_k: 6
   look_ahead: 2
   dt_ref: 6.0
   sampling_mode: "sequential"
