@@ -14,12 +14,12 @@ model:
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
-  year_range: [2000, 2009]
-  window_size: 20
-  sample_k: 6
+  year_range: [2000, 2000]
+  window_size: 10
+  sample_k: 5
   look_ahead: 2
   dt_ref: 6.0
-  sampling_mode: "sequential"
+  sampling_mode: "mix"
 
 train:
   batch_size: 1
