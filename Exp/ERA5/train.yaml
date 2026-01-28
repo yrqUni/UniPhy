@@ -20,6 +20,7 @@ data:
   sample_k: 5
   look_ahead: 2
   dt_ref: 6.0
+  sampling_mode: "mixed"
 
 train:
   batch_size: 1
@@ -43,4 +44,4 @@ logging:
   wandb_project: "ERA5"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
-  
+

@@ -20,6 +20,7 @@ class ERA5_Dataset(Dataset):
         look_ahead=2,
         is_train=True,
         dt_ref=6.0,
+        sampling_mode="mixed",
     ):
         self.input_root = input_dir
         self.window_size = window_size
@@ -27,6 +28,7 @@ class ERA5_Dataset(Dataset):
         self.look_ahead = look_ahead
         self.is_train = is_train
         self.dt_ref = dt_ref
+        self.sampling_mode = sampling_mode
 
         self.shm_root = f"/dev/shm/era5_cache/{uuid.uuid4().hex}"
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -95,12 +97,19 @@ class ERA5_Dataset(Dataset):
         idx = int(idx)
 
         if self.is_train:
-            if random.random() < 0.5:
-                offsets = sorted(random.sample(range(self.window_size), self.sample_k))
-            else:
+            use_sequential = False
+            if self.sampling_mode == "sequential":
+                use_sequential = True
+            elif self.sampling_mode == "mixed":
+                if random.random() < 0.5:
+                    use_sequential = True
+
+            if use_sequential:
                 max_start = self.window_size - self.sample_k
                 start_off = random.randint(0, max(0, max_start))
                 offsets = list(range(start_off, start_off + self.sample_k))
+            else:
+                offsets = sorted(random.sample(range(self.window_size), self.sample_k))
         else:
             offsets = list(range(self.sample_k))
 
