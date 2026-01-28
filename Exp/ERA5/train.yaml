@@ -41,7 +41,7 @@ logging:
   ckpt_dir: "./uniphy/ckpt"
   ckpt: ""
   use_wandb: true
-  wandb_project: "ERA5"
+  wandb_project: "ERA5-dt6.0"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
 
