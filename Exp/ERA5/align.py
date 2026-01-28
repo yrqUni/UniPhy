@@ -98,16 +98,20 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     ensemble_size = cfg["model"]["ensemble_size"]
     align_factors = cfg["alignment"]["sub_steps"]
     target_dt = cfg["alignment"]["target_dt"]
+    max_k = cfg["alignment"].get("max_rollout_steps", 1)
 
-    x_input = data[:, :-1]
-    x_target = data[:, -1]
+    k = random.randint(1, max_k)
 
-    steps = random.choice(align_factors)
-    dt_step = target_dt / steps
+    x_input = data[:, 0:1]  
+    x_target = data[:, k]   
 
+    sub_steps = random.choice(align_factors)
+    dt_step = target_dt / sub_steps
+    
+    total_steps = k * sub_steps
     dt_list = [
         torch.tensor(dt_step, device=device, dtype=torch.float32)
-        for _ in range(steps)
+        for _ in range(total_steps)
     ]
 
     if hasattr(model, "module"):
@@ -168,8 +172,9 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         "l1_loss": l1_loss.item(),
         "crps_loss": crps_loss.item(),
         "rmse": rmse.item(),
-        "steps": steps,
-        "dt": dt_step,
+        "k_steps": k,
+        "sub_steps": sub_steps,
+        "total_dt": k * target_dt,
         "grad_norm": grad_norm,
         "ensemble_std": ensemble_std.item(),
     }
@@ -261,11 +266,13 @@ def align(cfg):
 
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
+    max_rollout_steps = cfg["alignment"].get("max_rollout_steps", 1)
+
     train_dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
         year_range=cfg["data"]["year_range"],
         window_size=cfg["data"]["window_size"],
-        sample_k=2,
+        sample_k=max_rollout_steps + 1,
         look_ahead=0,
         is_train=True,
         dt_ref=cfg["alignment"]["target_dt"],
@@ -333,7 +340,7 @@ def align(cfg):
                 if (batch_idx + 1) % log_every == 0:
                     log_msg = (
                         f"[E{epoch+1:02d}] "
-                        f"Steps: {metrics['steps']} (dt={metrics['dt']:.1f}) | "
+                        f"K: {metrics['k_steps']} (dt={metrics['total_dt']:.0f}h) | "
                         f"RMSE: {metrics['rmse']:.4f} | "
                         f"Loss: {metrics['loss']:.4f}"
                     )
@@ -344,8 +351,8 @@ def align(cfg):
                     wandb.log({
                         "align/loss": metrics["loss"],
                         "align/rmse": metrics["rmse"],
-                        "align/steps": metrics["steps"],
-                        "align/dt": metrics["dt"],
+                        "align/k_steps": metrics["k_steps"],
+                        "align/total_dt": metrics["total_dt"],
                         "align/epoch": epoch,
                     }, step=global_step)
 

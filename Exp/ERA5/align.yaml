@@ -22,6 +22,7 @@ data:
 alignment:
   pretrained_ckpt: "./uniphy/ckpt/ckpt_final.pt"
   target_dt: 6.0
+  max_rollout_steps: 4
   sub_steps: [1, 2, 3, 6]
 
 train:
@@ -39,5 +40,5 @@ logging:
   use_wandb: true
   wandb_project: "ERA5-Align"
   wandb_entity: "UniPhy"
-  wandb_run_name: ""
+  wandb_run_name: "align_rollout_k2"
 
