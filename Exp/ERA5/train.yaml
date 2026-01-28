@@ -37,11 +37,11 @@ logging:
   log_every: 1
   wandb_every: 1
   ckpt_step: 0.5
-  log_path: "./uniphy/dt_6.0/logs"
-  ckpt_dir: "./uniphy/dt_ref6.0/ckpt"
+  log_path: "./uniphy/logs"
+  ckpt_dir: "./uniphy/ckpt"
   ckpt: ""
   use_wandb: true
-  wandb_project: "ERA5-dt_ref6.0"
+  wandb_project: "ERA5"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
 
