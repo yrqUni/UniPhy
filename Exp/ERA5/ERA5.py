@@ -2,7 +2,6 @@ import os
 import random
 import shutil
 import threading
-import time
 import uuid
 from collections import OrderedDict
 
@@ -96,7 +95,12 @@ class ERA5_Dataset(Dataset):
         idx = int(idx)
 
         if self.is_train:
-            offsets = sorted(random.sample(range(self.window_size), self.sample_k))
+            if random.random() < 0.5:
+                offsets = sorted(random.sample(range(self.window_size), self.sample_k))
+            else:
+                max_start = self.window_size - self.sample_k
+                start_off = random.randint(0, max(0, max_start))
+                offsets = list(range(start_off, start_off + self.sample_k))
         else:
             offsets = list(range(self.sample_k))
 
@@ -131,4 +135,4 @@ class ERA5_Dataset(Dataset):
 
     def __del__(self):
         self.cleanup()
-        
+

@@ -187,7 +187,7 @@ class TemporalPropagator(nn.Module):
             self.uncertainty_net = None
 
     def _get_effective_lambda(self):
-        lam_re_bounded = self.lam_re.clamp(-self.max_growth_rate, self.max_growth_rate)
+        lam_re_bounded = -F.softplus(self.lam_re)
         return torch.complex(lam_re_bounded, self.lam_im)
 
     def get_transition_operators(self, dt):
@@ -269,6 +269,8 @@ class RiemannianCliffordConv2d(nn.Module):
         self.conv_e2 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
         self.conv_e12 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
 
+        self.smooth_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
         self.bias = nn.Parameter(torch.zeros(out_channels))
 
         lat = torch.linspace(-math.pi / 2, math.pi / 2, img_height)
@@ -289,7 +291,7 @@ class RiemannianCliffordConv2d(nn.Module):
         cos_lat = self.cos_lat
         if H != self.cos_lat.shape[2]:
             cos_lat = F.interpolate(cos_lat, size=(H, 1), mode="bilinear", align_corners=False)
-        
+
         cos_lat = cos_lat.expand(B, -1, H, W)
         cos_lat_safe = torch.clamp(cos_lat, min=1e-6)
 
@@ -299,6 +301,8 @@ class RiemannianCliffordConv2d(nn.Module):
         out = y_e0 + y_e1_scaled + y_e2 + y_e12_scaled
         out = out * self.metric_scale
         out = out + self.bias.view(1, -1, 1, 1)
+
+        out = self.smooth_conv(out)
 
         return out
 

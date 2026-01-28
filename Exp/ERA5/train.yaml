@@ -38,9 +38,9 @@ logging:
   ckpt_step: 0.5
   log_path: "./uniphy/logs"
   ckpt_dir: "./uniphy/ckpt"
-  ckpt: ""
+  ckpt: "./uniphy/ckpt/ckpt_e12_s11500.pt"
   use_wandb: true
   wandb_project: "ERA5"
   wandb_entity: "UniPhy"
-  wandb_run_name: ""
+  wandb_run_name: "ckpt_e12_s11500.pt"
   
