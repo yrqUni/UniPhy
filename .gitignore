@@ -12,6 +12,5 @@ __pycache__/
 *.jpeg
 *.DS_Store
 wandb/
-convlru_base/
-inference_results/
+uniphy/
 

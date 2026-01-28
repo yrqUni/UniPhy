@@ -218,20 +218,29 @@ class TemporalPropagator(nn.Module):
             dt, device=device)
         if dt_tensor.is_complex():
             dt_tensor = dt_tensor.real
-        lam_re_exp = lam_re.view(1, 1, 1, 1, -1)
+
+        ndim = len(shape)
+        param_shape = [1] * ndim
+        param_shape[-1] = -1
+
+        lam_re_exp = lam_re.view(*param_shape)
         exp_term = torch.exp(2 * lam_re_exp * dt_tensor)
         denom = 2 * lam_re_exp
         denom_safe = denom + 1e-8 * torch.sign(denom)
         variance_factor = (exp_term - 1.0) / denom_safe
         std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
-        base_noise_expanded = self.base_noise.abs().view(1, 1, 1, 1, -1)
+
+        base_noise_expanded = self.base_noise.abs().view(*param_shape)
         final_scale = base_noise_expanded * std_scale
+
         noise_re = torch.randn(shape, device=device, dtype=torch.float32)
         noise_im = torch.randn(shape, device=device, dtype=torch.float32)
+
         if h_state is not None and self.uncertainty_net is not None:
             h_mag = h_state.abs()
             factor = self.uncertainty_net(h_mag) * 2.0
             final_scale = final_scale * factor
+
         if dtype.is_complex:
             return torch.complex(noise_re * final_scale, noise_im * final_scale)
         return noise_re * final_scale

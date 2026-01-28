@@ -5,6 +5,7 @@ from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
+
 class UniPhyBlock(nn.Module):
     def __init__(self, dim, expand, img_height, img_width, kernel_size=3, dt_ref=1.0, init_noise_scale=0.01, sde_mode="sde", max_growth_rate=0.3):
         super().__init__()
@@ -58,11 +59,11 @@ class UniPhyBlock(nn.Module):
             x_mean, dt, self.prop.dt_ref
         )
         flux_seq = pscan(A_flux, X_flux).squeeze(-1)
-        
+
         decay_seq = A_flux.squeeze(-1)
         decay_cum = torch.cumprod(decay_seq, dim=1)
         flux_seq = flux_seq + (flux_prev.unsqueeze(1) * decay_cum)
-        
+
         source_seq, gate_seq = self.prop.flux_tracker.compute_output(flux_seq)
         flux_out = flux_seq[:, -1]
 
@@ -150,7 +151,7 @@ class UniPhyBlock(nn.Module):
 
 
 class UniPhyModel(nn.Module):
-    def __init__(self, in_channels, out_channels, embed_dim, expand=4, depth=8, patch_size=16, img_height=64, img_width=64, dt_ref=1.0, sde_mode="sde", init_noise_scale=0.01, ensemble_size=8, max_growth_rate=0.3):
+    def __init__(self, in_channels, out_channels, embed_dim, expand=4, depth=8, patch_size=16, img_height=64, img_width=64, dt_ref=1.0, sde_mode="sde", init_noise_scale=0.01, max_growth_rate=0.3, ensemble_size=10):
         super().__init__()
         self.embed_dim, self.depth, self.img_height, self.img_width = embed_dim, depth, img_height, img_width
         self.h_patches = (img_height + (patch_size - img_height % patch_size) % patch_size) // patch_size
@@ -182,12 +183,11 @@ class UniPhyModel(nn.Module):
         out = self.decoder(z, member_idx=member_idx)
         return out[..., :self.img_height, :self.img_width]
 
-    @torch.no_grad()
     def forward_rollout(self, x_context, dt_context, dt_list):
         B, T_in = x_context.shape[0], x_context.shape[1]
         z_ctx = self.encoder(x_context)
         states = self._init_states(B, x_context.device, z_ctx.dtype if z_ctx.dtype.is_complex else torch.complex64)
-        
+
         if isinstance(dt_context, (float, int)):
              dt_ctx_tensor = torch.full((B, T_in), float(dt_context), device=x_context.device)
         elif dt_context.ndim == 0:
@@ -198,8 +198,10 @@ class UniPhyModel(nn.Module):
         for i, block in enumerate(self.blocks):
             z_ctx, h_f, f_f = block(z_ctx, states[i][0], dt_ctx_tensor, states[i][1])
             states[i] = (h_f, f_f)
-            
-        z_curr = z_ctx[:, -1]
+
+        x_last = x_context[:, -1]
+        z_curr = self.encoder(x_last)
+
         preds = []
         for dt_k in dt_list:
             new_states = []
@@ -207,7 +209,11 @@ class UniPhyModel(nn.Module):
                 z_curr, h_n, f_n = block.forward_step(z_curr, states[i][0], dt_k, states[i][1])
                 new_states.append((h_n, f_n))
             states = new_states
-            pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1)
-            preds.append(pred[..., :self.img_height, :self.img_width])
+            
+            x_pred = self.decoder(z_curr.unsqueeze(1)).squeeze(1)
+            preds.append(x_pred[..., :self.img_height, :self.img_width])
+            
+            z_curr = self.encoder(x_pred)
+
         return torch.stack(preds, dim=1)
-    
+

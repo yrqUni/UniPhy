@@ -1,7 +1,7 @@
 model:
   in_channels: 30
   out_channels: 30
-  embed_dim: 128
+  embed_dim: 512
   expand: 4
   depth: 8
   patch_size: 16
@@ -15,31 +15,29 @@ model:
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
-  year_range: [2000, 2000]
+  year_range: [2001, 2005]
   window_size: 10
-  sample_k: 5
-  look_ahead: 2
   sampling_mode: "mix"
+
+alignment:
+  pretrained_ckpt: "./uniphy/ckpt/ckpt_final.pt"
+  target_dt: 6.0
+  sub_steps: [1, 2, 3, 6]
 
 train:
   batch_size: 1
-  lr: 1.0e-4
-  weight_decay: 0.05
-  epochs: 64
-  grad_clip: 128.0
-  grad_accum_steps: 1
-  use_scheduler: false
-  use_tf32: true
+  lr: 5.0e-5
+  weight_decay: 0.01
+  epochs: 10
+  grad_clip: 1.0
+  grad_accum_steps: 4
 
 logging:
-  log_every: 1
-  wandb_every: 1
-  ckpt_step: 0.5
-  log_path: "./uniphy/logs"
-  ckpt_dir: "./uniphy/ckpt"
-  ckpt: ""
+  log_every: 5
+  log_path: "./uniphy/align_logs"
+  ckpt_dir: "./uniphy/align_ckpt"
   use_wandb: true
-  wandb_project: "ERA5"
+  wandb_project: "ERA5-Align"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
 

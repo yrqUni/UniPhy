@@ -100,50 +100,6 @@ def visualize(input_frame, pred_frame, target_frame, step_idx, save_dir):
     print(f"Saved visualization to {save_path}")
 
 
-def custom_rollout(model, x_ctx, dt_ctx, pred_steps, dt_pred_val,
-                   member_idx=None):
-    B, T_ctx, C, H, W = x_ctx.shape
-    device = x_ctx.device
-
-    z_ctx = model.encoder(x_ctx)
-    dtype = z_ctx.dtype if z_ctx.dtype.is_complex else torch.complex64
-    states = model._init_states(B, device, dtype)
-
-    if isinstance(dt_ctx, (float, int)):
-        dt_ctx_tensor = torch.full((B, T_ctx), float(dt_ctx), device=device)
-    elif dt_ctx.ndim == 0:
-        dt_ctx_tensor = dt_ctx.expand(B, T_ctx)
-    else:
-        dt_ctx_tensor = dt_ctx
-
-    for i, block in enumerate(model.blocks):
-        z_ctx, h_final, f_final = block(
-            z_ctx, states[i][0], dt_ctx_tensor, states[i][1]
-        )
-        states[i] = (h_final, f_final)
-
-    z_curr = z_ctx[:, -1]
-    preds = []
-
-    dt_pred_tensor = torch.tensor(float(dt_pred_val), device=device).expand(B)
-
-    for _ in range(pred_steps):
-        new_states = []
-        for i, block in enumerate(model.blocks):
-            z_curr, h_n, f_n = block.forward_step(
-                z_curr, states[i][0], dt_pred_tensor, states[i][1]
-            )
-            new_states.append((h_n, f_n))
-        states = new_states
-
-        pred = model.decoder(
-            z_curr.unsqueeze(1), member_idx=member_idx
-        ).squeeze(1)
-        preds.append(pred[..., :model.img_height, :model.img_width])
-
-    return torch.stack(preds, dim=1)
-
-
 def run_inference(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = cfg["inference"]["ckpt_path"]
@@ -174,33 +130,34 @@ def run_inference(cfg):
     x_tgt = x_all[:, cond_steps:]
 
     dt_ctx = user_dt
+    
+    dt_list = [
+        torch.tensor(user_dt, device=device, dtype=torch.float32)
+        for _ in range(pred_steps)
+    ]
 
-    ensemble_size = cfg["inference"]["ensemble_size"]
     trained_ensemble_size = model_cfg["ensemble_size"]
+    requested_ensemble_size = cfg["inference"]["ensemble_size"]
 
     print(f"Inference Config:")
     print(f"  Condition Steps: {cond_steps}")
     print(f"  Forecast Steps: {pred_steps}")
     print(f"  DT (Time Step): {user_dt} hours")
-    print(f"  Ensemble Size: {ensemble_size}")
-    print(f"  Trained Model Ensemble Size: {trained_ensemble_size}")
+    print(f"  Trained Ensemble Size: {trained_ensemble_size}")
+    print(f"  Requested Ensemble Size: {requested_ensemble_size}")
 
-    if ensemble_size > trained_ensemble_size:
-        print(f"Warning: Requesting {ensemble_size} members but model "
-              f"trained with {trained_ensemble_size}. Clamping.")
+    if requested_ensemble_size > trained_ensemble_size:
+        print(f"Warning: Requested size {requested_ensemble_size} exceeds "
+              f"trained size {trained_ensemble_size}. Clamping to trained size.")
         ensemble_size = trained_ensemble_size
+    else:
+        ensemble_size = requested_ensemble_size
 
     with torch.no_grad():
         member_preds_list = []
         for m in range(ensemble_size):
-            member_idx = torch.tensor([m], device=device).repeat(x_ctx.shape[0])
-            preds = custom_rollout(
-                model,
-                x_ctx,
-                dt_ctx,
-                pred_steps,
-                user_dt,
-                member_idx=member_idx
+            preds = model.forward_rollout(
+                x_ctx, dt_ctx, dt_list
             )
 
             if preds.is_complex():
