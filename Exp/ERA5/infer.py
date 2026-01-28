@@ -3,13 +3,8 @@ import sys
 import yaml
 import torch
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from torch.utils.data import DataLoader
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
@@ -17,168 +12,155 @@ sys.path.append("/nfs/UniPhy/Exp/ERA5")
 from ERA5 import ERA5_Dataset
 from ModelUniPhy import UniPhyModel
 
+import warnings
+warnings.filterwarnings("ignore")
 
-def setup_model(ckpt_path, device, console):
+
+def load_stats(stats_dir, device):
+    try:
+        mean = np.load(os.path.join(stats_dir, "mean.npy"))
+        std = np.load(os.path.join(stats_dir, "std.npy"))
+        mean_tensor = torch.from_numpy(mean).to(device).view(1, -1, 1, 1).float()
+        std_tensor = torch.from_numpy(std).to(device).view(1, -1, 1, 1).float()
+        return mean_tensor, std_tensor
+    except Exception as e:
+        print(f"Warning: Could not load stats from {stats_dir}: {e}")
+        return None, None
+
+
+def denormalize(x, mean, std):
+    if mean is None or std is None:
+        return x
+    return x * std + mean
+
+
+def load_model(cfg, device):
+    model = UniPhyModel(
+        in_channels=cfg["model"]["in_channels"],
+        out_channels=cfg["model"]["out_channels"],
+        embed_dim=cfg["model"]["embed_dim"],
+        expand=cfg["model"]["expand"],
+        depth=cfg["model"]["depth"],
+        patch_size=cfg["model"]["patch_size"],
+        img_height=cfg["model"]["img_height"],
+        img_width=cfg["model"]["img_width"],
+        dt_ref=cfg["model"]["dt_ref"],
+        sde_mode=cfg["model"]["sde_mode"],
+        init_noise_scale=cfg["model"]["init_noise_scale"],
+        max_growth_rate=cfg["model"]["max_growth_rate"],
+    ).to(device)
+
+    ckpt_path = cfg["inference"]["ckpt_path"]
     if not os.path.exists(ckpt_path):
-        console.print(f"[bold red]Error:[/bold red] Checkpoint not found at {ckpt_path}")
-        sys.exit(1)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    if "cfg" not in ckpt or "model" not in ckpt["cfg"]:
-        console.print("[bold red]Error:[/bold red] Missing model configuration in ckpt.")
-        sys.exit(1)
-    model_cfg = ckpt["cfg"]["model"]
-    model = UniPhyModel(**model_cfg).to(device)
-    state_dict = ckpt["model"]
-    clean_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_dict)
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    state_dict = checkpoint["model"]
+
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace("module.", "")
+        new_state_dict[name] = v
+
+    model.load_state_dict(new_state_dict, strict=True)
     model.eval()
     return model
 
 
-def get_dataloader(cfg, console):
-    i_len = cfg["inference"]["input_len"]
-    f_hz = cfg["inference"]["forecast_horizon"]
-    total_frames = i_len + int(f_hz / 6.0)
+def visualize(input_frame, pred_frame, target_frame, step_idx, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    ch_idx = 0
+    in_img = input_frame[0, ch_idx].cpu().numpy()
+    pred_img = pred_frame[0, ch_idx].cpu().numpy()
+    tgt_img = target_frame[0, ch_idx].cpu().numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    vmin = min(in_img.min(), pred_img.min(), tgt_img.min())
+    vmax = max(in_img.max(), pred_img.max(), tgt_img.max())
+
+    im0 = axes[0].imshow(in_img, cmap="RdBu_r", vmin=vmin, vmax=vmax)
+    axes[0].set_title(f"Input (Step {step_idx})")
+    plt.colorbar(im0, ax=axes[0])
+
+    im1 = axes[1].imshow(pred_img, cmap="RdBu_r", vmin=vmin, vmax=vmax)
+    axes[1].set_title(f"Prediction (Step {step_idx+1})")
+    plt.colorbar(im1, ax=axes[1])
+
+    im2 = axes[2].imshow(tgt_img, cmap="RdBu_r", vmin=vmin, vmax=vmax)
+    axes[2].set_title(f"Ground Truth (Step {step_idx+1})")
+    plt.colorbar(im2, ax=axes[2])
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"step_{step_idx+1:03d}.png"))
+    plt.close()
+
+
+def run_inference(cfg):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(cfg, device)
+    mean, std = load_stats(cfg["data"]["stats_dir"], device)
+
     dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
-        year_range=cfg["data"]["test_year_range"],
-        window_size=total_frames,
-        sample_k=1,
+        year_range=[cfg["data"]["test_year"], cfg["data"]["test_year"]],
+        window_size=cfg["data"]["window_size"],
+        sample_k=cfg["inference"]["autoregressive_steps"] + 1,
         look_ahead=0,
         is_train=False,
-        dt_ref=cfg["data"]["dt_ref"]
-    )
-    if len(dataset) == 0:
-        console.print("[bold red]Error:[/bold red] No samples found.")
-        sys.exit(1)
-    return torch.utils.data.DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=0
+        dt_ref=cfg["data"]["dt_ref"],
+        sampling_mode="sequential",
     )
 
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    data, dt_data = next(iter(loader))
 
-def save_visualization(tensor, output_dir, sample_idx, step_idx):
-    os.makedirs(output_dir, exist_ok=True)
-    img = tensor.cpu().numpy()
-    if img.ndim == 3:
-        img = img[0]
-    plt.figure(figsize=(6, 6))
-    plt.imshow(img, cmap='RdBu_r')
-    plt.axis('off')
-    plt.tight_layout()
-    save_path = os.path.join(output_dir, f"sample_{sample_idx:03d}_step_{step_idx:02d}.png")
-    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
-    plt.close('all')
+    curr_x = data[:, 0].to(device).float()
+    targets = data[:, 1:].to(device).float()
+    dt_steps = dt_data[:, :-1].to(device).float()
 
+    predictions = []
+    ensemble_size = cfg["inference"]["ensemble_size"]
 
-def print_metrics(results, console):
-    table = Table(title="Inference Metrics (RMSE @ Final Step)", show_header=True)
-    table.add_column("Strategy", style="cyan")
-    table.add_column("Mean RMSE", style="green")
-    table.add_column("Std Dev", style="magenta")
-    table.add_column("Samples", style="white")
+    print(f"Starting inference for {cfg['inference']['autoregressive_steps']} steps...")
 
-    for strat_name, errors in results.items():
-        if errors:
-            mean_rmse = np.mean(errors)
-            std_rmse = np.std(errors)
-            table.add_row(
-                strat_name,
-                f"{mean_rmse:.4f}",
-                f"{std_rmse:.4f}",
-                str(len(errors))
-            )
-        else:
-            table.add_row(strat_name, "N/A", "N/A", "0")
-    
-    console.print(Panel(table, expand=False))
+    with torch.no_grad():
+        for step in range(targets.shape[1]):
+            dt = dt_steps[:, step]
+            member_preds = []
+            for m in range(ensemble_size):
+                member_idx = torch.tensor([m], device=device).repeat(curr_x.shape[0])
+                pred_raw = model(curr_x, dt, member_idx=member_idx)
+                if pred_raw.is_complex():
+                    pred_raw = pred_raw.real
+                member_preds.append(pred_raw)
 
+            member_stack = torch.stack(member_preds, dim=0)
+            pred_mean = member_stack.mean(dim=0)
+            predictions.append(pred_mean)
+            curr_x = pred_mean
 
-def run_inference(cfg, model, device, console):
-    loader = get_dataloader(cfg, console)
-    strategies = cfg["inference"]["strategies"]
-    input_len = cfg["inference"]["input_len"]
-    input_dt = cfg["inference"]["input_dt"]
-    horizon = cfg["inference"]["forecast_horizon"]
-    output_base_dir = cfg["inference"]["output_dir"]
-    ensemble_mode = cfg["inference"].get("ensemble_mode", False)
-    ensemble_size = cfg["inference"].get("ensemble_size", 10) if ensemble_mode else 1
-    max_samples = cfg["inference"].get("max_samples", None)
-    
-    results = {s["name"]: [] for s in strategies}
-    processed_count = 0
-    total_to_process = min(len(loader), max_samples) if max_samples else len(loader)
+            target_step = targets[:, step]
+            pred_phys = denormalize(pred_mean, mean, std)
+            target_phys = denormalize(target_step, mean, std)
+            input_phys = denormalize(data[:, step].to(device), mean, std)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task("Inference", total=total_to_process)
+            rmse = torch.sqrt(((pred_phys - target_phys) ** 2).mean())
+            print(f"Step {step+1} (dt={dt.item()}): RMSE = {rmse.item():.4f}")
 
-        for batch_idx, batch in enumerate(loader):
-            if max_samples and processed_count >= max_samples:
-                break
-            
-            data = batch[0].to(device).float()
-            x_context = data[:, :input_len]
-            x_target = data[:, -1]
-            
-            for s in strategies:
-                dt_val = s["dt"]
-                strat_name_clean = s["name"].replace(" ", "_").replace("=", "_")
-                num_steps = int(horizon / dt_val)
-                dt_list = [torch.tensor(dt_val, device=device).float()] * num_steps
-                
-                strat_preds = []
-                for m in range(ensemble_size):
-                    torch.manual_seed(42 + batch_idx * 100 + m)
-                    with torch.no_grad():
-                        preds = model.forward_rollout(x_context, input_dt, dt_list)
-                        strat_preds.append(preds)
-                    
-                    member_dir = os.path.join(output_base_dir, strat_name_clean, f"member_{m:02d}")
-                    save_visualization(preds[0, -1], member_dir, processed_count, num_steps)
-                
-                ensemble_tensor = torch.stack(strat_preds, dim=0)
-                mean_pred = torch.mean(ensemble_tensor, dim=0)
-                
-                mean_dir = os.path.join(output_base_dir, strat_name_clean, "mean")
-                save_visualization(mean_pred[0, -1], mean_dir, processed_count, num_steps)
-                
-                final_rmse = torch.sqrt((mean_pred[0, -1] - x_target).pow(2).mean()).item()
-                results[s["name"]].append(final_rmse)
+            if cfg["inference"]["save_plot"]:
+                visualize(
+                    input_phys,
+                    pred_phys,
+                    target_phys,
+                    step,
+                    cfg["inference"]["output_dir"],
+                )
 
-            processed_count += 1
-            progress.advance(task)
-
-    return results
-
-
-def main():
-    config_path = "infer.yaml"
-    if "--config" in sys.argv:
-        try:
-            config_path = sys.argv[sys.argv.index("--config") + 1]
-        except IndexError:
-            pass
-
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-        
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    console = Console()
-    
-    console.print(f"[bold blue]UniPhy Inference[/bold blue]")
-    ckpt_path = cfg["inference"]["ckpt"]
-    model = setup_model(ckpt_path, device, console)
-    
-    metrics = run_inference(cfg, model, device, console)
-    print_metrics(metrics, console)
+    print("Inference completed.")
 
 
 if __name__ == "__main__":
-    main()
-    
+    with open("infer.yaml", "r") as f:
+        cfg = yaml.safe_load(f)
+    run_inference(cfg)
+
