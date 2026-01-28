@@ -98,7 +98,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
 
     B, T, C, H, W = data.shape
 
-    ensemble_size = cfg["train"]["ensemble_size"]
+    ensemble_size = cfg["model"]["ensemble_size"]
 
     x_input = data[:, :-1].detach().clone()
     x_target = data[:, 1:].detach().clone()
@@ -268,7 +268,7 @@ def train(cfg):
         sample_k=cfg["data"]["sample_k"],
         look_ahead=cfg["data"]["look_ahead"],
         is_train=True,
-        dt_ref=cfg["data"]["dt_ref"],
+        dt_ref=cfg["model"]["dt_ref"],
         sampling_mode=cfg["data"]["sampling_mode"],
     )
 

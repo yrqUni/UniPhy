@@ -3,7 +3,6 @@ data:
   stats_dir: "/nfs/ERA5_data/stats"
   test_year: 2000
   window_size: 20
-  dt_ref: 6.0
 
 inference:
   ckpt_path: "./uniphy/ckpt/ckpt_epoch38.pt"

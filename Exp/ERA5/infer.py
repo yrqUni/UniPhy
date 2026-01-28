@@ -59,7 +59,7 @@ def load_model(ckpt_path, device):
 
     model.load_state_dict(new_state_dict, strict=True)
     model.eval()
-    return model
+    return model, model_cfg
 
 
 def visualize(input_frame, pred_frame, target_frame, step_idx, save_dir):
@@ -147,12 +147,13 @@ def custom_rollout(model, x_ctx, dt_ctx, pred_steps, dt_pred_val,
 def run_inference(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = cfg["inference"]["ckpt_path"]
-    model = load_model(ckpt_path, device)
+    model, model_cfg = load_model(ckpt_path, device)
     mean, std = load_stats(cfg["data"]["stats_dir"], device)
 
     cond_steps = cfg["inference"]["condition_steps"]
     pred_steps = cfg["inference"]["autoregressive_steps"]
     user_dt = cfg["inference"]["dt"]
+    dt_ref = model_cfg["dt_ref"]
 
     dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -161,7 +162,7 @@ def run_inference(cfg):
         sample_k=cond_steps + pred_steps + 1,
         look_ahead=0,
         is_train=False,
-        dt_ref=cfg["data"]["dt_ref"],
+        dt_ref=dt_ref,
         sampling_mode="sequential",
     )
 
@@ -174,13 +175,20 @@ def run_inference(cfg):
 
     dt_ctx = user_dt
 
+    ensemble_size = cfg["inference"]["ensemble_size"]
+    trained_ensemble_size = model_cfg["ensemble_size"]
+
     print(f"Inference Config:")
     print(f"  Condition Steps: {cond_steps}")
     print(f"  Forecast Steps: {pred_steps}")
     print(f"  DT (Time Step): {user_dt} hours")
-    print(f"  Ensemble Size: {cfg['inference']['ensemble_size']}")
+    print(f"  Ensemble Size: {ensemble_size}")
+    print(f"  Trained Model Ensemble Size: {trained_ensemble_size}")
 
-    ensemble_size = cfg["inference"]["ensemble_size"]
+    if ensemble_size > trained_ensemble_size:
+        print(f"Warning: Requesting {ensemble_size} members but model "
+              f"trained with {trained_ensemble_size}. Clamping.")
+        ensemble_size = trained_ensemble_size
 
     with torch.no_grad():
         member_preds_list = []
