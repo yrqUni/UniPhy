@@ -180,7 +180,7 @@ class TemporalPropagator(nn.Module):
                 nn.Linear(dim, dim // 4),
                 nn.SiLU(),
                 nn.Linear(dim // 4, dim),
-                nn.Softplus(),
+                nn.Sigmoid(),
             )
         else:
             self.register_buffer("base_noise", torch.tensor(0.0))
@@ -236,9 +236,9 @@ class TemporalPropagator(nn.Module):
             else:
                 h_real = h_flat.abs()
             h_mag = h_real.mean(dim=-1, keepdim=True)
-            uncertainty = self.uncertainty_net(h_mag.expand(-1, self.dim))
-            uncertainty = uncertainty.reshape(shape)
-            scale = base_scale * (1 + uncertainty)
+            factor = self.uncertainty_net(h_mag.expand(-1, self.dim)) * 2.0
+            uncertainty = factor.reshape(shape)
+            scale = base_scale * uncertainty
         else:
             scale = base_scale
 
