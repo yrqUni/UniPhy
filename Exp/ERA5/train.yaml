@@ -3,7 +3,6 @@ model:
   out_channels: 30
   embed_dim: 512
   expand: 4
-  num_experts: 0
   depth: 8
   patch_size: 8
   img_height: 721

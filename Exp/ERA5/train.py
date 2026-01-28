@@ -246,7 +246,6 @@ def train(cfg):
         out_channels=cfg["model"]["out_channels"],
         embed_dim=cfg["model"]["embed_dim"],
         expand=cfg["model"]["expand"],
-        num_experts=cfg["model"]["num_experts"],
         depth=cfg["model"]["depth"],
         patch_size=cfg["model"]["patch_size"],
         img_height=cfg["model"]["img_height"],
