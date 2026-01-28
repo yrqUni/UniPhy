@@ -15,7 +15,7 @@ model:
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
-  year_range: [2000, 2000]
+  year_range: [2000, 2009]
   window_size: 10
   sample_k: 5
   look_ahead: 2
@@ -25,7 +25,7 @@ train:
   batch_size: 1
   lr: 1.0e-4
   weight_decay: 0.05
-  epochs: 64
+  epochs: 256
   grad_clip: 128.0
   grad_accum_steps: 1
   use_scheduler: false
