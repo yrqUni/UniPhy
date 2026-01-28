@@ -5,7 +5,7 @@ model:
   expand: 4
   num_experts: 0
   depth: 8
-  patch_size: 32
+  patch_size: 8
   img_height: 721
   img_width: 1440
   dt_ref: 6.0
