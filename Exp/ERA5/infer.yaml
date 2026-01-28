@@ -4,17 +4,17 @@ data:
   dt_ref: 6.0
 
 inference:
-  ckpt: "uniphy/ckpt/ckpt_epoch14.pt"
+  ckpt: "uniphy/ckpt/ckpt_e6_s5500.pt"
   batch_size: 1
   max_samples: 1
   output_dir: "results_viz"
   ensemble_mode: true
   ensemble_size: 3
-  input_len: 1
+  input_len: 4
   input_dt: 6.0
   forecast_horizon: 36.0
   strategies:
     - {name: "dt=6.0", dt: 6.0}
-    - {name: "dt=24.0", dt: 24.0}
+    - {name: "dt=12.0", dt: 12.0}
     - {name: "dt=36.0", dt: 36.0}
     

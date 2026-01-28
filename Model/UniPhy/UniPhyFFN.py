@@ -33,125 +33,76 @@ class ComplexLayerNorm2d(nn.Module):
         return torch.complex(re_norm, im_norm)
 
 
-class ComplexDynamicFFN(nn.Module):
-    def __init__(self, dim, hidden_dim, num_experts=8):
+class ComplexConvFFN(nn.Module):
+    def __init__(self, dim, expand):
         super().__init__()
-        self.dim = dim
-        self.hidden_dim = hidden_dim
-        self.num_experts = num_experts
+        hidden_dim = int(dim * expand)
 
-        self.experts_up_re = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
-        self.experts_up_im = nn.Conv2d(dim, hidden_dim * num_experts, 1, groups=1)
+        self.fc1_re = nn.Conv2d(dim, hidden_dim, 1)
+        self.fc1_im = nn.Conv2d(dim, hidden_dim, 1)
 
         self.dw_conv_re = nn.Conv2d(
-            hidden_dim * num_experts,
-            hidden_dim * num_experts,
-            kernel_size=3,
-            padding=1,
-            groups=hidden_dim * num_experts,
+            hidden_dim, 
+            hidden_dim, 
+            kernel_size=3, 
+            padding=1, 
+            groups=hidden_dim, 
             bias=False
         )
         self.dw_conv_im = nn.Conv2d(
-            hidden_dim * num_experts,
-            hidden_dim * num_experts,
-            kernel_size=3,
-            padding=1,
-            groups=hidden_dim * num_experts,
+            hidden_dim, 
+            hidden_dim, 
+            kernel_size=3, 
+            padding=1, 
+            groups=hidden_dim, 
             bias=False
         )
 
-        self.experts_down_re = nn.Conv2d(
-            hidden_dim * num_experts,
-            dim * num_experts,
-            1,
-            groups=num_experts
-        )
-        self.experts_down_im = nn.Conv2d(
-            hidden_dim * num_experts,
-            dim * num_experts,
-            1,
-            groups=num_experts
-        )
+        self.fc2_re = nn.Conv2d(hidden_dim, dim, 1)
+        self.fc2_im = nn.Conv2d(hidden_dim, dim, 1)
 
-        self.router = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1),
-            LayerNorm2d(dim),
-            nn.GELU(),
-            nn.Conv2d(dim, num_experts, 1),
-        )
-
-        self.out_conv_re = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
-        self.out_conv_im = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
-
-        self.aux_loss = 0.0
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.experts_up_re.weight)
-        nn.init.xavier_uniform_(self.experts_up_im.weight)
-        nn.init.xavier_uniform_(self.experts_down_re.weight)
-        nn.init.zeros_(self.experts_down_im.weight)
+        nn.init.xavier_uniform_(self.fc1_re.weight)
+        nn.init.xavier_uniform_(self.fc1_im.weight)
+        nn.init.xavier_uniform_(self.fc2_re.weight)
+        nn.init.zeros_(self.fc2_im.weight)
+        
+        if self.fc1_re.bias is not None: nn.init.zeros_(self.fc1_re.bias)
+        if self.fc1_im.bias is not None: nn.init.zeros_(self.fc1_im.bias)
+        if self.fc2_re.bias is not None: nn.init.zeros_(self.fc2_re.bias)
+        if self.fc2_im.bias is not None: nn.init.zeros_(self.fc2_im.bias)
 
-        if self.experts_up_re.bias is not None:
-            nn.init.zeros_(self.experts_up_re.bias)
-        if self.experts_up_im.bias is not None:
-            nn.init.zeros_(self.experts_up_im.bias)
-        if self.experts_down_re.bias is not None:
-            nn.init.zeros_(self.experts_down_re.bias)
-        if self.experts_down_im.bias is not None:
-            nn.init.zeros_(self.experts_down_im.bias)
-
-    def forward(self, z):
-        if z.is_complex():
-            re = z.real
-            im = z.imag
+    def forward(self, x):
+        if x.is_complex():
+            re = x.real
+            im = x.imag
         else:
-            re = z
-            im = torch.zeros_like(z)
+            re = x
+            im = torch.zeros_like(x)
 
-        B, C, H, W = re.shape
+        h_re = self.fc1_re(re) - self.fc1_im(im)
+        h_im = self.fc1_re(im) + self.fc1_im(re)
 
-        router_input = torch.cat([re, im], dim=1)
-        logits = self.router(router_input)
-        route_weights = F.softmax(logits, dim=1)
+        h_re = self.dw_conv_re(h_re)
+        h_im = self.dw_conv_im(h_im)
 
-        prob_mean = route_weights.mean(dim=(0, 2, 3))
-        self.aux_loss = (self.num_experts * (prob_mean ** 2).sum()) * 0.1
+        h_re = F.gelu(h_re)
+        h_im = F.gelu(h_im)
 
-        route_weights = route_weights.view(B, self.num_experts, 1, H, W)
-
-        up_re = self.experts_up_re(re) - self.experts_up_im(im)
-        up_im = self.experts_up_re(im) + self.experts_up_im(re)
-
-        up_re = self.dw_conv_re(up_re)
-        up_im = self.dw_conv_im(up_im)
-
-        up_re = F.silu(up_re)
-        up_im = F.silu(up_im)
-
-        down_re = self.experts_down_re(up_re) - self.experts_down_im(up_im)
-        down_im = self.experts_down_re(up_im) + self.experts_down_im(up_re)
-
-        down_re = down_re.view(B, self.num_experts, self.dim, H, W)
-        down_im = down_im.view(B, self.num_experts, self.dim, H, W)
-
-        out_re = (down_re * route_weights).sum(dim=1)
-        out_im = (down_im * route_weights).sum(dim=1)
-
-        out_re = self.out_conv_re(out_re)
-        out_im = self.out_conv_im(out_im)
+        out_re = self.fc2_re(h_re) - self.fc2_im(h_im)
+        out_im = self.fc2_re(h_im) + self.fc2_im(h_re)
 
         return torch.complex(out_re, out_im)
 
 
 class UniPhyFeedForwardNetwork(nn.Module):
-    def __init__(self, dim, expand, num_experts):
+    def __init__(self, dim, expand, num_experts=None, dropout=0.0):
         super().__init__()
         self.dim = dim
-        self.hidden_dim = int(dim * expand)
-        self.num_experts = num_experts
         self.pre_norm = ComplexLayerNorm2d(dim)
-        self.ffn = ComplexDynamicFFN(dim, self.hidden_dim, num_experts=num_experts)
+        self.ffn = ComplexConvFFN(dim, expand)
         self.post_norm = ComplexLayerNorm2d(dim)
         self.centering_scale = nn.Parameter(torch.tensor(0.5))
         self.output_scale = nn.Parameter(torch.tensor(1.0))
@@ -164,17 +115,18 @@ class UniPhyFeedForwardNetwork(nn.Module):
 
         x_norm = self.pre_norm(x)
         delta = self.ffn(x_norm)
-
+        
         delta_mean = torch.complex(
             delta.real.mean(dim=(-2, -1), keepdim=True),
             delta.imag.mean(dim=(-2, -1), keepdim=True)
         )
         delta_centered = delta - delta_mean * self.centering_scale
+        
         delta_out = self.post_norm(delta_centered)
         delta_out = delta_out * self.output_scale
 
         if is_5d:
             delta_out = delta_out.reshape(B, T, D, H, W)
-
+            
         return delta_out
 
