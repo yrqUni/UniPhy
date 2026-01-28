@@ -1,28 +1,16 @@
-model:
-  in_channels: 30
-  out_channels: 30
-  embed_dim: 512
-  expand: 4
-  depth: 8
-  patch_size: 32
-  img_height: 721
-  img_width: 1440
-  dt_ref: 6.0
-  sde_mode: "sde"
-  init_noise_scale: 0.0001
-  max_growth_rate: 0.3
-
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
   stats_dir: "/nfs/ERA5_data/stats"
-  test_year: 2021
+  test_year: 2000
   window_size: 20
   dt_ref: 6.0
 
 inference:
-  ckpt_path: "./uniphy/ckpt/ckpt_final.pt"
+  ckpt_path: "./uniphy/ckpt/ckpt_epoch38.pt"
   output_dir: "./uniphy/results"
-  ensemble_size: 10
-  autoregressive_steps: 10
+  ensemble_size: 4
+  condition_steps: 4
+  autoregressive_steps: 8
+  dt: 1.0
   save_plot: true
 
