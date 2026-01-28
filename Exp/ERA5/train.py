@@ -118,8 +118,6 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     l1_loss = (out_real - x_target).abs().mean()
     mse_loss = ((out_real - x_target) ** 2 * lat_weights).mean()
 
-    aux_loss = sum(m.aux_loss for m in model.modules() if hasattr(m, "aux_loss"))
-
     if ensemble_size > 1:
         ensemble_preds = [out_real]
         infer_model = model.module if hasattr(model, "module") else model
@@ -137,11 +135,11 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         crps_loss = compute_crps(ensemble_stack, x_target)
         ensemble_std = ensemble_stack.std(dim=0).mean()
 
-        loss = l1_loss + crps_loss + aux_loss
+        loss = l1_loss + crps_loss
     else:
         crps_loss = torch.tensor(0.0, device=device)
         ensemble_std = torch.tensor(0.0, device=device)
-        loss = l1_loss + aux_loss
+        loss = l1_loss
 
     loss_scaled = loss / grad_accum_steps
     loss_scaled.backward()
@@ -161,13 +159,12 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     metrics = {
         "loss": loss.item(),
         "l1_loss": l1_loss.item(),
-        "aux_loss": aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss,
-        "crps_loss": crps_loss.item() if isinstance(crps_loss, torch.Tensor) else crps_loss,
+        "crps_loss": crps_loss.item(),
         "mse": mse_loss.item(),
         "rmse": rmse.item(),
         "mae": mae.item(),
         "grad_norm": grad_norm,
-        "ensemble_std": ensemble_std.item() if isinstance(ensemble_std, torch.Tensor) else ensemble_std,
+        "ensemble_std": ensemble_std.item(),
     }
 
     return metrics
@@ -193,13 +190,19 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu")
     if hasattr(model, "module"):
-        model.module.load_state_dict(ckpt["model"])
+        model.module.load_state_dict(ckpt["model"], strict=False)
     else:
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"], strict=False)
     if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception:
+            pass
     if scheduler is not None and ckpt.get("scheduler") is not None:
-        scheduler.load_state_dict(ckpt["scheduler"])
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except Exception:
+            pass
     return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
 
 
@@ -357,7 +360,7 @@ def train(cfg):
                         f"[E{epoch+1:03d} B{batch_idx+1:04d}] "
                         f"Loss: {metrics['loss']:.4f} | "
                         f"L1: {metrics['l1_loss']:.4f} | "
-                        f"Aux: {metrics['aux_loss']:.4f} | "
+                        f"CRPS: {metrics['crps_loss']:.4f} | "
                         f"RMSE: {metrics['rmse']:.4f} | "
                         f"Grad: {metrics['grad_norm']:.4f} | "
                         f"LR: {current_lr:.2e}"
@@ -369,7 +372,6 @@ def train(cfg):
                     wandb.log({
                         "train/loss": metrics["loss"],
                         "train/l1_loss": metrics["l1_loss"],
-                        "train/aux_loss": metrics["aux_loss"],
                         "train/crps_loss": metrics["crps_loss"],
                         "train/mse": metrics["mse"],
                         "train/rmse": metrics["rmse"],

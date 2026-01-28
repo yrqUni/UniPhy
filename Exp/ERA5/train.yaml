@@ -3,24 +3,24 @@ model:
   out_channels: 30
   embed_dim: 512
   expand: 4
-  num_experts: 8
+  num_experts: 0
   depth: 8
   patch_size: 32
   img_height: 721
   img_width: 1440
   dt_ref: 6.0
   sde_mode: "sde"
-  init_noise_scale: 0.01
+  init_noise_scale: 0.0001
   max_growth_rate: 0.3
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
   year_range: [2000, 2021]
   window_size: 20
-  sample_k: 5 # for sequential sample, len is sample_k
+  sample_k: 9
   look_ahead: 2
   dt_ref: 6.0
-  sampling_mode: "sequential" # sequential random mixed
+  sampling_mode: "sequential"
 
 train:
   batch_size: 1
