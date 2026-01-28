@@ -11,6 +11,6 @@ inference:
   ensemble_size: 4
   condition_steps: 4
   autoregressive_steps: 8
-  dt: 1.0
+  dt: 6.0
   save_plot: true
 
