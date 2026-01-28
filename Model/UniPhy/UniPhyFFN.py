@@ -98,7 +98,7 @@ class ComplexConvFFN(nn.Module):
 
 
 class UniPhyFeedForwardNetwork(nn.Module):
-    def __init__(self, dim, expand, num_experts=None, dropout=0.0):
+    def __init__(self, dim, expand):
         super().__init__()
         self.dim = dim
         self.pre_norm = ComplexLayerNorm2d(dim)

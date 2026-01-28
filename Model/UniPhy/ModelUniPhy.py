@@ -6,14 +6,14 @@ from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
 class UniPhyBlock(nn.Module):
-    def __init__(self, dim, expand, num_experts, img_height, img_width, kernel_size=3, dt_ref=1.0, init_noise_scale=0.01, sde_mode="sde", max_growth_rate=0.3):
+    def __init__(self, dim, expand, img_height, img_width, kernel_size=3, dt_ref=1.0, init_noise_scale=0.01, sde_mode="sde", max_growth_rate=0.3):
         super().__init__()
         self.dim = dim
         self.norm_spatial = nn.LayerNorm(dim * 2)
         self.spatial_cliff = RiemannianCliffordConv2d(dim * 2, dim * 2, kernel_size=kernel_size, padding=kernel_size // 2, img_height=img_height, img_width=img_width)
         self.norm_temporal = nn.LayerNorm(dim * 2)
         self.prop = TemporalPropagator(dim, dt_ref=dt_ref, sde_mode=sde_mode, init_noise_scale=init_noise_scale, max_growth_rate=max_growth_rate)
-        self.ffn = UniPhyFeedForwardNetwork(dim, expand, num_experts)
+        self.ffn = UniPhyFeedForwardNetwork(dim, expand)
 
     def _spatial_process(self, x):
         is_5d = x.ndim == 5
@@ -150,14 +150,14 @@ class UniPhyBlock(nn.Module):
 
 
 class UniPhyModel(nn.Module):
-    def __init__(self, in_channels, out_channels, embed_dim, expand=4, num_experts=8, depth=8, patch_size=16, img_height=64, img_width=64, dt_ref=1.0, sde_mode="sde", init_noise_scale=0.01, max_growth_rate=0.3):
+    def __init__(self, in_channels, out_channels, embed_dim, expand=4, depth=8, patch_size=16, img_height=64, img_width=64, dt_ref=1.0, sde_mode="sde", init_noise_scale=0.01, max_growth_rate=0.3):
         super().__init__()
         self.embed_dim, self.depth, self.img_height, self.img_width = embed_dim, depth, img_height, img_width
         self.h_patches = (img_height + (patch_size - img_height % patch_size) % patch_size) // patch_size
         self.w_patches = (img_width + (patch_size - img_width % patch_size) % patch_size) // patch_size
         self.encoder = UniPhyEncoder(in_ch=in_channels, embed_dim=embed_dim, patch_size=patch_size, img_height=img_height, img_width=img_width)
         self.decoder = UniPhyEnsembleDecoder(out_ch=out_channels, latent_dim=embed_dim, patch_size=patch_size, model_channels=embed_dim, ensemble_size=10, img_height=img_height, img_width=img_width)
-        self.blocks = nn.ModuleList([UniPhyBlock(dim=embed_dim, expand=expand, num_experts=num_experts, img_height=self.h_patches, img_width=self.w_patches, dt_ref=dt_ref, sde_mode=sde_mode, init_noise_scale=init_noise_scale, max_growth_rate=max_growth_rate) for _ in range(depth)])
+        self.blocks = nn.ModuleList([UniPhyBlock(dim=embed_dim, expand=expand, img_height=self.h_patches, img_width=self.w_patches, dt_ref=dt_ref, sde_mode=sde_mode, init_noise_scale=init_noise_scale, max_growth_rate=max_growth_rate) for _ in range(depth)])
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
