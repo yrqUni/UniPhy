@@ -165,6 +165,8 @@ class UniPhyEnsembleDecoder(nn.Module):
             model_channels, out_ch * (patch_size ** 2), kernel_size=1
         )
 
+        self.out_smooth = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -208,6 +210,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         h = h + self.block(h)
         out = self.to_pixel(h)
         out = F.pixel_shuffle(out, self.patch_size)
+        out = self.out_smooth(out)
 
         self.padder.set_padding(self.img_height, self.img_width)
         out = self.padder.unpad(out)
@@ -220,4 +223,4 @@ class UniPhyEnsembleDecoder(nn.Module):
             out = out.reshape(B, T, C, H, W)
 
         return out
-    
+
