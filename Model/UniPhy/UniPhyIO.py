@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,126 +6,83 @@ import torch.nn.functional as F
 class FlexiblePadder(nn.Module):
     def __init__(self, patch_size, mode="replicate"):
         super().__init__()
-        self.patch_size = patch_size
+        if isinstance(patch_size, int):
+            self.ph = self.pw = patch_size
+        else:
+            self.ph, self.pw = patch_size
         self.mode = mode
         self.pad_h = 0
         self.pad_w = 0
 
-    def set_padding(self, h, w):
-        self.pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
-        self.pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
-
-    def pad(self, x):
-        _, _, h, w = x.shape
-        self.set_padding(h, w)
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        self.pad_h = (self.ph - h % self.ph) % self.ph
+        self.pad_w = (self.pw - w % self.pw) % self.pw
         if self.pad_h > 0 or self.pad_w > 0:
             x = F.pad(x, (0, self.pad_w, 0, self.pad_h), mode=self.mode)
         return x
 
     def unpad(self, x):
-        if self.pad_h > 0:
-            x = x[:, :, :-self.pad_h, :]
-        if self.pad_w > 0:
-            x = x[:, :, :, :-self.pad_w]
-        return x
-
-
-class LearnableSphericalPosEmb(nn.Module):
-    def __init__(self, dim, h_dim, w_dim):
-        super().__init__()
-        self.dim = dim
-        self.h_dim = h_dim
-        self.w_dim = w_dim
-
-        self.lat_emb = nn.Parameter(torch.randn(1, dim // 2, h_dim, 1) * 0.02)
-        self.lon_emb = nn.Parameter(torch.randn(1, dim // 2, 1, w_dim) * 0.02)
-
-        lat = torch.linspace(-math.pi / 2, math.pi / 2, h_dim)
-        lon = torch.linspace(0, 2 * math.pi, w_dim)
-        lat_grid, lon_grid = torch.meshgrid(lat, lon, indexing="ij")
-
-        self.register_buffer("cos_lat", torch.cos(lat_grid).unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_lat", torch.sin(lat_grid).unsqueeze(0).unsqueeze(0))
-        self.register_buffer("cos_lon", torch.cos(lon_grid).unsqueeze(0).unsqueeze(0))
-        self.register_buffer("sin_lon", torch.sin(lon_grid).unsqueeze(0).unsqueeze(0))
-
-        self.geo_proj = nn.Conv2d(4, dim, kernel_size=1)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        lat_emb = self.lat_emb
-        lon_emb = self.lon_emb
-
-        if H != self.h_dim or W != self.w_dim:
-            lat_emb = F.interpolate(lat_emb, size=(H, 1), mode="bilinear", align_corners=False)
-            lon_emb = F.interpolate(lon_emb, size=(1, W), mode="bilinear", align_corners=False)
-
-        pos_emb = torch.cat([
-            lat_emb.expand(B, -1, H, W),
-            lon_emb.expand(B, -1, H, W),
-        ], dim=1)
-
-        cos_lat = self.cos_lat
-        sin_lat = self.sin_lat
-        cos_lon = self.cos_lon
-        sin_lon = self.sin_lon
-
-        if H != self.h_dim or W != self.w_dim:
-            cos_lat = F.interpolate(cos_lat, size=(H, W), mode="bilinear", align_corners=False)
-            sin_lat = F.interpolate(sin_lat, size=(H, W), mode="bilinear", align_corners=False)
-            cos_lon = F.interpolate(cos_lon, size=(H, W), mode="bilinear", align_corners=False)
-            sin_lon = F.interpolate(sin_lon, size=(H, W), mode="bilinear", align_corners=False)
-
-        geo_feat = torch.cat([cos_lat, sin_lat, cos_lon, sin_lon], dim=1)
-        geo_feat = geo_feat.expand(B, -1, -1, -1)
-        geo_emb = self.geo_proj(geo_feat)
-
-        return x + pos_emb + geo_emb
+        h, w = x.shape[-2:]
+        return x[..., :h - self.pad_h, :w - self.pad_w]
 
 
 class UniPhyEncoder(nn.Module):
-    def __init__(self, in_ch, embed_dim, patch_size, img_height=64, img_width=64):
+    def __init__(
+        self,
+        in_ch,
+        embed_dim,
+        patch_size=16,
+        img_height=64,
+        img_width=64,
+    ):
         super().__init__()
-        self.patch_size = patch_size
-        self.img_height = img_height
-        self.img_width = img_width
+        if isinstance(patch_size, (tuple, list)):
+            self.ph, self.pw = patch_size
+        else:
+            self.ph = self.pw = patch_size
 
-        self.padder = FlexiblePadder(patch_size, mode="replicate")
+        self.padder = FlexiblePadder((self.ph, self.pw))
 
-        self.unshuffle_dim = in_ch * (patch_size ** 2)
-        self.proj = nn.Conv2d(self.unshuffle_dim, embed_dim * 2, kernel_size=1)
+        self.proj = nn.Conv2d(
+            in_ch,
+            embed_dim,
+            kernel_size=(self.ph, self.pw),
+            stride=(self.ph, self.pw),
+        )
 
-        nn.init.orthogonal_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        h_patches = (img_height + (self.ph - img_height % self.ph) % self.ph) // self.ph
+        w_patches = (img_width + (self.pw - img_width % self.pw) % self.pw) // self.pw
 
-        pad_h = (patch_size - img_height % patch_size) % patch_size
-        pad_w = (patch_size - img_width % patch_size) % patch_size
-        h_dim = (img_height + pad_h) // patch_size
-        w_dim = (img_width + pad_w) // patch_size
-
-        self.pos_emb = LearnableSphericalPosEmb(embed_dim * 2, h_dim, w_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(1, embed_dim, h_patches, w_patches))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
 
     def forward(self, x):
         is_5d = x.ndim == 5
-
         if is_5d:
             B, T, C, H, W = x.shape
-            x = x.reshape(B * T, C, H, W)
+            x = x.view(B * T, C, H, W)
+        else:
+            B, C, H, W = x.shape
+            T = 1
 
-        x = self.padder.pad(x)
-        x = F.pixel_unshuffle(x, self.patch_size)
-        x_emb = self.proj(x)
-        x_emb = self.pos_emb(x_emb)
+        x = self.padder(x)
+        x = self.proj(x)
 
-        x_real, x_imag = torch.chunk(x_emb, 2, dim=1)
-        out = torch.complex(x_real, x_imag)
+        if x.shape[-2:] != self.pos_emb.shape[-2:]:
+            pos_emb = F.interpolate(
+                self.pos_emb, size=x.shape[-2:], mode="bilinear", align_corners=False
+            )
+        else:
+            pos_emb = self.pos_emb
+
+        x = x + pos_emb
 
         if is_5d:
-            _, D, H_p, W_p = out.shape
-            out = out.reshape(B, T, D, H_p, W_p)
+            _, D, H_new, W_new = x.shape
+            x = x.view(B, T, D, H_new, W_new)
 
-        return out
+        return torch.complex(x, torch.zeros_like(x))
 
 
 class UniPhyEnsembleDecoder(nn.Module):
@@ -141,13 +97,15 @@ class UniPhyEnsembleDecoder(nn.Module):
         img_width=64,
     ):
         super().__init__()
-        self.patch_size = patch_size
+        if isinstance(patch_size, (tuple, list)):
+            self.ph, self.pw = patch_size
+        else:
+            self.ph = self.pw = patch_size
+
         self.img_height = img_height
         self.img_width = img_width
         self.ensemble_size = ensemble_size
         self.out_ch = out_ch
-
-        self.padder = FlexiblePadder(patch_size, mode="replicate")
 
         self.latent_proj = nn.Conv2d(
             latent_dim * 2, model_channels, kernel_size=3, padding=1
@@ -162,7 +120,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         )
 
         self.to_pixel = nn.Conv2d(
-            model_channels, out_ch * (patch_size ** 2), kernel_size=1
+            model_channels, out_ch * self.ph * self.pw, kernel_size=1
         )
 
         self.out_smooth = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
@@ -179,28 +137,29 @@ class UniPhyEnsembleDecoder(nn.Module):
 
     def forward(self, z, member_idx=None):
         is_5d = z.ndim == 5
-
         if is_5d:
             B, T, D, H_p, W_p = z.shape
-            z = z.reshape(B * T, D, H_p, W_p)
+            z = z.contiguous().view(B * T, D, H_p, W_p)
         else:
             B, D, H_p, W_p = z.shape
+            T = 1
 
-        if z.is_complex():
-            z_real = torch.cat([z.real, z.imag], dim=1)
-        else:
-            z_real = z
+        z_real = torch.cat([z.real, z.imag], dim=1)
 
         h = self.latent_proj(z_real)
 
         if member_idx is not None:
-            BT = z.shape[0]
+            BT = h.shape[0]
             if member_idx.ndim == 0:
                 member_idx = member_idx.unsqueeze(0).expand(BT)
             elif member_idx.numel() == B and is_5d:
                 member_idx = member_idx.repeat_interleave(T)
             elif member_idx.numel() != BT:
-                member_idx = member_idx.view(-1)[:BT]
+                member_idx = member_idx.view(-1)
+                if member_idx.shape[0] >= BT:
+                    member_idx = member_idx[:BT]
+                else:
+                    raise ValueError(f"member_idx size {member_idx.shape} mismatch {BT}")
 
             member_idx = member_idx.to(z.device)
             member_feat = self.member_emb(member_idx)
@@ -209,18 +168,18 @@ class UniPhyEnsembleDecoder(nn.Module):
 
         h = h + self.block(h)
         out = self.to_pixel(h)
-        out = F.pixel_shuffle(out, self.patch_size)
+
+        BT, _, H_grid, W_grid = out.shape
+        out = out.view(BT, self.out_ch, self.ph, self.pw, H_grid, W_grid)
+        out = out.permute(0, 1, 4, 2, 5, 3)
+        out = out.reshape(BT, self.out_ch, H_grid * self.ph, W_grid * self.pw)
+
         out = self.out_smooth(out)
 
-        self.padder.set_padding(self.img_height, self.img_width)
-        out = self.padder.unpad(out)
-
-        if out.shape[-2] > self.img_height or out.shape[-1] > self.img_width:
-            out = out[..., :self.img_height, :self.img_width]
+        out = out[..., :self.img_height, :self.img_width]
 
         if is_5d:
-            _, C, H, W = out.shape
-            out = out.reshape(B, T, C, H, W)
+            out = out.view(B, T, self.out_ch, self.img_height, self.img_width)
 
         return out
 
