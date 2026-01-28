@@ -1,7 +1,7 @@
 model:
   in_channels: 30
   out_channels: 30
-  embed_dim: 512
+  embed_dim: 128
   expand: 4
   depth: 8
   patch_size: [7, 15]
@@ -15,24 +15,31 @@ model:
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
-  year_range: [1979, 2015]
-  window_size: 1
+  year_range: [2000, 2000]
+  window_size: 10
+  sample_k: 5
+  look_ahead: 2
   sampling_mode: "mix"
 
 train:
-  batch_size: 4
-  lr: 5.0e-4
-  weight_decay: 0.01
-  epochs: 100
-  grad_clip: 1.0
+  batch_size: 1
+  lr: 1.0e-4
+  weight_decay: 0.05
+  epochs: 64
+  grad_clip: 128.0
   grad_accum_steps: 1
+  use_scheduler: false
+  use_tf32: true
 
 logging:
-  log_every: 10
+  log_every: 1
+  wandb_every: 1
+  ckpt_step: 0.5
   log_path: "./uniphy/logs"
   ckpt_dir: "./uniphy/ckpt"
+  ckpt: ""
   use_wandb: true
-  wandb_project: "ERA5-"
+  wandb_project: "ERA5"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
 

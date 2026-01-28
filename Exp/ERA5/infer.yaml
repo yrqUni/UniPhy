@@ -1,0 +1,15 @@
+data:
+  input_dir: "/nfs/ERA5_data/data_norm"
+  stats_dir: "/nfs/ERA5_data/stats"
+  test_year: 2000
+  window_size: 20
+
+inference:
+  ckpt_path: "./uniphy/ckpt/ckpt_final.pt"
+  output_dir: "./uniphy/results"
+  ensemble_size: 4
+  condition_steps: 4
+  autoregressive_steps: 8
+  dt: 6.0
+  save_plot: true
+

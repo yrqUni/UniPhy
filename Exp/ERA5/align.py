@@ -244,7 +244,7 @@ def align(cfg):
         embed_dim=cfg["model"]["embed_dim"],
         expand=cfg["model"]["expand"],
         depth=cfg["model"]["depth"],
-        patch_size=cfg["model"]["patch_size"],
+        patch_size=tuple(cfg["model"]["patch_size"]),
         img_height=cfg["model"]["img_height"],
         img_width=cfg["model"]["img_width"],
         dt_ref=cfg["model"]["dt_ref"],
