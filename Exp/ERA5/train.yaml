@@ -26,7 +26,7 @@ train:
   lr: 3.0e-5
   weight_decay: 0.05
   epochs: 100
-  grad_clip: 1.0
+  grad_clip: 128.0
   grad_accum_steps: 1
   ensemble_size: 3
   use_scheduler: false
