@@ -95,9 +95,9 @@ class ERA5_Dataset(Dataset):
 
     def __getitem__(self, idx):
         idx = int(idx)
+        use_sequential = False
 
         if self.is_train:
-            use_sequential = False
             if self.sampling_mode == "sequential":
                 use_sequential = True
             elif self.sampling_mode == "mixed":
@@ -111,29 +111,33 @@ class ERA5_Dataset(Dataset):
             else:
                 offsets = sorted(random.sample(range(self.window_size), self.sample_k))
         else:
+            use_sequential = True
             offsets = list(range(self.sample_k))
 
-        frames = []
         start_global = idx + offsets[0]
         f_idx = np.searchsorted(self.file_frame_offsets, start_global, side="right") - 1
         current_file_data = self._get_data_ptr(f_idx)
         file_start_global = self.file_frame_offsets[f_idx]
         file_len = self.file_shapes[f_idx][0]
+        start_local = start_global - file_start_global
 
-        for off in offsets:
-            curr_global = idx + off
-            local_off = curr_global - file_start_global
-            if 0 <= local_off < file_len:
-                frames.append(torch.from_numpy(current_file_data[local_off].copy()))
-            else:
-                frame_data = self._get_single_frame(curr_global)
-                frames.append(torch.from_numpy(frame_data.copy()))
-
-        data = torch.stack(frames, dim=0)
+        if use_sequential and (start_local + self.sample_k <= file_len):
+            chunk = current_file_data[start_local : start_local + self.sample_k]
+            data = torch.from_numpy(chunk.copy())
+        else:
+            frames = []
+            for off in offsets:
+                curr_global = idx + off
+                local_off = curr_global - file_start_global
+                if 0 <= local_off < file_len:
+                    frames.append(torch.from_numpy(current_file_data[local_off].copy()))
+                else:
+                    frame_data = self._get_single_frame(curr_global)
+                    frames.append(torch.from_numpy(frame_data.copy()))
+            data = torch.stack(frames, dim=0)
 
         offsets_tensor = torch.tensor(offsets, dtype=torch.float32)
         dt = (offsets_tensor[1:] - offsets_tensor[:-1]) * float(self.dt_ref)
-
         dt_padded = torch.cat([dt, dt[-1:]], dim=0)
 
         return data, dt_padded
