@@ -5,7 +5,7 @@ data:
   window_size: 20
 
 inference:
-  ckpt_path: "./uniphy/ckpt/ckpt_final.pt"
+  ckpt_path: "./uniphy/ckpt/ckpt_epoch20.pt"
   output_dir: "./uniphy/results"
   ensemble_size: 4
   condition_steps: 4
