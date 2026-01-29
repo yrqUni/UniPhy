@@ -1,7 +1,7 @@
 model:
   in_channels: 30
   out_channels: 30
-  embed_dim: 128
+  embed_dim: 256
   expand: 4
   depth: 8
   patch_size: [7, 15]
@@ -15,7 +15,7 @@ model:
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
-  year_range: [2000, 2009]
+  year_range: [2000, 2021]
   window_size: 10
   sample_k: 5
   look_ahead: 2
@@ -23,12 +23,12 @@ data:
 
 train:
   batch_size: 1
-  lr: 1.0e-4
+  lr: 1.0e-3
   weight_decay: 0.05
   epochs: 256
   grad_clip: 128.0
   grad_accum_steps: 1
-  use_scheduler: false
+  use_scheduler: true
   use_tf32: true
 
 logging:
