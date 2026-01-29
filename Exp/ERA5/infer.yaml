@@ -5,11 +5,11 @@ data:
   window_size: 20
 
 inference:
-  ckpt_path: "./uniphy/ckpt/ckpt_epoch20.pt"
+  ckpt_path: "./uniphy/align_ckpt/align_epoch1.pt"
   output_dir: "./uniphy/results"
   ensemble_size: 4
   condition_steps: 4
-  autoregressive_steps: 8
-  dt: 6.0
+  autoregressive_steps: 6
+  dt: 1.0
   save_plot: true
 

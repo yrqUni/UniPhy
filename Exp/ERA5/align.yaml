@@ -30,7 +30,7 @@ train:
   batch_size: 1
   lr: 5.0e-5
   weight_decay: 0.01
-  epochs: 10
+  epochs: 20
   grad_clip: 10.0
   grad_accum_steps: 4
 
