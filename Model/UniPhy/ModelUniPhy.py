@@ -266,30 +266,30 @@ class UniPhyModel(nn.Module):
         out = self.decoder(z, member_idx=member_idx)
         return out
 
-    def forward_rollout(self, x_context, dt_context, dt_list):
-        B, T_in = x_context.shape[0], x_context.shape[1]
+    def forward_rollout(self, x_context, dt_context, dt_list, member_idx=None):
+        bsz, t_in = x_context.shape[0], x_context.shape[1]
         z_ctx = self.encoder(x_context)
         dtype = z_ctx.dtype if z_ctx.is_complex() else torch.complex64
-        states = self._init_states(B, x_context.device, dtype)
-
+        states = self._init_states(bsz, x_context.device, dtype)
+     
         if isinstance(dt_context, (float, int)):
             dt_ctx_tensor = torch.full(
-                (B, T_in), float(dt_context), device=x_context.device
+                (bsz, t_in), float(dt_context), device=x_context.device
             )
         elif dt_context.ndim == 0:
-            dt_ctx_tensor = dt_context.expand(B, T_in)
+            dt_ctx_tensor = dt_context.expand(bsz, t_in)
         else:
             dt_ctx_tensor = dt_context
-
+     
         for i, block in enumerate(self.blocks):
             z_ctx, h_f, f_f = block(
                 z_ctx, states[i][0], dt_ctx_tensor, states[i][1]
             )
             states[i] = (h_f, f_f)
-
+     
         x_last = x_context[:, -1]
         z_curr = self.encoder(x_last)
-
+     
         preds = []
         for dt_k in dt_list:
             new_states = []
@@ -299,11 +299,11 @@ class UniPhyModel(nn.Module):
                 )
                 new_states.append((h_n, f_n))
             states = new_states
-
-            x_pred = self.decoder(z_curr)
+     
+            x_pred = self.decoder(z_curr, member_idx=member_idx)
             preds.append(x_pred)
-
+     
             z_curr = self.encoder(x_pred)
-
+     
         return torch.stack(preds, dim=1)
 

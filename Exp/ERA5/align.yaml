@@ -15,27 +15,26 @@ model:
 
 data:
   input_dir: "/nfs/ERA5_data/data_norm"
-  year_range: [2000, 2009]
-  window_size: 10
+  year_range: [2000, 2021]
+  window_size: 5
   sampling_mode: "sequential"
 
 alignment:
-  pretrained_ckpt: "./uniphy/ckpt/ckpt_epoch20.pt"
+  pretrained_ckpt: "./uniphy/ckpt/ckpt_final.pt"
   condition_steps: 4
-  max_target_steps: 2
-  target_dt: 6.0
+  max_target_steps: 1
   sub_steps: [1, 2, 3, 6]
 
 train:
   batch_size: 1
   lr: 5.0e-5
   weight_decay: 0.01
-  epochs: 20
+  epochs: 64
   grad_clip: 10.0
   grad_accum_steps: 4
 
 logging:
-  log_every: 5
+  log_every: 1
   log_path: "./uniphy/align_logs"
   ckpt_dir: "./uniphy/align_ckpt"
   use_wandb: true
