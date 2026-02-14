@@ -258,7 +258,7 @@ class UniPhyModel(nn.Module):
             states[i] = (h_f, f_f)
 
         x_last = x_context[:, -1]
-        z_curr = self.encoder(x_last)
+        z_curr = self.encoder(x_last.unsqueeze(1))[:, 0]
 
         if isinstance(dt_future, list):
             dt_future = torch.stack(
@@ -284,7 +284,8 @@ class UniPhyModel(nn.Module):
                 z_curr, h_n, f_n = block.forward_step(z_curr, states[i][0], dt_k, states[i][1])
                 new_states.append((h_n, f_n))
             states = new_states
-            x_pred = self.decoder(z_curr, member_idx=member_idx)
+            x_pred = self.decoder(z_curr.unsqueeze(1), member_idx=member_idx)[:, 0]
             preds.append(x_pred)
-            z_curr = self.encoder(x_pred)
+            z_curr = self.encoder(x_pred.unsqueeze(1))[:, 0]
+
         return torch.stack(preds, dim=1)
