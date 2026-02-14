@@ -27,15 +27,22 @@ train:
   seed: 42
   num_workers: 4
   batch_size: 1
-  lr: 0.001
+  lr: 1.0e-3
   weight_decay: 0.05
   epochs: 256
   grad_clip: 128.0
   grad_accum_steps: 1
+  use_scheduler: true
   use_tf32: true
-  crps_weight: 0.0
 
 logging:
   log_every: 1
+  wandb_every: 1
+  ckpt_step: 0.5
+  log_path: ./uniphy/logs
   ckpt_dir: ./uniphy/ckpt
-  save_every: 1
+  ckpt: ""
+  use_wandb: true
+  wandb_project: ERA5
+  wandb_entity: UniPhy
+  wandb_run_name: ""
