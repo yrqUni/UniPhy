@@ -5,6 +5,9 @@ import random
 import sys
 from pathlib import Path
 
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
+sys.path.append("/nfs/UniPhy/Exp/ERA5")
+
 import numpy as np
 import torch
 import torch.distributed as dist

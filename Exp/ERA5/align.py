@@ -1,8 +1,12 @@
 import argparse
 import datetime
 import os
+import sys
 import random
 from pathlib import Path
+
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
+sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
 import numpy as np
 import torch
