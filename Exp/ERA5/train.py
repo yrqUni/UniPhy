@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import time
 import os
 import random
 import sys
@@ -306,7 +307,7 @@ def train(cfg):
 
             model.train()
             running = {}
-            t0 = time.time() if "time" in sys.modules else None
+            t0 = time.time()
 
             for batch_idx, batch in enumerate(train_loader):
                 metrics = train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
