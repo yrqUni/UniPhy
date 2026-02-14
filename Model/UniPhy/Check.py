@@ -16,6 +16,11 @@ def _as_dt_seq(dt_context, bsz, t_in, device, dtype):
     return torch.full((bsz, t_in), float(dt_context), device=device, dtype=dtype)
 
 
+def _decode_step(model, z_step):
+    y = model.decoder(z_step.unsqueeze(1))
+    return y[:, 0]
+
+
 def full_serial_inference(model, x_context, dt_context, dt_list):
     bsz, t_in = x_context.shape[0], x_context.shape[1]
     device = x_context.device
@@ -23,7 +28,6 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
 
     z_all = model.encoder(x_context)
     states = model._init_states()
-
     dt_ctx = _as_dt_seq(dt_context, bsz, t_in, device, dtype)
 
     for t in range(t_in):
@@ -45,8 +49,8 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
             z_curr, h_next, flux_next = block.forward_step(z_curr, h_prev, dt_k, flux_prev)
             new_states.append((h_next, flux_next))
         states = new_states
-        pred = model.decoder(z_curr)
-        z_curr = model.encoder(pred)
+        pred = _decode_step(model, z_curr)
+        z_curr = model.encoder(pred.unsqueeze(1))[:, 0]
         preds.append(pred)
 
     return torch.stack(preds, dim=1)
@@ -92,7 +96,7 @@ def check_precision_robustness():
             h_prev, flux_prev = states[i]
             z_t, h_next, flux_next = block.forward_step(z_t, h_prev, dt_t, flux_prev)
             states[i] = (h_next, flux_next)
-        out_serial.append(model.decoder(z_t))
+        out_serial.append(_decode_step(model, z_t))
 
     out_serial = torch.stack(out_serial, dim=1)
     diff_1 = (out_parallel - out_serial).abs().max().item()
