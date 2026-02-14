@@ -81,10 +81,14 @@ class GlobalFluxTracker(nn.Module):
         return decay, u
 
     def compute_output(self, flux_seq):
-        gate = torch.sigmoid(self.gate_raw).unsqueeze(0).expand(flux_seq.shape[0], -1)
-        source = torch.complex(self.source_raw_re, self.source_raw_im).unsqueeze(0).expand(
-            flux_seq.shape[0], -1
-        )
+        bsz = flux_seq.shape[0]
+        gate = torch.sigmoid(self.gate_raw).unsqueeze(0).expand(bsz, -1)
+        source = torch.complex(self.source_raw_re, self.source_raw_im).unsqueeze(0).expand(bsz, -1)
+
+        if flux_seq.ndim == 3:
+            gate = gate.unsqueeze(1)
+            source = source.unsqueeze(1)
+
         src = source * flux_seq
         return src, gate
 
