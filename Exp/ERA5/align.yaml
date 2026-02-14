@@ -8,37 +8,40 @@ model:
   img_height: 721
   img_width: 1440
   dt_ref: 6.0
-  sde_mode: "sde"
+  tau_ref_hours: 6.0
+  sde_mode: sde
   init_noise_scale: 0.0001
   max_growth_rate: 0.3
   ensemble_size: 4
+  target_dt_hours: 6.0
 
 data:
-  input_dir: "/nfs/ERA5_data/data_norm"
+  input_dir: /nfs/ERA5_data/data_norm
   year_range: [2000, 2021]
   window_size: 5
-  sampling_mode: "sequential"
+  sample_k: 5
+  look_ahead: 0
+  sampling_mode: sequential
+  frame_hours: 6.0
 
 alignment:
-  pretrained_ckpt: "./uniphy/ckpt/ckpt_final.pt"
+  pretrained_ckpt: ./uniphy/ckpt/ckpt_final.pt
   condition_steps: 4
   max_target_steps: 1
   sub_steps: [1, 2, 3, 6]
 
 train:
+  seed: 42
+  num_workers: 4
   batch_size: 1
-  lr: 5.0e-5
+  lr: 0.00005
   weight_decay: 0.01
   epochs: 64
   grad_clip: 10.0
   grad_accum_steps: 4
+  use_tf32: true
 
 logging:
   log_every: 1
-  log_path: "./uniphy/align_logs"
-  ckpt_dir: "./uniphy/align_ckpt"
-  use_wandb: true
-  wandb_project: "ERA5-Align"
-  wandb_entity: "UniPhy"
-  wandb_run_name: ""
-
+  ckpt_dir: ./uniphy/align_ckpt
+  save_every: 1

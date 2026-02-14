@@ -8,38 +8,34 @@ model:
   img_height: 721
   img_width: 1440
   dt_ref: 6.0
-  sde_mode: "sde"
+  tau_ref_hours: 6.0
+  sde_mode: sde
   init_noise_scale: 0.0001
   max_growth_rate: 0.3
   ensemble_size: 4
 
 data:
-  input_dir: "/nfs/ERA5_data/data_norm"
+  input_dir: /nfs/ERA5_data/data_norm
   year_range: [2000, 2021]
   window_size: 10
   sample_k: 5
   look_ahead: 2
-  sampling_mode: "mix"
+  sampling_mode: mix
+  frame_hours: 6.0
 
 train:
+  seed: 42
+  num_workers: 4
   batch_size: 1
-  lr: 1.0e-3
+  lr: 0.001
   weight_decay: 0.05
   epochs: 256
   grad_clip: 128.0
   grad_accum_steps: 1
-  use_scheduler: true
   use_tf32: true
+  crps_weight: 0.0
 
 logging:
   log_every: 1
-  wandb_every: 1
-  ckpt_step: 0.5
-  log_path: "./uniphy/logs"
-  ckpt_dir: "./uniphy/ckpt"
-  ckpt: ""
-  use_wandb: true
-  wandb_project: "ERA5"
-  wandb_entity: "UniPhy"
-  wandb_run_name: ""
-
+  ckpt_dir: ./uniphy/ckpt
+  save_every: 1

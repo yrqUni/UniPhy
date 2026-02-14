@@ -23,39 +23,54 @@ def set_seed(seed):
 
 
 def setup_distributed():
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    dist.init_process_group(backend="nccl", init_method="env://")
-    torch.cuda.set_device(local_rank)
-    return rank, world_size, local_rank
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def is_dist():
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main():
+    return not is_dist() or dist.get_rank() == 0
 
 
 def reduce_mean(tensor):
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    tensor /= dist.get_world_size()
-    return tensor
+    if not is_dist():
+        return tensor
+    out = tensor.clone()
+    dist.all_reduce(out, op=dist.ReduceOp.SUM)
+    out /= dist.get_world_size()
+    return out
 
 
 def pad_dt(dt_between, t_len):
-    B = dt_between.shape[0]
     if dt_between.shape[1] == t_len:
         return dt_between
-    last = dt_between[:, -1:].expand(B, 1)
+    bsz = dt_between.shape[0]
+    if dt_between.shape[1] == 0:
+        return torch.zeros((bsz, t_len), device=dt_between.device, dtype=dt_between.dtype)
+    last = dt_between[:, -1:].expand(bsz, 1)
     return torch.cat([dt_between, last], dim=1)
 
 
 def load_checkpoint(model, path):
     ckpt = torch.load(path, map_location="cpu")
-    state = ckpt["model"] if "model" in ckpt else ckpt
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=False)
 
 
 def save_checkpoint(model, optimizer, cfg, path, epoch, step):
-    if dist.get_rank() != 0:
+    if not is_main():
         return
     state = {
-        "model": model.module.state_dict(),
+        "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "cfg": cfg,
         "epoch": epoch,
@@ -72,33 +87,46 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     dt_between = dt_between.to(device, non_blocking=True).float()
 
     cond_steps = int(cfg["alignment"]["condition_steps"])
-    max_tgt_steps = int(cfg["alignment"]["max_target_steps"])
+    max_target_steps = int(cfg["alignment"]["max_target_steps"])
     sub_steps_list = list(cfg["alignment"]["sub_steps"])
+
     target_dt = float(cfg["model"].get("target_dt_hours", cfg["model"].get("dt_ref", 6.0)))
 
-    x_ctx = data[:, :cond_steps]
-    x_targets = data[:, cond_steps:]
+    k_total = int(data.shape[1])
+    max_avail_t = max(0, k_total - cond_steps)
+    max_t = min(int(max_target_steps), int(max_avail_t))
 
-    dt_ctx_between = dt_between[:, : max(cond_steps - 1, 1)]
+    if max_t <= 0:
+        return {
+            "loss": 0.0,
+            "l1": 0.0,
+            "rmse": 0.0,
+            "t": 0.0,
+            "sub_step": 0.0,
+            "grad_norm": 0.0,
+        }
+
+    t = random.randint(1, max_t)
+    sub_step = int(random.choice(sub_steps_list))
+
+    x_ctx = data[:, :cond_steps]
+    x_targets = data[:, cond_steps : cond_steps + t]
+
+    dt_ctx_between = dt_between[:, : max(cond_steps - 1, 0)]
     dt_ctx = pad_dt(dt_ctx_between, cond_steps)
 
-    actual_tgt_steps = int(x_targets.shape[1])
-    max_t = min(max_tgt_steps, actual_tgt_steps)
-    t = random.randint(1, max_t)
-
-    sub_step = int(random.choice(sub_steps_list))
     dt_per_iter = target_dt / float(sub_step)
     n_iters = int(t * sub_step)
     dt_future = torch.full((n_iters,), float(dt_per_iter), device=device, dtype=torch.float32)
 
-    ensemble_size = int(cfg["model"]["ensemble_size"])
-    B = int(x_ctx.shape[0])
+    ensemble_size = int(cfg["model"].get("ensemble_size", 1))
+    bsz = x_ctx.shape[0]
     if ensemble_size > 1:
-        member_idx = torch.randint(0, ensemble_size, (B,), device=device)
+        member_idx = torch.randint(0, ensemble_size, (bsz,), device=device)
     else:
         member_idx = None
 
-    infer_model = model.module
+    infer_model = model.module if hasattr(model, "module") else model
     pred_seq = infer_model.forward_rollout(x_ctx, dt_ctx, dt_future, member_idx=member_idx)
 
     if sub_step > 1:
@@ -107,10 +135,9 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         pred_aligned = pred_seq
 
     pred_aligned = pred_aligned[:, :t]
-    x_tgt_aligned = x_targets[:, :t]
 
-    mse = ((pred_aligned - x_tgt_aligned) ** 2).mean()
-    l1 = (pred_aligned - x_tgt_aligned).abs().mean()
+    mse = ((pred_aligned - x_targets) ** 2).mean()
+    l1 = torch.abs(pred_aligned - x_targets).mean()
     loss = l1
 
     (loss / float(grad_accum_steps)).backward()
@@ -128,7 +155,9 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
         "loss": loss.detach(),
         "l1": l1.detach(),
         "rmse": torch.sqrt(mse).detach(),
-        "grad_norm": torch.tensor(grad_norm, device=device),
+        "t": torch.tensor(float(t), device=device),
+        "sub_step": torch.tensor(float(sub_step), device=device),
+        "grad_norm": torch.tensor(float(grad_norm), device=device),
     }
     for k in metrics:
         metrics[k] = reduce_mean(metrics[k]).item()
@@ -144,105 +173,153 @@ def main():
         cfg = yaml.safe_load(f)
 
     rank, world_size, local_rank = setup_distributed()
-    set_seed(int(cfg["train"]["seed"]) + rank)
 
-    device = torch.device("cuda", local_rank)
-    torch.backends.cuda.matmul.allow_tf32 = bool(cfg["train"].get("tf32", True))
-    torch.backends.cudnn.allow_tf32 = bool(cfg["train"].get("tf32", True))
+    seed = int(cfg.get("train", {}).get("seed", 42))
+    set_seed(seed + rank)
+
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+
+    use_tf32 = bool(cfg.get("train", {}).get("use_tf32", True))
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    torch.backends.cudnn.allow_tf32 = use_tf32
+
+    cond_steps = int(cfg["alignment"]["condition_steps"])
+    max_target_steps = int(cfg["alignment"]["max_target_steps"])
+
+    sample_k_default = max(2, cond_steps + max_target_steps + 1)
+    sample_k = int(cfg.get("data", {}).get("sample_k", sample_k_default))
+    look_ahead = int(cfg.get("data", {}).get("look_ahead", 0))
+
+    frame_hours = float(cfg.get("data", {}).get("frame_hours", cfg["model"].get("dt_ref", 6.0)))
 
     dataset = ERA5_Dataset(
         input_dir=cfg["data"]["input_dir"],
         year_range=cfg["data"]["year_range"],
         window_size=int(cfg["data"]["window_size"]),
-        sample_k=int(cfg["data"]["sample_k"]),
-        look_ahead=int(cfg["data"]["look_ahead"]),
+        sample_k=sample_k,
+        look_ahead=look_ahead,
         is_train=True,
-        frame_hours=float(cfg["data"].get("frame_hours", 6.0)),
+        frame_hours=frame_hours,
         sampling_mode=str(cfg["data"].get("sampling_mode", "mixed")),
     )
 
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True,
-    )
+    try:
+        if world_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
+            )
+        else:
+            sampler = None
 
-    loader = DataLoader(
-        dataset,
-        batch_size=int(cfg["train"]["batch_size"]),
-        sampler=sampler,
-        num_workers=int(cfg["train"]["num_workers"]),
-        pin_memory=True,
-        drop_last=True,
-    )
+        num_workers = int(cfg.get("train", {}).get("num_workers", 4))
 
-    model = UniPhyModel(
-        in_channels=int(cfg["model"]["in_channels"]),
-        out_channels=int(cfg["model"]["out_channels"]),
-        embed_dim=int(cfg["model"]["embed_dim"]),
-        expand=int(cfg["model"]["expand"]),
-        depth=int(cfg["model"]["depth"]),
-        patch_size=cfg["model"]["patch_size"],
-        img_height=int(cfg["model"]["img_height"]),
-        img_width=int(cfg["model"]["img_width"]),
-        tau_ref_hours=float(cfg["model"].get("tau_ref_hours", cfg["model"].get("dt_ref", 6.0))),
-        sde_mode=str(cfg["model"].get("sde_mode", "sde")),
-        init_noise_scale=float(cfg["model"].get("init_noise_scale", 0.01)),
-        max_growth_rate=float(cfg["model"].get("max_growth_rate", 0.3)),
-        ensemble_size=int(cfg["model"].get("ensemble_size", 1)),
-    ).to(device)
+        loader = DataLoader(
+            dataset,
+            batch_size=int(cfg["train"]["batch_size"]),
+            sampler=sampler,
+            shuffle=(sampler is None),
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
 
-    load_checkpoint(model, cfg["alignment"]["pretrained_ckpt"])
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        model = UniPhyModel(
+            in_channels=int(cfg["model"]["in_channels"]),
+            out_channels=int(cfg["model"]["out_channels"]),
+            embed_dim=int(cfg["model"]["embed_dim"]),
+            expand=int(cfg["model"]["expand"]),
+            depth=int(cfg["model"]["depth"]),
+            patch_size=cfg["model"]["patch_size"],
+            img_height=int(cfg["model"]["img_height"]),
+            img_width=int(cfg["model"]["img_width"]),
+            tau_ref_hours=float(cfg["model"].get("tau_ref_hours", cfg["model"].get("dt_ref", 6.0))),
+            sde_mode=str(cfg["model"].get("sde_mode", "sde")),
+            init_noise_scale=float(cfg["model"].get("init_noise_scale", 0.01)),
+            max_growth_rate=float(cfg["model"].get("max_growth_rate", 0.3)),
+            ensemble_size=int(cfg["model"].get("ensemble_size", 1)),
+        ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        betas=(0.9, 0.95),
-        weight_decay=float(cfg["train"]["weight_decay"]),
-    )
+        load_checkpoint(model, cfg["alignment"]["pretrained_ckpt"])
 
-    grad_accum_steps = int(cfg["train"].get("grad_accum_steps", 1))
-    log_every = int(cfg["train"].get("log_every", 50))
-    save_every = int(cfg["train"].get("save_every", 1))
-    epochs = int(cfg["train"]["epochs"])
-    ckpt_dir = cfg["train"].get("ckpt_dir", "./ckpt_align")
-
-    step = 0
-    for epoch in range(epochs):
-        sampler.set_epoch(epoch)
-        model.train()
-        t0 = time.time()
-        running = {}
-        for batch_idx, batch in enumerate(loader):
-            metrics = align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
-            step += 1
-            for k, v in metrics.items():
-                running[k] = running.get(k, 0.0) + float(v)
-            if step % log_every == 0 and dist.get_rank() == 0:
-                denom = float(log_every)
-                msg = f"epoch={epoch} step={step}"
-                for k in sorted(running.keys()):
-                    msg += f" {k}={running[k] / denom:.6f}"
-                msg += f" time={time.time() - t0:.2f}s"
-                print(msg, flush=True)
-                running = {}
-                t0 = time.time()
-        if (epoch + 1) % save_every == 0:
-            save_checkpoint(
+        if world_size > 1:
+            model = DDP(
                 model,
-                optimizer,
-                cfg,
-                os.path.join(ckpt_dir, f"ckpt_epoch_{epoch + 1}.pt"),
-                epoch,
-                step,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
             )
 
-    save_checkpoint(model, optimizer, cfg, os.path.join(ckpt_dir, "ckpt_final.pt"), epochs - 1, step)
-    dist.barrier()
-    dist.destroy_process_group()
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(cfg["train"]["lr"]),
+            betas=(0.9, 0.95),
+            weight_decay=float(cfg["train"]["weight_decay"]),
+        )
+
+        epochs = int(cfg["train"]["epochs"])
+        grad_accum_steps = int(cfg["train"].get("grad_accum_steps", 1))
+
+        log_every = int(cfg.get("logging", {}).get("log_every", 50))
+        ckpt_dir = cfg.get("logging", {}).get("ckpt_dir", "./align_ckpt")
+        ckpt_every_epochs = int(cfg.get("logging", {}).get("save_every", 1))
+
+        step = 0
+        running = {}
+        t0 = time.time()
+
+        for epoch in range(epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+
+            model.train()
+
+            for batch_idx, batch in enumerate(loader):
+                metrics = align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
+                step += 1
+
+                for k, v in metrics.items():
+                    running[k] = running.get(k, 0.0) + float(v)
+
+                if is_main() and step % log_every == 0:
+                    denom = float(log_every)
+                    msg = f"epoch={epoch} step={step}"
+                    for k in sorted(running.keys()):
+                        msg += f" {k}={running[k] / denom:.6f}"
+                    msg += f" time={time.time() - t0:.2f}s"
+                    print(msg, flush=True)
+                    running = {}
+                    t0 = time.time()
+
+            if (epoch + 1) % max(1, ckpt_every_epochs) == 0:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    cfg,
+                    os.path.join(ckpt_dir, f"ckpt_epoch_{epoch + 1}.pt"),
+                    epoch,
+                    step,
+                )
+
+        save_checkpoint(
+            model,
+            optimizer,
+            cfg,
+            os.path.join(ckpt_dir, "ckpt_final.pt"),
+            epochs - 1,
+            step,
+        )
+
+        if is_dist():
+            dist.barrier()
+
+    finally:
+        dataset.cleanup()
+        if is_dist():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
