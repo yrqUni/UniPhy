@@ -39,7 +39,7 @@ class UniPhyBlock(nn.Module):
             init_noise_scale=init_noise_scale,
             max_growth_rate=max_growth_rate,
         )
-        self.ffn = UniPhyFeedForwardNetwork(dim, expand)
+        self.ffn = UniPhyFeedForwardNetwork(dim * 2, expand)
 
     def _spatial_process(self, x):
         is_5d = x.ndim == 5
