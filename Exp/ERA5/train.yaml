@@ -12,7 +12,7 @@ model:
   sde_mode: sde
   init_noise_scale: 0.0001
   max_growth_rate: 0.3
-  ensemble_size: 8
+  ensemble_size: 6
 
 data:
   input_dir: /nfs/ERA5_data/data_norm
