@@ -38,7 +38,7 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
             z_in, h_next, flux_next = block.forward_step(z_in, h_prev, dt_t, flux_prev)
             states[i] = (h_next, flux_next)
 
-    z_curr = model.encoder(x_context[:, -1])
+    z_curr = model.encoder(x_context[:, -1].unsqueeze(1))[:, 0]
 
     preds = []
     for dt_k in dt_list:
