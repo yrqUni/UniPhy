@@ -234,12 +234,27 @@ class UniPhyModel(nn.Module):
         return self.decoder(z, member_idx=member_idx)
 
     def forward_rollout(self, x_context, dt_context, dt_future, member_idx=None):
-        B, t_in = x_context.shape[0], x_context.shape[1]
+        bsz, t_in = x_context.shape[0], x_context.shape[1]
+        device = x_context.device
+        dt_dtype = x_context.dtype
+
+        if isinstance(dt_context, (float, int)):
+            dt_ctx = torch.full((bsz, t_in), float(dt_context), device=device, dtype=dt_dtype)
+        elif isinstance(dt_context, torch.Tensor):
+            if dt_context.ndim == 0:
+                dt_ctx = dt_context.to(device=device, dtype=dt_dtype).expand(bsz, t_in)
+            elif dt_context.ndim == 1:
+                dt_ctx = dt_context.to(device=device, dtype=dt_dtype).unsqueeze(0).expand(bsz, t_in)
+            else:
+                dt_ctx = dt_context.to(device=device, dtype=dt_dtype)
+        else:
+            dt_ctx = torch.full((bsz, t_in), float(dt_context), device=device, dtype=dt_dtype)
+
         z_ctx = self.encoder(x_context)
         states = self._init_states()
 
         for i, block in enumerate(self.blocks):
-            z_ctx, h_f, f_f = block(z_ctx, states[i][0], dt_context, states[i][1])
+            z_ctx, h_f, f_f = block(z_ctx, states[i][0], dt_ctx, states[i][1])
             states[i] = (h_f, f_f)
 
         x_last = x_context[:, -1]
@@ -248,15 +263,16 @@ class UniPhyModel(nn.Module):
         if isinstance(dt_future, list):
             dt_future = torch.stack(
                 [
-                    d.float().to(x_context.device)
+                    d.to(device=device, dtype=dt_dtype)
                     if isinstance(d, torch.Tensor)
-                    else torch.tensor(float(d), device=x_context.device)
+                    else torch.tensor(float(d), device=device, dtype=dt_dtype)
                     for d in dt_future
                 ]
             )
-
-        if not isinstance(dt_future, torch.Tensor):
-            dt_future = torch.tensor(dt_future, device=x_context.device, dtype=torch.float32)
+        elif not isinstance(dt_future, torch.Tensor):
+            dt_future = torch.tensor(dt_future, device=device, dtype=dt_dtype)
+        else:
+            dt_future = dt_future.to(device=device, dtype=dt_dtype)
 
         steps = int(dt_future.shape[0]) if dt_future.ndim == 1 else int(dt_future.shape[1])
 
