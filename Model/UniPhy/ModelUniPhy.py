@@ -39,7 +39,7 @@ class UniPhyBlock(nn.Module):
             init_noise_scale=init_noise_scale,
             max_growth_rate=max_growth_rate,
         )
-        self.ffn = UniPhyFeedForwardNetwork(dim * 2, expand)
+        self.ffn = UniPhyFeedForwardNetwork(dim, expand)
 
     def _spatial_process(self, x):
         is_5d = x.ndim == 5
@@ -58,16 +58,17 @@ class UniPhyBlock(nn.Module):
     def _temporal_decode(self, x):
         is_5d = x.ndim == 5
         if is_5d:
-            B, T, D, H, W = x.shape
-            x_flat = x.reshape(B * T, D, H, W)
+            bsz, t_len, dim, hgt, wdt = x.shape
+            x_flat = x.reshape(bsz * t_len, dim, hgt, wdt)
         else:
             x_flat = x
-        x_real = torch.cat([x_flat.real, x_flat.imag], dim=1)
-        x_norm = self.norm_temporal(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x_ffn = self.ffn(x_norm)
-        x_re, x_im = torch.chunk(x_ffn, 2, dim=1)
-        x_out = x_flat + torch.complex(x_re, x_im)
-        return x_out.reshape(B, T, D, H, W) if is_5d else x_out
+
+        x_out = x_flat + self.ffn(x_flat)
+
+        if is_5d:
+            return x_out.reshape(bsz, t_len, dim, hgt, wdt)
+        return x_out
+
 
     def forward(self, x, h_prev, dt, flux_prev):
         B, T, D, H, W = x.shape
