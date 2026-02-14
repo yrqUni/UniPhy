@@ -19,133 +19,104 @@ class ERA5_Dataset(Dataset):
         sample_k=4,
         look_ahead=2,
         is_train=True,
-        dt_ref=6.0,
+        frame_hours=6.0,
         sampling_mode="mixed",
     ):
         self.input_root = input_dir
-        self.window_size = window_size
-        self.sample_k = sample_k
-        self.look_ahead = look_ahead
-        self.is_train = is_train
-        self.dt_ref = dt_ref
-        self.sampling_mode = sampling_mode
+        self.window_size = int(window_size)
+        self.sample_k = int(sample_k)
+        self.look_ahead = int(look_ahead)
+        self.is_train = bool(is_train)
+        self.frame_hours = float(frame_hours)
+        self.sampling_mode = "mixed" if sampling_mode in {"mix", "mixed"} else sampling_mode
 
         self.shm_root = f"/dev/shm/era5_cache/{uuid.uuid4().hex}"
-        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
         self.all_info = []
-        for year in range(year_range[0], year_range[1] + 1):
+        for year in range(int(year_range[0]), int(year_range[1]) + 1):
             y_dir = os.path.join(input_dir, str(year))
-            if os.path.isdir(y_dir):
-                months = sorted([f for f in os.listdir(y_dir) if f.endswith(".npy")])
-                for m in months:
-                    self.all_info.append({
+            if not os.path.isdir(y_dir):
+                continue
+            months = sorted([f for f in os.listdir(y_dir) if f.endswith(".npy")])
+            for m in months:
+                self.all_info.append(
+                    {
                         "nfs_path": os.path.join(y_dir, m),
                         "shm_path": os.path.join(self.shm_root, str(year), m),
                         "id": f"{year}_{m}",
-                    })
+                    }
+                )
 
         self.file_frame_offsets = [0]
-        self.file_shapes = []
-        self._mmap_cache = OrderedDict()
-        self._mmap_lock = threading.Lock()
-        self._max_cache = 4
-
         for info in self.all_info:
-            shape = self._get_shape(info["nfs_path"])
-            self.file_shapes.append(shape)
-            self.file_frame_offsets.append(self.file_frame_offsets[-1] + shape[0])
-
+            arr = np.load(info["nfs_path"], mmap_mode="r")
+            self.file_frame_offsets.append(self.file_frame_offsets[-1] + int(arr.shape[0]))
         self.total_frames = self.file_frame_offsets[-1]
 
-    def _get_shape(self, path):
-        arr = np.load(path, mmap_mode="r")
-        return arr.shape
+        self.cache_lock = threading.Lock()
+        self.local_cache = OrderedDict()
+        self.max_cache_files = 8
 
     def __len__(self):
-        return max(0, self.total_frames - self.window_size - self.look_ahead + 1)
+        n = self.total_frames - self.window_size - self.look_ahead
+        return max(0, int(n))
 
-    def _get_data_ptr(self, file_idx):
-        info = self.all_info[file_idx]
+    def _locate_file_and_index(self, global_idx):
+        lo = 0
+        hi = len(self.file_frame_offsets) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.file_frame_offsets[mid + 1] <= global_idx:
+                lo = mid + 1
+            else:
+                hi = mid
+        file_idx = lo
+        local_idx = global_idx - self.file_frame_offsets[file_idx]
+        return file_idx, local_idx
 
-        with self._mmap_lock:
-            if file_idx in self._mmap_cache:
-                self._mmap_cache.move_to_end(file_idx)
-                return self._mmap_cache[file_idx]
-
+    def _ensure_file_in_shm(self, info):
         shm_path = info["shm_path"]
-        nfs_path = info["nfs_path"]
+        os.makedirs(os.path.dirname(shm_path), exist_ok=True)
+        shutil.copy2(info["nfs_path"], shm_path)
+        return shm_path
 
-        if os.path.exists(shm_path):
-            data = np.load(shm_path, mmap_mode="r")
-        else:
-            data = np.load(nfs_path, mmap_mode="r")
+    def _get_array_mmap(self, file_idx):
+        info = self.all_info[file_idx]
+        with self.cache_lock:
+            arr = self.local_cache.get(info["id"])
+            if arr is not None:
+                self.local_cache.move_to_end(info["id"])
+                return arr
+        shm_path = self._ensure_file_in_shm(info)
+        arr = np.load(shm_path, mmap_mode="r")
+        with self.cache_lock:
+            self.local_cache[info["id"]] = arr
+            while len(self.local_cache) > self.max_cache_files:
+                self.local_cache.popitem(last=False)
+        return arr
 
-        with self._mmap_lock:
-            self._mmap_cache[file_idx] = data
-            while len(self._mmap_cache) > self._max_cache:
-                self._mmap_cache.popitem(last=False)
-
-        return data
-
-    def _get_single_frame(self, global_idx):
-        f_idx = np.searchsorted(self.file_frame_offsets, global_idx, side="right") - 1
-        off = global_idx - self.file_frame_offsets[f_idx]
-        return self._get_data_ptr(f_idx)[off]
+    def _sample_offsets(self):
+        if self.sampling_mode == "sequential":
+            return list(range(self.sample_k))
+        return sorted(random.sample(range(self.window_size), self.sample_k))
 
     def __getitem__(self, idx):
-        idx = int(idx)
-        use_sequential = False
+        base = int(idx)
+        offsets = self._sample_offsets()
+        frame_indices = [base + o for o in offsets]
 
-        if self.is_train:
-            if self.sampling_mode == "sequential":
-                use_sequential = True
-            elif self.sampling_mode == "mixed":
-                if random.random() < 0.5:
-                    use_sequential = True
-
-            if use_sequential:
-                max_start = self.window_size - self.sample_k
-                start_off = random.randint(0, max(0, max_start))
-                offsets = list(range(start_off, start_off + self.sample_k))
-            else:
-                offsets = sorted(random.sample(range(self.window_size), self.sample_k))
-        else:
-            use_sequential = True
-            offsets = list(range(self.sample_k))
-
-        start_global = idx + offsets[0]
-        f_idx = np.searchsorted(self.file_frame_offsets, start_global, side="right") - 1
-        current_file_data = self._get_data_ptr(f_idx)
-        file_start_global = self.file_frame_offsets[f_idx]
-        file_len = self.file_shapes[f_idx][0]
-        start_local = start_global - file_start_global
-
-        if use_sequential and (start_local + self.sample_k <= file_len):
-            chunk = current_file_data[start_local : start_local + self.sample_k]
-            data = torch.from_numpy(chunk.copy())
-        else:
-            frames = []
-            for off in offsets:
-                curr_global = idx + off
-                local_off = curr_global - file_start_global
-                if 0 <= local_off < file_len:
-                    frames.append(torch.from_numpy(current_file_data[local_off].copy()))
-                else:
-                    frame_data = self._get_single_frame(curr_global)
-                    frames.append(torch.from_numpy(frame_data.copy()))
-            data = torch.stack(frames, dim=0)
+        frames = []
+        for gidx in frame_indices:
+            file_idx, local_idx = self._locate_file_and_index(gidx)
+            arr = self._get_array_mmap(file_idx)
+            frames.append(torch.from_numpy(arr[local_idx].copy()))
+        data = torch.stack(frames, dim=0)
 
         offsets_tensor = torch.tensor(offsets, dtype=torch.float32)
-        dt = (offsets_tensor[1:] - offsets_tensor[:-1]) * float(self.dt_ref)
-        dt_padded = torch.cat([dt, dt[-1:]], dim=0)
-
-        return data, dt_padded
+        dt_between = (offsets_tensor[1:] - offsets_tensor[:-1]) * self.frame_hours
+        return data, dt_between
 
     def cleanup(self):
-        if os.path.exists(self.shm_root):
-            shutil.rmtree(self.shm_root, ignore_errors=True)
+        shutil.rmtree(self.shm_root, ignore_errors=True)
 
     def __del__(self):
         self.cleanup()
-

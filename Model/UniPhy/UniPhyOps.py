@@ -1,249 +1,138 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+def compute_continuous_operators(lam, dt, tau_ref_hours):
+    dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(dt, device=lam.device)
+    if dt_tensor.is_complex():
+        dt_tensor = dt_tensor.real
+    dt_ratio = dt_tensor / tau_ref_hours
+    if dt_ratio.ndim >= 1:
+        dt_ratio = dt_ratio.unsqueeze(-1)
+    exp_arg = lam * dt_ratio
+    decay = torch.exp(exp_arg)
+    lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
+    forcing = torch.expm1(exp_arg) / lam_safe
+    return decay, forcing
+
+
 class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.dim = dim
+        self.dim = int(dim)
         self.u_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
         self.u_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
         self.v_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
         self.v_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.log_sigma = nn.Parameter(torch.zeros(dim))
-        n = torch.arange(dim).float()
-        k = torch.arange(dim).float().reshape(-1, 1)
-        dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
-        self.register_buffer("dft_basis", dft_matrix)
-        self.dft_weight = nn.Parameter(torch.tensor(0.0))
 
-    def _cayley_orthogonalize(self, raw_re, raw_im):
-        A = torch.complex(raw_re, raw_im)
-        A_skew = A - A.T.conj()
-        I = torch.eye(self.dim, device=A.device, dtype=A.dtype)
-        Q = torch.linalg.solve(I + A_skew, I - A_skew)
-        return Q
+    def _unitary_from_raw(self, re_raw, im_raw):
+        raw = torch.complex(re_raw, im_raw)
+        q, _ = torch.linalg.qr(raw)
+        return q
 
-    def _get_basis(self):
-        U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
-        V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
-        S = torch.exp(self.log_sigma)
-        return U, S, V
-
-    def _get_transform_matrix(self, dtype):
-        U, S, V = self._get_basis()
-        alpha = torch.sigmoid(self.dft_weight)
-        V_scaled = V @ torch.diag(S.to(V.dtype))
-        dft_basis = self.dft_basis.to(dtype=dtype)
-        W = V_scaled * (1 - alpha) + dft_basis * alpha
-        return W
+    def get_basis(self):
+        u = self._unitary_from_raw(self.u_raw_re, self.u_raw_im)
+        v = self._unitary_from_raw(self.v_raw_re, self.v_raw_im)
+        return u, v
 
     def encode(self, x):
-        if not x.is_complex():
-            x = torch.complex(x, torch.zeros_like(x))
-        W = self._get_transform_matrix(x.dtype)
-        h = torch.einsum("...d,de->...e", x, W)
-        return h
+        u, _ = self.get_basis()
+        return torch.matmul(x, u.conj())
 
-    def decode(self, h):
-        W = self._get_transform_matrix(h.dtype)
-        W_inv = torch.linalg.inv(W)
-        x = torch.einsum("...d,de->...e", h, W_inv)
-        return x
-
-
-class LearnableSpectralBasis(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.transform = ComplexSVDTransform(dim)
-
-    def encode(self, x):
-        return self.transform.encode(x)
-
-    def decode(self, z):
-        return self.transform.decode(z)
+    def decode(self, x):
+        u, _ = self.get_basis()
+        return torch.matmul(x, u)
 
 
 class GlobalFluxTracker(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, tau_ref_hours=1.0):
         super().__init__()
-        self.dim = dim
+        self.dim = int(dim)
+        self.tau_ref_hours = float(tau_ref_hours)
         self.decay_re = nn.Parameter(torch.randn(dim) * 0.1 - 1.0)
         self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
-        self.input_mix = nn.Linear(dim * 2, dim * 2)
-        self.output_proj = nn.Linear(dim * 2, dim * 2)
-        nn.init.xavier_uniform_(self.input_mix.weight)
-        nn.init.zeros_(self.input_mix.bias)
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
-        self.gate_net = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.Sigmoid()
-        )
-        self.gate_min = 0.01
-        self.gate_max = 0.99
+        self.gate_raw = nn.Parameter(torch.randn(dim) * 0.02)
+        self.source_raw_re = nn.Parameter(torch.randn(dim) * 0.02)
+        self.source_raw_im = nn.Parameter(torch.randn(dim) * 0.02)
 
     def _get_continuous_params(self):
-        lam_re = -F.softplus(self.decay_re)
-        lam_im = self.decay_im
-        return torch.complex(lam_re, lam_im)
+        return torch.complex(self.decay_re, self.decay_im)
 
-    def get_transition_operators(self, dt, dt_ref=6.0):
+    def get_transition_operators(self, dt):
         lam = self._get_continuous_params()
-        if isinstance(dt, torch.Tensor):
-            dt_ratio = dt / dt_ref
-            if dt_ratio.ndim == 1:
-                dt_ratio = dt_ratio.unsqueeze(-1)
-            elif dt_ratio.ndim >= 2:
-                dt_ratio = dt_ratio.unsqueeze(-1)
-        else:
-            dt_ratio = dt / dt_ref
-        exp_arg = lam * dt_ratio
-        decay = torch.exp(exp_arg)
-        lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
-        forcing = torch.expm1(exp_arg) / lam_safe
-        return decay, forcing
+        return compute_continuous_operators(lam, dt, self.tau_ref_hours)
 
-    def get_scan_operators(self, x_mean_seq, dt, dt_ref=6.0):
+    def get_scan_operators(self, x_mean_seq, dt):
         B, T, D = x_mean_seq.shape
-        decay, forcing_op = self.get_transition_operators(dt, dt_ref)
-        if decay.ndim == 2:
-            decay = decay.unsqueeze(1).unsqueeze(-1)
-            forcing_op = forcing_op.unsqueeze(1).unsqueeze(-1)
-        elif decay.ndim == 3:
-            decay = decay.unsqueeze(-1)
-            forcing_op = forcing_op.unsqueeze(-1)
-        decay = decay.expand(B, T, D, 1)
-        forcing_op = forcing_op.expand(B, T, D, 1)
-        x_flat = x_mean_seq.reshape(B * T, D)
-        x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
-        x_in = self.input_mix(x_cat)
-        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        x_complex = torch.complex(x_re, x_im).reshape(B, T, D, 1)
-        X_scan = x_complex * forcing_op
-        return decay, X_scan
+        decay, forcing = self.get_transition_operators(dt)
+
+        if decay.ndim == 1:
+            decay = decay.unsqueeze(0).unsqueeze(0).expand(B, T, D)
+            forcing = forcing.unsqueeze(0).unsqueeze(0).expand(B, T, D)
+        elif decay.ndim == 2:
+            decay = decay.unsqueeze(1).expand(B, T, D)
+            forcing = forcing.unsqueeze(1).expand(B, T, D)
+
+        decay = decay.reshape(B, T, D, 1)
+        forcing = forcing.reshape(B, T, D, 1)
+        x_in = x_mean_seq.reshape(B, T, D, 1)
+        u = x_in * forcing
+        return decay, u
 
     def compute_output(self, flux_seq):
-        if flux_seq.ndim == 4:
-            flux_seq = flux_seq.squeeze(-1)
-        s_cat = torch.cat([flux_seq.real, flux_seq.imag], dim=-1)
-        source_out = self.output_proj(s_cat)
-        src_re, src_im = torch.chunk(source_out, 2, dim=-1)
-        source_seq = torch.complex(src_re, src_im)
-        gate = self.gate_net(s_cat)
-        gate_seq = gate * (self.gate_max - self.gate_min) + self.gate_min
-        return source_seq, gate_seq
-
-    def forward_step(self, prev_state, x_t, dt, dt_ref=6.0):
-        decay, forcing_op = self.get_transition_operators(dt, dt_ref)
-        if decay.ndim > 1:
-            decay = decay.reshape(-1, self.dim)
-            forcing_op = forcing_op.reshape(-1, self.dim)
-        if not x_t.is_complex():
-            x_t = torch.complex(x_t, torch.zeros_like(x_t))
-        x_cat = torch.cat([x_t.real, x_t.imag], dim=-1)
-        x_in = self.input_mix(x_cat)
-        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        x_mixed = torch.complex(x_re, x_im)
-        new_state = prev_state * decay + x_mixed * forcing_op
-        source_seq, gate_seq = self.compute_output(new_state)
-        return new_state, source_seq, gate_seq
+        gate = torch.sigmoid(self.gate_raw).unsqueeze(0).expand(flux_seq.shape[0], -1)
+        source = torch.complex(self.source_raw_re, self.source_raw_im).unsqueeze(0).expand(
+            flux_seq.shape[0], -1
+        )
+        src = source * flux_seq
+        return src, gate
 
 
 class TemporalPropagator(nn.Module):
     def __init__(
         self,
         dim,
-        dt_ref=1.0,
+        tau_ref_hours=1.0,
         sde_mode="sde",
         init_noise_scale=0.01,
         max_growth_rate=0.3,
     ):
         super().__init__()
-        self.dim = dim
-        self.dt_ref = dt_ref
-        self.sde_mode = sde_mode
-        self.init_noise_scale = init_noise_scale
-        self.max_growth_rate = max_growth_rate
+        self.dim = int(dim)
+        self.tau_ref_hours = float(tau_ref_hours)
+        self.sde_mode = str(sde_mode)
+        self.init_noise_scale = float(init_noise_scale)
+        self.max_growth_rate = float(max_growth_rate)
         self.basis = ComplexSVDTransform(dim)
-        self.flux_tracker = GlobalFluxTracker(dim)
+        self.flux_tracker = GlobalFluxTracker(dim, tau_ref_hours=self.tau_ref_hours)
         self.lam_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.lam_im = nn.Parameter(torch.randn(dim) * 0.1)
-        if sde_mode == "sde":
-            self.base_noise = nn.Parameter(torch.ones(dim) * init_noise_scale)
-            self.uncertainty_net = nn.Sequential(
-                nn.Linear(dim, dim // 4),
-                nn.SiLU(),
-                nn.Linear(dim // 4, dim),
-                nn.Sigmoid(),
-            )
-        else:
-            self.register_buffer("base_noise", torch.tensor(0.0))
-            self.uncertainty_net = None
+        self.noise_raw = nn.Parameter(torch.randn(dim) * 0.02)
 
     def _get_effective_lambda(self):
-        lam_re_bounded = -F.softplus(self.lam_re)
-        return torch.complex(lam_re_bounded, self.lam_im)
+        lam_re = -F.softplus(-self.lam_re)
+        lam_re = torch.clamp(lam_re, min=-self.max_growth_rate)
+        return torch.complex(lam_re, self.lam_im)
 
     def get_transition_operators(self, dt):
         lam = self._get_effective_lambda()
-        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(
-            dt, device=lam.device)
-        if dt_tensor.is_complex():
-            dt_tensor = dt_tensor.real
-        if dt_tensor.ndim == 0:
-            dt_ratio = dt_tensor / self.dt_ref
-        elif dt_tensor.ndim == 1:
-            dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
-        elif dt_tensor.ndim == 2:
-            dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
-        else:
-            dt_ratio = dt_tensor / self.dt_ref
-        exp_arg = lam * dt_ratio
-        decay = torch.exp(exp_arg)
-        lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
-        forcing = torch.expm1(exp_arg) / lam_safe
-        return decay, forcing
+        return compute_continuous_operators(lam, dt, self.tau_ref_hours)
 
-    def generate_stochastic_term(self, shape, dt, dtype, h_state=None):
+    def generate_stochastic_term(self, shape, dt, dtype):
         if self.sde_mode != "sde":
-            return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
-        device = self.lam_re.device
-        lam = self._get_effective_lambda()
-        lam_re = lam.real
-        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(
-            dt, device=device)
+            return torch.zeros(shape, device=self.noise_raw.device, dtype=dtype)
+        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(dt, device=self.noise_raw.device)
         if dt_tensor.is_complex():
             dt_tensor = dt_tensor.real
-
-        ndim = len(shape)
-        param_shape = [1] * ndim
-        param_shape[-1] = -1
-
-        lam_re_exp = lam_re.view(*param_shape)
-        exp_term = torch.exp(2 * lam_re_exp * dt_tensor)
-        denom = 2 * lam_re_exp
-        denom_safe = denom + 1e-8 * torch.sign(denom)
-        variance_factor = (exp_term - 1.0) / denom_safe
-        std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
-
-        base_noise_expanded = self.base_noise.abs().view(*param_shape)
-        final_scale = base_noise_expanded * std_scale
-
-        noise_re = torch.randn(shape, device=device, dtype=torch.float32)
-        noise_im = torch.randn(shape, device=device, dtype=torch.float32)
-
-        if h_state is not None and self.uncertainty_net is not None:
-            h_mag = h_state.abs()
-            factor = self.uncertainty_net(h_mag) * 2.0
-            final_scale = final_scale * factor
-
-        if dtype.is_complex:
-            return torch.complex(noise_re * final_scale, noise_im * final_scale)
-        return noise_re * final_scale
+        while dt_tensor.ndim < 2:
+            dt_tensor = dt_tensor.unsqueeze(0)
+        dt_scale = torch.sqrt(torch.clamp(dt_tensor, min=0.0)).unsqueeze(-1)
+        noise_scale = F.softplus(self.noise_raw).reshape(1, 1, -1)
+        eps = torch.randn(shape, device=self.noise_raw.device, dtype=dtype)
+        if not eps.is_complex():
+            eps = torch.complex(eps, torch.zeros_like(eps))
+        return eps * dt_scale * noise_scale * self.init_noise_scale
 
 
 class RiemannianCliffordConv2d(nn.Module):
@@ -257,42 +146,19 @@ class RiemannianCliffordConv2d(nn.Module):
         img_width=64,
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.conv_e0 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
-        self.conv_e1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
-        self.conv_e2 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
-        self.conv_e12 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
-        self.smooth_conv = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, padding=1)
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.kernel_size = int(kernel_size)
+        self.padding = int(padding)
+        self.img_height = int(img_height)
+        self.img_width = int(img_width)
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.02
+        )
         self.bias = nn.Parameter(torch.zeros(out_channels))
-        lat = torch.linspace(-math.pi / 2, math.pi / 2, img_height)
-        self.register_buffer("cos_lat", torch.cos(lat).view(1, 1, -1, 1))
-        self.metric_scale = nn.Parameter(torch.tensor(1.0))
-        self.viscosity_scale = nn.Parameter(torch.tensor(0.1))
-        self.dispersion_scale = nn.Parameter(torch.tensor(0.01))
+        self.metric_raw = nn.Parameter(torch.randn(out_channels) * 0.02)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        y_e0 = self.conv_e0(x)
-        y_e1 = self.conv_e1(x)
-        y_e2 = self.conv_e2(x)
-        y_e12 = self.conv_e12(x)
-        cos_lat = self.cos_lat
-        if H != self.cos_lat.shape[2]:
-            cos_lat = F.interpolate(
-                cos_lat, size=(H, 1), mode="bilinear", align_corners=False)
-        cos_lat = cos_lat.expand(B, -1, H, W)
-        cos_lat_safe = torch.clamp(cos_lat, min=1e-6)
-        y_e1_scaled = y_e1 * cos_lat_safe
-        y_e12_scaled = y_e12 * cos_lat_safe
-        out = y_e0 + y_e1_scaled + y_e2 + y_e12_scaled
-        out = out * self.metric_scale
-        out = out + self.bias.view(1, -1, 1, 1)
-        out = self.smooth_conv(out)
-        return out
-
+        metric = 1.0 + torch.tanh(self.metric_raw).reshape(1, -1, 1, 1)
+        y = F.conv2d(x, self.weight, bias=self.bias, padding=self.padding)
+        return y * metric
