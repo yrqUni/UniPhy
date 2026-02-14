@@ -126,17 +126,28 @@ class TemporalPropagator(nn.Module):
     def generate_stochastic_term(self, shape, dt, dtype):
         if self.sde_mode != "sde":
             return torch.zeros(shape, device=self.noise_raw.device, dtype=dtype)
+
         dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(dt, device=self.noise_raw.device)
         if dt_tensor.is_complex():
             dt_tensor = dt_tensor.real
-        while dt_tensor.ndim < 2:
-            dt_tensor = dt_tensor.unsqueeze(0)
-        dt_scale = torch.sqrt(torch.clamp(dt_tensor, min=0.0)).unsqueeze(-1)
-        noise_scale = F.softplus(self.noise_raw).reshape(1, 1, -1)
+        dt_tensor = dt_tensor.to(device=self.noise_raw.device)
+
+        if dt_tensor.ndim == 0:
+            dt_tensor = dt_tensor.view(1, 1)
+        elif dt_tensor.ndim == 1:
+            dt_tensor = dt_tensor.view(-1, 1)
+
+        dt_scale = torch.sqrt(torch.clamp(dt_tensor, min=0.0)).to(dtype=torch.float32)
+        dt_scale = dt_scale.view(dt_scale.shape[0], dt_scale.shape[1], 1, 1, 1)
+
+        noise_scale = torch.nn.functional.softplus(self.noise_raw).to(dtype=torch.float32)
+        noise_scale = noise_scale.view(1, 1, 1, 1, -1)
+
         eps = torch.randn(shape, device=self.noise_raw.device, dtype=dtype)
         if not eps.is_complex():
             eps = torch.complex(eps, torch.zeros_like(eps))
-        return eps * dt_scale * noise_scale * self.init_noise_scale
+
+        return eps * dt_scale.to(device=eps.device) * noise_scale.to(device=eps.device) * float(self.init_noise_scale)
 
 
 class RiemannianCliffordConv2d(nn.Module):
