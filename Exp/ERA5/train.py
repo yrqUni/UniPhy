@@ -121,13 +121,12 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
 
     if ensemble_size > 1:
         ensemble_preds = [out_real]
-        infer_model = model.module if hasattr(model, "module") else model
         with torch.no_grad():
             for _ in range(ensemble_size - 1):
                 rand_idx = torch.randint(
                     0, ensemble_size, (B,), device=device,
                 )
-                out_ens = infer_model(x_input, dt_input, member_idx=rand_idx)
+                out_ens = model(x_input, dt_input, member_idx=rand_idx)
                 ens_real = (
                     out_ens.real.contiguous()
                     if out_ens.is_complex()

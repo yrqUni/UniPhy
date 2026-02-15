@@ -46,7 +46,7 @@ class UniPhyBlock(nn.Module):
         x_re, x_im = torch.chunk(x_norm, 2, dim=1)
         x_complex = torch.complex(x_re, x_im)
         delta = self.ffn(x_complex)
-        return x_complex + delta
+        return x_4d + delta
 
     def forward(self, x, h_prev, dt_seq, flux_prev):
         B, T, D, H, W = x.shape
@@ -189,22 +189,20 @@ class UniPhyModel(nn.Module):
             )
             for _ in range(depth)
         ])
-        self.apply(self._init_weights)
+        self._init_encoder_decoder_weights()
 
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
+    def _init_encoder_decoder_weights(self):
+        for m in self.encoder.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu",
+                )
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for m in self.blocks.modules():
+            if isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(
-                m.weight, mode="fan_out", nonlinearity="relu",
-            )
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
 
     def _init_states(self, B, device, dtype):
         H, W, D = self.h_patches, self.w_patches, self.embed_dim

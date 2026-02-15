@@ -26,19 +26,14 @@ class ComplexSVDTransform(nn.Module):
         Q = torch.linalg.solve(I + A_skew, I - A_skew)
         return Q
 
-    def _get_basis(self):
+    def _get_transform_matrix(self, dtype):
         U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
         V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
         S = torch.exp(self.log_sigma)
-        return U, S, V
-
-    def _get_transform_matrix(self, dtype):
-        U, S, V = self._get_basis()
         alpha = torch.sigmoid(self.dft_weight)
-        V_scaled = V @ torch.diag(S.to(V.dtype))
+        learned = U @ torch.diag(S.to(U.dtype)) @ V.conj().T
         dft_basis = self.dft_basis.to(dtype=dtype)
-        W = V_scaled * (1 - alpha) + dft_basis * alpha
-        return W
+        return learned * (1 - alpha) + dft_basis * alpha
 
     def encode(self, x):
         if not x.is_complex():
@@ -48,8 +43,16 @@ class ComplexSVDTransform(nn.Module):
 
     def decode(self, h):
         W = self._get_transform_matrix(h.dtype)
-        W_inv = torch.linalg.inv(W)
-        return torch.einsum("...d,de->...e", h, W_inv)
+        h_flat = h.reshape(-1, self.dim)
+        sol = torch.linalg.solve(W.T, h_flat.T).T
+        return sol.reshape(h.shape)
+
+
+def _safe_forcing(exp_arg, eps=1e-7):
+    safe_denom = exp_arg + eps * torch.sign(
+        exp_arg.real + eps
+    ).to(exp_arg.dtype)
+    return torch.expm1(exp_arg) / safe_denom
 
 
 class GlobalFluxTracker(nn.Module):
@@ -61,10 +64,6 @@ class GlobalFluxTracker(nn.Module):
         self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
         self.input_mix = nn.Linear(dim * 2, dim * 2)
         self.output_proj = nn.Linear(dim * 2, dim * 2)
-        nn.init.xavier_uniform_(self.input_mix.weight)
-        nn.init.zeros_(self.input_mix.bias)
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
         self.gate_net = nn.Sequential(
             nn.Linear(dim * 2, dim),
             nn.Sigmoid(),
@@ -81,8 +80,7 @@ class GlobalFluxTracker(nn.Module):
         lam = self._get_continuous_params()
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
-        lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
-        forcing = torch.expm1(exp_arg) / lam_safe
+        forcing = _safe_forcing(exp_arg)
         return decay, forcing
 
     def _mix_input(self, x_flat):
@@ -125,7 +123,8 @@ class GlobalFluxTracker(nn.Module):
 
 
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref, sde_mode, init_noise_scale, max_growth_rate):
+    def __init__(self, dim, dt_ref, sde_mode, init_noise_scale,
+                 max_growth_rate):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
@@ -158,8 +157,7 @@ class TemporalPropagator(nn.Module):
         lam = self._get_effective_lambda()
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
-        lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
-        forcing = torch.expm1(exp_arg) / lam_safe
+        forcing = _safe_forcing(exp_arg)
         return decay, forcing
 
     def get_transition_operators_seq(self, dt_seq):
@@ -175,18 +173,16 @@ class TemporalPropagator(nn.Module):
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
         B, T, H, W, D = shape
         device = self.lam_re.device
-        lam = self._get_effective_lambda()
-        lam_re = lam.real
+        lam_re = self._get_effective_lambda().real
         dt_real = dt_seq.real if dt_seq.is_complex() else dt_seq
-        dt_expanded = dt_real.reshape(B, T, 1, 1, 1)
-        lam_re_expanded = lam_re.reshape(1, 1, 1, 1, D)
-        exp_term = torch.exp(2 * lam_re_expanded * dt_expanded)
-        denom = 2 * lam_re_expanded
-        denom_safe = denom + 1e-8 * torch.sign(denom)
+        dt_ratio = dt_real.reshape(B, T, 1, 1, 1) / self.dt_ref
+        lam_re_exp = lam_re.reshape(1, 1, 1, 1, D)
+        exp_term = torch.exp(2 * lam_re_exp * dt_ratio)
+        denom_safe = 2 * lam_re_exp - 1e-8
         variance_factor = (exp_term - 1.0) / denom_safe
         std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
-        base_noise_expanded = self.base_noise.abs().reshape(1, 1, 1, 1, D)
-        final_scale = base_noise_expanded * std_scale
+        base_exp = self.base_noise.abs().reshape(1, 1, 1, 1, D)
+        final_scale = base_exp * std_scale
         noise_re = torch.randn(shape, device=device, dtype=torch.float32)
         noise_im = torch.randn(shape, device=device, dtype=torch.float32)
         if h_state is not None and self.uncertainty_net is not None:
@@ -195,7 +191,7 @@ class TemporalPropagator(nn.Module):
             final_scale = final_scale * factor
         if dtype.is_complex:
             return torch.complex(
-                noise_re * final_scale, noise_im * final_scale
+                noise_re * final_scale, noise_im * final_scale,
             )
         return noise_re * final_scale
 
@@ -204,18 +200,16 @@ class TemporalPropagator(nn.Module):
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
         B, H, W, D = shape
         device = self.lam_re.device
-        lam = self._get_effective_lambda()
-        lam_re = lam.real
+        lam_re = self._get_effective_lambda().real
         dt_real = dt_step.real if dt_step.is_complex() else dt_step
-        dt_expanded = dt_real.reshape(B, 1, 1, 1)
-        lam_re_expanded = lam_re.reshape(1, 1, 1, D)
-        exp_term = torch.exp(2 * lam_re_expanded * dt_expanded)
-        denom = 2 * lam_re_expanded
-        denom_safe = denom + 1e-8 * torch.sign(denom)
+        dt_ratio = dt_real.reshape(B, 1, 1, 1) / self.dt_ref
+        lam_re_exp = lam_re.reshape(1, 1, 1, D)
+        exp_term = torch.exp(2 * lam_re_exp * dt_ratio)
+        denom_safe = 2 * lam_re_exp - 1e-8
         variance_factor = (exp_term - 1.0) / denom_safe
         std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
-        base_noise_expanded = self.base_noise.abs().reshape(1, 1, 1, D)
-        final_scale = base_noise_expanded * std_scale
+        base_exp = self.base_noise.abs().reshape(1, 1, 1, D)
+        final_scale = base_exp * std_scale
         noise_re = torch.randn(shape, device=device, dtype=torch.float32)
         noise_im = torch.randn(shape, device=device, dtype=torch.float32)
         if h_state is not None and self.uncertainty_net is not None:
@@ -224,7 +218,7 @@ class TemporalPropagator(nn.Module):
             final_scale = final_scale * factor
         if dtype.is_complex:
             return torch.complex(
-                noise_re * final_scale, noise_im * final_scale
+                noise_re * final_scale, noise_im * final_scale,
             )
         return noise_re * final_scale
 
@@ -238,24 +232,28 @@ class RiemannianCliffordConv2d(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.conv_e0 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
+            in_channels, out_channels, kernel_size, padding=padding,
+            bias=False,
         )
         self.conv_e1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
+            in_channels, out_channels, kernel_size, padding=padding,
+            bias=False,
         )
         self.conv_e2 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
+            in_channels, out_channels, kernel_size, padding=padding,
+            bias=False,
         )
         self.conv_e12 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False
+            in_channels, out_channels, kernel_size, padding=padding,
+            bias=False,
         )
         self.smooth_conv = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, padding=1
+            out_channels, out_channels, kernel_size=3, padding=1,
         )
         self.bias = nn.Parameter(torch.zeros(out_channels))
         lat = torch.linspace(-math.pi / 2, math.pi / 2, img_height)
         self.register_buffer(
-            "cos_lat", torch.cos(lat).view(1, 1, img_height, 1)
+            "cos_lat", torch.cos(lat).view(1, 1, img_height, 1),
         )
         self.metric_scale = nn.Parameter(torch.tensor(1.0))
 
