@@ -7,14 +7,9 @@ from UniPhyFFN import UniPhyFeedForwardNetwork
 
 
 class UniPhyBlock(nn.Module):
-    def __init__(
-        self, dim, expand, img_height, img_width, kernel_size, dt_ref,
-        init_noise_scale, sde_mode, max_growth_rate,
-    ):
+    def __init__(self, dim, expand, img_height, img_width, kernel_size,
+                 dt_ref, init_noise_scale, sde_mode):
         super().__init__()
-        self.dim = dim
-        self.img_height = img_height
-        self.img_width = img_width
         self.norm_spatial = nn.LayerNorm(dim * 2)
         self.spatial_cliff = RiemannianCliffordConv2d(
             dim * 2, dim * 2, kernel_size=kernel_size,
@@ -25,7 +20,6 @@ class UniPhyBlock(nn.Module):
         self.prop = TemporalPropagator(
             dim, dt_ref=dt_ref, sde_mode=sde_mode,
             init_noise_scale=init_noise_scale,
-            max_growth_rate=max_growth_rate,
         )
         self.ffn = UniPhyFeedForwardNetwork(dim, expand)
 
@@ -153,14 +147,11 @@ class UniPhyModel(nn.Module):
     def __init__(
         self, in_channels, out_channels, embed_dim, expand=4, depth=8,
         patch_size=16, img_height=64, img_width=64, dt_ref=1.0,
-        sde_mode="sde", init_noise_scale=0.01, max_growth_rate=0.3,
-        ensemble_size=10,
+        sde_mode="sde", init_noise_scale=0.01, ensemble_size=10,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.depth = depth
-        self.img_height = img_height
-        self.img_width = img_width
         if isinstance(patch_size, (tuple, list)):
             ph, pw = patch_size
         else:
@@ -184,8 +175,7 @@ class UniPhyModel(nn.Module):
             UniPhyBlock(
                 dim=embed_dim, expand=expand, img_height=self.h_patches,
                 img_width=self.w_patches, kernel_size=3, dt_ref=dt_ref,
-                sde_mode=sde_mode, init_noise_scale=init_noise_scale,
-                max_growth_rate=max_growth_rate,
+                init_noise_scale=init_noise_scale, sde_mode=sde_mode,
             )
             for _ in range(depth)
         ])

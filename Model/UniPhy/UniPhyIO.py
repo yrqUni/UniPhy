@@ -11,20 +11,14 @@ class FlexiblePadder(nn.Module):
         else:
             self.ph, self.pw = patch_size
         self.mode = mode
-        self.pad_h = 0
-        self.pad_w = 0
 
     def forward(self, x):
         h, w = x.shape[-2:]
-        self.pad_h = (self.ph - h % self.ph) % self.ph
-        self.pad_w = (self.pw - w % self.pw) % self.pw
-        if self.pad_h > 0 or self.pad_w > 0:
-            x = F.pad(x, (0, self.pad_w, 0, self.pad_h), mode=self.mode)
+        pad_h = (self.ph - h % self.ph) % self.ph
+        pad_w = (self.pw - w % self.pw) % self.pw
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode=self.mode)
         return x
-
-    def unpad(self, x):
-        h, w = x.shape[-2:]
-        return x[..., : h - self.pad_h, : w - self.pad_w]
 
 
 class UniPhyEncoder(nn.Module):
@@ -73,15 +67,38 @@ class UniPhyEncoder(nn.Module):
             z = self._encode_4d(x_flat)
             _, D, Hp, Wp = z.shape
             return z.reshape(B, T, D, Hp, Wp)
-        B, C, H, W = x.shape
         return self._encode_4d(x)
 
 
+class _PixelShuffleStage(nn.Module):
+    def __init__(self, in_ch, out_ch, scale_h, scale_w):
+        super().__init__()
+        self.scale_h = scale_h
+        self.scale_w = scale_w
+        self.expand = nn.Conv2d(
+            in_ch, out_ch * scale_h * scale_w, kernel_size=1,
+        )
+        self.refine = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1),
+        )
+
+    def forward(self, x):
+        BT = x.shape[0]
+        h = self.expand(x)
+        C_out = h.shape[1] // (self.scale_h * self.scale_w)
+        Hp, Wp = h.shape[2], h.shape[3]
+        h = h.view(BT, C_out, self.scale_h, self.scale_w, Hp, Wp)
+        h = h.permute(0, 1, 4, 2, 5, 3)
+        h = h.reshape(BT, C_out, Hp * self.scale_h, Wp * self.scale_w)
+        h = h + self.refine(h)
+        return h
+
+
 class UniPhyEnsembleDecoder(nn.Module):
-    def __init__(
-        self, out_ch, latent_dim, patch_size, model_channels, ensemble_size,
-        img_height, img_width,
-    ):
+    def __init__(self, out_ch, latent_dim, patch_size, model_channels,
+                 ensemble_size, img_height, img_width):
         super().__init__()
         if isinstance(patch_size, (tuple, list)):
             self.ph, self.pw = patch_size
@@ -89,10 +106,8 @@ class UniPhyEnsembleDecoder(nn.Module):
             self.ph = self.pw = patch_size
         self.img_height = img_height
         self.img_width = img_width
-        self.ensemble_size = ensemble_size
-        self.out_ch = out_ch
         self.latent_proj = nn.Conv2d(
-            latent_dim * 2, model_channels, kernel_size=3, padding=1
+            latent_dim * 2, model_channels, kernel_size=3, padding=1,
         )
         self.member_emb = nn.Embedding(ensemble_size, model_channels)
         self.block = nn.Sequential(
@@ -100,8 +115,12 @@ class UniPhyEnsembleDecoder(nn.Module):
             nn.SiLU(),
             nn.Conv2d(model_channels, model_channels, 3, 1, 1),
         )
-        self.to_pixel = nn.Conv2d(
-            model_channels, out_ch * self.ph * self.pw, kernel_size=1
+        mid_ch = max(out_ch, model_channels // 4)
+        self.stage1 = _PixelShuffleStage(
+            model_channels, mid_ch, self.ph, 1,
+        )
+        self.stage2 = _PixelShuffleStage(
+            mid_ch, out_ch, 1, self.pw,
         )
         self.out_smooth = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
         self._init_weights()
@@ -110,7 +129,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(
-                    m.weight, mode="fan_out", nonlinearity="relu"
+                    m.weight, mode="fan_out", nonlinearity="relu",
                 )
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -126,14 +145,10 @@ class UniPhyEnsembleDecoder(nn.Module):
             member_feat = member_feat.view(BT, -1, 1, 1)
             h = h + member_feat
         h = h + self.block(h)
-        out = self.to_pixel(h)
-        out = out.view(BT, self.out_ch, self.ph, self.pw, H_p, W_p)
-        out = out.permute(0, 1, 4, 2, 5, 3)
-        out = out.reshape(
-            BT, self.out_ch, H_p * self.ph, W_p * self.pw
-        )
+        out = self.stage1(h)
+        out = self.stage2(out)
         out = self.out_smooth(out)
-        out = out[..., : self.img_height, : self.img_width]
+        out = out[..., :self.img_height, :self.img_width]
         return out
 
     def forward(self, z, member_idx=None):

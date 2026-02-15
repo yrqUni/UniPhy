@@ -229,7 +229,6 @@ def align(cfg):
         sde_mode=cfg["model"]["sde_mode"],
         init_noise_scale=cfg["model"]["init_noise_scale"],
         ensemble_size=cfg["model"]["ensemble_size"],
-        max_growth_rate=cfg["model"]["max_growth_rate"],
     ).cuda()
 
     if ckpt_state is not None:

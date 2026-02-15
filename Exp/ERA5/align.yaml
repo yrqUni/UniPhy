@@ -10,7 +10,6 @@ model:
   dt_ref: 6.0
   sde_mode: "sde"
   init_noise_scale: 0.0001
-  max_growth_rate: 0.3
   ensemble_size: 4
 
 data:

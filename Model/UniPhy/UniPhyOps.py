@@ -123,14 +123,11 @@ class GlobalFluxTracker(nn.Module):
 
 
 class TemporalPropagator(nn.Module):
-    def __init__(self, dim, dt_ref, sde_mode, init_noise_scale,
-                 max_growth_rate):
+    def __init__(self, dim, dt_ref, sde_mode, init_noise_scale):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
         self.sde_mode = sde_mode
-        self.init_noise_scale = init_noise_scale
-        self.max_growth_rate = max_growth_rate
         self.basis = ComplexSVDTransform(dim)
         self.flux_tracker = GlobalFluxTracker(dim, dt_ref)
         self.lam_re = nn.Parameter(torch.randn(dim) * 0.01)
@@ -224,13 +221,9 @@ class TemporalPropagator(nn.Module):
 
 
 class RiemannianCliffordConv2d(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, kernel_size, padding, img_height,
-        img_width,
-    ):
+    def __init__(self, in_channels, out_channels, kernel_size, padding,
+                 img_height, img_width):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
         self.conv_e0 = nn.Conv2d(
             in_channels, out_channels, kernel_size, padding=padding,
             bias=False,
