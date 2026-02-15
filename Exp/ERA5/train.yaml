@@ -12,7 +12,7 @@ model:
   sde_mode: sde
   init_noise_scale: 0.0001
   max_growth_rate: 0.3
-  ensemble_size: 6
+  ensemble_size: 4
 
 data:
   input_dir: /nfs/ERA5_data/data_norm
@@ -25,7 +25,7 @@ data:
 
 train:
   seed: 1017
-  num_workers: 4
+  num_workers: 2
   batch_size: 1
   lr: 1.0e-5
   weight_decay: 0.05
