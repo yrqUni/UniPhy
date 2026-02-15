@@ -7,7 +7,6 @@ model:
   patch_size: [7, 15]
   img_height: 721
   img_width: 1440
-  dt_ref: 6.0
   tau_ref_hours: 6.0
   sde_mode: sde
   init_noise_scale: 0.0001
@@ -25,7 +24,6 @@ data:
   frame_hours: 6.0
 
 alignment:
-  pretrained_ckpt: ./uniphy/ckpt/ckpt_final.pt
   condition_steps: 4
   max_target_steps: 1
   sub_steps: [1, 2, 3, 6]
@@ -40,13 +38,12 @@ train:
   grad_clip: 10.0
   grad_accum_steps: 4
   use_tf32: true
+  log_every: 1
+  save_every: 1
+  out_dir: ./uniphy/align_outputs
+  resume: ./uniphy/ckpt/ckpt_final.pt
 
 logging:
-  log_every: 1
-  wandb_every: 1
-  ckpt_step: 0.5
-  log_path: ./uniphy/align_logs
-  ckpt_dir: ./uniphy/align_ckpt
   use_wandb: true
   wandb_project: ERA5-Align
   wandb_entity: UniPhy

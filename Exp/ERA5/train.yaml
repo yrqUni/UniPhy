@@ -7,7 +7,6 @@ model:
   patch_size: [7, 15]
   img_height: 721
   img_width: 1440
-  dt_ref: 6.0
   tau_ref_hours: 6.0
   sde_mode: sde
   init_noise_scale: 0.0001
@@ -32,16 +31,16 @@ train:
   epochs: 256
   grad_clip: 16.0
   grad_accum_steps: 1
-  use_scheduler: false
   use_tf32: true
+  log_every: 1
+  save_every: 1
+  out_dir: ./uniphy/outputs
+  resume: ""
+
+scheduler:
+  use_scheduler: false
 
 logging:
-  log_every: 1
-  wandb_every: 1
-  ckpt_step: 0.5
-  log_path: ./uniphy/logs
-  ckpt_dir: ./uniphy/ckpt
-  ckpt: ""
   use_wandb: true
   wandb_project: ERA5
   wandb_entity: UniPhy
