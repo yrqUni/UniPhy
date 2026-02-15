@@ -1,25 +1,64 @@
-import argparse
-import datetime
 import os
-import random
 import sys
-import time
-
-sys.path.append("/nfs/UniPhy/Model/UniPhy")
-sys.path.append("/nfs/UniPhy/Exp/ERA5")
+import random
+import datetime
+import logging
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
-import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.optim import lr_scheduler
+import wandb
+import yaml
+from rich.console import Console
+from rich.text import Text
+from rich.progress import (
+    Progress,
+    ProgressColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn,
+)
 
-from ERA5 import ERA5_Dataset
+sys.path.append("/nfs/UniPhy/Model/UniPhy")
+sys.path.append("/nfs/UniPhy/Exp/ERA5")
+
+from ERA5 import ERA5Dataset
 from ModelUniPhy import UniPhyModel
+
+import warnings
+
+warnings.filterwarnings("ignore")
+
+
+class SpeedColumn(ProgressColumn):
+    def render(self, task):
+        if task.speed is None:
+            return Text("0.00 it/s", style="progress.data.speed")
+        return Text(f"{task.speed:.2f} it/s", style="progress.data.speed")
+
+
+def setup_logging(log_path, rank):
+    logger = logging.getLogger("train")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    if rank == 0:
+        fh = logging.FileHandler(os.path.join(log_path, "train_metrics.log"))
+        fh.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s"
+        )
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+    else:
+        logger.addHandler(logging.NullHandler())
+    return logger
 
 
 def set_seed(seed):
@@ -29,258 +68,404 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def is_dist():
-    return dist.is_available() and dist.is_initialized()
+def build_lat_weights(H, W, device):
+    lat = torch.linspace(-90, 90, H, device=device)
+    weights = torch.cos(torch.deg2rad(lat))
+    weights = weights / weights.mean()
+    return weights.view(1, 1, 1, H, 1)
 
 
-def get_rank():
-    return dist.get_rank() if is_dist() else 0
+def compute_crps(pred_ensemble, target):
+    M = pred_ensemble.shape[0]
+    target_exp = target.unsqueeze(0)
+    mae = (pred_ensemble - target_exp).abs().mean()
+    if M > 1:
+        total_diff = torch.tensor(0.0, device=target.device)
+        for i in range(M):
+            for j in range(i + 1, M):
+                total_diff = total_diff + (
+                    pred_ensemble[i] - pred_ensemble[j]
+                ).abs().mean()
+        n_pairs = M * (M - 1) / 2
+        loss = mae - (1.0 / M) * (total_diff / n_pairs)
+    else:
+        loss = mae
+    return loss
 
 
-def get_world_size():
-    return dist.get_world_size() if is_dist() else 1
-
-
-def is_main():
-    return get_rank() == 0
-
-
-def setup_distributed():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        dist.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(local_rank)
-        return rank, world_size, local_rank
-    return 0, 1, 0
-
-
-def reduce_mean(tensor):
-    if not is_dist():
-        return tensor
-    out = tensor.detach().clone()
-    dist.all_reduce(out, op=dist.ReduceOp.SUM)
-    out /= float(get_world_size())
-    return out
-
-
-def get_lat_weights(h, w, device):
-    lat = torch.linspace(-90.0, 90.0, h, device=device)
-    weights = torch.cos(torch.deg2rad(lat)).clamp_min(0.0)
-    return weights.reshape(1, 1, 1, h, 1).expand(1, 1, 1, h, w)
-
-
-def compute_crps(ensemble_preds, target):
-    y = target.unsqueeze(0).expand_as(ensemble_preds)
-    abs_err = torch.abs(ensemble_preds - y).mean(dim=0)
-    pairwise = torch.abs(ensemble_preds.unsqueeze(0) - ensemble_preds.unsqueeze(1)).mean(dim=(0, 1))
-    return abs_err.mean() - 0.5 * pairwise.mean()
-
-
-def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
+def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
+               lat_weights):
     device = next(model.parameters()).device
-    data, dt_step = batch
+    data, dt_data = batch
     data = data.to(device, non_blocking=True).float()
-    dt_step = dt_step.to(device, non_blocking=True).float()
+    dt_data = dt_data.to(device, non_blocking=True).float()
 
-    bsz, k_len, _, hgt, wdt = data.shape
+    B, T, C, H, W = data.shape
+    ensemble_size = cfg["model"]["ensemble_size"]
+
     x_input = data[:, :-1]
     x_target = data[:, 1:]
-    dt_input = dt_step
+    dt_input = dt_data[:, 1:]
 
-    ensemble_size = int(cfg["model"].get("ensemble_size", 1))
     if ensemble_size > 1:
-        member_idx = torch.randint(0, ensemble_size, (bsz,), device=device)
+        member_idx = torch.randint(0, ensemble_size, (B,), device=device)
     else:
         member_idx = None
 
     out = model(x_input, dt_input, member_idx=member_idx)
+
     out_real = out.real.contiguous() if out.is_complex() else out.contiguous()
-    lat_weights = get_lat_weights(hgt, wdt, device)
 
     l1_loss = (out_real - x_target).abs().mean()
     mse_loss = ((out_real - x_target) ** 2 * lat_weights).mean()
 
     if ensemble_size > 1:
+        ensemble_preds = [out_real]
         infer_model = model.module if hasattr(model, "module") else model
-        preds = [out_real]
         with torch.no_grad():
             for _ in range(ensemble_size - 1):
-                rand_idx = torch.randint(0, ensemble_size, (bsz,), device=device)
+                rand_idx = torch.randint(
+                    0, ensemble_size, (B,), device=device,
+                )
                 out_ens = infer_model(x_input, dt_input, member_idx=rand_idx)
-                preds.append(out_ens.real.contiguous() if out_ens.is_complex() else out_ens.contiguous())
-        ensemble_stack = torch.stack(preds, dim=0)
+                ens_real = (
+                    out_ens.real.contiguous()
+                    if out_ens.is_complex()
+                    else out_ens.contiguous()
+                )
+                ensemble_preds.append(ens_real)
+        ensemble_stack = torch.stack(ensemble_preds, dim=0)
         crps_loss = compute_crps(ensemble_stack, x_target)
         ensemble_std = ensemble_stack.std(dim=0).mean()
         loss = l1_loss + crps_loss
     else:
-        crps_loss = torch.zeros((), device=device)
-        ensemble_std = torch.zeros((), device=device)
+        crps_loss = torch.tensor(0.0, device=device)
+        ensemble_std = torch.tensor(0.0, device=device)
         loss = l1_loss
 
-    (loss / float(grad_accum_steps)).backward()
+    loss_scaled = loss / grad_accum_steps
+    loss_scaled.backward()
 
     grad_norm = 0.0
-    if (batch_idx + 1) % int(grad_accum_steps) == 0:
+    if (batch_idx + 1) % grad_accum_steps == 0:
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            float(cfg["train"]["grad_clip"]),
+            model.parameters(), cfg["train"]["grad_clip"],
         ).item()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+    with torch.no_grad():
+        rmse = torch.sqrt(mse_loss)
+
     metrics = {
-        "loss": loss.detach(),
-        "l1": l1_loss.detach(),
-        "mse": mse_loss.detach(),
-        "crps": crps_loss.detach(),
-        "ens_std": ensemble_std.detach(),
-        "grad_norm": torch.tensor(float(grad_norm), device=device),
+        "loss": loss.item(),
+        "l1_loss": l1_loss.item(),
+        "crps_loss": crps_loss.item(),
+        "mse": mse_loss.item(),
+        "rmse": rmse.item(),
+        "grad_norm": grad_norm,
+        "ensemble_std": ensemble_std.item(),
     }
-    for k in metrics:
-        metrics[k] = reduce_mean(metrics[k]).item()
     return metrics
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
-    state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg,
+                    path):
+    state_dict = (
+        model.module.state_dict()
+        if hasattr(model, "module")
+        else model.state_dict()
+    )
     state = {
         "model": state_dict,
         "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "epoch": int(epoch),
-        "global_step": int(global_step),
+        "scheduler": (
+            scheduler.state_dict() if scheduler is not None else None
+        ),
+        "epoch": epoch,
+        "global_step": global_step,
         "cfg": cfg,
     }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(state, path)
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
-    ckpt = torch.load(path, map_location="cpu")
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    model.load_state_dict(state, strict=False)
-    if isinstance(ckpt, dict) and optimizer is not None and ckpt.get("optimizer") is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if isinstance(ckpt, dict) and scheduler is not None and ckpt.get("scheduler") is not None:
-        scheduler.load_state_dict(ckpt["scheduler"])
-    epoch = int(ckpt.get("epoch", 0)) if isinstance(ckpt, dict) else 0
-    global_step = int(ckpt.get("global_step", 0)) if isinstance(ckpt, dict) else 0
-    return epoch, global_step
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model"]
+    clean_state = {
+        k.replace("module.", ""): v for k, v in state_dict.items()
+    }
+    target = model.module if hasattr(model, "module") else model
+    target.load_state_dict(clean_state, strict=False)
+    if optimizer is not None and "optimizer" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception:
+            pass
+    if scheduler is not None and ckpt.get("scheduler") is not None:
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except Exception:
+            pass
+    return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
 
 
-def init_wandb(cfg):
-    log_cfg = cfg.get("logging", {})
-    if not bool(log_cfg.get("use_wandb", False)):
-        return False
-    project = str(log_cfg.get("wandb_project", "UniPhy"))
-    entity = str(log_cfg.get("wandb_entity", ""))
-    run_name = str(log_cfg.get("wandb_run_name", "")).strip()
-    if not run_name:
-        run_name = datetime.datetime.now().strftime("train-%Y%m%d-%H%M%S")
-    wandb.init(project=project, entity=entity or None, name=run_name, config=cfg)
-    return True
+def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
+    if (batch_idx + 1) % grad_accum_steps != 0:
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), cfg["train"]["grad_clip"],
+        )
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
 
 def train(cfg):
-    rank, world_size, local_rank = setup_distributed()
-    seed = int(cfg.get("train", {}).get("seed", 42))
-    set_seed(seed + rank)
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    set_seed(42 + rank)
 
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
-    use_tf32 = bool(cfg.get("train", {}).get("use_tf32", True))
-    torch.backends.cuda.matmul.allow_tf32 = use_tf32
-    torch.backends.cudnn.allow_tf32 = use_tf32
+    if rank == 0:
+        log_dir = cfg["logging"]["log_path"]
+        os.makedirs(log_dir, exist_ok=True)
+        console = Console()
+    else:
+        devnull = open(os.devnull, "w")
+        console = Console(file=devnull)
 
-    frame_hours = float(cfg.get("data", {}).get("frame_hours", cfg["model"].get("dt_ref", 6.0)))
-    train_dataset = ERA5_Dataset(
+    logger = setup_logging(cfg["logging"]["log_path"], rank)
+
+    if rank == 0:
+        logger.info(f"Training started on {world_size} GPUs")
+
+    if cfg["train"]["use_tf32"]:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    if rank == 0 and cfg["logging"]["use_wandb"]:
+        run_name = cfg["logging"]["wandb_run_name"] or (
+            f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        wandb.init(
+            project=cfg["logging"]["wandb_project"],
+            entity=cfg["logging"]["wandb_entity"],
+            name=run_name,
+            config=cfg,
+        )
+
+    model = UniPhyModel(
+        in_channels=cfg["model"]["in_channels"],
+        out_channels=cfg["model"]["out_channels"],
+        embed_dim=cfg["model"]["embed_dim"],
+        expand=cfg["model"]["expand"],
+        depth=cfg["model"]["depth"],
+        patch_size=tuple(cfg["model"]["patch_size"]),
+        img_height=cfg["model"]["img_height"],
+        img_width=cfg["model"]["img_width"],
+        dt_ref=cfg["model"]["dt_ref"],
+        sde_mode=cfg["model"]["sde_mode"],
+        init_noise_scale=cfg["model"]["init_noise_scale"],
+        ensemble_size=cfg["model"]["ensemble_size"],
+        max_growth_rate=cfg["model"]["max_growth_rate"],
+    ).cuda()
+
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+    train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
         year_range=cfg["data"]["year_range"],
-        window_size=int(cfg["data"]["window_size"]),
-        sample_k=int(cfg["data"]["sample_k"]),
-        look_ahead=int(cfg["data"].get("look_ahead", 0)),
+        window_size=cfg["data"]["window_size"],
+        sample_k=cfg["data"]["sample_k"],
+        look_ahead=cfg["data"]["look_ahead"],
         is_train=True,
-        frame_hours=frame_hours,
-        sampling_mode=str(cfg["data"].get("sampling_mode", "mixed")),
+        dt_ref=cfg["model"]["dt_ref"],
+        sampling_mode=cfg["data"]["sampling_mode"],
     )
 
-    use_wandb = init_wandb(cfg) if is_main() else False
-    sampler = DistributedSampler(train_dataset, shuffle=False) if world_size > 1 else None
-    dataloader = DataLoader(
+    train_sampler = DistributedSampler(
         train_dataset,
-        batch_size=int(cfg["train"]["batch_size"]),
-        num_workers=int(cfg["train"].get("num_workers", 4)),
-        pin_memory=True,
-        sampler=sampler,
-        shuffle=(sampler is None),
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
         drop_last=True,
     )
 
-    model = UniPhyModel(**cfg["model"]).to(device)
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg["train"]["batch_size"],
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        drop_last=True,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(cfg["train"]["lr"]),
-        weight_decay=float(cfg["train"]["weight_decay"]),
+        weight_decay=cfg["train"]["weight_decay"],
     )
-    sched_cfg = cfg.get("scheduler", {})
+
+    grad_accum_steps = cfg["train"]["grad_accum_steps"]
+    epochs = cfg["train"]["epochs"]
+
     scheduler = None
-    if bool(sched_cfg.get("use_scheduler", False)):
-        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(cfg["train"]["epochs"]))
+    if cfg["train"]["use_scheduler"]:
+        scheduler = lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(cfg["train"]["lr"]),
+            steps_per_epoch=len(train_loader) // grad_accum_steps,
+            epochs=epochs,
+        )
 
     start_epoch = 0
     global_step = 0
-    ckpt_path = str(cfg["train"].get("resume", "")).strip()
-    if ckpt_path:
-        start_epoch, global_step = load_checkpoint(ckpt_path, model, optimizer, scheduler)
 
-    grad_accum_steps = int(cfg["train"].get("grad_accum_steps", 1))
-    log_every = int(cfg["train"].get("log_every", 10))
-    save_every = int(cfg["train"].get("save_every", 1))
-    out_dir = str(cfg["train"].get("out_dir", "./outputs"))
+    if cfg["logging"]["ckpt"]:
+        start_epoch, global_step = load_checkpoint(
+            cfg["logging"]["ckpt"], model, optimizer, scheduler,
+        )
+        if rank == 0:
+            logger.info(f"Resumed from checkpoint: {cfg['logging']['ckpt']}")
 
-    for epoch in range(start_epoch, int(cfg["train"]["epochs"])):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
+    log_every = cfg["logging"]["log_every"]
+    save_interval = max(
+        1, int(len(train_loader) * cfg["logging"]["ckpt_step"]),
+    )
+
+    if rank == 0:
+        os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
+
+    H = cfg["model"]["img_height"]
+    W = cfg["model"]["img_width"]
+    lat_weights = build_lat_weights(H, W, torch.device(f"cuda:{local_rank}"))
+
+    progress = None
+    if rank == 0:
+        progress = Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            SpeedColumn(),
+            console=console,
+        )
+        progress.start()
+        task_id = progress.add_task(
+            "Training",
+            total=len(train_loader) * epochs,
+            completed=global_step,
+        )
+
+    for epoch in range(start_epoch, epochs):
+        train_sampler.set_epoch(epoch)
         model.train()
-        t0 = time.time()
-        for batch_idx, batch in enumerate(dataloader):
-            metrics = train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in enumerate(train_loader):
+            metrics = train_step(
+                model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
+                lat_weights,
+            )
             global_step += 1
-            if is_main() and global_step % log_every == 0:
-                metrics_out = dict(metrics)
-                metrics_out["epoch"] = epoch
-                metrics_out["step"] = global_step
-                metrics_out["time"] = time.time() - t0
-                if use_wandb:
-                    wandb.log(metrics_out, step=global_step)
-                else:
-                    print(metrics_out)
-        if scheduler is not None:
-            scheduler.step()
-        if is_main() and (epoch + 1) % save_every == 0:
-            ckpt_name = f"ckpt-epoch{epoch+1}.pt"
-            save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, cfg, os.path.join(out_dir, ckpt_name))
 
-    if use_wandb and is_main():
-        wandb.finish()
+            if (
+                scheduler is not None
+                and (batch_idx + 1) % grad_accum_steps == 0
+            ):
+                scheduler.step()
 
+            if rank == 0:
+                progress.update(task_id, advance=1)
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    return parser.parse_args()
+                if (batch_idx + 1) % log_every == 0:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    log_msg = (
+                        f"[E{epoch + 1:03d} B{batch_idx + 1:04d}] "
+                        f"Loss: {metrics['loss']:.4f} | "
+                        f"L1: {metrics['l1_loss']:.4f} | "
+                        f"CRPS: {metrics['crps_loss']:.4f} | "
+                        f"RMSE: {metrics['rmse']:.4f} | "
+                        f"Grad: {metrics['grad_norm']:.4f} | "
+                        f"LR: {current_lr:.2e}"
+                    )
+                    progress.console.print(log_msg)
+                    logger.info(log_msg)
+
+                if cfg["logging"]["use_wandb"]:
+                    wandb.log(
+                        {
+                            "train/loss": metrics["loss"],
+                            "train/l1_loss": metrics["l1_loss"],
+                            "train/crps_loss": metrics["crps_loss"],
+                            "train/mse": metrics["mse"],
+                            "train/rmse": metrics["rmse"],
+                            "train/ensemble_std": metrics["ensemble_std"],
+                            "train/grad_norm": metrics["grad_norm"],
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/epoch": epoch,
+                        },
+                        step=global_step,
+                    )
+
+                if (
+                    save_interval > 0
+                    and (batch_idx + 1) % save_interval == 0
+                ):
+                    ckpt_path = os.path.join(
+                        cfg["logging"]["ckpt_dir"],
+                        f"ckpt_e{epoch + 1}_s{global_step}.pt",
+                    )
+                    save_checkpoint(
+                        model, optimizer, scheduler,
+                        epoch, global_step, cfg, ckpt_path,
+                    )
+                    logger.info(f"Saved checkpoint: {ckpt_path}")
+
+        flush_remaining_grads(
+            model, optimizer, cfg, batch_idx, grad_accum_steps,
+        )
+
+        if rank == 0:
+            epoch_path = os.path.join(
+                cfg["logging"]["ckpt_dir"], f"ckpt_epoch{epoch + 1}.pt",
+            )
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, global_step, cfg,
+                epoch_path,
+            )
+            logger.info(f"Epoch {epoch + 1} finished. Saved checkpoint.")
+
+        dist.barrier()
+
+    if rank == 0:
+        final_path = os.path.join(
+            cfg["logging"]["ckpt_dir"], "ckpt_final.pt",
+        )
+        save_checkpoint(
+            model, optimizer, scheduler, epochs, global_step, cfg, final_path,
+        )
+        progress.console.print(
+            f"[bold green]Training Completed. Final checkpoint: {final_path}"
+        )
+        if cfg["logging"]["use_wandb"]:
+            wandb.finish()
+        progress.stop()
+
+    train_dataset.cleanup()
+    dist.destroy_process_group()
 
 
 def main():
-    args = parse_args()
-    with open(args.config, "r", encoding="utf-8") as f:
+    with open("train.yaml", "r") as f:
         cfg = yaml.safe_load(f)
     train(cfg)
 
 
 if __name__ == "__main__":
     main()
+    

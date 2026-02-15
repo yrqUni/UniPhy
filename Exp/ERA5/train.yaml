@@ -1,47 +1,45 @@
 model:
   in_channels: 30
   out_channels: 30
-  embed_dim: 128
+  embed_dim: 256
   expand: 4
   depth: 8
   patch_size: [7, 15]
   img_height: 721
   img_width: 1440
-  tau_ref_hours: 6.0
-  sde_mode: sde
+  dt_ref: 6.0
+  sde_mode: "sde"
   init_noise_scale: 0.0001
   max_growth_rate: 0.3
   ensemble_size: 4
 
 data:
-  input_dir: /nfs/ERA5_data/data_norm
+  input_dir: "/nfs/ERA5_data/data_norm"
   year_range: [2000, 2021]
   window_size: 10
   sample_k: 5
   look_ahead: 2
-  sampling_mode: mix
-  frame_hours: 6.0
+  sampling_mode: "mix"
 
 train:
-  seed: 1017
-  num_workers: 2
   batch_size: 1
-  lr: 1.0e-5
+  lr: 1.0e-3
   weight_decay: 0.05
   epochs: 256
-  grad_clip: 16.0
+  grad_clip: 128.0
   grad_accum_steps: 1
+  use_scheduler: true
   use_tf32: true
-  log_every: 1
-  save_every: 1
-  out_dir: ./uniphy/outputs
-  resume: ""
-
-scheduler:
-  use_scheduler: false
 
 logging:
+  log_every: 1
+  wandb_every: 1
+  ckpt_step: 0.5
+  log_path: "./uniphy/logs"
+  ckpt_dir: "./uniphy/ckpt"
+  ckpt: ""
   use_wandb: true
-  wandb_project: ERA5
-  wandb_entity: UniPhy
+  wandb_project: "ERA5"
+  wandb_entity: "UniPhy"
   wandb_run_name: ""
+  
