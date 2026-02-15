@@ -20,7 +20,7 @@ class ERA5_Dataset(Dataset):
         is_train=True,
         frame_hours=6.0,
         sampling_mode="mixed",
-        max_shm_gb=32,
+        max_shm_gb=16,
     ):
         self.input_root = str(input_dir)
         self.window_size = int(window_size)
@@ -55,8 +55,8 @@ class ERA5_Dataset(Dataset):
             self.file_frame_offsets.append(self.file_frame_offsets[-1] + int(arr.shape[0]))
         self.total_frames = int(self.file_frame_offsets[-1])
 
-        self.local_cache = OrderedDict()
-        self.max_cache_files = 8
+        self._mmap_cache = OrderedDict()
+        self._max_mmap_handles = 8
         self.max_shm_bytes = max_shm_gb * 1024 * 1024 * 1024
 
     def __len__(self):
@@ -72,55 +72,66 @@ class ERA5_Dataset(Dataset):
                 lo = mid + 1
             else:
                 hi = mid
-        file_idx = int(lo)
-        local_idx = int(global_idx - self.file_frame_offsets[file_idx])
-        return file_idx, local_idx
+        return int(lo), int(global_idx - self.file_frame_offsets[lo])
+
+    def _get_current_cache_size(self):
+        files = [
+            os.path.join(self.shm_root, f) 
+            for f in os.listdir(self.shm_root) 
+            if f.endswith(".npy")
+        ]
+        return sum(os.path.getsize(f) for f in files)
 
     def _manage_shm_space(self, required_bytes):
         try:
-            _, _, free = shutil.disk_usage("/dev/shm")
-            if free < (required_bytes + 1024**3):
+            _, _, free_phys = shutil.disk_usage("/dev/shm")
+            current_cache_usage = self._get_current_cache_size()
+
+            while (current_cache_usage + required_bytes > self.max_shm_bytes) or \
+                  (free_phys < required_bytes + 1024**3):
                 files = [
                     os.path.join(self.shm_root, f)
                     for f in os.listdir(self.shm_root)
                     if f.endswith(".npy")
                 ]
                 if not files:
-                    return
+                    break
                 files.sort(key=lambda x: os.path.getatime(x))
-                for f in files:
-                    try:
-                        os.remove(f)
-                        lock_f = f + ".lock"
-                        if os.path.exists(lock_f):
-                            os.remove(lock_f)
-                    except OSError:
-                        pass
-                    _, _, free = shutil.disk_usage("/dev/shm")
-                    if free > (required_bytes + 1024**3):
-                        break
+                target = files[0]
+                try:
+                    os.remove(target)
+                    lock_f = target + ".lock"
+                    if os.path.exists(lock_f):
+                        os.remove(lock_f)
+                except OSError:
+                    pass
+                current_cache_usage = self._get_current_cache_size()
+                _, _, free_phys = shutil.disk_usage("/dev/shm")
         except Exception:
             pass
 
     def _ensure_file_in_shm(self, info):
         shm_path = info["shm_path"]
         if os.path.exists(shm_path):
-            os.utime(shm_path, None)
+            try:
+                os.utime(shm_path, None)
+            except OSError:
+                pass
             return shm_path
 
         nfs_path = info["nfs_path"]
         lock_path = shm_path + ".lock"
 
         with open(lock_path, "w") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
                 if os.path.exists(shm_path):
                     return shm_path
-
+                
                 file_size = os.path.getsize(nfs_path)
                 self._manage_shm_space(file_size)
-
-                temp_path = shm_path + f".{os.getpid()}.tmp"
+                
+                temp_path = f"{shm_path}.{os.getpid()}.{random.randint(0, 1000)}.tmp"
                 shutil.copy2(nfs_path, temp_path)
                 os.rename(temp_path, shm_path)
                 return shm_path
@@ -131,46 +142,49 @@ class ERA5_Dataset(Dataset):
 
     def _get_array_mmap(self, file_idx):
         info = self.all_info[file_idx]
-        arr = self.local_cache.get(info["id"])
-        if arr is not None:
-            self.local_cache.move_to_end(info["id"])
-            return arr
+        if info["id"] in self._mmap_cache:
+            self._mmap_cache.move_to_end(info["id"])
+            return self._mmap_cache[info["id"]]
 
         path_to_use = self._ensure_file_in_shm(info)
-
         try:
             arr = np.load(path_to_use, mmap_mode="r")
         except Exception:
-            if path_to_use != info["nfs_path"]:
-                try:
-                    os.remove(path_to_use)
-                except OSError:
-                    pass
             arr = np.load(info["nfs_path"], mmap_mode="r")
 
-        self.local_cache[info["id"]] = arr
-        while len(self.local_cache) > self.max_cache_files:
-            self.local_cache.popitem(last=False)
+        self._mmap_cache[info["id"]] = arr
+        while len(self._mmap_cache) > self._max_mmap_handles:
+            self._mmap_cache.popitem(last=False)
         return arr
 
     def _sample_offsets(self):
-        if self.sampling_mode == "sequential":
+        if not self.is_train:
             return list(range(self.sample_k))
+        
+        if self.sampling_mode == "sequential":
+            start = random.randint(0, self.window_size - self.sample_k)
+            return list(range(start, start + self.sample_k))
+        
+        if self.sampling_mode == "mixed" and random.random() < 0.5:
+            start = random.randint(0, self.window_size - self.sample_k)
+            return list(range(start, start + self.sample_k))
+            
         return sorted(random.sample(range(self.window_size), self.sample_k))
 
     def __getitem__(self, idx):
         base = int(idx)
         offsets = self._sample_offsets()
-        frame_indices = [base + o for o in offsets]
-
+        
         frames = []
-        for gidx in frame_indices:
-            file_idx, local_idx = self._locate_file_and_index(gidx)
-            arr = self._get_array_mmap(file_idx)
-            frames.append(torch.from_numpy(arr[local_idx].copy()))
+        for off in offsets:
+            f_idx, l_idx = self._locate_file_and_index(base + off)
+            arr = self._get_array_mmap(f_idx)
+            frames.append(torch.from_numpy(arr[l_idx].copy()))
 
         data = torch.stack(frames, dim=0)
         offsets_t = torch.tensor(offsets, dtype=torch.float32)
         dt_step = (offsets_t[1:] - offsets_t[:-1]) * self.frame_hours
-        return data, dt_step
+        dt_padded = torch.cat([dt_step, dt_step[-1:]], dim=0)
+        
+        return data, dt_padded
     
