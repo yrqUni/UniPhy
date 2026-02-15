@@ -277,7 +277,7 @@ def align(cfg):
         load_checkpoint(model, pretrained_ckpt)
 
         if world_size > 1:
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False, gradient_as_bucket_view=True)
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True, gradient_as_bucket_view=True)
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
