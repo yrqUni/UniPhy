@@ -1,7 +1,10 @@
 import os
 import hashlib
 import shutil
+import sys
 import numpy as np
+import torch
+from ERA5 import ERA5_Dataset
 
 
 def get_shm_path(input_dir):
@@ -34,6 +37,37 @@ def check_nfs_source(input_dir, year_range):
     print(f"NFS Status: {total_files} files found, {total_frames} total frames.")
     if missing_years:
         print(f"Missing years: {missing_years}")
+    return total_frames
+
+
+def check_era5_dataset_logic(input_dir, year_range):
+    print(f"Testing ERA5_Dataset class from ERA5.py")
+    try:
+        ds = ERA5_Dataset(
+            input_dir=input_dir,
+            year_range=year_range,
+            window_size=16,
+            sample_k=4,
+            look_ahead=2
+        )
+        
+        ds_len = len(ds)
+        print(f"Dataset length: {ds_len}")
+        print(f"Total internal frames: {ds.total_frames}")
+        print(f"File offsets: {ds.file_frame_offsets}")
+        
+        if ds_len > 0:
+            print("Testing __getitem__ (this may trigger SHM caching)...")
+            data, dt = ds[0]
+            print(f"Sample data shape: {data.shape}")
+            print(f"Sample dt_step: {dt}")
+            print("Dataset __getitem__ test passed.")
+        else:
+            print("Warning: Dataset is empty.")
+            
+    except Exception as e:
+        print(f"Dataset Logic Error: {e}")
+        sys.exit(1)
 
 
 def check_shm_status(input_dir):
@@ -44,7 +78,11 @@ def check_shm_status(input_dir):
         print("SHM cache directory does not exist.")
         return
 
-    files = [os.path.join(shm_path, f) for f in os.listdir(shm_path) if f.endswith(".npy")]
+    files = [
+        os.path.join(shm_path, f) 
+        for f in os.listdir(shm_path) 
+        if f.endswith(".npy")
+    ]
     total_size = sum(os.path.getsize(f) for f in files)
     
     print(f"SHM Status: {len(files)} files cached.")
@@ -52,26 +90,20 @@ def check_shm_status(input_dir):
 
     try:
         total, used, free = shutil.disk_usage("/dev/shm")
+        print(f"/dev/shm System Total: {total / (1024**3):.2f} GB")
         print(f"/dev/shm System Free: {free / (1024**3):.2f} GB")
     except Exception:
         pass
-
-
-def clean_shm_cache(input_dir):
-    shm_path = get_shm_path(input_dir)
-    if os.path.exists(shm_path):
-        print(f"Cleaning cache: {shm_path}")
-        shutil.rmtree(shm_path)
-        print("Cache cleared.")
-    else:
-        print("No cache found to clean.")
 
 
 if __name__ == "__main__":
     DATA_DIR = "/nfs/ERA5_data/data_norm"
     YEARS = (2010, 2020)
 
+    print("=" * 50)
     check_nfs_source(DATA_DIR, YEARS)
-    print("-" * 30)
+    print("-" * 50)
+    check_era5_dataset_logic(DATA_DIR, YEARS)
+    print("-" * 50)
     check_shm_status(DATA_DIR)
-    clean_shm_cache(DATA_DIR)
+    print("=" * 50)
