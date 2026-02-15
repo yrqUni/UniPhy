@@ -38,14 +38,17 @@ class ComplexConvFFN(nn.Module):
         self.fc1_re = nn.Conv2d(dim, hidden_dim, 1)
         self.fc1_im = nn.Conv2d(dim, hidden_dim, 1)
         self.dw_conv_re = nn.Conv2d(
-            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False
+            hidden_dim, hidden_dim, kernel_size=3, padding=1,
+            groups=hidden_dim, bias=False
         )
         self.dw_conv_im = nn.Conv2d(
-            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False
+            hidden_dim, hidden_dim, kernel_size=3, padding=1,
+            groups=hidden_dim, bias=False
         )
         self.fc2_re = nn.Conv2d(hidden_dim, dim, 1)
         self.fc2_im = nn.Conv2d(hidden_dim, dim, 1)
         self._init_weights()
+
         for param in self.parameters():
             if param.requires_grad:
                 param.register_hook(lambda grad: grad.contiguous())
@@ -66,20 +69,25 @@ class ComplexConvFFN(nn.Module):
 
     def forward(self, x):
         if x.is_complex():
-            re = x.real
-            im = x.imag
+            re = x.real.contiguous()
+            im = x.imag.contiguous()
         else:
-            re = x
+            re = x.contiguous()
             im = torch.zeros_like(x)
+
         h_re = self.fc1_re(re) - self.fc1_im(im)
         h_im = self.fc1_re(im) + self.fc1_im(re)
+
         h_re = self.dw_conv_re(h_re)
         h_im = self.dw_conv_im(h_im)
+
         h_re = F.gelu(h_re)
         h_im = F.gelu(h_im)
+
         out_re = self.fc2_re(h_re) - self.fc2_im(h_im)
         out_im = self.fc2_re(h_im) + self.fc2_im(h_re)
-        return torch.complex(out_re, out_im)
+
+        return torch.complex(out_re.contiguous(), out_im.contiguous())
 
 
 class UniPhyFeedForwardNetwork(nn.Module):
