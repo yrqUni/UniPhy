@@ -71,7 +71,7 @@ def test_full_epoch(input_dir, year_range, batch_size=4, num_workers=4):
 
 
 if __name__ == "__main__":
-    DATA_ROOT = "/nfs/UniPhy/Data/ERA5"
+    DATA_ROOT = "/nfs/ERA5_data/data_norm"
     TEST_YEARS = (2010, 2011)
     
     if os.path.exists(DATA_ROOT):
