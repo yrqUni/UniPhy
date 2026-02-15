@@ -1,8 +1,9 @@
 import os
-import random
 import shutil
-import threading
-import uuid
+import random
+import hashlib
+import fcntl
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -30,7 +31,10 @@ class ERA5_Dataset(Dataset):
         self.frame_hours = float(frame_hours)
         self.sampling_mode = "mixed" if sampling_mode in {"mix", "mixed"} else str(sampling_mode)
 
-        self.shm_root = f"/dev/shm/era5_cache/{uuid.uuid4().hex}"
+        input_hash = hashlib.md5(self.input_root.encode("utf-8")).hexdigest()
+        self.shm_root = os.path.join("/dev/shm", "era5_cache", input_hash)
+        os.makedirs(self.shm_root, exist_ok=True)
+
         self.all_info = []
         for year in range(int(year_range[0]), int(year_range[1]) + 1):
             y_dir = os.path.join(self.input_root, str(year))
@@ -38,10 +42,12 @@ class ERA5_Dataset(Dataset):
                 continue
             months = sorted([f for f in os.listdir(y_dir) if f.endswith(".npy")])
             for m in months:
+                full_path = os.path.join(y_dir, m)
+                file_hash = hashlib.md5(full_path.encode("utf-8")).hexdigest()
                 self.all_info.append(
                     {
-                        "nfs_path": os.path.join(y_dir, m),
-                        "shm_path": os.path.join(self.shm_root, str(year), m),
+                        "nfs_path": full_path,
+                        "shm_path": os.path.join(self.shm_root, f"{file_hash}.npy"),
                         "id": f"{year}_{m}",
                     }
                 )
@@ -52,7 +58,6 @@ class ERA5_Dataset(Dataset):
             self.file_frame_offsets.append(self.file_frame_offsets[-1] + int(arr.shape[0]))
         self.total_frames = int(self.file_frame_offsets[-1])
 
-        self.cache_lock = threading.Lock()
         self.local_cache = OrderedDict()
         self.max_cache_files = 8
 
@@ -75,24 +80,43 @@ class ERA5_Dataset(Dataset):
 
     def _ensure_file_in_shm(self, info):
         shm_path = info["shm_path"]
-        os.makedirs(os.path.dirname(shm_path), exist_ok=True)
-        if not os.path.exists(shm_path):
-            shutil.copy2(info["nfs_path"], shm_path)
+        if os.path.exists(shm_path):
+            return shm_path
+
+        lock_path = shm_path + ".lock"
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                if not os.path.exists(shm_path):
+                    temp_path = shm_path + ".tmp"
+                    shutil.copy2(info["nfs_path"], temp_path)
+                    os.rename(temp_path, shm_path)
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+        
         return shm_path
 
     def _get_array_mmap(self, file_idx):
         info = self.all_info[file_idx]
-        with self.cache_lock:
-            arr = self.local_cache.get(info["id"])
-            if arr is not None:
-                self.local_cache.move_to_end(info["id"])
-                return arr
+        
+        arr = self.local_cache.get(info["id"])
+        if arr is not None:
+            self.local_cache.move_to_end(info["id"])
+            return arr
+
         shm_path = self._ensure_file_in_shm(info)
-        arr = np.load(shm_path, mmap_mode="r")
-        with self.cache_lock:
-            self.local_cache[info["id"]] = arr
-            while len(self.local_cache) > self.max_cache_files:
-                self.local_cache.popitem(last=False)
+        
+        try:
+            arr = np.load(shm_path, mmap_mode="r")
+        except (ValueError, OSError):
+            os.remove(shm_path)
+            shm_path = self._ensure_file_in_shm(info)
+            arr = np.load(shm_path, mmap_mode="r")
+
+        self.local_cache[info["id"]] = arr
+        while len(self.local_cache) > self.max_cache_files:
+            self.local_cache.popitem(last=False)
+        
         return arr
 
     def _sample_offsets(self):
@@ -110,14 +134,10 @@ class ERA5_Dataset(Dataset):
             file_idx, local_idx = self._locate_file_and_index(gidx)
             arr = self._get_array_mmap(file_idx)
             frames.append(torch.from_numpy(arr[local_idx].copy()))
+        
         data = torch.stack(frames, dim=0)
-
         offsets_t = torch.tensor(offsets, dtype=torch.float32)
         dt_step = (offsets_t[1:] - offsets_t[:-1]) * self.frame_hours
+        
         return data, dt_step
-
-    def cleanup(self):
-        shutil.rmtree(self.shm_root, ignore_errors=True)
-
-    def __del__(self):
-        self.cleanup()
+    
