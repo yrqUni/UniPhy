@@ -1,9 +1,8 @@
 import argparse
 import datetime
 import os
-import sys
 import random
-from pathlib import Path
+import sys
 
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
@@ -64,20 +63,6 @@ def reduce_mean(tensor):
     return out
 
 
-def pad_dt(dt_between, t_len):
-    if dt_between.ndim == 1:
-        dt_between = dt_between.unsqueeze(0)
-    if dt_between.shape[1] == t_len:
-        return dt_between
-    bsz = dt_between.shape[0]
-    if dt_between.shape[1] == 0:
-        return torch.zeros((bsz, t_len), device=dt_between.device, dtype=dt_between.dtype)
-    last = dt_between[:, -1:].expand(bsz, 1)
-    while dt_between.shape[1] < t_len:
-        dt_between = torch.cat([dt_between, last], dim=1)
-    return dt_between[:, :t_len]
-
-
 def get_infer_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -116,22 +101,20 @@ def save_checkpoint(model, optimizer, epoch, global_step, cfg, path):
 
 def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     device = next(model.parameters()).device
-    data, dt_between = batch
+    data, dt_step = batch
     data = data.to(device, non_blocking=True).float()
-    dt_between = dt_between.to(device, non_blocking=True).float()
+    dt_step = dt_step.to(device, non_blocking=True).float()
 
     cond_steps = int(cfg["alignment"]["condition_steps"])
     max_tgt_steps = int(cfg["alignment"]["max_target_steps"])
     sub_steps_list = list(cfg["alignment"]["sub_steps"])
-
     target_dt = float(cfg["model"].get("target_dt_hours", cfg["model"].get("dt_ref", 6.0)))
 
     x_ctx = data[:, :cond_steps]
     x_targets = data[:, cond_steps:]
+    dt_ctx = dt_step[:, : max(cond_steps - 1, 0)]
 
-    dt_ctx_between = dt_between[:, : max(cond_steps - 1, 0)]
-    dt_ctx = pad_dt(dt_ctx_between, cond_steps)
-
+    bsz = int(data.shape[0])
     actual_tgt_steps = int(x_targets.shape[1])
     max_t = min(int(max_tgt_steps), int(actual_tgt_steps))
     if max_t <= 0:
@@ -149,13 +132,11 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
 
     t = random.randint(1, max_t)
     sub_step = int(random.choice(sub_steps_list))
-
     dt_per_iter = target_dt / float(sub_step)
     n_iters = int(t * sub_step)
-    dt_future = torch.full((n_iters,), float(dt_per_iter), device=device, dtype=torch.float32)
+    dt_future = torch.full((bsz, n_iters), float(dt_per_iter), device=device, dtype=torch.float32)
 
     ensemble_size = int(cfg["model"].get("ensemble_size", 1))
-    bsz = int(x_ctx.shape[0])
     if ensemble_size > 1:
         member_idx = torch.randint(0, ensemble_size, (bsz,), device=device)
     else:
@@ -202,22 +183,18 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
 
 def align(cfg):
     rank, world_size, local_rank = setup_distributed()
-
     seed = int(cfg.get("train", {}).get("seed", 42))
     set_seed(seed + rank)
 
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
-
     use_tf32 = bool(cfg.get("train", {}).get("use_tf32", True))
     torch.backends.cuda.matmul.allow_tf32 = use_tf32
     torch.backends.cudnn.allow_tf32 = use_tf32
 
     frame_hours = float(cfg.get("data", {}).get("frame_hours", cfg["model"].get("dt_ref", 6.0)))
-
     cond_steps = int(cfg["alignment"]["condition_steps"])
     max_target_steps = int(cfg["alignment"]["max_target_steps"])
     sample_k_default = max(2, cond_steps + max_target_steps + 1)
-
     sample_k = int(cfg.get("data", {}).get("sample_k", sample_k_default))
     look_ahead = int(cfg.get("data", {}).get("look_ahead", 0))
 
@@ -233,149 +210,71 @@ def align(cfg):
     )
 
     use_wandb = init_wandb(cfg) if is_main() else False
+    sampler = DistributedSampler(align_dataset, shuffle=True) if world_size > 1 else None
+    dataloader = DataLoader(
+        align_dataset,
+        batch_size=int(cfg["train"]["batch_size"]),
+        num_workers=int(cfg["train"].get("num_workers", 4)),
+        pin_memory=True,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        drop_last=True,
+    )
 
-    try:
-        sampler = None
-        if world_size > 1:
-            sampler = DistributedSampler(
-                align_dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                drop_last=True,
-            )
+    model = UniPhyModel(**cfg["model"]).to(device)
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-        num_workers = int(cfg.get("train", {}).get("num_workers", 4))
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg["train"]["lr"]),
+        weight_decay=float(cfg["train"]["weight_decay"]),
+    )
 
-        align_loader = DataLoader(
-            align_dataset,
-            batch_size=int(cfg["train"]["batch_size"]),
-            sampler=sampler,
-            shuffle=(sampler is None),
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
+    ckpt_path = str(cfg["train"].get("resume", "")).strip()
+    if ckpt_path:
+        load_checkpoint(model, ckpt_path)
 
-        model = UniPhyModel(
-            in_channels=int(cfg["model"]["in_channels"]),
-            out_channels=int(cfg["model"]["out_channels"]),
-            embed_dim=int(cfg["model"]["embed_dim"]),
-            expand=int(cfg["model"]["expand"]),
-            depth=int(cfg["model"]["depth"]),
-            patch_size=cfg["model"]["patch_size"],
-            img_height=int(cfg["model"]["img_height"]),
-            img_width=int(cfg["model"]["img_width"]),
-            tau_ref_hours=float(cfg["model"].get("tau_ref_hours", cfg["model"].get("dt_ref", 6.0))),
-            sde_mode=str(cfg["model"].get("sde_mode", "sde")),
-            init_noise_scale=float(cfg["model"].get("init_noise_scale", 0.01)),
-            max_growth_rate=float(cfg["model"].get("max_growth_rate", 0.3)),
-            ensemble_size=int(cfg["model"].get("ensemble_size", 1)),
-        ).to(device)
+    grad_accum_steps = int(cfg["train"].get("grad_accum_steps", 1))
+    log_every = int(cfg["train"].get("log_every", 10))
+    save_every = int(cfg["train"].get("save_every", 1))
+    out_dir = str(cfg["train"].get("out_dir", "./outputs"))
+    epochs = int(cfg["train"]["epochs"])
 
-        pretrained_ckpt = str(cfg["alignment"]["pretrained_ckpt"])
-        load_checkpoint(model, pretrained_ckpt)
+    global_step = 0
+    for epoch in range(epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        model.train()
+        for batch_idx, batch in enumerate(dataloader):
+            metrics = align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
+            global_step += 1
+            if is_main() and global_step % log_every == 0:
+                metrics_out = dict(metrics)
+                metrics_out["epoch"] = epoch
+                metrics_out["step"] = global_step
+                if use_wandb:
+                    wandb.log(metrics_out, step=global_step)
+                else:
+                    print(metrics_out)
+        if is_main() and (epoch + 1) % save_every == 0:
+            ckpt_name = f"align-ckpt-epoch{epoch+1}.pt"
+            save_checkpoint(model, optimizer, epoch + 1, global_step, cfg, os.path.join(out_dir, ckpt_name))
 
-        if world_size > 1:
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True, gradient_as_bucket_view=True)
+    if use_wandb and is_main():
+        wandb.finish()
 
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(cfg["train"]["lr"]),
-            betas=(0.9, 0.95),
-            weight_decay=float(cfg["train"]["weight_decay"]),
-        )
 
-        epochs = int(cfg["train"]["epochs"])
-        grad_accum_steps = int(cfg["train"].get("grad_accum_steps", 1))
-
-        log_cfg = cfg.get("logging", {})
-        log_every = int(log_cfg.get("log_every", 50))
-        wandb_every = int(log_cfg.get("wandb_every", 50))
-        ckpt_step_frac = float(log_cfg.get("ckpt_step", 0.0))
-        ckpt_dir = str(log_cfg.get("ckpt_dir", "./align_ckpt"))
-
-        steps_per_epoch = max(1, len(align_loader))
-        ckpt_every_steps = 0
-        if ckpt_step_frac > 0:
-            ckpt_every_steps = max(1, int(round(steps_per_epoch * ckpt_step_frac)))
-
-        global_step = 0
-        for epoch in range(epochs):
-            if sampler is not None:
-                sampler.set_epoch(epoch)
-
-            model.train()
-            running = {}
-
-            for batch_idx, batch in enumerate(align_loader):
-                metrics = align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx)
-                global_step += 1
-
-                for k, v in metrics.items():
-                    running[k] = running.get(k, 0.0) + float(v)
-
-                if is_main() and global_step % log_every == 0:
-                    denom = float(log_every)
-                    msg = f"epoch={epoch} step={global_step}"
-                    for k in sorted(running.keys()):
-                        msg += f" {k}={running[k] / denom:.6f}"
-                    print(msg, flush=True)
-                    running = {}
-
-                if use_wandb and global_step % wandb_every == 0:
-                    wandb.log({f"align/{k}": float(v) for k, v in metrics.items()}, step=global_step)
-
-                if is_main() and ckpt_every_steps > 0 and global_step % ckpt_every_steps == 0:
-                    save_checkpoint(
-                        model,
-                        optimizer,
-                        epoch,
-                        global_step,
-                        cfg,
-                        os.path.join(ckpt_dir, f"ckpt_step_{global_step}.pt"),
-                    )
-
-            if is_main():
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    epoch,
-                    global_step,
-                    cfg,
-                    os.path.join(ckpt_dir, f"ckpt_epoch_{epoch + 1}.pt"),
-                )
-
-        if is_main():
-            save_checkpoint(
-                model,
-                optimizer,
-                epochs - 1,
-                global_step,
-                cfg,
-                os.path.join(ckpt_dir, "ckpt_final.pt"),
-            )
-
-        if is_dist():
-            dist.barrier()
-
-    finally:
-        align_dataset.cleanup()
-        if use_wandb:
-            wandb.finish()
-        if is_dist():
-            dist.destroy_process_group()
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="align.yaml")
-    args = parser.parse_args()
-
-    cfg_path = Path(args.config)
-    with open(cfg_path, "r", encoding="utf-8") as f:
+    args = parse_args()
+    with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-
     align(cfg)
 
 

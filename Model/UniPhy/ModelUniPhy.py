@@ -31,7 +31,6 @@ class UniPhyBlock(nn.Module):
             img_height=img_height,
             img_width=img_width,
         )
-        self.norm_temporal = nn.LayerNorm(dim * 2)
         self.prop = TemporalPropagator(
             dim,
             tau_ref_hours=tau_ref_hours,
@@ -41,119 +40,107 @@ class UniPhyBlock(nn.Module):
         )
         self.ffn = UniPhyFeedForwardNetwork(dim, expand)
 
-    def _spatial_process(self, x):
-        is_5d = x.ndim == 5
-        if is_5d:
-            B, T, D, H, W = x.shape
-            x_flat = x.reshape(B * T, D, H, W)
-        else:
-            x_flat = x
+    def spatial_process_seq(self, x):
+        bsz, t_len, dim, height, width = x.shape
+        x_flat = x.reshape(bsz * t_len, dim, height, width)
         x_real = torch.cat([x_flat.real, x_flat.imag], dim=1)
         x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_spatial = self.spatial_cliff(x_norm)
         x_re, x_im = torch.chunk(x_spatial, 2, dim=1)
-        x_out = x_flat + torch.complex(x_re, x_im)
-        return x_out.reshape(B, T, D, H, W) if is_5d else x_out
+        y = x_flat + torch.complex(x_re, x_im)
+        return y.reshape(bsz, t_len, dim, height, width)
 
-    def _temporal_decode(self, x):
-        is_5d = x.ndim == 5
-        if is_5d:
-            bsz, t_len, dim, hgt, wdt = x.shape
-            x_flat = x.reshape(bsz * t_len, dim, hgt, wdt)
-        else:
-            x_flat = x
+    def spatial_process_step(self, x):
+        bsz, dim, height, width = x.shape
+        x_real = torch.cat([x.real, x.imag], dim=1)
+        x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_spatial = self.spatial_cliff(x_norm)
+        x_re, x_im = torch.chunk(x_spatial, 2, dim=1)
+        return x + torch.complex(x_re, x_im)
 
-        x_out = x_flat + self.ffn(x_flat)
+    def temporal_decode_seq(self, x):
+        bsz, t_len, dim, height, width = x.shape
+        x_flat = x.reshape(bsz * t_len, dim, height, width)
+        y_flat = x_flat + self.ffn(x_flat)
+        return y_flat.reshape(bsz, t_len, dim, height, width)
 
-        if is_5d:
-            return x_out.reshape(bsz, t_len, dim, hgt, wdt)
-        return x_out
+    def temporal_decode_step(self, x):
+        return x + self.ffn(x)
 
+    def forward(self, x, h_prev, dt_step, flux_prev):
+        bsz, t_len, dim, height, width = x.shape
 
-    def forward(self, x, h_prev, dt, flux_prev):
-        B, T, D, H, W = x.shape
-        x = self._spatial_process(x)
-
-        x_perm = x.permute(0, 1, 3, 4, 2)
-        x_eigen = self.prop.basis.encode(x_perm)
+        x = self.spatial_process_seq(x)
+        x_eigen = self.prop.basis.encode(x.permute(0, 1, 3, 4, 2))
         x_mean = x_eigen.mean(dim=(2, 3))
 
         if flux_prev is None:
-            flux_prev = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+            flux_prev = torch.zeros((bsz, dim), device=x.device, dtype=x.dtype)
 
-        A_flux, X_flux = self.prop.flux_tracker.get_scan_operators(x_mean, dt)
-        flux_seq = pscan(A_flux, X_flux).squeeze(-1)
-        decay_seq = A_flux.squeeze(-1)
-        decay_cum = torch.cumprod(decay_seq, dim=1)
-        flux_seq = flux_seq + flux_prev.unsqueeze(1) * decay_cum
-
-        source_seq, gate_seq = self.prop.flux_tracker.compute_output(flux_seq)
+        a_flux, u_flux = self.prop.flux_tracker.get_scan_operators(x_mean, dt_step)
+        flux_seq = pscan(a_flux, u_flux)[..., 0]
+        decay_flux_cum = torch.cumprod(a_flux[..., 0], dim=1)
+        flux_seq = flux_seq + flux_prev.unsqueeze(1) * decay_flux_cum
         flux_out = flux_seq[:, -1]
 
-        source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
-        gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        source_seq, gate_seq = self.prop.flux_tracker.compute_output_seq(flux_seq)
+        source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(bsz, t_len, height, width, dim)
+        gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(bsz, t_len, height, width, dim)
+
         forcing = x_eigen * gate_exp + source_exp * (1.0 - gate_exp)
 
-        op_decay, op_forcing = self.prop.get_transition_operators(dt)
-        op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
-        op_forcing = op_forcing.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
+        op_decay, op_forcing = self.prop.get_transition_operators_seq(dt_step)
+        op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(bsz, t_len, height, width, dim)
+        op_forcing = op_forcing.unsqueeze(2).unsqueeze(3).expand(bsz, t_len, height, width, dim)
 
         u_t = forcing * op_forcing
         if self.prop.sde_mode == "sde":
-            u_t = u_t + self.prop.generate_stochastic_term(u_t.shape, dt, u_t.dtype)
+            u_t = u_t + self.prop.generate_stochastic_term_seq(u_t.shape, dt_step, u_t.dtype)
+
+        a = op_decay.permute(0, 2, 3, 1, 4).reshape(bsz * height * width, t_len, dim, 1)
+        u = u_t.permute(0, 2, 3, 1, 4).reshape(bsz * height * width, t_len, dim, 1)
+        y = pscan(a, u).reshape(bsz, height, width, t_len, dim).permute(0, 3, 1, 2, 4)
 
         if h_prev is not None:
-            h_contrib_t0 = h_prev.reshape(B, H, W, D) * op_decay[:, 0]
-            u0 = u_t[:, 0] + h_contrib_t0
-            u_t = torch.cat([u0.unsqueeze(1), u_t[:, 1:]], dim=1)
+            h0 = h_prev.reshape(bsz, height, width, dim)
+            decay_cum = torch.cumprod(op_decay[..., 0, 0, :], dim=1)
+            y = y + h0.unsqueeze(1) * decay_cum.unsqueeze(2).unsqueeze(3)
 
-        A = op_decay.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
-        X = u_t.permute(0, 2, 3, 1, 4).reshape(B * H * W, T, D, 1)
-        u_out = pscan(A, X).reshape(B, H, W, T, D).permute(0, 3, 1, 2, 4)
+        h_out = y[:, -1].reshape(bsz * height * width, 1, dim)
 
-        h_out = u_out[:, -1].reshape(B * H * W, 1, D)
-        x_out = self._temporal_decode(self.prop.basis.decode(u_out).permute(0, 1, 4, 2, 3))
+        y_dec = self.prop.basis.decode(y).permute(0, 1, 4, 2, 3)
+        x_out = self.temporal_decode_seq(y_dec)
+
         return x + x_out, h_out, flux_out
 
-    def forward_step(self, x_curr, h_prev, dt, flux_prev):
-        B, D, H, W = x_curr.shape
-        x_real = torch.cat([x_curr.real, x_curr.imag], dim=1)
-        x_norm = self.norm_spatial(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x_s_re, x_s_im = torch.chunk(self.spatial_cliff(x_norm), 2, dim=1)
-        x_curr = x_curr + torch.complex(x_s_re, x_s_im)
+    def forward_step(self, x_curr, h_prev, dt_step, flux_prev):
+        bsz, dim, height, width = x_curr.shape
 
+        x_curr = self.spatial_process_step(x_curr)
         x_eigen = self.prop.basis.encode(x_curr.permute(0, 2, 3, 1))
         x_mean = x_eigen.mean(dim=(1, 2))
 
         if flux_prev is None:
-            flux_prev = torch.zeros(B, D, device=x_curr.device, dtype=x_curr.dtype)
+            flux_prev = torch.zeros((bsz, dim), device=x_curr.device, dtype=x_curr.dtype)
 
-        decay_flux, forcing_flux = self.prop.flux_tracker.get_transition_operators(dt)
-        if decay_flux.ndim == 1:
-            decay_flux = decay_flux.unsqueeze(0).expand(B, D)
-            forcing_flux = forcing_flux.unsqueeze(0).expand(B, D)
-
+        decay_flux, forcing_flux = self.prop.flux_tracker.get_transition_operators_step(dt_step)
         flux_next = flux_prev * decay_flux + x_mean * forcing_flux
-        source, gate = self.prop.flux_tracker.compute_output(flux_next)
+        source, gate = self.prop.flux_tracker.compute_output_step(flux_next)
 
-        source_exp = source.reshape(B, 1, 1, D).expand(B, H, W, D)
-        gate_exp = gate.reshape(B, 1, 1, D).expand(B, H, W, D)
+        source_exp = source.view(bsz, 1, 1, dim).expand(bsz, height, width, dim)
+        gate_exp = gate.view(bsz, 1, 1, dim).expand(bsz, height, width, dim)
         forcing = x_eigen * gate_exp + source_exp * (1.0 - gate_exp)
 
-        op_decay, op_forcing = self.prop.get_transition_operators(dt)
-        if op_decay.ndim == 1:
-            op_decay = op_decay.unsqueeze(0).expand(B, D)
-            op_forcing = op_forcing.unsqueeze(0).expand(B, D)
-
-        u = forcing * op_forcing.reshape(B, 1, 1, D)
+        op_decay, op_forcing = self.prop.get_transition_operators_step(dt_step)
+        u = forcing * op_forcing.view(bsz, 1, 1, dim)
         if self.prop.sde_mode == "sde":
-            u = u + self.prop.generate_stochastic_term(u.shape, dt, u.dtype)
+            u = u + self.prop.generate_stochastic_term_step(u.shape, dt_step, u.dtype)
 
         if h_prev is not None:
-            u = u + h_prev.reshape(B, H, W, D) * op_decay.reshape(B, 1, 1, D)
+            u = u + h_prev.reshape(bsz, height, width, dim) * op_decay.view(bsz, 1, 1, dim)
 
-        h_out = u.reshape(B * H * W, 1, D)
-        x_out = self._temporal_decode(self.prop.basis.decode(u).permute(0, 3, 1, 2))
+        h_out = u.reshape(bsz * height * width, 1, dim)
+        x_out = self.temporal_decode_step(self.prop.basis.decode(u).permute(0, 3, 1, 2))
         return x_curr + x_out, h_out, flux_next
 
 
@@ -182,9 +169,11 @@ class UniPhyModel(nn.Module):
         self.tau_ref_hours = float(tau_ref_hours)
 
         if isinstance(patch_size, (tuple, list)):
-            ph, pw = int(patch_size[0]), int(patch_size[1])
+            ph = int(patch_size[0])
+            pw = int(patch_size[1])
         else:
-            ph = pw = int(patch_size)
+            ph = int(patch_size)
+            pw = int(patch_size)
 
         self.h_patches = (self.img_height + (ph - self.img_height % ph) % ph) // ph
         self.w_patches = (self.img_width + (pw - self.img_width % pw) % pw) // pw
@@ -224,68 +213,37 @@ class UniPhyModel(nn.Module):
     def _init_states(self):
         return [(None, None) for _ in range(self.depth)]
 
-    def forward(self, x, dt, member_idx=None):
-        B, T, _, _, _ = x.shape
-        z = self.encoder(x)
+    def forward(self, x_input, dt_step, member_idx=None):
+        z = self.encoder(x_input)
         states = self._init_states()
-        for i, block in enumerate(self.blocks):
-            z, h_f, f_f = block(z, states[i][0], dt, states[i][1])
-            states[i] = (h_f, f_f)
+        for idx, block in enumerate(self.blocks):
+            z, h_f, f_f = block(z, states[idx][0], dt_step, states[idx][1])
+            states[idx] = (h_f, f_f)
         return self.decoder(z, member_idx=member_idx)
 
-    def forward_rollout(self, x_context, dt_context, dt_future, member_idx=None):
-        bsz, t_in = x_context.shape[0], x_context.shape[1]
-        device = x_context.device
-        dt_dtype = x_context.dtype
-
-        if isinstance(dt_context, (float, int)):
-            dt_ctx = torch.full((bsz, t_in), float(dt_context), device=device, dtype=dt_dtype)
-        elif isinstance(dt_context, torch.Tensor):
-            if dt_context.ndim == 0:
-                dt_ctx = dt_context.to(device=device, dtype=dt_dtype).expand(bsz, t_in)
-            elif dt_context.ndim == 1:
-                dt_ctx = dt_context.to(device=device, dtype=dt_dtype).unsqueeze(0).expand(bsz, t_in)
-            else:
-                dt_ctx = dt_context.to(device=device, dtype=dt_dtype)
+    def forward_rollout(self, x_context, dt_context_step, dt_future_step, member_idx=None):
+        bsz, t_ctx = x_context.shape[0], x_context.shape[1]
+        if t_ctx >= 2:
+            x_ctx_step = x_context[:, :-1]
+            z = self.encoder(x_ctx_step)
+            states = self._init_states()
+            for idx, block in enumerate(self.blocks):
+                z, h_f, f_f = block(z, states[idx][0], dt_context_step, states[idx][1])
+                states[idx] = (h_f, f_f)
         else:
-            dt_ctx = torch.full((bsz, t_in), float(dt_context), device=device, dtype=dt_dtype)
+            states = self._init_states()
 
-        z_ctx = self.encoder(x_context)
-        states = self._init_states()
-
-        for i, block in enumerate(self.blocks):
-            z_ctx, h_f, f_f = block(z_ctx, states[i][0], dt_ctx, states[i][1])
-            states[i] = (h_f, f_f)
-
-        x_last = x_context[:, -1]
-        z_curr = self.encoder(x_last.unsqueeze(1))[:, 0]
-
-        if isinstance(dt_future, list):
-            dt_future = torch.stack(
-                [
-                    d.to(device=device, dtype=dt_dtype)
-                    if isinstance(d, torch.Tensor)
-                    else torch.tensor(float(d), device=device, dtype=dt_dtype)
-                    for d in dt_future
-                ]
-            )
-        elif not isinstance(dt_future, torch.Tensor):
-            dt_future = torch.tensor(dt_future, device=device, dtype=dt_dtype)
-        else:
-            dt_future = dt_future.to(device=device, dtype=dt_dtype)
-
-        steps = int(dt_future.shape[0]) if dt_future.ndim == 1 else int(dt_future.shape[1])
-
+        z_curr = self.encoder(x_context[:, -1].unsqueeze(1))[:, 0]
+        steps = int(dt_future_step.shape[1])
         preds = []
         for k in range(steps):
-            dt_k = dt_future[k] if dt_future.ndim == 1 else dt_future[:, k]
+            dt_k = dt_future_step[:, k]
             new_states = []
-            for i, block in enumerate(self.blocks):
-                z_curr, h_n, f_n = block.forward_step(z_curr, states[i][0], dt_k, states[i][1])
+            for idx, block in enumerate(self.blocks):
+                z_curr, h_n, f_n = block.forward_step(z_curr, states[idx][0], dt_k, states[idx][1])
                 new_states.append((h_n, f_n))
             states = new_states
             x_pred = self.decoder(z_curr.unsqueeze(1), member_idx=member_idx)[:, 0]
             preds.append(x_pred)
             z_curr = self.encoder(x_pred.unsqueeze(1))[:, 0]
-
         return torch.stack(preds, dim=1)

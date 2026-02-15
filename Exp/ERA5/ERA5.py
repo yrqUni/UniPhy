@@ -22,18 +22,18 @@ class ERA5_Dataset(Dataset):
         frame_hours=6.0,
         sampling_mode="mixed",
     ):
-        self.input_root = input_dir
+        self.input_root = str(input_dir)
         self.window_size = int(window_size)
         self.sample_k = int(sample_k)
         self.look_ahead = int(look_ahead)
         self.is_train = bool(is_train)
         self.frame_hours = float(frame_hours)
-        self.sampling_mode = "mixed" if sampling_mode in {"mix", "mixed"} else sampling_mode
+        self.sampling_mode = "mixed" if sampling_mode in {"mix", "mixed"} else str(sampling_mode)
 
         self.shm_root = f"/dev/shm/era5_cache/{uuid.uuid4().hex}"
         self.all_info = []
         for year in range(int(year_range[0]), int(year_range[1]) + 1):
-            y_dir = os.path.join(input_dir, str(year))
+            y_dir = os.path.join(self.input_root, str(year))
             if not os.path.isdir(y_dir):
                 continue
             months = sorted([f for f in os.listdir(y_dir) if f.endswith(".npy")])
@@ -50,7 +50,7 @@ class ERA5_Dataset(Dataset):
         for info in self.all_info:
             arr = np.load(info["nfs_path"], mmap_mode="r")
             self.file_frame_offsets.append(self.file_frame_offsets[-1] + int(arr.shape[0]))
-        self.total_frames = self.file_frame_offsets[-1]
+        self.total_frames = int(self.file_frame_offsets[-1])
 
         self.cache_lock = threading.Lock()
         self.local_cache = OrderedDict()
@@ -69,14 +69,15 @@ class ERA5_Dataset(Dataset):
                 lo = mid + 1
             else:
                 hi = mid
-        file_idx = lo
-        local_idx = global_idx - self.file_frame_offsets[file_idx]
+        file_idx = int(lo)
+        local_idx = int(global_idx - self.file_frame_offsets[file_idx])
         return file_idx, local_idx
 
     def _ensure_file_in_shm(self, info):
         shm_path = info["shm_path"]
         os.makedirs(os.path.dirname(shm_path), exist_ok=True)
-        shutil.copy2(info["nfs_path"], shm_path)
+        if not os.path.exists(shm_path):
+            shutil.copy2(info["nfs_path"], shm_path)
         return shm_path
 
     def _get_array_mmap(self, file_idx):
@@ -111,9 +112,9 @@ class ERA5_Dataset(Dataset):
             frames.append(torch.from_numpy(arr[local_idx].copy()))
         data = torch.stack(frames, dim=0)
 
-        offsets_tensor = torch.tensor(offsets, dtype=torch.float32)
-        dt_between = (offsets_tensor[1:] - offsets_tensor[:-1]) * self.frame_hours
-        return data, dt_between
+        offsets_t = torch.tensor(offsets, dtype=torch.float32)
+        dt_step = (offsets_t[1:] - offsets_t[:-1]) * self.frame_hours
+        return data, dt_step
 
     def cleanup(self):
         shutil.rmtree(self.shm_root, ignore_errors=True)
