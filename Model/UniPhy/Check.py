@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from ModelUniPhy import UniPhyModel
 
 
@@ -11,22 +10,15 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
     dtype = z_all.dtype
     states = model._init_states(B, device, dtype)
 
-    if isinstance(dt_context, (float, int)):
-        dt_ctx_val = float(dt_context)
-    else:
-        if dt_context.ndim > 0:
-            dt_ctx_val = dt_context[0].item()
-        else:
-            dt_ctx_val = dt_context.item()
+    dt_ctx_val = float(dt_context) if isinstance(dt_context, (float, int)) else dt_context.item()
 
     for t in range(T_in):
         z_in = z_all[:, t]
-        dt_t = torch.tensor(dt_ctx_val, device=device, dtype=torch.float64)
-
+        dt_t = torch.full((B,), dt_ctx_val, device=device, dtype=torch.float64)
         for i, block in enumerate(model.blocks):
             h_prev, flux_prev = states[i]
             z_in, h_next, flux_next = block.forward_step(
-                z_in, h_prev, dt_t, flux_prev
+                z_in, h_prev, dt_t, flux_prev,
             )
             states[i] = (h_next, flux_next)
 
@@ -35,17 +27,17 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
 
     preds = []
     for dt_k in dt_list:
+        dt_step = torch.full(
+            (B,), dt_k.item(), device=device, dtype=torch.float64,
+        )
         new_states = []
-        dt_k = dt_k.to(dtype=torch.float64)
-
         for i, block in enumerate(model.blocks):
             h_prev, flux_prev = states[i]
             z_curr, h_next, flux_next = block.forward_step(
-                z_curr, h_prev, dt_k, flux_prev
+                z_curr, h_prev, dt_step, flux_prev,
             )
             new_states.append((h_next, flux_next))
         states = new_states
-
         pred = model.decoder(z_curr)
         z_curr = model.encoder(pred)
         preds.append(pred)
@@ -63,7 +55,7 @@ def check_precision_robustness():
 
     model = UniPhyModel(
         in_channels=4, out_channels=4, embed_dim=64, depth=2,
-        patch_size=(4, 2), img_height=32, img_width=32, sde_mode="det"
+        patch_size=(4, 2), img_height=32, img_width=32, sde_mode="det",
     ).to(device).double()
 
     model.eval()
@@ -76,22 +68,22 @@ def check_precision_robustness():
     with torch.no_grad():
         out_parallel = model(x, dt)
 
-    out_serial = []
-    z_all = model.encoder(x)
-    dtype = z_all.dtype
-    states = model._init_states(B, device, dtype)
+        z_all = model.encoder(x)
+        dtype = z_all.dtype
+        states = model._init_states(B, device, dtype)
 
-    for t in range(T):
-        z_t = z_all[:, t]
-        dt_t = dt[:, t]
-        for i, block in enumerate(model.blocks):
-            h, f = states[i]
-            z_t, h_n, f_n = block.forward_step(z_t, h, dt_t, f)
-            states[i] = (h_n, f_n)
-        out = model.decoder(z_t)
-        out_serial.append(out)
+        out_serial = []
+        for t in range(T):
+            z_t = z_all[:, t]
+            dt_t = dt[:, t]
+            for i, block in enumerate(model.blocks):
+                h, f = states[i]
+                z_t, h_n, f_n = block.forward_step(z_t, h, dt_t, f)
+                states[i] = (h_n, f_n)
+            out = model.decoder(z_t)
+            out_serial.append(out)
 
-    out_serial = torch.stack(out_serial, dim=1)
+        out_serial = torch.stack(out_serial, dim=1)
 
     diff_1 = (out_parallel - out_serial).abs().max().item()
     print(f"Test 1 Max Diff: {diff_1:.2e}")
@@ -110,7 +102,7 @@ def check_precision_robustness():
     with torch.no_grad():
         out_optimized = model.forward_rollout(x_context, dt_context, dt_list)
         out_full_serial = full_serial_inference(
-            model, x_context, dt_context, dt_list
+            model, x_context, dt_context, dt_list,
         )
 
     diff_2 = (out_optimized - out_full_serial).abs().max().item()
@@ -130,4 +122,4 @@ def check_precision_robustness():
 if __name__ == "__main__":
     success = check_precision_robustness()
     exit(0 if success else 1)
-
+    

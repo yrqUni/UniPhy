@@ -44,33 +44,19 @@ class ComplexSVDTransform(nn.Module):
         if not x.is_complex():
             x = torch.complex(x, torch.zeros_like(x))
         W = self._get_transform_matrix(x.dtype)
-        h = torch.einsum("...d,de->...e", x, W)
-        return h
+        return torch.einsum("...d,de->...e", x, W)
 
     def decode(self, h):
         W = self._get_transform_matrix(h.dtype)
         W_inv = torch.linalg.inv(W)
-        x = torch.einsum("...d,de->...e", h, W_inv)
-        return x
-
-
-class LearnableSpectralBasis(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.transform = ComplexSVDTransform(dim)
-
-    def encode(self, x):
-        return self.transform.encode(x)
-
-    def decode(self, z):
-        return self.transform.decode(z)
+        return torch.einsum("...d,de->...e", h, W_inv)
 
 
 class GlobalFluxTracker(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, dt_ref):
         super().__init__()
         self.dim = dim
+        self.dt_ref = dt_ref
         self.decay_re = nn.Parameter(torch.randn(dim) * 0.1 - 1.0)
         self.decay_im = nn.Parameter(torch.randn(dim) * 0.1)
         self.input_mix = nn.Linear(dim * 2, dim * 2)
@@ -81,7 +67,7 @@ class GlobalFluxTracker(nn.Module):
         nn.init.zeros_(self.output_proj.bias)
         self.gate_net = nn.Sequential(
             nn.Linear(dim * 2, dim),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
         self.gate_min = 0.01
         self.gate_max = 0.99
@@ -91,77 +77,55 @@ class GlobalFluxTracker(nn.Module):
         lam_im = self.decay_im
         return torch.complex(lam_re, lam_im)
 
-    def get_transition_operators(self, dt, dt_ref=6.0):
+    def _compute_exp_operators(self, dt_ratio):
         lam = self._get_continuous_params()
-        if isinstance(dt, torch.Tensor):
-            dt_ratio = dt / dt_ref
-            if dt_ratio.ndim == 1:
-                dt_ratio = dt_ratio.unsqueeze(-1)
-            elif dt_ratio.ndim >= 2:
-                dt_ratio = dt_ratio.unsqueeze(-1)
-        else:
-            dt_ratio = dt / dt_ref
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
         lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
         forcing = torch.expm1(exp_arg) / lam_safe
         return decay, forcing
 
-    def get_scan_operators(self, x_mean_seq, dt, dt_ref=6.0):
-        B, T, D = x_mean_seq.shape
-        decay, forcing_op = self.get_transition_operators(dt, dt_ref)
-        if decay.ndim == 2:
-            decay = decay.unsqueeze(1).unsqueeze(-1)
-            forcing_op = forcing_op.unsqueeze(1).unsqueeze(-1)
-        elif decay.ndim == 3:
-            decay = decay.unsqueeze(-1)
-            forcing_op = forcing_op.unsqueeze(-1)
-        decay = decay.expand(B, T, D, 1)
-        forcing_op = forcing_op.expand(B, T, D, 1)
-        x_flat = x_mean_seq.reshape(B * T, D)
+    def _mix_input(self, x_flat):
         x_cat = torch.cat([x_flat.real, x_flat.imag], dim=-1)
         x_in = self.input_mix(x_cat)
         x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        x_complex = torch.complex(x_re, x_im).reshape(B, T, D, 1)
-        X_scan = x_complex * forcing_op
-        return decay, X_scan
+        return torch.complex(x_re, x_im)
 
-    def compute_output(self, flux_seq):
-        if flux_seq.ndim == 4:
-            flux_seq = flux_seq.squeeze(-1)
-        s_cat = torch.cat([flux_seq.real, flux_seq.imag], dim=-1)
+    def _compute_output(self, flux):
+        s_cat = torch.cat([flux.real, flux.imag], dim=-1)
         source_out = self.output_proj(s_cat)
         src_re, src_im = torch.chunk(source_out, 2, dim=-1)
-        source_seq = torch.complex(src_re, src_im)
+        source = torch.complex(src_re, src_im)
         gate = self.gate_net(s_cat)
-        gate_seq = gate * (self.gate_max - self.gate_min) + self.gate_min
-        return source_seq, gate_seq
+        gate = gate * (self.gate_max - self.gate_min) + self.gate_min
+        return source, gate
 
-    def forward_step(self, prev_state, x_t, dt, dt_ref=6.0):
-        decay, forcing_op = self.get_transition_operators(dt, dt_ref)
-        if decay.ndim > 1:
-            decay = decay.reshape(-1, self.dim)
-            forcing_op = forcing_op.reshape(-1, self.dim)
-        if not x_t.is_complex():
-            x_t = torch.complex(x_t, torch.zeros_like(x_t))
-        x_cat = torch.cat([x_t.real, x_t.imag], dim=-1)
-        x_in = self.input_mix(x_cat)
-        x_re, x_im = torch.chunk(x_in, 2, dim=-1)
-        x_mixed = torch.complex(x_re, x_im)
+    def get_scan_operators(self, x_mean_seq, dt_seq):
+        B, T, D = x_mean_seq.shape
+        dt_ratio = dt_seq.unsqueeze(-1) / self.dt_ref
+        decay, forcing_op = self._compute_exp_operators(dt_ratio)
+        decay = decay.unsqueeze(-1)
+        forcing_op = forcing_op.unsqueeze(-1)
+        x_flat = x_mean_seq.reshape(B * T, D)
+        x_mixed = self._mix_input(x_flat).reshape(B, T, D, 1)
+        X_scan = x_mixed * forcing_op
+        return decay, X_scan
+
+    def compute_output_seq(self, flux_seq):
+        return self._compute_output(flux_seq)
+
+    def forward_step(self, prev_state, x_t, dt_step):
+        B, D = prev_state.shape
+        dt_ratio = dt_step.unsqueeze(-1) / self.dt_ref
+        decay, forcing_op = self._compute_exp_operators(dt_ratio)
+        x_mixed = self._mix_input(x_t)
         new_state = prev_state * decay + x_mixed * forcing_op
-        source_seq, gate_seq = self.compute_output(new_state)
-        return new_state, source_seq, gate_seq
+        source, gate = self._compute_output(new_state)
+        return new_state, source, gate
 
 
 class TemporalPropagator(nn.Module):
-    def __init__(
-        self,
-        dim,
-        dt_ref=1.0,
-        sde_mode="sde",
-        init_noise_scale=0.01,
-        max_growth_rate=0.3,
-    ):
+    def __init__(self, dim, dt_ref, sde_mode, init_noise_scale, max_growth_rate):
         super().__init__()
         self.dim = dim
         self.dt_ref = dt_ref
@@ -169,11 +133,13 @@ class TemporalPropagator(nn.Module):
         self.init_noise_scale = init_noise_scale
         self.max_growth_rate = max_growth_rate
         self.basis = ComplexSVDTransform(dim)
-        self.flux_tracker = GlobalFluxTracker(dim)
+        self.flux_tracker = GlobalFluxTracker(dim, dt_ref)
         self.lam_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.lam_im = nn.Parameter(torch.randn(dim) * 0.1)
         if sde_mode == "sde":
-            self.base_noise = nn.Parameter(torch.ones(dim) * init_noise_scale)
+            self.base_noise = nn.Parameter(
+                torch.ones(dim) * init_noise_scale
+            )
             self.uncertainty_net = nn.Sequential(
                 nn.Linear(dim, dim // 4),
                 nn.SiLU(),
@@ -188,93 +154,110 @@ class TemporalPropagator(nn.Module):
         lam_re_bounded = -F.softplus(self.lam_re)
         return torch.complex(lam_re_bounded, self.lam_im)
 
-    def get_transition_operators(self, dt):
+    def _compute_exp_operators(self, dt_ratio):
         lam = self._get_effective_lambda()
-        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(
-            dt, device=lam.device)
-        if dt_tensor.is_complex():
-            dt_tensor = dt_tensor.real
-        if dt_tensor.ndim == 0:
-            dt_ratio = dt_tensor / self.dt_ref
-        elif dt_tensor.ndim == 1:
-            dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
-        elif dt_tensor.ndim == 2:
-            dt_ratio = dt_tensor.unsqueeze(-1) / self.dt_ref
-        else:
-            dt_ratio = dt_tensor / self.dt_ref
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
         lam_safe = lam + 1e-8 * torch.sign(lam.real + 1e-12)
         forcing = torch.expm1(exp_arg) / lam_safe
         return decay, forcing
 
-    def generate_stochastic_term(self, shape, dt, dtype, h_state=None):
+    def get_transition_operators_seq(self, dt_seq):
+        dt_ratio = dt_seq.unsqueeze(-1) / self.dt_ref
+        return self._compute_exp_operators(dt_ratio)
+
+    def get_transition_operators_step(self, dt_step):
+        dt_ratio = dt_step.unsqueeze(-1) / self.dt_ref
+        return self._compute_exp_operators(dt_ratio)
+
+    def generate_stochastic_term_seq(self, shape, dt_seq, dtype, h_state):
         if self.sde_mode != "sde":
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
+        B, T, H, W, D = shape
         device = self.lam_re.device
         lam = self._get_effective_lambda()
         lam_re = lam.real
-        dt_tensor = dt if isinstance(dt, torch.Tensor) else torch.tensor(
-            dt, device=device)
-        if dt_tensor.is_complex():
-            dt_tensor = dt_tensor.real
-
-        ndim = len(shape)
-        param_shape = [1] * ndim
-        param_shape[-1] = -1
-
-        lam_re_exp = lam_re.view(*param_shape)
-        exp_term = torch.exp(2 * lam_re_exp * dt_tensor)
-        denom = 2 * lam_re_exp
+        dt_real = dt_seq.real if dt_seq.is_complex() else dt_seq
+        dt_expanded = dt_real.reshape(B, T, 1, 1, 1)
+        lam_re_expanded = lam_re.reshape(1, 1, 1, 1, D)
+        exp_term = torch.exp(2 * lam_re_expanded * dt_expanded)
+        denom = 2 * lam_re_expanded
         denom_safe = denom + 1e-8 * torch.sign(denom)
         variance_factor = (exp_term - 1.0) / denom_safe
         std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
-
-        base_noise_expanded = self.base_noise.abs().view(*param_shape)
+        base_noise_expanded = self.base_noise.abs().reshape(1, 1, 1, 1, D)
         final_scale = base_noise_expanded * std_scale
-
         noise_re = torch.randn(shape, device=device, dtype=torch.float32)
         noise_im = torch.randn(shape, device=device, dtype=torch.float32)
-
         if h_state is not None and self.uncertainty_net is not None:
             h_mag = h_state.abs()
             factor = self.uncertainty_net(h_mag) * 2.0
             final_scale = final_scale * factor
-
         if dtype.is_complex:
-            return torch.complex(noise_re * final_scale, noise_im * final_scale)
+            return torch.complex(
+                noise_re * final_scale, noise_im * final_scale
+            )
+        return noise_re * final_scale
+
+    def generate_stochastic_term_step(self, shape, dt_step, dtype, h_state):
+        if self.sde_mode != "sde":
+            return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
+        B, H, W, D = shape
+        device = self.lam_re.device
+        lam = self._get_effective_lambda()
+        lam_re = lam.real
+        dt_real = dt_step.real if dt_step.is_complex() else dt_step
+        dt_expanded = dt_real.reshape(B, 1, 1, 1)
+        lam_re_expanded = lam_re.reshape(1, 1, 1, D)
+        exp_term = torch.exp(2 * lam_re_expanded * dt_expanded)
+        denom = 2 * lam_re_expanded
+        denom_safe = denom + 1e-8 * torch.sign(denom)
+        variance_factor = (exp_term - 1.0) / denom_safe
+        std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
+        base_noise_expanded = self.base_noise.abs().reshape(1, 1, 1, D)
+        final_scale = base_noise_expanded * std_scale
+        noise_re = torch.randn(shape, device=device, dtype=torch.float32)
+        noise_im = torch.randn(shape, device=device, dtype=torch.float32)
+        if h_state is not None and self.uncertainty_net is not None:
+            h_mag = h_state.abs()
+            factor = self.uncertainty_net(h_mag) * 2.0
+            final_scale = final_scale * factor
+        if dtype.is_complex:
+            return torch.complex(
+                noise_re * final_scale, noise_im * final_scale
+            )
         return noise_re * final_scale
 
 
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        padding=1,
-        img_height=64,
-        img_width=64,
+        self, in_channels, out_channels, kernel_size, padding, img_height,
+        img_width,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.conv_e0 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
+            in_channels, out_channels, kernel_size, padding=padding, bias=False
+        )
         self.conv_e1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
+            in_channels, out_channels, kernel_size, padding=padding, bias=False
+        )
         self.conv_e2 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
+            in_channels, out_channels, kernel_size, padding=padding, bias=False
+        )
         self.conv_e12 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding, bias=False)
+            in_channels, out_channels, kernel_size, padding=padding, bias=False
+        )
         self.smooth_conv = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, padding=1)
+            out_channels, out_channels, kernel_size=3, padding=1
+        )
         self.bias = nn.Parameter(torch.zeros(out_channels))
         lat = torch.linspace(-math.pi / 2, math.pi / 2, img_height)
-        self.register_buffer("cos_lat", torch.cos(lat).view(1, 1, -1, 1))
+        self.register_buffer(
+            "cos_lat", torch.cos(lat).view(1, 1, img_height, 1)
+        )
         self.metric_scale = nn.Parameter(torch.tensor(1.0))
-        self.viscosity_scale = nn.Parameter(torch.tensor(0.1))
-        self.dispersion_scale = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -282,11 +265,7 @@ class RiemannianCliffordConv2d(nn.Module):
         y_e1 = self.conv_e1(x)
         y_e2 = self.conv_e2(x)
         y_e12 = self.conv_e12(x)
-        cos_lat = self.cos_lat
-        if H != self.cos_lat.shape[2]:
-            cos_lat = F.interpolate(
-                cos_lat, size=(H, 1), mode="bilinear", align_corners=False)
-        cos_lat = cos_lat.expand(B, -1, H, W)
+        cos_lat = self.cos_lat.expand(B, 1, H, W)
         cos_lat_safe = torch.clamp(cos_lat, min=1e-6)
         y_e1_scaled = y_e1 * cos_lat_safe
         y_e12_scaled = y_e12 * cos_lat_safe
@@ -295,4 +274,4 @@ class RiemannianCliffordConv2d(nn.Module):
         out = out + self.bias.view(1, -1, 1, 1)
         out = self.smooth_conv(out)
         return out
-
+    
