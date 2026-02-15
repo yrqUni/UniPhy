@@ -210,7 +210,7 @@ def align(cfg):
     )
 
     use_wandb = init_wandb(cfg) if is_main() else False
-    sampler = DistributedSampler(align_dataset, shuffle=True) if world_size > 1 else None
+    sampler = DistributedSampler(align_dataset, shuffle=False) if world_size > 1 else None
     dataloader = DataLoader(
         align_dataset,
         batch_size=int(cfg["train"]["batch_size"]),

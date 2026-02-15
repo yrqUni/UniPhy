@@ -206,7 +206,7 @@ def train(cfg):
     )
 
     use_wandb = init_wandb(cfg) if is_main() else False
-    sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
+    sampler = DistributedSampler(train_dataset, shuffle=False) if world_size > 1 else None
     dataloader = DataLoader(
         train_dataset,
         batch_size=int(cfg["train"]["batch_size"]),

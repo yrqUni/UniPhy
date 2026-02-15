@@ -35,7 +35,7 @@ def test_full_epoch(input_dir, year_range, batch_size=4, num_workers=4):
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=True,
+        shuffle=False,
         drop_last=True
     )
 
