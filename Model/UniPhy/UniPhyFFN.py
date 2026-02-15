@@ -37,11 +37,18 @@ class ComplexConvFFN(nn.Module):
         hidden_dim = int(dim * expand)
         self.fc1_re = nn.Conv2d(dim, hidden_dim, 1)
         self.fc1_im = nn.Conv2d(dim, hidden_dim, 1)
-        self.dw_conv_re = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False)
-        self.dw_conv_im = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False)
+        self.dw_conv_re = nn.Conv2d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False
+        )
+        self.dw_conv_im = nn.Conv2d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False
+        )
         self.fc2_re = nn.Conv2d(hidden_dim, dim, 1)
         self.fc2_im = nn.Conv2d(hidden_dim, dim, 1)
         self._init_weights()
+        for param in self.parameters():
+            if param.requires_grad:
+                param.register_hook(lambda grad: grad.contiguous())
 
     def _init_weights(self):
         nn.init.xavier_uniform_(self.fc1_re.weight)
@@ -94,3 +101,4 @@ class UniPhyFeedForwardNetwork(nn.Module):
         delta_centered = delta - delta_mean * self.centering_scale
         delta_out = self.post_norm(delta_centered) * self.output_scale
         return delta_out
+    
