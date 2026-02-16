@@ -49,7 +49,7 @@ class UniPhyBlock(nn.Module):
         x_flat = self._apply_spatial(x_flat)
         x = x_flat.reshape(B, T, D, H, W)
 
-        basis_W = self.prop.basis.get_matrix(torch.complex64)
+        basis_W, basis_W_inv = self.prop.basis.get_matrix(torch.complex64)
 
         x_perm = x.permute(0, 1, 3, 4, 2)
         x_eigen = self.prop.basis.encode_with(x_perm, basis_W)
@@ -100,7 +100,7 @@ class UniPhyBlock(nn.Module):
         h_out = u_out[:, -1].reshape(B * H * W, 1, D)
 
         decoded = self.prop.basis.decode_with(
-            u_out, basis_W,
+            u_out, basis_W_inv,
         ).permute(0, 1, 4, 2, 3)
         decoded_flat = decoded.reshape(B * T, D, H, W)
         x_out_flat = self._apply_temporal_decode(decoded_flat)
@@ -113,7 +113,7 @@ class UniPhyBlock(nn.Module):
 
         x_curr = self._apply_spatial(x_curr)
 
-        basis_W = self.prop.basis.get_matrix(torch.complex64)
+        basis_W, basis_W_inv = self.prop.basis.get_matrix(torch.complex64)
 
         x_eigen = self.prop.basis.encode_with(
             x_curr.permute(0, 2, 3, 1), basis_W,
@@ -144,7 +144,7 @@ class UniPhyBlock(nn.Module):
 
         h_next = h_prev_hw * op_decay + forcing * op_forcing + noise
         x_out = self.prop.basis.decode_with(
-            h_next, basis_W,
+            h_next, basis_W_inv,
         ).permute(0, 3, 1, 2)
 
         x_out = self._apply_temporal_decode(x_out)
