@@ -12,5 +12,3 @@ __pycache__/
 *.jpeg
 *.DS_Store
 wandb/
-uniphy/
-
