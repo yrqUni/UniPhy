@@ -230,7 +230,7 @@ class UniPhyModel(nn.Module):
             return dt.expand(B).contiguous()
         return dt
 
-    def forward(self, x, dt, member_idx=None):
+    def forward(self, x, dt, member_idx=None, return_latent=False):
         B, T = x.shape[0], x.shape[1]
         dt_seq = self._normalize_dt_seq(dt, B, T, x.device)
         z = self.encoder(x)
@@ -241,7 +241,10 @@ class UniPhyModel(nn.Module):
                 z, states[i][0], dt_seq, states[i][1],
             )
             states[i] = (h_next, flux_next)
-        return self.decoder(z, member_idx=member_idx)
+        out = self.decoder(z, member_idx=member_idx)
+        if return_latent:
+            return out, z
+        return out
 
     def forward_rollout(self, x_context, dt_context, dt_list):
         B, T_in = x_context.shape[0], x_context.shape[1]

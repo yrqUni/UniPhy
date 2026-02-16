@@ -17,24 +17,30 @@ class ComplexSVDTransform(nn.Module):
         k = torch.arange(dim).float().reshape(-1, 1)
         dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
         self.register_buffer("dft_basis", dft_matrix)
+        self.register_buffer(
+            "dft_basis_inv", dft_matrix.conj().T.contiguous(),
+        )
         self.dft_weight = nn.Parameter(torch.tensor(0.0))
 
-    def _cayley_orthogonalize(self, raw_re, raw_im):
+    def _unitary_from_skew(self, raw_re, raw_im):
         A = torch.complex(raw_re, raw_im)
         A_skew = A - A.T.conj()
-        I = torch.eye(self.dim, device=A.device, dtype=A.dtype)
-        Q = torch.linalg.solve(I + A_skew, I - A_skew)
-        return Q
+        return torch.matrix_exp(A_skew)
 
     def get_matrix(self, dtype):
-        U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
-        V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
+        U = self._unitary_from_skew(self.u_raw_re, self.u_raw_im)
+        V = self._unitary_from_skew(self.v_raw_re, self.v_raw_im)
         S = torch.exp(self.log_sigma)
+        S_inv = torch.exp(-self.log_sigma)
         alpha = torch.sigmoid(self.dft_weight)
-        learned = U @ torch.diag(S.to(U.dtype)) @ V.conj().T
-        dft_basis = self.dft_basis.to(dtype=dtype)
-        W = learned * (1 - alpha) + dft_basis * alpha
-        W_inv = torch.linalg.inv(W)
+        S_c = S.to(U.dtype)
+        S_inv_c = S_inv.to(U.dtype)
+        W_learned = U @ torch.diag(S_c) @ V.conj().T
+        W_learned_inv = V @ torch.diag(S_inv_c) @ U.conj().T
+        dft = self.dft_basis.to(dtype=dtype)
+        dft_inv = self.dft_basis_inv.to(dtype=dtype)
+        W = W_learned * (1 - alpha) + dft * alpha
+        W_inv = W_learned_inv * (1 - alpha) + dft_inv * alpha
         return W, W_inv
 
     def encode_with(self, x, W):
