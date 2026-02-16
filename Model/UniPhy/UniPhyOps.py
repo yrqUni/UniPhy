@@ -26,7 +26,7 @@ class ComplexSVDTransform(nn.Module):
         Q = torch.linalg.solve(I + A_skew, I - A_skew)
         return Q
 
-    def _get_transform_matrix(self, dtype):
+    def get_matrix(self, dtype):
         U = self._cayley_orthogonalize(self.u_raw_re, self.u_raw_im)
         V = self._cayley_orthogonalize(self.v_raw_re, self.v_raw_im)
         S = torch.exp(self.log_sigma)
@@ -35,17 +35,25 @@ class ComplexSVDTransform(nn.Module):
         dft_basis = self.dft_basis.to(dtype=dtype)
         return learned * (1 - alpha) + dft_basis * alpha
 
-    def encode(self, x):
+    def encode_with(self, x, W):
         if not x.is_complex():
             x = torch.complex(x, torch.zeros_like(x))
-        W = self._get_transform_matrix(x.dtype)
         return torch.einsum("...d,de->...e", x, W)
 
-    def decode(self, h):
-        W = self._get_transform_matrix(h.dtype)
+    def decode_with(self, h, W):
         h_flat = h.reshape(-1, self.dim)
         sol = torch.linalg.solve(W.T, h_flat.T).T
         return sol.reshape(h.shape)
+
+    def encode(self, x):
+        W = self.get_matrix(
+            x.dtype if x.is_complex() else torch.complex64,
+        )
+        return self.encode_with(x, W)
+
+    def decode(self, h):
+        W = self.get_matrix(h.dtype)
+        return self.decode_with(h, W)
 
 
 def _safe_forcing(exp_arg, eps=1e-7):
