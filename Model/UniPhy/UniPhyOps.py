@@ -8,39 +8,18 @@ class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.u_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.u_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.v_raw_re = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.v_raw_im = nn.Parameter(torch.randn(dim, dim) * 0.02)
-        self.log_sigma = nn.Parameter(torch.zeros(dim))
         n = torch.arange(dim).float()
         k = torch.arange(dim).float().reshape(-1, 1)
-        dft_matrix = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
-        self.register_buffer("dft_basis", dft_matrix)
-        self.register_buffer(
-            "dft_basis_inv", dft_matrix.conj().T.contiguous(),
-        )
-        self.dft_weight = nn.Parameter(torch.tensor(0.0))
-
-    def _unitary_from_skew(self, raw_re, raw_im):
-        A = torch.complex(raw_re, raw_im)
-        A_skew = A - A.T.conj()
-        return torch.matrix_exp(A_skew)
+        dft = torch.exp(-2j * torch.pi * n * k / dim) / (dim ** 0.5)
+        dft_inv = dft.conj().T.contiguous()
+        self.w_re = nn.Parameter(dft.real.clone())
+        self.w_im = nn.Parameter(dft.imag.clone())
+        self.w_inv_re = nn.Parameter(dft_inv.real.clone())
+        self.w_inv_im = nn.Parameter(dft_inv.imag.clone())
 
     def get_matrix(self, dtype):
-        U = self._unitary_from_skew(self.u_raw_re, self.u_raw_im)
-        V = self._unitary_from_skew(self.v_raw_re, self.v_raw_im)
-        S = torch.exp(self.log_sigma)
-        S_inv = torch.exp(-self.log_sigma)
-        alpha = torch.sigmoid(self.dft_weight)
-        S_c = S.to(U.dtype)
-        S_inv_c = S_inv.to(U.dtype)
-        W_learned = U @ torch.diag(S_c) @ V.conj().T
-        W_learned_inv = V @ torch.diag(S_inv_c) @ U.conj().T
-        dft = self.dft_basis.to(dtype=dtype)
-        dft_inv = self.dft_basis_inv.to(dtype=dtype)
-        W = W_learned * (1 - alpha) + dft * alpha
-        W_inv = W_learned_inv * (1 - alpha) + dft_inv * alpha
+        W = torch.complex(self.w_re, self.w_im).clone()
+        W_inv = torch.complex(self.w_inv_re, self.w_inv_im).clone()
         return W, W_inv
 
     def encode_with(self, x, W):

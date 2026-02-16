@@ -6,6 +6,8 @@ import logging
 
 import numpy as np
 import torch
+torch.autograd.set_detect_anomaly(True)
+
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
