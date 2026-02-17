@@ -6,8 +6,6 @@ import logging
 
 import numpy as np
 import torch
-torch.autograd.set_detect_anomaly(True)
-
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -271,7 +269,7 @@ def train(cfg):
         ensemble_size=cfg["model"]["ensemble_size"],
     ).cuda()
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
