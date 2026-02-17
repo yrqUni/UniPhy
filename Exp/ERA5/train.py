@@ -86,8 +86,7 @@ def compute_crps(pred_ensemble, target):
                 total_diff = total_diff + (
                     pred_ensemble[i] - pred_ensemble[j]
                 ).abs().mean()
-        n_pairs = M * (M - 1) / 2
-        loss = mae - (1.0 / M) * (total_diff / n_pairs)
+        loss = mae - total_diff / (M * M * 2)
     else:
         loss = mae
     return loss
@@ -112,7 +111,8 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
     else:
         member_idx = None
 
-    out = model(x_input, dt_input, member_idx=member_idx)
+    out, z_latent = model(x_input, dt_input, member_idx=member_idx,
+                          return_latent=True)
 
     out_real = out.real.contiguous() if out.is_complex() else out.contiguous()
 
@@ -121,12 +121,14 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
 
     if ensemble_size > 1:
         ensemble_preds = [out_real]
+        infer_model = model.module if hasattr(model, "module") else model
         with torch.no_grad():
+            z_det = z_latent.detach()
             for _ in range(ensemble_size - 1):
                 rand_idx = torch.randint(
                     0, ensemble_size, (B,), device=device,
                 )
-                out_ens = model(x_input, dt_input, member_idx=rand_idx)
+                out_ens = infer_model.decoder(z_det, member_idx=rand_idx)
                 ens_real = (
                     out_ens.real.contiguous()
                     if out_ens.is_complex()
@@ -141,6 +143,14 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
         crps_loss = torch.tensor(0.0, device=device)
         ensemble_std = torch.tensor(0.0, device=device)
         loss = l1_loss
+
+    basis_reg = torch.tensor(0.0, device=device)
+    base_model = model.module if hasattr(model, "module") else model
+    for block in base_model.blocks:
+        W, W_inv = block.prop.basis.get_matrix(torch.complex64)
+        eye = torch.eye(W.shape[0], device=device, dtype=W.dtype)
+        basis_reg = basis_reg + (W @ W_inv - eye).abs().mean()
+    loss = loss + 0.01 * basis_reg
 
     loss_scaled = loss / grad_accum_steps
     loss_scaled.backward()
@@ -300,11 +310,19 @@ def train(cfg):
         drop_last=True,
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        weight_decay=cfg["train"]["weight_decay"],
-    )
+    basis_params = []
+    other_params = []
+    basis_keys = {"w_re", "w_im", "w_inv_re", "w_inv_im"}
+    for name, p in model.named_parameters():
+        if any(name.endswith("." + k) for k in basis_keys):
+            basis_params.append(p)
+        else:
+            other_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {"params": other_params, "weight_decay": cfg["train"]["weight_decay"]},
+        {"params": basis_params, "weight_decay": 0.0},
+    ], lr=float(cfg["train"]["lr"]))
 
     grad_accum_steps = cfg["train"]["grad_accum_steps"]
     epochs = cfg["train"]["epochs"]

@@ -118,10 +118,6 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
 
     grad_norm = 0.0
     if (batch_idx + 1) % grad_accum_steps == 0:
-        if dist.is_initialized():
-            for param in model.parameters():
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg["train"]["grad_clip"],
         ).item()
@@ -163,10 +159,6 @@ def save_checkpoint(model, optimizer, epoch, global_step, cfg, path):
 
 def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
     if (batch_idx + 1) % grad_accum_steps != 0:
-        if dist.is_initialized():
-            for param in model.parameters():
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg["train"]["grad_clip"],
         )
@@ -240,7 +232,7 @@ def align(cfg):
         }
         model.load_state_dict(clean_state, strict=False)
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -271,11 +263,19 @@ def align(cfg):
         drop_last=True,
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        weight_decay=cfg["train"]["weight_decay"],
-    )
+    basis_params = []
+    other_params = []
+    basis_keys = {"w_re", "w_im", "w_inv_re", "w_inv_im"}
+    for name, p in model.named_parameters():
+        if any(name.endswith("." + k) for k in basis_keys):
+            basis_params.append(p)
+        else:
+            other_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {"params": other_params, "weight_decay": cfg["train"]["weight_decay"]},
+        {"params": basis_params, "weight_decay": 0.0},
+    ], lr=float(cfg["train"]["lr"]))
 
     grad_accum_steps = cfg["train"]["grad_accum_steps"]
     epochs = cfg["train"]["epochs"]

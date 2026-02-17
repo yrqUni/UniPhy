@@ -41,11 +41,11 @@ class ComplexSVDTransform(nn.Module):
         return self.decode_with(h, W_inv)
 
 
-def _safe_forcing(exp_arg, eps=1e-7):
-    safe_denom = exp_arg + eps * torch.sign(
-        exp_arg.real + eps
-    ).to(exp_arg.dtype)
-    return torch.expm1(exp_arg) / safe_denom
+def _safe_forcing(exp_arg, lam, eps=1e-7):
+    safe_lam = lam + eps * torch.sign(
+        lam.real + eps
+    ).to(lam.dtype)
+    return torch.expm1(exp_arg) / safe_lam
 
 
 class GlobalFluxTracker(nn.Module):
@@ -73,7 +73,7 @@ class GlobalFluxTracker(nn.Module):
         lam = self._get_continuous_params()
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
-        forcing = _safe_forcing(exp_arg)
+        forcing = _safe_forcing(exp_arg, lam)
         return decay, forcing
 
     def _mix_input(self, x_flat):
@@ -147,7 +147,7 @@ class TemporalPropagator(nn.Module):
         lam = self._get_effective_lambda()
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
-        forcing = _safe_forcing(exp_arg)
+        forcing = _safe_forcing(exp_arg, lam)
         return decay, forcing
 
     def get_transition_operators_seq(self, dt_seq):
