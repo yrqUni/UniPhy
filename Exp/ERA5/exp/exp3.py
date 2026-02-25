@@ -1,11 +1,12 @@
 import os
 import sys
-import torch
+import warnings
+
+import matplotlib.pyplot as plt
 import numpy as np
 import scipy.linalg
-import matplotlib.pyplot as plt
 import seaborn as sns
-import warnings
+import torch
 
 warnings.filterwarnings("ignore")
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
@@ -14,58 +15,51 @@ sys.path.append("/nfs/UniPhy/Exp/ERA5")
 from ModelUniPhy import UniPhyModel
 
 
+VALID_ARGS = {
+    "in_channels",
+    "out_channels",
+    "embed_dim",
+    "expand",
+    "depth",
+    "patch_size",
+    "img_height",
+    "img_width",
+    "dt_ref",
+    "sde_mode",
+    "init_noise_scale",
+    "ensemble_size",
+}
+
+
 def load_config_and_model(ckpt_path, device):
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "cfg" in checkpoint:
         model_cfg = checkpoint["cfg"]["model"]
     else:
         model_cfg = {
             "in_channels": 30,
             "out_channels": 30,
-            "embed_dim": 512,
+            "embed_dim": 256,
             "expand": 4,
             "depth": 8,
-            "patch_size": (7, 15),
+            "patch_size": [7, 15],
             "img_height": 721,
             "img_width": 1440,
             "dt_ref": 6.0,
             "sde_mode": "sde",
             "init_noise_scale": 0.0001,
-            "max_growth_rate": 0.3,
             "ensemble_size": 4,
         }
-
-    valid_args = {
-        "in_channels",
-        "out_channels",
-        "embed_dim",
-        "expand",
-        "depth",
-        "patch_size",
-        "img_height",
-        "img_width",
-        "dt_ref",
-        "sde_mode",
-        "init_noise_scale",
-        "ensemble_size",
-        "max_growth_rate",
-        "num_experts",
-    }
-    filtered_cfg = {k: v for k, v in model_cfg.items() if k in valid_args}
-
+    filtered_cfg = {k: v for k, v in model_cfg.items() if k in VALID_ARGS}
+    if "patch_size" in filtered_cfg:
+        filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
     model = UniPhyModel(**filtered_cfg).to(device)
     state_dict = checkpoint["model"]
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        name = k.replace("module.", "")
-        new_state_dict[name] = v
-    model.load_state_dict(new_state_dict, strict=False)
+    clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(clean_state, strict=False)
     model.eval()
-
     return model, model_cfg
 
 
@@ -73,14 +67,26 @@ def extract_block_timescales(block, dim, num_modes, h_p, w_p, device):
     eff_dim = min(dim, num_modes)
     probe = torch.eye(dim, device=device)[:eff_dim]
     probe_input = probe.view(eff_dim, dim, 1, 1).expand(-1, -1, h_p, w_p)
+    probe_complex = torch.complex(probe_input, torch.zeros_like(probe_input))
 
-    h_prev = torch.zeros(eff_dim, h_p, w_p, dim, device=device)
-    flux_prev = torch.zeros(eff_dim, dim, device=device)
+    h_prev = torch.zeros(
+        eff_dim * h_p * w_p, 1, dim,
+        device=device,
+        dtype=torch.complex64,
+    )
+    flux_prev = torch.zeros(
+        eff_dim, dim,
+        device=device,
+        dtype=torch.complex64,
+    )
     dt = torch.tensor(1.0, device=device)
 
     with torch.no_grad():
-        z_out, _, _ = block.forward_step(probe_input, h_prev, dt, flux_prev)
-        a_matrix = z_out.mean(dim=[-1, -2])[:, :eff_dim].cpu().numpy()
+        z_out, _, _ = block.forward_step(
+            probe_complex, h_prev, dt, flux_prev,
+        )
+    z_real = z_out.real if z_out.is_complex() else z_out
+    a_matrix = z_real.mean(dim=[-1, -2])[:, :eff_dim].cpu().numpy()
 
     try:
         l_matrix = scipy.linalg.logm(a_matrix)
@@ -104,12 +110,7 @@ def extract_block_timescales(block, dim, num_modes, h_p, w_p, device):
 
 def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    try:
-        model, cfg = load_config_and_model(ckpt_path, device)
-    except Exception as e:
-        print(f"Error: {e}")
-        return
+    model, cfg = load_config_and_model(ckpt_path, device)
 
     print("Scanning all blocks for hierarchical memory structure...")
 
@@ -118,12 +119,8 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
 
     for i, block in enumerate(model.blocks):
         taus = extract_block_timescales(
-            block,
-            model.embed_dim,
-            64,
-            model.h_patches,
-            model.w_patches,
-            device,
+            block, model.embed_dim, 64,
+            model.h_patches, model.w_patches, device,
         )
         all_taus.append(taus)
         block_taus[f"Block {i}"] = taus
@@ -159,7 +156,6 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
 
     ax1 = axes[0]
-
     sns.kdeplot(
         tau_days_viz,
         fill=True,
@@ -171,7 +167,6 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
         bw_adjust=0.6,
         ax=ax1,
     )
-
     current_ylim = ax1.get_ylim()
     ax1.set_ylim(0, current_ylim[1] * 1.2)
     y_max = ax1.get_ylim()[1]
@@ -186,7 +181,10 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
         color="#333333",
         fontweight="medium",
         bbox=dict(
-            boxstyle="round,pad=0.3", fc="white", ec="#dddddd", alpha=0.85
+            boxstyle="round,pad=0.3",
+            fc="white",
+            ec="#dddddd",
+            alpha=0.85,
         ),
     )
     ax1.text(2.5, y_max * 0.96, "Synoptic\n(< 5 days)", **text_style)
@@ -226,15 +224,12 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
             block_data.append(clipped_taus)
             median_values.append(np.median(clipped_taus))
 
-    colors = []
     cmap = plt.cm.RdYlGn_r
     norm_vals = np.array(median_values)
     norm_vals = (norm_vals - norm_vals.min()) / (
         norm_vals.max() - norm_vals.min() + 1e-8
     )
-
-    for nv in norm_vals:
-        colors.append(cmap(nv * 0.8 + 0.1))
+    colors = [cmap(nv * 0.8 + 0.1) for nv in norm_vals]
 
     bp = ax2.boxplot(
         block_data,
@@ -254,20 +249,12 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
         median.set_linewidth(2)
 
     ax2.axhline(
-        y=5,
-        color="#888888",
-        linestyle="--",
-        alpha=0.6,
-        linewidth=1,
-        label="5-day threshold",
+        y=5, color="#888888", linestyle="--",
+        alpha=0.6, linewidth=1, label="5-day threshold",
     )
     ax2.axhline(
-        y=20,
-        color="#888888",
-        linestyle=":",
-        alpha=0.6,
-        linewidth=1,
-        label="20-day threshold",
+        y=20, color="#888888", linestyle=":",
+        alpha=0.6, linewidth=1, label="20-day threshold",
     )
 
     ax2.set_xlabel("Network Depth")
@@ -287,6 +274,7 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     cbar.set_label("Median Timescale (Days)", fontsize=10)
 
     plt.tight_layout()
+
     plt.savefig(save_path, format="pdf", dpi=300, bbox_inches="tight")
     print(f"\nFigure saved to {save_path}")
 
@@ -294,10 +282,9 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     plt.savefig(png_path, format="png", dpi=300, bbox_inches="tight")
     print(f"PNG version saved to {png_path}")
 
-    plt.show()
+    plt.close(fig)
 
 
 if __name__ == "__main__":
     ckpt_file = "./uniphy/align_ckpt/align_epoch10.pt"
     analyze_memory_timescales(ckpt_file)
-
