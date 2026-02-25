@@ -258,3 +258,4 @@ class RiemannianCliffordConv2d(nn.Module):
         out = out + self.bias.view(1, -1, 1, 1)
         out = self.smooth_conv(out)
         return out
+    

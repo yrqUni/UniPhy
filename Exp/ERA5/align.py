@@ -99,6 +99,8 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     infer_model = model.module if hasattr(model, "module") else model
 
     pred_seq = infer_model.forward_rollout(x_ctx, dt_ctx, dt_list)
+    if pred_seq.is_complex():
+        pred_seq = pred_seq.real
 
     if sub_step > 1:
         pred_aligned = pred_seq[:, sub_step - 1::sub_step]
@@ -232,7 +234,7 @@ def align(cfg):
         }
         model.load_state_dict(clean_state, strict=False)
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],

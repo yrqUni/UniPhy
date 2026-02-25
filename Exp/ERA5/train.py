@@ -86,7 +86,7 @@ def compute_crps(pred_ensemble, target):
                 total_diff = total_diff + (
                     pred_ensemble[i] - pred_ensemble[j]
                 ).abs().mean()
-        loss = mae - total_diff / (M * M * 2)
+        loss = mae - total_diff / (M * M)
     else:
         loss = mae
     return loss
@@ -279,7 +279,7 @@ def train(cfg):
         ensemble_size=cfg["model"]["ensemble_size"],
     ).cuda()
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
