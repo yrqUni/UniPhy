@@ -242,7 +242,7 @@ def align(cfg):
         }
         model.load_state_dict(clean_state, strict=False)
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
