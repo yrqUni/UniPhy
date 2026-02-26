@@ -1,4 +1,3 @@
-import os
 import sys
 import warnings
 
@@ -11,55 +10,7 @@ warnings.filterwarnings("ignore")
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
-from ModelUniPhy import UniPhyModel
-
-
-VALID_ARGS = {
-    "in_channels",
-    "out_channels",
-    "embed_dim",
-    "expand",
-    "depth",
-    "patch_size",
-    "img_height",
-    "img_width",
-    "dt_ref",
-    "sde_mode",
-    "init_noise_scale",
-    "ensemble_size",
-}
-
-
-def load_config_and_model(ckpt_path, device):
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "cfg" in checkpoint:
-        model_cfg = checkpoint["cfg"]["model"]
-    else:
-        model_cfg = {
-            "in_channels": 30,
-            "out_channels": 30,
-            "embed_dim": 256,
-            "expand": 4,
-            "depth": 8,
-            "patch_size": [7, 15],
-            "img_height": 721,
-            "img_width": 1440,
-            "dt_ref": 6.0,
-            "sde_mode": "sde",
-            "init_noise_scale": 0.0001,
-            "ensemble_size": 4,
-        }
-    filtered_cfg = {k: v for k, v in model_cfg.items() if k in VALID_ARGS}
-    if "patch_size" in filtered_cfg:
-        filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
-    model = UniPhyModel(**filtered_cfg).to(device)
-    state_dict = checkpoint["model"]
-    clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_state, strict=False)
-    model.eval()
-    return model, model_cfg
+from exp_utils import get_device, load_config_and_model
 
 
 def extract_block_operator(block, dim, h_p, w_p, device, num_modes=64):
@@ -71,13 +22,10 @@ def extract_block_operator(block, dim, h_p, w_p, device, num_modes=64):
     probe_complex = torch.complex(probe_input, torch.zeros_like(probe_input))
     h_prev = torch.zeros(
         effective_dim * h_p * w_p, 1, dim,
-        device=device,
-        dtype=torch.complex64,
+        device=device, dtype=torch.complex64,
     )
     flux_prev = torch.zeros(
-        effective_dim, dim,
-        device=device,
-        dtype=torch.complex64,
+        effective_dim, dim, device=device, dtype=torch.complex64,
     )
     dt = torch.tensor(1.0, device=device)
     with torch.no_grad():
@@ -113,7 +61,7 @@ def analyze_transient_growth(l_matrix, time_horizon=48, dt=0.5):
 
 
 def plot_spectral_analysis(ckpt_path, save_path="transient_growth.pdf"):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     model, cfg = load_config_and_model(ckpt_path, device)
 
     print("Scanning all blocks for spectral properties...")
@@ -161,14 +109,10 @@ def plot_spectral_analysis(ckpt_path, save_path="transient_growth.pdf"):
         "legend.edgecolor": "0.7",
     })
 
-    fig_width = 7.5
-    fig_height = 3.4
-    fig = plt.figure(figsize=(fig_width, fig_height), dpi=600)
+    fig = plt.figure(figsize=(7.5, 3.4), dpi=600)
     fig.suptitle(
         "Spectral Evidence of Transient Instability (All Layers)",
-        fontsize=13,
-        fontweight="bold",
-        y=1.02,
+        fontsize=13, fontweight="bold", y=1.02,
     )
 
     ax1 = fig.add_axes([0.08, 0.15, 0.38, 0.70])
@@ -185,39 +129,28 @@ def plot_spectral_analysis(ckpt_path, save_path="transient_growth.pdf"):
     ax1.set_ylabel("Imaginary Part (Frequency)")
     ax1.set_title(
         r"(a) Global Spectrum (Re $\lambda < 0$)",
-        fontsize=10,
-        fontweight="normal",
-        pad=12,
+        fontsize=10, fontweight="normal", pad=12,
     )
     ax1.grid(True, linestyle=":", alpha=0.4, linewidth=0.5)
     ax1.set_axisbelow(True)
 
     props_a = dict(
-        boxstyle="round,pad=0.3",
-        facecolor="#e8f4e8",
-        edgecolor="0.7",
-        alpha=0.95,
-        linewidth=0.5,
+        boxstyle="round,pad=0.3", facecolor="#e8f4e8",
+        edgecolor="0.7", alpha=0.95, linewidth=0.5,
     )
     ax1.text(
-        0.05, 0.95,
-        "Stable\nRegion",
-        transform=ax1.transAxes,
-        fontsize=9,
-        verticalalignment="top",
-        horizontalalignment="left",
-        fontweight="bold",
-        alpha=0.9,
-        bbox=props_a,
+        0.05, 0.95, "Stable\nRegion",
+        transform=ax1.transAxes, fontsize=9,
+        verticalalignment="top", horizontalalignment="left",
+        fontweight="bold", alpha=0.9, bbox=props_a,
     )
 
     for i, curve in enumerate(all_growth_curves):
         if i == best_layer_idx:
             continue
         ax2.plot(
-            common_t, curve,
-            color="#c0392b", linewidth=1.0,
-            alpha=0.15, zorder=2,
+            common_t, curve, color="#c0392b",
+            linewidth=1.0, alpha=0.15, zorder=2,
         )
 
     ax2.plot(
@@ -239,46 +172,29 @@ def plot_spectral_analysis(ckpt_path, save_path="transient_growth.pdf"):
     initial_val = all_growth_curves[best_layer_idx][0]
     if peak_idx > 0 and peak_e > initial_val * 1.05:
         props_b = dict(
-            boxstyle="round,pad=0.3",
-            facecolor="white",
-            edgecolor="#c0392b",
-            alpha=0.95,
-            linewidth=0.8,
+            boxstyle="round,pad=0.3", facecolor="white",
+            edgecolor="#c0392b", alpha=0.95, linewidth=0.8,
         )
         ax2.annotate(
-            "Transient Peak",
-            xy=(peak_t, peak_e),
+            "Transient Peak", xy=(peak_t, peak_e),
             xytext=(peak_t + 12.0, peak_e - 3.0),
             arrowprops=dict(
-                arrowstyle="-|>",
-                color="#c0392b",
-                lw=1.2,
-                connectionstyle="arc3,rad=0.2",
+                arrowstyle="-|>", color="#c0392b",
+                lw=1.2, connectionstyle="arc3,rad=0.2",
             ),
-            fontsize=9,
-            fontweight="bold",
-            color="#c0392b",
-            ha="right",
-            va="center",
-            bbox=props_b,
+            fontsize=9, fontweight="bold", color="#c0392b",
+            ha="right", va="center", bbox=props_b,
         )
 
     ax2.set_xlabel("Forecast Time (Steps)")
     ax2.set_ylabel(r"Energy Gain $\|e^{\mathcal{L}t}\|$")
     ax2.set_title(
         "(b) Non-Normal Amplification",
-        fontsize=10,
-        fontweight="normal",
-        pad=12,
+        fontsize=10, fontweight="normal", pad=12,
     )
     ax2.legend(
-        loc="upper right",
-        frameon=True,
-        fancybox=False,
-        edgecolor="0.7",
-        borderpad=0.5,
-        handlelength=1.8,
-        fontsize=8,
+        loc="upper right", frameon=True, fancybox=False,
+        edgecolor="0.7", borderpad=0.5, handlelength=1.8, fontsize=8,
     )
     ax2.grid(True, linestyle=":", alpha=0.4, linewidth=0.5)
     ax2.set_axisbelow(True)
@@ -286,11 +202,8 @@ def plot_spectral_analysis(ckpt_path, save_path="transient_growth.pdf"):
     ax2.set_ylim(0, y_max)
 
     plt.savefig(
-        save_path,
-        format="pdf",
-        bbox_inches="tight",
-        pad_inches=0.05,
-        dpi=600,
+        save_path, format="pdf",
+        bbox_inches="tight", pad_inches=0.05, dpi=600,
     )
     print(f"Figure saved to {save_path}")
     plt.close(fig)

@@ -1,4 +1,3 @@
-import os
 import sys
 
 import matplotlib.pyplot as plt
@@ -8,61 +7,13 @@ import torch
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
-from ModelUniPhy import UniPhyModel
-
-
-VALID_ARGS = {
-    "in_channels",
-    "out_channels",
-    "embed_dim",
-    "expand",
-    "depth",
-    "patch_size",
-    "img_height",
-    "img_width",
-    "dt_ref",
-    "sde_mode",
-    "init_noise_scale",
-    "ensemble_size",
-}
-
-
-def load_config_and_model(ckpt_path, device):
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "cfg" in checkpoint:
-        model_cfg = checkpoint["cfg"]["model"]
-    else:
-        model_cfg = {
-            "in_channels": 30,
-            "out_channels": 30,
-            "embed_dim": 256,
-            "expand": 4,
-            "depth": 8,
-            "patch_size": [7, 15],
-            "img_height": 721,
-            "img_width": 1440,
-            "dt_ref": 6.0,
-            "sde_mode": "sde",
-            "init_noise_scale": 0.0001,
-            "ensemble_size": 4,
-        }
-    filtered_cfg = {k: v for k, v in model_cfg.items() if k in VALID_ARGS}
-    if "patch_size" in filtered_cfg:
-        filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
-    model = UniPhyModel(**filtered_cfg).to(device)
-    state_dict = checkpoint["model"]
-    clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_state, strict=False)
-    model.eval()
-    return model, model_cfg
+from exp_utils import get_device, load_config_and_model
 
 
 def visualize_riemannian_perception(
     ckpt_path, save_path="riemannian_perception.pdf"
 ):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     model, cfg = load_config_and_model(ckpt_path, device)
 
     pos_emb = model.encoder.pos_emb.detach().cpu()
@@ -104,15 +55,11 @@ def visualize_riemannian_perception(
         "text.usetex": False,
     })
 
-    fig_width = 7.5
-    fig_height = 3.6
-    fig = plt.figure(figsize=(fig_width, fig_height), dpi=600)
+    fig = plt.figure(figsize=(7.5, 3.6), dpi=600)
     fig.suptitle(
         "Mechanistic Verification:"
         " Learning to Compensate Geometric Distortion",
-        fontsize=13,
-        fontweight="bold",
-        y=1.02,
+        fontsize=13, fontweight="bold", y=1.02,
     )
 
     ax1 = fig.add_axes([0.06, 0.13, 0.32, 0.70])
@@ -120,18 +67,13 @@ def visualize_riemannian_perception(
     ax2 = fig.add_axes([0.58, 0.13, 0.38, 0.70])
 
     im = ax1.imshow(
-        spatial_energy_norm,
-        cmap="magma",
-        aspect="auto",
-        extent=[-180, 180, -90, 90],
-        origin="lower",
+        spatial_energy_norm, cmap="magma", aspect="auto",
+        extent=[-180, 180, -90, 90], origin="lower",
         interpolation="bilinear",
     )
     ax1.set_title(
         r"(a) Learned Spatial Gauge Field $\sigma_\phi(\mathbf{x})$",
-        fontsize=10,
-        fontweight="normal",
-        pad=12,
+        fontsize=10, fontweight="normal", pad=12,
     )
     ax1.set_xlabel("Longitude (\u00b0)")
     ax1.set_ylabel("Latitude (\u00b0)")
@@ -141,66 +83,40 @@ def visualize_riemannian_perception(
     cbar.ax.tick_params(labelsize=8)
     cbar.set_label(
         r"$\|\mathbf{h}\|_2$ (norm.)",
-        fontsize=9,
-        rotation=270,
-        labelpad=14,
+        fontsize=9, rotation=270, labelpad=14,
     )
 
     color_theory = "#2c3e50"
     color_learned = "#c0392b"
 
     ax2.plot(
-        inverse_metric_norm,
-        latitudes,
-        color=color_theory,
-        linestyle="--",
-        linewidth=1.8,
-        alpha=0.85,
-        label=r"Theory: $(\cos\phi)^{-1}$",
-        zorder=2,
+        inverse_metric_norm, latitudes,
+        color=color_theory, linestyle="--", linewidth=1.8,
+        alpha=0.85, label=r"Theory: $(\cos\phi)^{-1}$", zorder=2,
     )
     ax2.plot(
-        zonal_mean_norm,
-        latitudes,
-        color=color_learned,
-        linewidth=2.2,
-        label="Learned",
-        zorder=3,
+        zonal_mean_norm, latitudes,
+        color=color_learned, linewidth=2.2, label="Learned", zorder=3,
     )
     ax2.fill_betweenx(
-        latitudes,
-        zonal_mean_norm,
-        0,
-        color=color_learned,
-        alpha=0.12,
-        zorder=1,
+        latitudes, zonal_mean_norm, 0,
+        color=color_learned, alpha=0.12, zorder=1,
     )
 
     textstr = f"$r = {correlation:.3f}$"
     props = dict(
-        boxstyle="round,pad=0.35",
-        facecolor="white",
-        edgecolor="0.6",
-        alpha=0.95,
-        linewidth=0.8,
+        boxstyle="round,pad=0.35", facecolor="white",
+        edgecolor="0.6", alpha=0.95, linewidth=0.8,
     )
     ax2.text(
-        0.94,
-        0.06,
-        textstr,
-        transform=ax2.transAxes,
-        fontsize=10,
-        verticalalignment="bottom",
-        horizontalalignment="right",
-        bbox=props,
-        fontweight="bold",
+        0.94, 0.06, textstr, transform=ax2.transAxes,
+        fontsize=10, verticalalignment="bottom",
+        horizontalalignment="right", bbox=props, fontweight="bold",
     )
 
     ax2.set_title(
         "(b) Geometric Compensation",
-        fontsize=10,
-        fontweight="normal",
-        pad=12,
+        fontsize=10, fontweight="normal", pad=12,
     )
     ax2.set_xlabel("Normalized Magnitude")
     ax2.set_ylabel("Latitude (\u00b0)")
@@ -210,28 +126,18 @@ def visualize_riemannian_perception(
     ax2.grid(True, linestyle=":", alpha=0.5, linewidth=0.6)
     ax2.set_axisbelow(True)
     ax2.legend(
-        loc="center right",
-        bbox_to_anchor=(0.98, 0.64),
-        frameon=True,
-        fancybox=False,
-        edgecolor="0.7",
-        borderpad=0.5,
-        handlelength=1.8,
+        loc="center right", bbox_to_anchor=(0.98, 0.64),
+        frameon=True, fancybox=False, edgecolor="0.7",
+        borderpad=0.5, handlelength=1.8,
     )
 
     plt.savefig(
-        save_path,
-        format="pdf",
-        bbox_inches="tight",
-        pad_inches=0.05,
-        dpi=600,
+        save_path, format="pdf",
+        bbox_inches="tight", pad_inches=0.05, dpi=600,
     )
     plt.savefig(
-        save_path.replace(".pdf", ".png"),
-        format="png",
-        bbox_inches="tight",
-        pad_inches=0.05,
-        dpi=600,
+        save_path.replace(".pdf", ".png"), format="png",
+        bbox_inches="tight", pad_inches=0.05, dpi=600,
     )
     print(f"Figure saved to {save_path}")
     plt.close(fig)

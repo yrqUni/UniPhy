@@ -1,4 +1,3 @@
-import os
 import sys
 import warnings
 
@@ -12,55 +11,7 @@ warnings.filterwarnings("ignore")
 sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
-from ModelUniPhy import UniPhyModel
-
-
-VALID_ARGS = {
-    "in_channels",
-    "out_channels",
-    "embed_dim",
-    "expand",
-    "depth",
-    "patch_size",
-    "img_height",
-    "img_width",
-    "dt_ref",
-    "sde_mode",
-    "init_noise_scale",
-    "ensemble_size",
-}
-
-
-def load_config_and_model(ckpt_path, device):
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "cfg" in checkpoint:
-        model_cfg = checkpoint["cfg"]["model"]
-    else:
-        model_cfg = {
-            "in_channels": 30,
-            "out_channels": 30,
-            "embed_dim": 256,
-            "expand": 4,
-            "depth": 8,
-            "patch_size": [7, 15],
-            "img_height": 721,
-            "img_width": 1440,
-            "dt_ref": 6.0,
-            "sde_mode": "sde",
-            "init_noise_scale": 0.0001,
-            "ensemble_size": 4,
-        }
-    filtered_cfg = {k: v for k, v in model_cfg.items() if k in VALID_ARGS}
-    if "patch_size" in filtered_cfg:
-        filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
-    model = UniPhyModel(**filtered_cfg).to(device)
-    state_dict = checkpoint["model"]
-    clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_state, strict=False)
-    model.eval()
-    return model, model_cfg
+from exp_utils import get_device, load_config_and_model
 
 
 def extract_block_timescales(block, dim, num_modes, h_p, w_p, device):
@@ -68,48 +19,38 @@ def extract_block_timescales(block, dim, num_modes, h_p, w_p, device):
     probe = torch.eye(dim, device=device)[:eff_dim]
     probe_input = probe.view(eff_dim, dim, 1, 1).expand(-1, -1, h_p, w_p)
     probe_complex = torch.complex(probe_input, torch.zeros_like(probe_input))
-
     h_prev = torch.zeros(
         eff_dim * h_p * w_p, 1, dim,
-        device=device,
-        dtype=torch.complex64,
+        device=device, dtype=torch.complex64,
     )
     flux_prev = torch.zeros(
-        eff_dim, dim,
-        device=device,
-        dtype=torch.complex64,
+        eff_dim, dim, device=device, dtype=torch.complex64,
     )
     dt = torch.tensor(1.0, device=device)
-
     with torch.no_grad():
         z_out, _, _ = block.forward_step(
             probe_complex, h_prev, dt, flux_prev,
         )
     z_real = z_out.real if z_out.is_complex() else z_out
     a_matrix = z_real.mean(dim=[-1, -2])[:, :eff_dim].cpu().numpy()
-
     try:
         l_matrix = scipy.linalg.logm(a_matrix)
     except Exception:
         l_matrix = a_matrix - np.eye(len(a_matrix))
-
     evals = np.linalg.eigvals(l_matrix)
     max_real = np.max(evals.real)
     if max_real > -1e-6:
-        shift = max_real + 1e-5
-        evals = evals - shift
-
+        evals = evals - (max_real + 1e-5)
     stable_evals = evals[evals.real < -1e-8]
     if len(stable_evals) == 0:
         return np.array([])
-
     decay_rates = np.abs(stable_evals.real)
     tau_days = (1.0 / decay_rates) * 0.25
     return tau_days
 
 
 def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     model, cfg = load_config_and_model(ckpt_path, device)
 
     print("Scanning all blocks for hierarchical memory structure...")
@@ -157,15 +98,9 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
 
     ax1 = axes[0]
     sns.kdeplot(
-        tau_days_viz,
-        fill=True,
-        color="#2ca02c",
-        alpha=0.3,
-        linewidth=2.5,
-        label="Learned Hierarchy",
-        clip=(0, 60),
-        bw_adjust=0.6,
-        ax=ax1,
+        tau_days_viz, fill=True, color="#2ca02c", alpha=0.3,
+        linewidth=2.5, label="Learned Hierarchy",
+        clip=(0, 60), bw_adjust=0.6, ax=ax1,
     )
     current_ylim = ax1.get_ylim()
     ax1.set_ylim(0, current_ylim[1] * 1.2)
@@ -175,16 +110,11 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     ax1.axvline(x=20, color="#555555", linestyle="--", alpha=0.5, linewidth=1)
 
     text_style = dict(
-        ha="center",
-        va="top",
-        fontsize=10,
-        color="#333333",
+        ha="center", va="top", fontsize=10, color="#333333",
         fontweight="medium",
         bbox=dict(
-            boxstyle="round,pad=0.3",
-            fc="white",
-            ec="#dddddd",
-            alpha=0.85,
+            boxstyle="round,pad=0.3", fc="white",
+            ec="#dddddd", alpha=0.85,
         ),
     )
     ax1.text(2.5, y_max * 0.96, "Synoptic\n(< 5 days)", **text_style)
@@ -195,8 +125,7 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     ax1.set_ylabel("Probability Density")
     ax1.set_title(
         "(a) Spectral Distribution of Memory Timescales",
-        fontweight="bold",
-        pad=10,
+        fontweight="bold", pad=10,
     )
     ax1.set_xlim(0, 65)
     ax1.set_xticks([0, 5, 10, 20, 30, 40, 50, 60])
@@ -232,12 +161,8 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     colors = [cmap(nv * 0.8 + 0.1) for nv in norm_vals]
 
     bp = ax2.boxplot(
-        block_data,
-        labels=block_names,
-        patch_artist=True,
-        widths=0.6,
-        showfliers=False,
-        whis=[5, 95],
+        block_data, labels=block_names, patch_artist=True,
+        widths=0.6, showfliers=False, whis=[5, 95],
     )
 
     for patch, color in zip(bp["boxes"], colors):
@@ -261,8 +186,7 @@ def analyze_memory_timescales(ckpt_path, save_path="memory_timescales.pdf"):
     ax2.set_ylabel("Memory Timescale (Days)")
     ax2.set_title(
         "(b) Hierarchical Memory Structure by Layer",
-        fontweight="bold",
-        pad=10,
+        fontweight="bold", pad=10,
     )
     ax2.set_ylim(0, y_upper * 1.1)
     ax2.grid(True, linestyle=":", alpha=0.3, axis="y")

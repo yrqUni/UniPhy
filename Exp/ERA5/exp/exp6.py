@@ -12,7 +12,7 @@ sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
 from ERA5 import ERA5Dataset
-from ModelUniPhy import UniPhyModel
+from exp_utils import get_device, load_config_and_model
 
 
 CKPT_GLOB = "./uniphy/ckpt/ckpt_epoch200.pt"
@@ -22,9 +22,7 @@ COND_STEPS = 4
 INFER_DT = 6.0
 INFER_STEPS = 12
 
-DEVICE = "cuda"
 FPS = 1
-
 PERCENTILE_LO = 1.0
 PERCENTILE_HI = 99.0
 
@@ -40,22 +38,6 @@ PRESSURE_VARS = [v + h for v in VAR for h in HEIGHTS]
 CHANNEL_NAMES = SURFACE_VARS + PRESSURE_VARS
 
 
-VALID_ARGS = {
-    "in_channels",
-    "out_channels",
-    "embed_dim",
-    "expand",
-    "depth",
-    "patch_size",
-    "img_height",
-    "img_width",
-    "dt_ref",
-    "sde_mode",
-    "init_noise_scale",
-    "ensemble_size",
-}
-
-
 def pick_ckpt_path():
     paths = sorted(glob.glob(CKPT_GLOB), key=os.path.getmtime)
     if not paths:
@@ -65,21 +47,7 @@ def pick_ckpt_path():
 
 def load_model(device):
     ckpt_path = pick_ckpt_path()
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-    if "cfg" not in ckpt or "model" not in ckpt["cfg"]:
-        raise ValueError("Checkpoint must contain keys: cfg.model and model")
-
-    model_cfg = dict(ckpt["cfg"]["model"])
-    filtered_cfg = {k: v for k, v in model_cfg.items() if k in VALID_ARGS}
-    if "patch_size" in filtered_cfg:
-        filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
-
-    model = UniPhyModel(**filtered_cfg).to(device)
-    sd = {k.replace("module.", ""): v for k, v in ckpt["model"].items()}
-    model.load_state_dict(sd, strict=False)
-    model.eval()
-
+    model, model_cfg = load_config_and_model(ckpt_path, device)
     dt_ref = float(model_cfg.get("dt_ref", 6.0))
     ensemble_size = int(model_cfg.get("ensemble_size", 1))
     return model, dt_ref, ensemble_size, ckpt_path
@@ -150,7 +118,7 @@ def save_channel_gif(series, varname):
 
 
 def main():
-    device = DEVICE if torch.cuda.is_available() else "cpu"
+    device = get_device()
     os.makedirs(OUTDIR, exist_ok=True)
 
     model, dt_ref, ensemble_size, ckpt_path = load_model(device)

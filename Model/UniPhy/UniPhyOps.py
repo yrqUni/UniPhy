@@ -115,6 +115,14 @@ class GlobalFluxTracker(nn.Module):
         return new_state, source, gate
 
 
+def _compute_sde_scale(lam_re, dt_ratio, base_noise):
+    two_lam = 2 * lam_re
+    denom_safe = two_lam - 1e-8
+    variance_factor = torch.expm1(two_lam * dt_ratio) / denom_safe
+    std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
+    return base_noise * std_scale
+
+
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref, sde_mode, init_noise_scale):
         super().__init__()
@@ -167,17 +175,12 @@ class TemporalPropagator(nn.Module):
         dt_real = dt_seq.real if dt_seq.is_complex() else dt_seq
         dt_ratio = dt_real.reshape(B, T, 1, 1, 1) / self.dt_ref
         lam_re_exp = lam_re.reshape(1, 1, 1, 1, D)
-        exp_term = torch.exp(2 * lam_re_exp * dt_ratio)
-        denom_safe = 2 * lam_re_exp - 1e-8
-        variance_factor = (exp_term - 1.0) / denom_safe
-        std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
         base_exp = self.base_noise.abs().reshape(1, 1, 1, 1, D)
-        final_scale = base_exp * std_scale
+        final_scale = _compute_sde_scale(lam_re_exp, dt_ratio, base_exp)
         noise_re = torch.randn(shape, device=device, dtype=torch.float32)
         noise_im = torch.randn(shape, device=device, dtype=torch.float32)
         if h_state is not None and self.uncertainty_net is not None:
-            h_mag = h_state.abs()
-            factor = self.uncertainty_net(h_mag) * 2.0
+            factor = self.uncertainty_net(h_state.abs()) * 2.0
             final_scale = final_scale * factor
         if dtype.is_complex:
             return torch.complex(
@@ -194,17 +197,12 @@ class TemporalPropagator(nn.Module):
         dt_real = dt_step.real if dt_step.is_complex() else dt_step
         dt_ratio = dt_real.reshape(B, 1, 1, 1) / self.dt_ref
         lam_re_exp = lam_re.reshape(1, 1, 1, D)
-        exp_term = torch.exp(2 * lam_re_exp * dt_ratio)
-        denom_safe = 2 * lam_re_exp - 1e-8
-        variance_factor = (exp_term - 1.0) / denom_safe
-        std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
         base_exp = self.base_noise.abs().reshape(1, 1, 1, D)
-        final_scale = base_exp * std_scale
+        final_scale = _compute_sde_scale(lam_re_exp, dt_ratio, base_exp)
         noise_re = torch.randn(shape, device=device, dtype=torch.float32)
         noise_im = torch.randn(shape, device=device, dtype=torch.float32)
         if h_state is not None and self.uncertainty_net is not None:
-            h_mag = h_state.abs()
-            factor = self.uncertainty_net(h_mag) * 2.0
+            factor = self.uncertainty_net(h_state.abs()) * 2.0
             final_scale = final_scale * factor
         if dtype.is_complex:
             return torch.complex(

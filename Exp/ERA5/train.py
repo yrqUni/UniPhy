@@ -3,6 +3,7 @@ import sys
 import random
 import datetime
 import logging
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -80,13 +81,12 @@ def compute_crps(pred_ensemble, target):
     target_exp = target.unsqueeze(0)
     mae = (pred_ensemble - target_exp).abs().mean()
     if M > 1:
-        total_diff = torch.tensor(0.0, device=target.device)
-        for i in range(M):
-            for j in range(i + 1, M):
-                total_diff = total_diff + (
-                    pred_ensemble[i] - pred_ensemble[j]
-                ).abs().mean()
-        loss = mae - total_diff / (M * M)
+        idx_i, idx_j = torch.triu_indices(M, M, offset=1, device=target.device)
+        pairwise_diff = (
+            pred_ensemble[idx_i] - pred_ensemble[idx_j]
+        ).abs().mean()
+        num_pairs = idx_i.shape[0]
+        loss = mae - pairwise_diff * num_pairs / (M * M)
     else:
         loss = mae
     return loss
@@ -114,28 +114,27 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
     out, z_latent = model(x_input, dt_input, member_idx=member_idx,
                           return_latent=True)
 
-    out_real = out.real.contiguous() if out.is_complex() else out.contiguous()
+    out_real = out.real if out.is_complex() else out
 
     l1_loss = (out_real - x_target).abs().mean()
     mse_loss = ((out_real - x_target) ** 2 * lat_weights).mean()
 
     if ensemble_size > 1:
-        ensemble_preds = [out_real]
         infer_model = model.module if hasattr(model, "module") else model
         with torch.no_grad():
             z_det = z_latent.detach()
-            for _ in range(ensemble_size - 1):
-                rand_idx = torch.randint(
-                    0, ensemble_size, (B,), device=device,
-                )
-                out_ens = infer_model.decoder(z_det, member_idx=rand_idx)
-                ens_real = (
-                    out_ens.real.contiguous()
-                    if out_ens.is_complex()
-                    else out_ens.contiguous()
-                )
-                ensemble_preds.append(ens_real)
-        ensemble_stack = torch.stack(ensemble_preds, dim=0)
+            n_extra = ensemble_size - 1
+            T_lat = z_det.shape[1]
+            z_rep = z_det.repeat(n_extra, 1, 1, 1, 1)
+            rand_indices = torch.randint(
+                0, ensemble_size, (n_extra * B,), device=device,
+            )
+            out_ens = infer_model.decoder(z_rep, member_idx=rand_indices)
+            ens_real = out_ens.real if out_ens.is_complex() else out_ens
+            ens_chunks = ens_real.reshape(n_extra, B, T_lat, C, H, W)
+        ensemble_stack = torch.cat(
+            [out_real.unsqueeze(0), ens_chunks], dim=0,
+        )
         crps_loss = compute_crps(ensemble_stack, x_target)
         ensemble_std = ensemble_stack.std(dim=0).mean()
         loss = l1_loss + crps_loss
@@ -226,6 +225,13 @@ def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
         )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
+
+def _ddp_sync_context(model, batch_idx, grad_accum_steps):
+    is_sync_step = (batch_idx + 1) % grad_accum_steps == 0
+    if is_sync_step or not hasattr(model, "no_sync"):
+        return nullcontext()
+    return model.no_sync()
 
 
 def train(cfg):
@@ -383,10 +389,11 @@ def train(cfg):
         optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
-            metrics = train_step(
-                model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
-                lat_weights,
-            )
+            with _ddp_sync_context(model, batch_idx, grad_accum_steps):
+                metrics = train_step(
+                    model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
+                    lat_weights,
+                )
             global_step += 1
 
             if (
@@ -484,4 +491,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

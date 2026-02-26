@@ -260,8 +260,9 @@ class UniPhyModel(nn.Module):
             states[i] = (h_f, f_f)
         x_last = x_context[:, -1]
         z_curr = self.encoder(x_last)
+        n_steps = len(dt_list)
         preds = []
-        for dt_k in dt_list:
+        for step_idx, dt_k in enumerate(dt_list):
             dt_step = self._normalize_dt_step(dt_k, B, device)
             new_states = []
             for i, block in enumerate(self.blocks):
@@ -272,6 +273,6 @@ class UniPhyModel(nn.Module):
             states = new_states
             x_pred = self.decoder(z_curr)
             preds.append(x_pred)
-            z_curr = self.encoder(x_pred)
+            if step_idx < n_steps - 1:
+                z_curr = self.encoder(x_pred)
         return torch.stack(preds, dim=1)
-    

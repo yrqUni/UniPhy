@@ -2,6 +2,7 @@ import os
 import sys
 import random
 import logging
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -168,6 +169,13 @@ def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
         optimizer.zero_grad(set_to_none=True)
 
 
+def _ddp_sync_context(model, batch_idx, grad_accum_steps):
+    is_sync_step = (batch_idx + 1) % grad_accum_steps == 0
+    if is_sync_step or not hasattr(model, "no_sync"):
+        return nullcontext()
+    return model.no_sync()
+
+
 def align(cfg):
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -311,9 +319,10 @@ def align(cfg):
             )
 
         for batch_idx, batch in enumerate(train_loader):
-            metrics = align_step(
-                model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
-            )
+            with _ddp_sync_context(model, batch_idx, grad_accum_steps):
+                metrics = align_step(
+                    model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
+                )
             global_step += 1
 
             if rank == 0:
@@ -391,4 +400,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

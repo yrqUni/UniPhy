@@ -12,7 +12,7 @@ sys.path.append("/nfs/UniPhy/Model/UniPhy")
 sys.path.append("/nfs/UniPhy/Exp/ERA5")
 
 from ERA5 import ERA5Dataset
-from ModelUniPhy import UniPhyModel
+from exp_utils import get_device, load_config_and_model
 
 
 DT_REF = 6.0
@@ -30,58 +30,6 @@ rcParams["legend.fontsize"] = 8
 rcParams["axes.linewidth"] = 0.5
 rcParams["xtick.major.width"] = 0.5
 rcParams["ytick.major.width"] = 0.5
-
-
-VALID_ARGS = {
-    "in_channels",
-    "out_channels",
-    "embed_dim",
-    "expand",
-    "depth",
-    "patch_size",
-    "img_height",
-    "img_width",
-    "dt_ref",
-    "sde_mode",
-    "init_noise_scale",
-    "ensemble_size",
-}
-
-
-def load_config_and_model(ckpt_path, device):
-    if not os.path.exists(ckpt_path):
-        return None, None
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "cfg" in checkpoint:
-        model_cfg = checkpoint["cfg"]["model"]
-    else:
-        model_cfg = {
-            "in_channels": 30,
-            "out_channels": 30,
-            "embed_dim": 256,
-            "expand": 4,
-            "depth": 8,
-            "patch_size": [7, 15],
-            "img_height": 721,
-            "img_width": 1440,
-            "dt_ref": DT_REF,
-            "sde_mode": "sde",
-            "init_noise_scale": 0.0001,
-            "ensemble_size": 4,
-        }
-    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
-    if "encoder.pos_emb" in state_dict:
-        model_cfg["embed_dim"] = state_dict["encoder.pos_emb"].shape[1]
-    filtered_cfg = {k: v for k, v in model_cfg.items() if k in VALID_ARGS}
-    if "patch_size" in filtered_cfg:
-        filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
-    model = UniPhyModel(**filtered_cfg).to(device)
-    clean_state = {
-        k.replace("module.", ""): v for k, v in state_dict.items()
-    }
-    model.load_state_dict(clean_state, strict=False)
-    model.eval()
-    return model, model_cfg
 
 
 def get_vis_data(device):
@@ -112,9 +60,7 @@ def run_inference_sequence(model, x_ctx, dt_step, total_steps, dt_context):
     ]
     dt_ctx = torch.full(
         (x_ctx.shape[0], x_ctx.shape[1]),
-        dt_context,
-        device=device,
-        dtype=torch.float32,
+        dt_context, device=device, dtype=torch.float32,
     )
     pred_seq = model.forward_rollout(x_ctx, dt_ctx, dt_list)
     if pred_seq.is_complex():
@@ -236,15 +182,12 @@ def visualize_comparison(real_data, pre_seq, fine_seq, channel_idx, save_path):
             ax.text(
                 0.97, 0.03,
                 f"RMSE={rmse:.3f}\nMAE={mae:.3f}",
-                transform=ax.transAxes,
-                fontsize=6,
+                transform=ax.transAxes, fontsize=6,
                 verticalalignment="bottom",
                 horizontalalignment="right",
                 bbox=dict(
                     boxstyle="round,pad=0.2",
-                    facecolor="white",
-                    alpha=0.8,
-                    linewidth=0.3,
+                    facecolor="white", alpha=0.8, linewidth=0.3,
                 ),
             )
             ax.set_xticks([])
@@ -264,8 +207,7 @@ def visualize_comparison(real_data, pre_seq, fine_seq, channel_idx, save_path):
     fig.suptitle(
         r"Temporal Generalization ($\Delta t$=1h)"
         f" - Channel {channel_idx}",
-        fontsize=10,
-        y=0.98,
+        fontsize=10, y=0.98,
     )
 
     plt.savefig(
@@ -277,7 +219,7 @@ def visualize_comparison(real_data, pre_seq, fine_seq, channel_idx, save_path):
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print("=" * 60)
     print("Experiment 5: Visualizing Temporal Consistency (dt=1h)")
     print("=" * 60)
@@ -302,9 +244,8 @@ def main():
     model_pre, cfg_pre = load_config_and_model(ckpt_pre, device)
     dt_context_pre = float(cfg_pre.get("dt_ref", DT_REF))
     seq_pre = run_inference_sequence(
-        model_pre, x_ctx,
-        dt_step=1.0, total_steps=12,
-        dt_context=dt_context_pre,
+        model_pre, x_ctx, dt_step=1.0,
+        total_steps=12, dt_context=dt_context_pre,
     )
     del model_pre
     torch.cuda.empty_cache()
@@ -313,9 +254,8 @@ def main():
     model_align, cfg_align = load_config_and_model(ckpt_align, device)
     dt_context_align = float(cfg_align.get("dt_ref", DT_REF))
     seq_align = run_inference_sequence(
-        model_align, x_ctx,
-        dt_step=1.0, total_steps=12,
-        dt_context=dt_context_align,
+        model_align, x_ctx, dt_step=1.0,
+        total_steps=12, dt_context=dt_context_align,
     )
     del model_align
     torch.cuda.empty_cache()
