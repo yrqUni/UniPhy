@@ -20,7 +20,7 @@ class SpatialGateModulator(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, gate_global, source_global, x_local):
+    def _forward_single(self, gate_global, source_global, x_local):
         x_cat = torch.cat([x_local.real, x_local.imag], dim=-1)
         B, H, W, D2 = x_cat.shape
         spatial_feat = x_cat.permute(0, 3, 1, 2)
@@ -31,6 +31,16 @@ class SpatialGateModulator(nn.Module):
             B, H, W, D2 // 2,
         )
         return x_local * gate_combined + source_exp * (1 - gate_combined)
+
+    def forward(self, gate_global, source_global, x_local):
+        if x_local.ndim == 5:
+            B, T, H, W, D = x_local.shape
+            x_flat = x_local.reshape(B * T, H, W, D)
+            gate_flat = gate_global.reshape(B * T, -1)
+            source_flat = source_global.reshape(B * T, -1)
+            out = self._forward_single(gate_flat, source_flat, x_flat)
+            return out.reshape(B, T, H, W, D)
+        return self._forward_single(gate_global, source_global, x_local)
 
 
 class UniPhyBlock(nn.Module):
@@ -97,15 +107,7 @@ class UniPhyBlock(nn.Module):
         )
         flux_out = flux_seq[:, -1]
 
-        forcing_list = []
-        for t_idx in range(T):
-            f_t = self.spatial_gate(
-                gate_seq[:, t_idx],
-                source_seq[:, t_idx],
-                x_eigen[:, t_idx],
-            )
-            forcing_list.append(f_t)
-        forcing = torch.stack(forcing_list, dim=1)
+        forcing = self.spatial_gate(gate_seq, source_seq, x_eigen)
 
         op_decay, op_forcing = self.prop.get_transition_operators_seq(dt_seq)
         op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)

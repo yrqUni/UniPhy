@@ -116,7 +116,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
 
     out_real = out.real if out.is_complex() else out
 
-    l1_loss = (out_real - x_target).abs().mean()
+    l1_loss = ((out_real - x_target).abs() * lat_weights).mean()
     mse_loss = ((out_real - x_target) ** 2 * lat_weights).mean()
 
     if ensemble_size > 1:
