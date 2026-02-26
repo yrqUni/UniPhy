@@ -6,6 +6,33 @@ from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
 
+class SpatialGateModulator(nn.Module):
+    def __init__(self, dim, h_patches, w_patches):
+        super().__init__()
+        self.spatial_proj = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(
+                dim, dim, kernel_size=3, padding=1,
+                groups=dim, bias=False,
+            ),
+            nn.Conv2d(dim, dim, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, gate_global, source_global, x_local):
+        x_cat = torch.cat([x_local.real, x_local.imag], dim=-1)
+        B, H, W, D2 = x_cat.shape
+        spatial_feat = x_cat.permute(0, 3, 1, 2)
+        spatial_gate = self.spatial_proj(spatial_feat)
+        spatial_gate = spatial_gate.permute(0, 2, 3, 1)
+        gate_combined = gate_global.unsqueeze(1).unsqueeze(2) * spatial_gate
+        source_exp = source_global.unsqueeze(1).unsqueeze(2).expand(
+            B, H, W, D2 // 2,
+        )
+        return x_local * gate_combined + source_exp * (1 - gate_combined)
+
+
 class UniPhyBlock(nn.Module):
     def __init__(self, dim, expand, img_height, img_width, kernel_size,
                  dt_ref, init_noise_scale, sde_mode):
@@ -22,6 +49,7 @@ class UniPhyBlock(nn.Module):
             init_noise_scale=init_noise_scale,
         )
         self.ffn = UniPhyFeedForwardNetwork(dim, expand)
+        self.spatial_gate = SpatialGateModulator(dim, img_height, img_width)
 
     def _apply_spatial(self, x_4d):
         x_real = torch.cat([x_4d.real, x_4d.imag], dim=1)
@@ -69,11 +97,15 @@ class UniPhyBlock(nn.Module):
         )
         flux_out = flux_seq[:, -1]
 
-        source_exp = source_seq.unsqueeze(2).unsqueeze(3).expand(
-            B, T, H, W, D,
-        )
-        gate_exp = gate_seq.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
-        forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
+        forcing_list = []
+        for t_idx in range(T):
+            f_t = self.spatial_gate(
+                gate_seq[:, t_idx],
+                source_seq[:, t_idx],
+                x_eigen[:, t_idx],
+            )
+            forcing_list.append(f_t)
+        forcing = torch.stack(forcing_list, dim=1)
 
         op_decay, op_forcing = self.prop.get_transition_operators_seq(dt_seq)
         op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(B, T, H, W, D)
@@ -124,9 +156,7 @@ class UniPhyBlock(nn.Module):
             flux_prev, x_mean, dt_step,
         )
 
-        source_exp = source.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
-        gate_exp = gate.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
-        forcing = x_eigen * gate_exp + source_exp * (1 - gate_exp)
+        forcing = self.spatial_gate(gate, source, x_eigen)
 
         op_decay, op_forcing = self.prop.get_transition_operators_step(
             dt_step,
@@ -214,25 +244,20 @@ class UniPhyModel(nn.Module):
             for _ in range(self.depth)
         ]
 
-    def _normalize_dt_seq(self, dt, B, T, device):
+    def _normalize_dt(self, dt, B, T, device):
         if isinstance(dt, (float, int)):
             return torch.full((B, T), float(dt), device=device)
         if dt.ndim == 0:
             return dt.expand(B, T).contiguous()
         if dt.ndim == 1:
+            if dt.shape[0] == B:
+                return dt.unsqueeze(1).expand(B, T).contiguous()
             return dt.unsqueeze(0).expand(B, T).contiguous()
-        return dt
-
-    def _normalize_dt_step(self, dt, B, device):
-        if isinstance(dt, (float, int)):
-            return torch.full((B,), float(dt), device=device)
-        if dt.ndim == 0:
-            return dt.expand(B).contiguous()
         return dt
 
     def forward(self, x, dt, member_idx=None, return_latent=False):
         B, T = x.shape[0], x.shape[1]
-        dt_seq = self._normalize_dt_seq(dt, B, T, x.device)
+        dt_seq = self._normalize_dt(dt, B, T, x.device)
         z = self.encoder(x)
         dtype = z.dtype if z.is_complex() else torch.complex64
         states = self._init_states(B, x.device, dtype)
@@ -249,7 +274,7 @@ class UniPhyModel(nn.Module):
     def forward_rollout(self, x_context, dt_context, dt_list):
         B, T_in = x_context.shape[0], x_context.shape[1]
         device = x_context.device
-        dt_ctx_seq = self._normalize_dt_seq(dt_context, B, T_in, device)
+        dt_ctx_seq = self._normalize_dt(dt_context, B, T_in, device)
         z_ctx = self.encoder(x_context)
         dtype = z_ctx.dtype if z_ctx.is_complex() else torch.complex64
         states = self._init_states(B, device, dtype)
@@ -258,12 +283,11 @@ class UniPhyModel(nn.Module):
                 z_ctx, states[i][0], dt_ctx_seq, states[i][1],
             )
             states[i] = (h_f, f_f)
-        x_last = x_context[:, -1]
-        z_curr = self.encoder(x_last)
+        z_curr = z_ctx[:, -1]
         n_steps = len(dt_list)
         preds = []
         for step_idx, dt_k in enumerate(dt_list):
-            dt_step = self._normalize_dt_step(dt_k, B, device)
+            dt_step = self._normalize_dt(dt_k, B, 1, device).squeeze(1)
             new_states = []
             for i, block in enumerate(self.blocks):
                 z_curr, h_n, f_n = block.forward_step(

@@ -2,7 +2,6 @@ import os
 import sys
 import random
 import logging
-from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -30,6 +29,7 @@ sys.path.append("/nfs/UniPhy/Exp/ERA5")
 from ERA5 import ERA5Dataset
 from ModelUniPhy import UniPhyModel
 
+from contextlib import nullcontext
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -102,6 +102,8 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     pred_seq = infer_model.forward_rollout(x_ctx, dt_ctx, dt_list)
     if pred_seq.is_complex():
         pred_seq = pred_seq.real
+    if pred_seq.is_complex():
+        pred_seq = pred_seq.real
 
     if sub_step > 1:
         pred_aligned = pred_seq[:, sub_step - 1::sub_step]
@@ -169,12 +171,12 @@ def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
         optimizer.zero_grad(set_to_none=True)
 
 
+
 def _ddp_sync_context(model, batch_idx, grad_accum_steps):
     is_sync_step = (batch_idx + 1) % grad_accum_steps == 0
     if is_sync_step or not hasattr(model, "no_sync"):
         return nullcontext()
     return model.no_sync()
-
 
 def align(cfg):
     dist.init_process_group(backend="nccl")
@@ -282,10 +284,14 @@ def align(cfg):
         else:
             other_params.append(p)
 
+    base_lr = float(cfg["train"]["lr"])
+    basis_lr = float(cfg["train"].get("basis_lr", base_lr * 0.1))
+
     optimizer = torch.optim.AdamW([
-        {"params": other_params, "weight_decay": cfg["train"]["weight_decay"]},
-        {"params": basis_params, "weight_decay": 0.0},
-    ], lr=float(cfg["train"]["lr"]))
+        {"params": other_params, "weight_decay": cfg["train"]["weight_decay"],
+         "lr": base_lr},
+        {"params": basis_params, "weight_decay": 0.0, "lr": basis_lr},
+    ])
 
     grad_accum_steps = cfg["train"]["grad_accum_steps"]
     epochs = cfg["train"]["epochs"]

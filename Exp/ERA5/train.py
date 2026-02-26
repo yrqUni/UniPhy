@@ -3,7 +3,6 @@ import sys
 import random
 import datetime
 import logging
-from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -34,6 +33,7 @@ from ERA5 import ERA5Dataset
 from ModelUniPhy import UniPhyModel
 
 import warnings
+from contextlib import nullcontext
 
 warnings.filterwarnings("ignore")
 
@@ -143,13 +143,14 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
         ensemble_std = torch.tensor(0.0, device=device)
         loss = l1_loss
 
+    basis_reg_coeff = cfg["train"].get("basis_reg_coeff", 0.01)
     basis_reg = torch.tensor(0.0, device=device)
     base_model = model.module if hasattr(model, "module") else model
     for block in base_model.blocks:
         W, W_inv = block.prop.basis.get_matrix(torch.complex64)
         eye = torch.eye(W.shape[0], device=device, dtype=W.dtype)
         basis_reg = basis_reg + (W @ W_inv - eye).abs().mean()
-    loss = loss + 0.01 * basis_reg
+    loss = loss + basis_reg_coeff * basis_reg
 
     loss_scaled = loss / grad_accum_steps
     loss_scaled.backward()
@@ -227,12 +228,12 @@ def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
         optimizer.zero_grad(set_to_none=True)
 
 
+
 def _ddp_sync_context(model, batch_idx, grad_accum_steps):
     is_sync_step = (batch_idx + 1) % grad_accum_steps == 0
     if is_sync_step or not hasattr(model, "no_sync"):
         return nullcontext()
     return model.no_sync()
-
 
 def train(cfg):
     dist.init_process_group(backend="nccl")
@@ -325,10 +326,14 @@ def train(cfg):
         else:
             other_params.append(p)
 
+    base_lr = float(cfg["train"]["lr"])
+    basis_lr = float(cfg["train"].get("basis_lr", base_lr * 0.1))
+
     optimizer = torch.optim.AdamW([
-        {"params": other_params, "weight_decay": cfg["train"]["weight_decay"]},
-        {"params": basis_params, "weight_decay": 0.0},
-    ], lr=float(cfg["train"]["lr"]))
+        {"params": other_params, "weight_decay": cfg["train"]["weight_decay"],
+         "lr": base_lr},
+        {"params": basis_params, "weight_decay": 0.0, "lr": basis_lr},
+    ])
 
     grad_accum_steps = cfg["train"]["grad_accum_steps"]
     epochs = cfg["train"]["epochs"]
@@ -337,7 +342,7 @@ def train(cfg):
     if cfg["train"]["use_scheduler"]:
         scheduler = lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=float(cfg["train"]["lr"]),
+            max_lr=[base_lr, basis_lr],
             steps_per_epoch=len(train_loader) // grad_accum_steps,
             epochs=epochs,
         )

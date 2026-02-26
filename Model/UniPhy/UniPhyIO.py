@@ -29,8 +29,15 @@ class UniPhyEncoder(nn.Module):
         else:
             self.ph = self.pw = patch_size
         self.padder = FlexiblePadder((self.ph, self.pw))
+        mid_ch = max(embed_dim // 2, in_ch)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
         self.proj = nn.Conv2d(
-            in_ch, embed_dim,
+            mid_ch, embed_dim,
             kernel_size=(self.ph, self.pw),
             stride=(self.ph, self.pw),
         )
@@ -49,6 +56,7 @@ class UniPhyEncoder(nn.Module):
 
     def _encode_4d(self, x):
         x = self.padder(x)
+        x = self.stem(x)
         x = self.proj(x)
         if x.shape[-2:] != self.pos_emb.shape[-2:]:
             pos_emb = F.interpolate(
@@ -110,7 +118,9 @@ class UniPhyEnsembleDecoder(nn.Module):
             latent_dim * 2, model_channels, kernel_size=3, padding=1,
         )
         self.member_emb = nn.Embedding(ensemble_size, model_channels)
-        self.block = nn.Sequential(
+        self.blocks = nn.Sequential(
+            nn.Conv2d(model_channels, model_channels, 3, 1, 1),
+            nn.SiLU(),
             nn.Conv2d(model_channels, model_channels, 3, 1, 1),
             nn.SiLU(),
             nn.Conv2d(model_channels, model_channels, 3, 1, 1),
@@ -144,7 +154,7 @@ class UniPhyEnsembleDecoder(nn.Module):
             member_feat = self.member_emb(member_idx)
             member_feat = member_feat.view(BT, -1, 1, 1)
             h = h + member_feat
-        h = h + self.block(h)
+        h = h + self.blocks(h)
         out = self.stage1(h)
         out = self.stage2(out)
         out = self.out_smooth(out)
@@ -162,4 +172,3 @@ class UniPhyEnsembleDecoder(nn.Module):
             _, C_out, H_out, W_out = out.shape
             return out.view(B, T, C_out, H_out, W_out)
         return self._decode_4d(z, member_idx)
-    

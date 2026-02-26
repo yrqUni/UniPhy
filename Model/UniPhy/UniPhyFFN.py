@@ -106,4 +106,3 @@ class UniPhyFeedForwardNetwork(nn.Module):
         delta_out = self.post_norm(delta_centered)
         delta_out = delta_out * self.output_scale
         return delta_out
-    

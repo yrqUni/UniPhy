@@ -215,44 +215,52 @@ class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding,
                  img_height, img_width):
         super().__init__()
-        self.conv_e0 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding,
-            bias=False,
+        self.groups = min(in_channels, out_channels)
+        self.dw_e0 = nn.Conv2d(
+            in_channels, in_channels, kernel_size, padding=padding,
+            groups=in_channels, bias=False,
         )
-        self.conv_e1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding,
-            bias=False,
+        self.pw_e0 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.dw_e1 = nn.Conv2d(
+            in_channels, in_channels, kernel_size, padding=padding,
+            groups=in_channels, bias=False,
         )
-        self.conv_e2 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding,
-            bias=False,
+        self.pw_e1 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.dw_e2 = nn.Conv2d(
+            in_channels, in_channels, kernel_size, padding=padding,
+            groups=in_channels, bias=False,
         )
-        self.conv_e12 = nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=padding,
-            bias=False,
+        self.pw_e2 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.dw_e12 = nn.Conv2d(
+            in_channels, in_channels, kernel_size, padding=padding,
+            groups=in_channels, bias=False,
         )
+        self.pw_e12 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
         self.smooth_conv = nn.Conv2d(
             out_channels, out_channels, kernel_size=3, padding=1,
+            groups=out_channels, bias=False,
         )
-        self.bias = nn.Parameter(torch.zeros(out_channels))
+        self.smooth_pw = nn.Conv2d(out_channels, out_channels, 1)
         lat = torch.linspace(-math.pi / 2, math.pi / 2, img_height)
         self.register_buffer(
             "cos_lat", torch.cos(lat).view(1, 1, img_height, 1),
         )
         self.metric_scale = nn.Parameter(torch.tensor(1.0))
 
+    def _ds_conv(self, dw, pw, x):
+        return pw(dw(x))
+
     def forward(self, x):
         B, C, H, W = x.shape
-        y_e0 = self.conv_e0(x)
-        y_e1 = self.conv_e1(x)
-        y_e2 = self.conv_e2(x)
-        y_e12 = self.conv_e12(x)
+        y_e0 = self._ds_conv(self.dw_e0, self.pw_e0, x)
+        y_e1 = self._ds_conv(self.dw_e1, self.pw_e1, x)
+        y_e2 = self._ds_conv(self.dw_e2, self.pw_e2, x)
+        y_e12 = self._ds_conv(self.dw_e12, self.pw_e12, x)
         cos_lat = self.cos_lat.expand(B, 1, H, W)
         cos_lat_safe = torch.clamp(cos_lat, min=1e-6)
         y_e1_scaled = y_e1 * cos_lat_safe
         y_e12_scaled = y_e12 * cos_lat_safe
         out = y_e0 + y_e1_scaled + y_e2 + y_e12_scaled
         out = out * self.metric_scale
-        out = out + self.bias.view(1, -1, 1, 1)
-        out = self.smooth_conv(out)
+        out = self.smooth_pw(self.smooth_conv(out))
         return out
