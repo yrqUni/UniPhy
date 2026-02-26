@@ -102,8 +102,6 @@ def align_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx):
     pred_seq = infer_model.forward_rollout(x_ctx, dt_ctx, dt_list)
     if pred_seq.is_complex():
         pred_seq = pred_seq.real
-    if pred_seq.is_complex():
-        pred_seq = pred_seq.real
 
     if sub_step > 1:
         pred_aligned = pred_seq[:, sub_step - 1::sub_step]

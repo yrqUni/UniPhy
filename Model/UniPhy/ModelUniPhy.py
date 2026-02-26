@@ -222,11 +222,16 @@ class UniPhyModel(nn.Module):
         self._init_encoder_decoder_weights()
 
     def _init_encoder_decoder_weights(self):
-        for m in self.encoder.modules():
+        for name, m in self.encoder.named_modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight, mode="fan_out", nonlinearity="relu",
-                )
+                if "stem" in name:
+                    nn.init.kaiming_normal_(
+                        m.weight, mode="fan_out", nonlinearity="linear",
+                    )
+                else:
+                    nn.init.kaiming_normal_(
+                        m.weight, mode="fan_out", nonlinearity="relu",
+                    )
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         for m in self.blocks.modules():

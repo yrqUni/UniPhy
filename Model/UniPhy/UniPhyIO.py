@@ -29,17 +29,16 @@ class UniPhyEncoder(nn.Module):
         else:
             self.ph = self.pw = patch_size
         self.padder = FlexiblePadder((self.ph, self.pw))
-        mid_ch = max(embed_dim // 2, in_ch)
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1),
-            nn.SiLU(),
-        )
         self.proj = nn.Conv2d(
-            mid_ch, embed_dim,
+            in_ch, embed_dim,
             kernel_size=(self.ph, self.pw),
             stride=(self.ph, self.pw),
+        )
+        self.stem = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
         )
         h_patches = (
             (img_height + (self.ph - img_height % self.ph) % self.ph)
@@ -56,8 +55,8 @@ class UniPhyEncoder(nn.Module):
 
     def _encode_4d(self, x):
         x = self.padder(x)
-        x = self.stem(x)
         x = self.proj(x)
+        x = self.stem(x)
         if x.shape[-2:] != self.pos_emb.shape[-2:]:
             pos_emb = F.interpolate(
                 self.pos_emb, size=x.shape[-2:],
@@ -118,10 +117,12 @@ class UniPhyEnsembleDecoder(nn.Module):
             latent_dim * 2, model_channels, kernel_size=3, padding=1,
         )
         self.member_emb = nn.Embedding(ensemble_size, model_channels)
-        self.blocks = nn.Sequential(
+        self.block1 = nn.Sequential(
             nn.Conv2d(model_channels, model_channels, 3, 1, 1),
             nn.SiLU(),
             nn.Conv2d(model_channels, model_channels, 3, 1, 1),
+        )
+        self.block2 = nn.Sequential(
             nn.SiLU(),
             nn.Conv2d(model_channels, model_channels, 3, 1, 1),
         )
@@ -154,7 +155,8 @@ class UniPhyEnsembleDecoder(nn.Module):
             member_feat = self.member_emb(member_idx)
             member_feat = member_feat.view(BT, -1, 1, 1)
             h = h + member_feat
-        h = h + self.blocks(h)
+        h = h + self.block1(h)
+        h = h + self.block2(h)
         out = self.stage1(h)
         out = self.stage2(out)
         out = self.out_smooth(out)

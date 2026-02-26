@@ -215,7 +215,6 @@ class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding,
                  img_height, img_width):
         super().__init__()
-        self.groups = min(in_channels, out_channels)
         self.dw_e0 = nn.Conv2d(
             in_channels, in_channels, kernel_size, padding=padding,
             groups=in_channels, bias=False,
