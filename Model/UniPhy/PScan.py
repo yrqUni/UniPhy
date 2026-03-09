@@ -63,7 +63,7 @@ def _mat2x2_prod_combine(
     a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
     b00r, b00i, b01r, b01i, b10r, b10i, b11r, b11i,
 ):
-    """Combine two 2×2 complex matrices: result = B @ A."""
+    """Combine two 2x2 complex matrices: result = B @ A."""
     c00r = b00r * a00r - b00i * a00i + b01r * a10r - b01i * a10i
     c00i = b00r * a00i + b00i * a00r + b01r * a10i + b01i * a10r
     c01r = b00r * a01r - b00i * a01i + b01r * a11r - b01i * a11i
@@ -80,7 +80,7 @@ def _mat2x2_apply(
     a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
     y00r, y00i, y01r, y01i, y10r, y10i, y11r, y11i,
 ):
-    """Compute A @ Y in-place, accumulating into provided y values."""
+    """Compute A @ Y."""
     z00r = a00r * y00r - a00i * y00i + a01r * y10r - a01i * y10i
     z00i = a00r * y00i + a00i * y00r + a01r * y10i + a01i * y10r
     z01r = a00r * y01r - a00i * y01i + a01r * y11r - a01i * y11i
@@ -93,22 +93,53 @@ def _mat2x2_apply(
 
 
 @triton.jit
+def _affine_combine(
+    # left element: (A_l, y_l)  — A: 8 floats, y: 4 floats (2x1 col vec)
+    a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
+    y0r, y0i, y1r, y1i,
+    # right element: (A_r, y_r)
+    b00r, b00i, b01r, b01i, b10r, b10i, b11r, b11i,
+    z0r, z0i, z1r, z1i,
+):
+    """
+    Combine two affine maps (A_l, y_l) and (A_r, y_r).
+    Result = (A_r @ A_l, A_r @ y_l + y_r).
+    This is the associative operator for the scan Y[t] = A[t]@Y[t-1] + X[t].
+    """
+    # c = A_r @ A_l
+    c00r, c00i, c01r, c01i, c10r, c10i, c11r, c11i = _mat2x2_prod_combine(
+        a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
+        b00r, b00i, b01r, b01i, b10r, b10i, b11r, b11i,
+    )
+    # w = A_r @ y_l + y_r
+    w0r = b00r * y0r - b00i * y0i + b01r * y1r - b01i * y1i + z0r
+    w0i = b00r * y0i + b00i * y0r + b01r * y1i + b01i * y1r + z0i
+    w1r = b10r * y0r - b10i * y0i + b11r * y1r - b11i * y1i + z1r
+    w1i = b10r * y0i + b10i * y0r + b11r * y1i + b11i * y1r + z1i
+    return c00r, c00i, c01r, c01i, c10r, c10i, c11r, c11i, w0r, w0i, w1r, w1i
+
+
+@triton.jit
 def _mat2x2_chunk_pass1_kernel(
-    A_ptr, X_ptr, Y_ptr, Aend_ptr,
+    A_ptr, X_ptr, Y_ptr, State_ptr,
     stride_a_batch, stride_a_time, stride_a_d1, stride_a_d2,
     stride_x_batch, stride_x_time, stride_x_d1, stride_x_d2,
-    stride_ae_batch, stride_ae_chunk,
+    stride_s_batch, stride_s_chunk,
     L, CHUNK: tl.constexpr, REVERSE: tl.constexpr,
     N_CHUNKS: tl.constexpr,
 ):
     """
-    Pass 1 of chunk scan.
+    Pass 1: sequential local scan within each chunk, starting from Y=0.
 
-    Each program handles one (batch, chunk) pair.  It runs a sequential scan
-    over the CHUNK elements in its assigned chunk, writing local Y values and
-    storing the chunk-end A-accumulator into Aend for Pass 2.
+    Writes:
+      - Y_local[t] for all valid t (local scan result, prefix state = identity/0)
+      - State[chunk] = (A_prod, Y_end) for pass 2
+        A_prod = product of A values in chunk (8 floats)
+        Y_end  = Y_local at chunk end (4 floats)
+    State layout: [a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
+                   y0r,  y0i,  y1r,  y1i]  -> 12 floats per chunk
 
-    grid = (BC * N_CHUNKS,), where BC = B*C.
+    grid = (BC * N_CHUNKS,)
     """
     pid = tl.program_id(axis=0)
     batch_id = pid // N_CHUNKS
@@ -117,27 +148,17 @@ def _mat2x2_chunk_pass1_kernel(
     A_base = A_ptr + batch_id * stride_a_batch
     X_base = X_ptr + batch_id * stride_x_batch
     Y_base = Y_ptr + batch_id * stride_x_batch
-    Aend_base = Aend_ptr + batch_id * stride_ae_batch
+    S_base = State_ptr + batch_id * stride_s_batch
 
     chunk_start = chunk_id * CHUNK if not REVERSE else (N_CHUNKS - 1 - chunk_id) * CHUNK
 
-    acc_a00r = 1.0
-    acc_a00i = 0.0
-    acc_a01r = 0.0
-    acc_a01i = 0.0
-    acc_a10r = 0.0
-    acc_a10i = 0.0
-    acc_a11r = 1.0
-    acc_a11i = 0.0
-
-    acc_y00r = 0.0
-    acc_y00i = 0.0
-    acc_y01r = 0.0
-    acc_y01i = 0.0
-    acc_y10r = 0.0
-    acc_y10i = 0.0
-    acc_y11r = 0.0
-    acc_y11i = 0.0
+    # Running state: A_acc (2x2 identity), y_acc (2x1 zero)
+    acc_a00r = 1.0; acc_a00i = 0.0
+    acc_a01r = 0.0; acc_a01i = 0.0
+    acc_a10r = 0.0; acc_a10i = 0.0
+    acc_a11r = 1.0; acc_a11i = 0.0
+    acc_y0r = 0.0; acc_y0i = 0.0
+    acc_y1r = 0.0; acc_y1i = 0.0
 
     for step in tl.static_range(CHUNK):
         t = chunk_start + step if not REVERSE else chunk_start + (CHUNK - 1 - step)
@@ -150,62 +171,31 @@ def _mat2x2_chunk_pass1_kernel(
         a01i = tl.load(A_base + ta + stride_a_d2 + 1, mask=valid, other=0.0)
         a10r = tl.load(A_base + ta + stride_a_d1 + 0, mask=valid, other=0.0)
         a10i = tl.load(A_base + ta + stride_a_d1 + 1, mask=valid, other=0.0)
-        a11r = tl.load(
-            A_base + ta + stride_a_d1 + stride_a_d2 + 0, mask=valid, other=1.0,
-        )
-        a11i = tl.load(
-            A_base + ta + stride_a_d1 + stride_a_d2 + 1, mask=valid, other=0.0,
-        )
+        a11r = tl.load(A_base + ta + stride_a_d1 + stride_a_d2 + 0, mask=valid, other=1.0)
+        a11i = tl.load(A_base + ta + stride_a_d1 + stride_a_d2 + 1, mask=valid, other=0.0)
 
         tx = t * stride_x_time
-        x00r = tl.load(X_base + tx + 0, mask=valid, other=0.0)
-        x00i = tl.load(X_base + tx + 1, mask=valid, other=0.0)
-        x01r = tl.load(X_base + tx + stride_x_d2 + 0, mask=valid, other=0.0)
-        x01i = tl.load(X_base + tx + stride_x_d2 + 1, mask=valid, other=0.0)
-        x10r = tl.load(X_base + tx + stride_x_d1 + 0, mask=valid, other=0.0)
-        x10i = tl.load(X_base + tx + stride_x_d1 + 1, mask=valid, other=0.0)
-        x11r = tl.load(
-            X_base + tx + stride_x_d1 + stride_x_d2 + 0, mask=valid, other=0.0,
-        )
-        x11i = tl.load(
-            X_base + tx + stride_x_d1 + stride_x_d2 + 1, mask=valid, other=0.0,
-        )
+        x0r = tl.load(X_base + tx + 0, mask=valid, other=0.0)
+        x0i = tl.load(X_base + tx + 1, mask=valid, other=0.0)
+        x1r = tl.load(X_base + tx + stride_x_d1 + 0, mask=valid, other=0.0)
+        x1i = tl.load(X_base + tx + stride_x_d1 + 1, mask=valid, other=0.0)
 
-        (
-            new_y00r, new_y00i, new_y01r, new_y01i,
-            new_y10r, new_y10i, new_y11r, new_y11i,
-        ) = _mat2x2_apply(
-            a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
-            acc_y00r, acc_y00i, acc_y01r, acc_y01i,
-            acc_y10r, acc_y10i, acc_y11r, acc_y11i,
-        )
-        new_y00r += x00r
-        new_y00i += x00i
-        new_y01r += x01r
-        new_y01i += x01i
-        new_y10r += x10r
-        new_y10i += x10i
-        new_y11r += x11r
-        new_y11i += x11i
-
-        if valid:
-            tl.store(Y_base + tx + 0, new_y00r)
-            tl.store(Y_base + tx + 1, new_y00i)
-            tl.store(Y_base + tx + stride_x_d2 + 0, new_y01r)
-            tl.store(Y_base + tx + stride_x_d2 + 1, new_y01i)
-            tl.store(Y_base + tx + stride_x_d1 + 0, new_y10r)
-            tl.store(Y_base + tx + stride_x_d1 + 1, new_y10i)
-            tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 0, new_y11r)
-            tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 1, new_y11i)
-
-        (
-            new_a00r, new_a00i, new_a01r, new_a01i,
-            new_a10r, new_a10i, new_a11r, new_a11i,
-        ) = _mat2x2_prod_combine(
+        # new_acc = affine_combine(acc, (A[t], X[t]))
+        # = (A[t] @ A_acc, A[t] @ y_acc + X[t])
+        new_a00r, new_a00i, new_a01r, new_a01i, new_a10r, new_a10i, new_a11r, new_a11i, \
+        new_y0r, new_y0i, new_y1r, new_y1i = _affine_combine(
             acc_a00r, acc_a00i, acc_a01r, acc_a01i,
             acc_a10r, acc_a10i, acc_a11r, acc_a11i,
+            acc_y0r, acc_y0i, acc_y1r, acc_y1i,
             a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i,
+            x0r, x0i, x1r, x1i,
         )
+
+        if valid:
+            tl.store(Y_base + tx + 0, new_y0r)
+            tl.store(Y_base + tx + 1, new_y0i)
+            tl.store(Y_base + tx + stride_x_d1 + 0, new_y1r)
+            tl.store(Y_base + tx + stride_x_d1 + 1, new_y1i)
 
         acc_a00r = new_a00r if valid else acc_a00r
         acc_a00i = new_a00i if valid else acc_a00i
@@ -215,88 +205,105 @@ def _mat2x2_chunk_pass1_kernel(
         acc_a10i = new_a10i if valid else acc_a10i
         acc_a11r = new_a11r if valid else acc_a11r
         acc_a11i = new_a11i if valid else acc_a11i
+        acc_y0r = new_y0r if valid else acc_y0r
+        acc_y0i = new_y0i if valid else acc_y0i
+        acc_y1r = new_y1r if valid else acc_y1r
+        acc_y1i = new_y1i if valid else acc_y1i
 
-        acc_y00r = new_y00r if valid else acc_y00r
-        acc_y00i = new_y00i if valid else acc_y00i
-        acc_y01r = new_y01r if valid else acc_y01r
-        acc_y01i = new_y01i if valid else acc_y01i
-        acc_y10r = new_y10r if valid else acc_y10r
-        acc_y10i = new_y10i if valid else acc_y10i
-        acc_y11r = new_y11r if valid else acc_y11r
-        acc_y11i = new_y11i if valid else acc_y11i
-
-    ae = chunk_id * stride_ae_chunk
-    tl.store(Aend_base + ae + 0, acc_a00r)
-    tl.store(Aend_base + ae + 1, acc_a00i)
-    tl.store(Aend_base + ae + 2, acc_a01r)
-    tl.store(Aend_base + ae + 3, acc_a01i)
-    tl.store(Aend_base + ae + 4, acc_a10r)
-    tl.store(Aend_base + ae + 5, acc_a10i)
-    tl.store(Aend_base + ae + 6, acc_a11r)
-    tl.store(Aend_base + ae + 7, acc_a11i)
+    # Write chunk-end state to State buffer
+    s = chunk_id * stride_s_chunk
+    tl.store(S_base + s + 0,  acc_a00r)
+    tl.store(S_base + s + 1,  acc_a00i)
+    tl.store(S_base + s + 2,  acc_a01r)
+    tl.store(S_base + s + 3,  acc_a01i)
+    tl.store(S_base + s + 4,  acc_a10r)
+    tl.store(S_base + s + 5,  acc_a10i)
+    tl.store(S_base + s + 6,  acc_a11r)
+    tl.store(S_base + s + 7,  acc_a11i)
+    tl.store(S_base + s + 8,  acc_y0r)
+    tl.store(S_base + s + 9,  acc_y0i)
+    tl.store(S_base + s + 10, acc_y1r)
+    tl.store(S_base + s + 11, acc_y1i)
 
 
 @triton.jit
 def _mat2x2_chunk_pass2_kernel(
-    Aend_ptr,
-    stride_ae_batch,
-    stride_ae_chunk,
+    State_ptr,
+    stride_s_batch,
+    stride_s_chunk,
     N_CHUNKS: tl.constexpr,
     N_CHUNKS_POW2: tl.constexpr,
 ):
     """
-    Pass 2: prefix-product scan over the N_CHUNKS chunk-end A matrices.
+    Pass 2: prefix scan over State[chunk] using _affine_combine.
 
-    Only 8 float32 values are live at once — no register spill possible.
-    N_CHUNKS_POW2 is the next power of two >= N_CHUNKS, required by
-    tl.associative_scan.
-    grid = (BC,).
+    After this pass, State[k] contains the prefix affine map that maps
+    chunk k's local Y_local values to the global Y values:
+        global_Y[t in chunk k] = A_prefix[k-1] @ Y_local[t] + Y_carry[k-1]
+    where (A_prefix[k-1], Y_carry[k-1]) = State[k-1] after this scan.
+
+    State layout per chunk: 12 floats (A: 8, Y: 4).
+    grid = (BC,)
     """
     pid = tl.program_id(axis=0)
-    Aend_base = Aend_ptr + pid * stride_ae_batch
+    S_base = State_ptr + pid * stride_s_batch
 
     offs = tl.arange(0, N_CHUNKS_POW2)
     mask = offs < N_CHUNKS
-    ae = offs * stride_ae_chunk
+    s = offs * stride_s_chunk
 
-    a00r = tl.load(Aend_base + ae + 0, mask=mask, other=1.0)
-    a00i = tl.load(Aend_base + ae + 1, mask=mask, other=0.0)
-    a01r = tl.load(Aend_base + ae + 2, mask=mask, other=0.0)
-    a01i = tl.load(Aend_base + ae + 3, mask=mask, other=0.0)
-    a10r = tl.load(Aend_base + ae + 4, mask=mask, other=0.0)
-    a10i = tl.load(Aend_base + ae + 5, mask=mask, other=0.0)
-    a11r = tl.load(Aend_base + ae + 6, mask=mask, other=1.0)
-    a11i = tl.load(Aend_base + ae + 7, mask=mask, other=0.0)
+    a00r = tl.load(S_base + s + 0,  mask=mask, other=1.0)
+    a00i = tl.load(S_base + s + 1,  mask=mask, other=0.0)
+    a01r = tl.load(S_base + s + 2,  mask=mask, other=0.0)
+    a01i = tl.load(S_base + s + 3,  mask=mask, other=0.0)
+    a10r = tl.load(S_base + s + 4,  mask=mask, other=0.0)
+    a10i = tl.load(S_base + s + 5,  mask=mask, other=0.0)
+    a11r = tl.load(S_base + s + 6,  mask=mask, other=1.0)
+    a11i = tl.load(S_base + s + 7,  mask=mask, other=0.0)
+    y0r  = tl.load(S_base + s + 8,  mask=mask, other=0.0)
+    y0i  = tl.load(S_base + s + 9,  mask=mask, other=0.0)
+    y1r  = tl.load(S_base + s + 10, mask=mask, other=0.0)
+    y1i  = tl.load(S_base + s + 11, mask=mask, other=0.0)
 
-    pa00r, pa00i, pa01r, pa01i, pa10r, pa10i, pa11r, pa11i = tl.associative_scan(
-        (a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i),
+    (
+        pa00r, pa00i, pa01r, pa01i, pa10r, pa10i, pa11r, pa11i,
+        py0r, py0i, py1r, py1i,
+    ) = tl.associative_scan(
+        (a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i, y0r, y0i, y1r, y1i),
         axis=0,
-        combine_fn=_mat2x2_prod_combine,
+        combine_fn=_affine_combine,
     )
 
-    tl.store(Aend_base + ae + 0, pa00r, mask=mask)
-    tl.store(Aend_base + ae + 1, pa00i, mask=mask)
-    tl.store(Aend_base + ae + 2, pa01r, mask=mask)
-    tl.store(Aend_base + ae + 3, pa01i, mask=mask)
-    tl.store(Aend_base + ae + 4, pa10r, mask=mask)
-    tl.store(Aend_base + ae + 5, pa10i, mask=mask)
-    tl.store(Aend_base + ae + 6, pa11r, mask=mask)
-    tl.store(Aend_base + ae + 7, pa11i, mask=mask)
+    tl.store(S_base + s + 0,  pa00r, mask=mask)
+    tl.store(S_base + s + 1,  pa00i, mask=mask)
+    tl.store(S_base + s + 2,  pa01r, mask=mask)
+    tl.store(S_base + s + 3,  pa01i, mask=mask)
+    tl.store(S_base + s + 4,  pa10r, mask=mask)
+    tl.store(S_base + s + 5,  pa10i, mask=mask)
+    tl.store(S_base + s + 6,  pa11r, mask=mask)
+    tl.store(S_base + s + 7,  pa11i, mask=mask)
+    tl.store(S_base + s + 8,  py0r,  mask=mask)
+    tl.store(S_base + s + 9,  py0i,  mask=mask)
+    tl.store(S_base + s + 10, py1r,  mask=mask)
+    tl.store(S_base + s + 11, py1i,  mask=mask)
 
 
 @triton.jit
 def _mat2x2_chunk_pass3_kernel(
-    Y_ptr, Aend_ptr,
-    stride_x_batch, stride_x_time, stride_x_d1, stride_x_d2,
-    stride_ae_batch, stride_ae_chunk,
+    Y_ptr, State_ptr,
+    stride_x_batch, stride_x_time, stride_x_d1,
+    stride_s_batch, stride_s_chunk,
     L, CHUNK: tl.constexpr, REVERSE: tl.constexpr,
     N_CHUNKS: tl.constexpr,
 ):
     """
-    Pass 3: apply the prefix A-state from the previous chunk to every
-    element in the current chunk.
+    Pass 3: apply prefix state from chunk k-1 to every element in chunk k.
 
-    grid = (BC * N_CHUNKS,).
+    For chunk k (k > 0):
+        Y[t] = A_prefix[k-1] @ Y_local[t] + Y_carry[k-1]
+    where (A_prefix[k-1], Y_carry[k-1]) = State[k-1] after pass 2.
+
+    grid = (BC * N_CHUNKS,)
     """
     pid = tl.program_id(axis=0)
     batch_id = pid // N_CHUNKS
@@ -306,17 +313,22 @@ def _mat2x2_chunk_pass3_kernel(
         return
 
     Y_base = Y_ptr + batch_id * stride_x_batch
-    Aend_base = Aend_ptr + batch_id * stride_ae_batch
+    S_base = State_ptr + batch_id * stride_s_batch
 
-    ae = (chunk_id - 1) * stride_ae_chunk
-    p00r = tl.load(Aend_base + ae + 0)
-    p00i = tl.load(Aend_base + ae + 1)
-    p01r = tl.load(Aend_base + ae + 2)
-    p01i = tl.load(Aend_base + ae + 3)
-    p10r = tl.load(Aend_base + ae + 4)
-    p10i = tl.load(Aend_base + ae + 5)
-    p11r = tl.load(Aend_base + ae + 6)
-    p11i = tl.load(Aend_base + ae + 7)
+    # Load prefix state from chunk k-1
+    s = (chunk_id - 1) * stride_s_chunk
+    p00r = tl.load(S_base + s + 0)
+    p00i = tl.load(S_base + s + 1)
+    p01r = tl.load(S_base + s + 2)
+    p01i = tl.load(S_base + s + 3)
+    p10r = tl.load(S_base + s + 4)
+    p10i = tl.load(S_base + s + 5)
+    p11r = tl.load(S_base + s + 6)
+    p11i = tl.load(S_base + s + 7)
+    c0r  = tl.load(S_base + s + 8)
+    c0i  = tl.load(S_base + s + 9)
+    c1r  = tl.load(S_base + s + 10)
+    c1i  = tl.load(S_base + s + 11)
 
     chunk_start = chunk_id * CHUNK if not REVERSE else (N_CHUNKS - 1 - chunk_id) * CHUNK
 
@@ -326,28 +338,22 @@ def _mat2x2_chunk_pass3_kernel(
 
         if valid:
             tx = t * stride_x_time
-            y00r = tl.load(Y_base + tx + 0)
-            y00i = tl.load(Y_base + tx + 1)
-            y01r = tl.load(Y_base + tx + stride_x_d2 + 0)
-            y01i = tl.load(Y_base + tx + stride_x_d2 + 1)
-            y10r = tl.load(Y_base + tx + stride_x_d1 + 0)
-            y10i = tl.load(Y_base + tx + stride_x_d1 + 1)
-            y11r = tl.load(Y_base + tx + stride_x_d1 + stride_x_d2 + 0)
-            y11i = tl.load(Y_base + tx + stride_x_d1 + stride_x_d2 + 1)
+            # Load Y_local[t]
+            yl0r = tl.load(Y_base + tx + 0)
+            yl0i = tl.load(Y_base + tx + 1)
+            yl1r = tl.load(Y_base + tx + stride_x_d1 + 0)
+            yl1i = tl.load(Y_base + tx + stride_x_d1 + 1)
 
-            z00r, z00i, z01r, z01i, z10r, z10i, z11r, z11i = _mat2x2_apply(
-                p00r, p00i, p01r, p01i, p10r, p10i, p11r, p11i,
-                y00r, y00i, y01r, y01i, y10r, y10i, y11r, y11i,
-            )
+            # Y[t] = A_prefix @ Y_local[t] + Y_carry
+            z0r = p00r * yl0r - p00i * yl0i + p01r * yl1r - p01i * yl1i + c0r
+            z0i = p00r * yl0i + p00i * yl0r + p01r * yl1i + p01i * yl1r + c0i
+            z1r = p10r * yl0r - p10i * yl0i + p11r * yl1r - p11i * yl1i + c1r
+            z1i = p10r * yl0i + p10i * yl0r + p11r * yl1i + p11i * yl1r + c1i
 
-            tl.store(Y_base + tx + 0, z00r)
-            tl.store(Y_base + tx + 1, z00i)
-            tl.store(Y_base + tx + stride_x_d2 + 0, z01r)
-            tl.store(Y_base + tx + stride_x_d2 + 1, z01i)
-            tl.store(Y_base + tx + stride_x_d1 + 0, z10r)
-            tl.store(Y_base + tx + stride_x_d1 + 1, z10i)
-            tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 0, z11r)
-            tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 1, z11i)
+            tl.store(Y_base + tx + 0, z0r)
+            tl.store(Y_base + tx + 1, z0i)
+            tl.store(Y_base + tx + stride_x_d1 + 0, z1r)
+            tl.store(Y_base + tx + stride_x_d1 + 1, z1i)
 
 
 def _run_scalar_pscan(A_real, X_real, L, reverse=False):
@@ -365,12 +371,14 @@ def _run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     """
     Three-pass chunk scan for 2x2 complex matrix SSM.
 
-    Pass 1: sequential scan within each chunk  (serial A+Y update, no spill)
-    Pass 2: prefix-product scan over chunk-end A states  (8 floats, no spill)
-    Pass 3: apply prefix A to every element in chunks 1..N-1
+    Pass 1: local sequential scan per chunk starting from (I, 0).
+            Stores Y_local and chunk-end state (A_prod, Y_end).
+    Pass 2: prefix scan over chunk states using _affine_combine.
+            After pass 2, State[k] = (A_prefix_k, Y_carry_k).
+    Pass 3: correct each non-first chunk:
+            Y[t] = A_prefix[k-1] @ Y_local[t] + Y_carry[k-1].
 
-    N_CHUNKS = ceil(L / _MAT_CHUNK_SIZE).  _MAT_CHUNK_SIZE is a compile-time
-    constant that keeps each Triton program's register budget within limits.
+    State tensor: [BC, n_chunks, 12] float32
     """
     BC = A_real.shape[0]
     n_chunks = (L + _MAT_CHUNK_SIZE - 1) // _MAT_CHUNK_SIZE
@@ -379,30 +387,31 @@ def _run_mat2x2_pscan(A_real, X_real, L, reverse=False):
         n_chunks_pow2 *= 2
 
     Y_real = torch.empty_like(X_real)
-    Aend = torch.empty(BC, n_chunks, 8, dtype=torch.float32, device=A_real.device)
+    # 12 floats per chunk: 8 for A, 4 for Y (2x1 vector)
+    State = torch.empty(BC, n_chunks, 12, dtype=torch.float32, device=A_real.device)
 
     _mat2x2_chunk_pass1_kernel[(BC * n_chunks,)](
-        A_real, X_real, Y_real, Aend,
+        A_real, X_real, Y_real, State,
         A_real.stride(0), A_real.stride(1),
         A_real.stride(2), A_real.stride(3),
         X_real.stride(0), X_real.stride(1),
         X_real.stride(2), X_real.stride(3),
-        Aend.stride(0), Aend.stride(1),
+        State.stride(0), State.stride(1),
         L, CHUNK=_MAT_CHUNK_SIZE, REVERSE=reverse, N_CHUNKS=n_chunks,
     )
 
     if n_chunks > 1:
         _mat2x2_chunk_pass2_kernel[(BC,)](
-            Aend,
-            Aend.stride(0), Aend.stride(1),
+            State,
+            State.stride(0), State.stride(1),
             N_CHUNKS=n_chunks, N_CHUNKS_POW2=n_chunks_pow2,
         )
 
         _mat2x2_chunk_pass3_kernel[(BC * n_chunks,)](
-            Y_real, Aend,
+            Y_real, State,
             X_real.stride(0), X_real.stride(1),
-            X_real.stride(2), X_real.stride(3),
-            Aend.stride(0), Aend.stride(1),
+            X_real.stride(2),
+            State.stride(0), State.stride(1),
             L, CHUNK=_MAT_CHUNK_SIZE, REVERSE=reverse, N_CHUNKS=n_chunks,
         )
 
@@ -638,11 +647,10 @@ def pscan(A, X):
     8 float32 values in the combine function.
 
     Matrix path (diagonal mode D1 == 2, or full matrix mode): three-pass chunk
-    scan.  Pass 1 runs a sequential scan within each chunk of _MAT_CHUNK_SIZE
-    steps.  Pass 2 does a prefix-product scan over the chunk-end A matrices
-    (8 float32 values, no register pressure).  Pass 3 applies the prefix state
-    to each non-first chunk.  The chunk decomposition eliminates register spill
-    while keeping numerical error at sequential-scan level.
+    scan.  Pass 1 runs a local sequential scan per chunk from (I, 0).  Pass 2
+    does a prefix scan over (A_prod, Y_end) states using the affine combine
+    operator (B,y_B)∘(A,y_A)=(B@A, B@y_A+y_B).  Pass 3 corrects each
+    non-first chunk: Y[t] = A_prefix[k-1]@Y_local[t] + Y_carry[k-1].
     """
     squeeze_output = X.ndim == 4
     if squeeze_output:
