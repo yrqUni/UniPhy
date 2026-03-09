@@ -278,6 +278,23 @@ class UniPhyModel(nn.Module):
             return out, z
         return out
 
+    def _rollout_step_fn(self, z_curr, dt_step, *flat_states):
+        num_layers = self.depth
+        states = []
+        for i in range(num_layers):
+            states.append((flat_states[i * 2], flat_states[i * 2 + 1]))
+        new_states = []
+        for i, block in enumerate(self.blocks):
+            z_curr, h_n, f_n = block.forward_step(
+                z_curr, states[i][0], dt_step, states[i][1],
+            )
+            new_states.append((h_n, f_n))
+        x_pred = self.decoder(z_curr)
+        out_tensors = [z_curr, x_pred]
+        for h, f in new_states:
+            out_tensors.extend([h, f])
+        return tuple(out_tensors)
+
     def forward_rollout(self, x_context, dt_context, dt_list):
         B, T_in = x_context.shape[0], x_context.shape[1]
         device = x_context.device
@@ -295,19 +312,24 @@ class UniPhyModel(nn.Module):
         preds = []
         for step_idx, dt_k in enumerate(dt_list):
             dt_step = self._normalize_dt(dt_k, B, 1, device).squeeze(1)
-            states = [
-                (h.detach().requires_grad_(), f.detach().requires_grad_())
-                for h, f in states
-            ]
+            flat_states = []
+            for h, f in states:
+                flat_states.extend([h, f])
+            outs = torch.utils.checkpoint.checkpoint(
+                self._rollout_step_fn,
+                z_curr, dt_step, *flat_states,
+                use_reentrant=False,
+            )
+            z_curr = outs[0]
+            x_pred = outs[1]
             new_states = []
-            for i, block in enumerate(self.blocks):
-                z_curr, h_n, f_n = block.forward_step(
-                    z_curr, states[i][0], dt_step, states[i][1],
-                )
-                new_states.append((h_n, f_n))
+            for i in range(self.depth):
+                new_states.append((outs[2 + i * 2], outs[3 + i * 2]))
             states = new_states
-            x_pred = self.decoder(z_curr)
             preds.append(x_pred)
             if step_idx < n_steps - 1:
-                z_curr = self.encoder(x_pred)
+                z_curr = torch.utils.checkpoint.checkpoint(
+                    self.encoder, x_pred,
+                    use_reentrant=False,
+                )
         return torch.stack(preds, dim=1)
