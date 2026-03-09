@@ -323,32 +323,31 @@ def _mat2x2_chunk_pass3_kernel(
     for step in tl.static_range(CHUNK):
         t = chunk_start + step if not REVERSE else chunk_start + (CHUNK - 1 - step)
         valid = t < L
-        if not valid:
-            continue
 
-        tx = t * stride_x_time
-        y00r = tl.load(Y_base + tx + 0)
-        y00i = tl.load(Y_base + tx + 1)
-        y01r = tl.load(Y_base + tx + stride_x_d2 + 0)
-        y01i = tl.load(Y_base + tx + stride_x_d2 + 1)
-        y10r = tl.load(Y_base + tx + stride_x_d1 + 0)
-        y10i = tl.load(Y_base + tx + stride_x_d1 + 1)
-        y11r = tl.load(Y_base + tx + stride_x_d1 + stride_x_d2 + 0)
-        y11i = tl.load(Y_base + tx + stride_x_d1 + stride_x_d2 + 1)
+        if valid:
+            tx = t * stride_x_time
+            y00r = tl.load(Y_base + tx + 0)
+            y00i = tl.load(Y_base + tx + 1)
+            y01r = tl.load(Y_base + tx + stride_x_d2 + 0)
+            y01i = tl.load(Y_base + tx + stride_x_d2 + 1)
+            y10r = tl.load(Y_base + tx + stride_x_d1 + 0)
+            y10i = tl.load(Y_base + tx + stride_x_d1 + 1)
+            y11r = tl.load(Y_base + tx + stride_x_d1 + stride_x_d2 + 0)
+            y11i = tl.load(Y_base + tx + stride_x_d1 + stride_x_d2 + 1)
 
-        z00r, z00i, z01r, z01i, z10r, z10i, z11r, z11i = _mat2x2_apply(
-            p00r, p00i, p01r, p01i, p10r, p10i, p11r, p11i,
-            y00r, y00i, y01r, y01i, y10r, y10i, y11r, y11i,
-        )
+            z00r, z00i, z01r, z01i, z10r, z10i, z11r, z11i = _mat2x2_apply(
+                p00r, p00i, p01r, p01i, p10r, p10i, p11r, p11i,
+                y00r, y00i, y01r, y01i, y10r, y10i, y11r, y11i,
+            )
 
-        tl.store(Y_base + tx + 0, z00r)
-        tl.store(Y_base + tx + 1, z00i)
-        tl.store(Y_base + tx + stride_x_d2 + 0, z01r)
-        tl.store(Y_base + tx + stride_x_d2 + 1, z01i)
-        tl.store(Y_base + tx + stride_x_d1 + 0, z10r)
-        tl.store(Y_base + tx + stride_x_d1 + 1, z10i)
-        tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 0, z11r)
-        tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 1, z11i)
+            tl.store(Y_base + tx + 0, z00r)
+            tl.store(Y_base + tx + 1, z00i)
+            tl.store(Y_base + tx + stride_x_d2 + 0, z01r)
+            tl.store(Y_base + tx + stride_x_d2 + 1, z01i)
+            tl.store(Y_base + tx + stride_x_d1 + 0, z10r)
+            tl.store(Y_base + tx + stride_x_d1 + 1, z10i)
+            tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 0, z11r)
+            tl.store(Y_base + tx + stride_x_d1 + stride_x_d2 + 1, z11i)
 
 
 def _run_scalar_pscan(A_real, X_real, L, reverse=False):
