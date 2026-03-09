@@ -57,11 +57,6 @@ def _scalar_pscan_kernel(
 
 _MAT_CHUNK_SIZE = 8
 
-_MAT_AUTOTUNE_CONFIGS = [
-    triton.Config({"N_CHUNKS": n}, num_warps=4)
-    for n in [1, 2, 4, 8, 16, 32, 64, 128]
-]
-
 
 @triton.jit
 def _mat2x2_prod_combine(
@@ -97,7 +92,6 @@ def _mat2x2_apply(
     return z00r, z00i, z01r, z01i, z10r, z10i, z11r, z11i
 
 
-@triton.autotune(configs=_MAT_AUTOTUNE_CONFIGS, key=["N_CHUNKS"])
 @triton.jit
 def _mat2x2_chunk_pass1_kernel(
     A_ptr, X_ptr, Y_ptr, Aend_ptr,
@@ -242,34 +236,37 @@ def _mat2x2_chunk_pass1_kernel(
     tl.store(Aend_base + ae + 7, acc_a11i)
 
 
-@triton.autotune(configs=_MAT_AUTOTUNE_CONFIGS, key=["N_CHUNKS"])
 @triton.jit
 def _mat2x2_chunk_pass2_kernel(
     Aend_ptr,
     stride_ae_batch,
     stride_ae_chunk,
     N_CHUNKS: tl.constexpr,
+    N_CHUNKS_POW2: tl.constexpr,
 ):
     """
     Pass 2: prefix-product scan over the N_CHUNKS chunk-end A matrices.
 
     Only 8 float32 values are live at once — no register spill possible.
+    N_CHUNKS_POW2 is the next power of two >= N_CHUNKS, required by
+    tl.associative_scan.
     grid = (BC,).
     """
     pid = tl.program_id(axis=0)
     Aend_base = Aend_ptr + pid * stride_ae_batch
 
-    offs = tl.arange(0, N_CHUNKS)
-
+    offs = tl.arange(0, N_CHUNKS_POW2)
+    mask = offs < N_CHUNKS
     ae = offs * stride_ae_chunk
-    a00r = tl.load(Aend_base + ae + 0)
-    a00i = tl.load(Aend_base + ae + 1)
-    a01r = tl.load(Aend_base + ae + 2)
-    a01i = tl.load(Aend_base + ae + 3)
-    a10r = tl.load(Aend_base + ae + 4)
-    a10i = tl.load(Aend_base + ae + 5)
-    a11r = tl.load(Aend_base + ae + 6)
-    a11i = tl.load(Aend_base + ae + 7)
+
+    a00r = tl.load(Aend_base + ae + 0, mask=mask, other=1.0)
+    a00i = tl.load(Aend_base + ae + 1, mask=mask, other=0.0)
+    a01r = tl.load(Aend_base + ae + 2, mask=mask, other=0.0)
+    a01i = tl.load(Aend_base + ae + 3, mask=mask, other=0.0)
+    a10r = tl.load(Aend_base + ae + 4, mask=mask, other=0.0)
+    a10i = tl.load(Aend_base + ae + 5, mask=mask, other=0.0)
+    a11r = tl.load(Aend_base + ae + 6, mask=mask, other=1.0)
+    a11i = tl.load(Aend_base + ae + 7, mask=mask, other=0.0)
 
     pa00r, pa00i, pa01r, pa01i, pa10r, pa10i, pa11r, pa11i = tl.associative_scan(
         (a00r, a00i, a01r, a01i, a10r, a10i, a11r, a11i),
@@ -277,17 +274,16 @@ def _mat2x2_chunk_pass2_kernel(
         combine_fn=_mat2x2_prod_combine,
     )
 
-    tl.store(Aend_base + ae + 0, pa00r)
-    tl.store(Aend_base + ae + 1, pa00i)
-    tl.store(Aend_base + ae + 2, pa01r)
-    tl.store(Aend_base + ae + 3, pa01i)
-    tl.store(Aend_base + ae + 4, pa10r)
-    tl.store(Aend_base + ae + 5, pa10i)
-    tl.store(Aend_base + ae + 6, pa11r)
-    tl.store(Aend_base + ae + 7, pa11i)
+    tl.store(Aend_base + ae + 0, pa00r, mask=mask)
+    tl.store(Aend_base + ae + 1, pa00i, mask=mask)
+    tl.store(Aend_base + ae + 2, pa01r, mask=mask)
+    tl.store(Aend_base + ae + 3, pa01i, mask=mask)
+    tl.store(Aend_base + ae + 4, pa10r, mask=mask)
+    tl.store(Aend_base + ae + 5, pa10i, mask=mask)
+    tl.store(Aend_base + ae + 6, pa11r, mask=mask)
+    tl.store(Aend_base + ae + 7, pa11i, mask=mask)
 
 
-@triton.autotune(configs=_MAT_AUTOTUNE_CONFIGS, key=["N_CHUNKS"])
 @triton.jit
 def _mat2x2_chunk_pass3_kernel(
     Y_ptr, Aend_ptr,
@@ -368,7 +364,7 @@ def _run_scalar_pscan(A_real, X_real, L, reverse=False):
 
 def _run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     """
-    Three-pass chunk scan for 2×2 complex matrix SSM.
+    Three-pass chunk scan for 2x2 complex matrix SSM.
 
     Pass 1: sequential scan within each chunk  (serial A+Y update, no spill)
     Pass 2: prefix-product scan over chunk-end A states  (8 floats, no spill)
@@ -379,6 +375,9 @@ def _run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     """
     BC = A_real.shape[0]
     n_chunks = (L + _MAT_CHUNK_SIZE - 1) // _MAT_CHUNK_SIZE
+    n_chunks_pow2 = 1
+    while n_chunks_pow2 < n_chunks:
+        n_chunks_pow2 *= 2
 
     Y_real = torch.empty_like(X_real)
     Aend = torch.empty(BC, n_chunks, 8, dtype=torch.float32, device=A_real.device)
@@ -397,7 +396,7 @@ def _run_mat2x2_pscan(A_real, X_real, L, reverse=False):
         _mat2x2_chunk_pass2_kernel[(BC,)](
             Aend,
             Aend.stride(0), Aend.stride(1),
-            N_CHUNKS=n_chunks,
+            N_CHUNKS=n_chunks, N_CHUNKS_POW2=n_chunks_pow2,
         )
 
         _mat2x2_chunk_pass3_kernel[(BC * n_chunks,)](
