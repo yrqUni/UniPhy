@@ -198,7 +198,10 @@ def check_various_shapes():
         passed_mat = diff_mat < 1e-4
         passed = passed_diag and passed_mat
 
-        print(f"Shape (B={B}, L={L}, C={C}, D={D}): Diag={diff_diag:.2e} Mat={diff_mat:.2e} Passed={passed}")
+        print(
+            f"Shape (B={B}, L={L}, C={C}, D={D}): "
+            f"Diag={diff_diag:.2e} Mat={diff_mat:.2e} Passed={passed}"
+        )
         all_passed = all_passed and passed
 
     print()
@@ -329,4 +332,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
