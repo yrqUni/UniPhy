@@ -311,3 +311,4 @@ class UniPhyModel(nn.Module):
             if step_idx < n_steps - 1:
                 z_curr = self.encoder(x_pred)
         return torch.stack(preds, dim=1)
+
