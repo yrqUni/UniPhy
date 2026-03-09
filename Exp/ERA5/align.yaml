@@ -21,15 +21,18 @@ data:
 alignment:
   pretrained_ckpt: "./uniphy/ckpt/ckpt_epoch20.pt"
   condition_steps: 4
-  max_target_steps: 2
+  max_target_steps: 4
   target_dt: 6.0
-  sub_steps: [1, 2, 3, 6]
+  sub_steps: [1, 2, 3, 6, 12, 18, 36]
+  max_rollout_steps: 72
+  chunk_size: 6
 
 train:
   batch_size: 1
   lr: 5.0e-5
+  basis_lr: 5.0e-6
   weight_decay: 0.01
-  epochs: 20
+  epochs: 30
   grad_clip: 10.0
   grad_accum_steps: 4
 
@@ -41,4 +44,3 @@ logging:
   wandb_project: "ERA5-Align"
   wandb_entity: "UniPhy"
   wandb_run_name: ""
-  

@@ -42,9 +42,7 @@ class ComplexSVDTransform(nn.Module):
 
 
 def _safe_forcing(exp_arg, lam, eps=1e-7):
-    safe_lam = lam + eps * torch.sign(
-        lam.real + eps
-    ).to(lam.dtype)
+    safe_lam = lam + eps * torch.sign(lam.real + eps).to(lam.dtype)
     return torch.expm1(exp_arg) / safe_lam
 
 
@@ -63,6 +61,15 @@ class GlobalFluxTracker(nn.Module):
         )
         self.gate_min = 0.01
         self.gate_max = 0.99
+        self.h0_re = nn.Parameter(torch.zeros(dim))
+        self.h0_im = nn.Parameter(torch.zeros(dim))
+
+    def get_initial_state(self, B, device, dtype):
+        h0 = torch.complex(
+            self.h0_re.to(device),
+            self.h0_im.to(device),
+        ).to(dtype)
+        return h0.unsqueeze(0).expand(B, -1).contiguous()
 
     def _get_continuous_params(self):
         lam_re = -F.softplus(self.decay_re)
@@ -133,9 +140,11 @@ class TemporalPropagator(nn.Module):
         self.flux_tracker = GlobalFluxTracker(dim, dt_ref)
         self.lam_re = nn.Parameter(torch.randn(dim) * 0.01)
         self.lam_im = nn.Parameter(torch.randn(dim) * 0.1)
+        self.h0_re = nn.Parameter(torch.zeros(dim))
+        self.h0_im = nn.Parameter(torch.zeros(dim))
         if sde_mode == "sde":
             self.base_noise = nn.Parameter(
-                torch.ones(dim) * init_noise_scale
+                torch.ones(dim) * init_noise_scale,
             )
             self.uncertainty_net = nn.Sequential(
                 nn.Linear(dim, dim // 4),
@@ -146,6 +155,13 @@ class TemporalPropagator(nn.Module):
         else:
             self.register_buffer("base_noise", torch.tensor(0.0))
             self.uncertainty_net = None
+
+    def get_initial_h(self, B, H, W, device, dtype):
+        h0 = torch.complex(
+            self.h0_re.to(device),
+            self.h0_im.to(device),
+        ).to(dtype)
+        return h0.reshape(1, 1, 1, self.dim).expand(B, H, W, -1).contiguous()
 
     def _get_effective_lambda(self):
         lam_re_bounded = -F.softplus(self.lam_re)

@@ -64,7 +64,7 @@ class UniPhyBlock(nn.Module):
     def _apply_spatial(self, x_4d):
         x_real = torch.cat([x_4d.real, x_4d.imag], dim=1)
         x_norm = self.norm_spatial(
-            x_real.permute(0, 2, 3, 1)
+            x_real.permute(0, 2, 3, 1),
         ).permute(0, 3, 1, 2)
         x_spatial = self.spatial_cliff(x_norm)
         x_re, x_im = torch.chunk(x_spatial, 2, dim=1)
@@ -73,7 +73,7 @@ class UniPhyBlock(nn.Module):
     def _apply_temporal_decode(self, x_4d):
         x_real = torch.cat([x_4d.real, x_4d.imag], dim=1)
         x_norm = self.norm_temporal(
-            x_real.permute(0, 2, 3, 1)
+            x_real.permute(0, 2, 3, 1),
         ).permute(0, 3, 1, 2)
         x_re, x_im = torch.chunk(x_norm, 2, dim=1)
         x_complex = torch.complex(x_re, x_im)
@@ -243,13 +243,13 @@ class UniPhyModel(nn.Module):
 
     def _init_states(self, B, device, dtype):
         H, W, D = self.h_patches, self.w_patches, self.embed_dim
-        return [
-            (
-                torch.zeros(B * H * W, 1, D, device=device, dtype=dtype),
-                torch.zeros(B, D, device=device, dtype=dtype),
-            )
-            for _ in range(self.depth)
-        ]
+        states = []
+        for block in self.blocks:
+            h0 = block.prop.get_initial_h(B, H, W, device, dtype)
+            h0_flat = h0.reshape(B * H * W, 1, D)
+            f0 = block.prop.flux_tracker.get_initial_state(B, device, dtype)
+            states.append((h0_flat, f0))
+        return states
 
     def _normalize_dt(self, dt, B, T, device):
         if isinstance(dt, (float, int)):
@@ -278,24 +278,32 @@ class UniPhyModel(nn.Module):
             return out, z
         return out
 
-    def _rollout_step_fn(self, z_curr, dt_step, *flat_states):
+    def _rollout_chunk_fn(self, z_curr, chunk_dt_steps, *flat_states):
         num_layers = self.depth
-        states = []
-        for i in range(num_layers):
-            states.append((flat_states[i * 2], flat_states[i * 2 + 1]))
-        new_states = []
-        for i, block in enumerate(self.blocks):
-            z_curr, h_n, f_n = block.forward_step(
-                z_curr, states[i][0], dt_step, states[i][1],
-            )
-            new_states.append((h_n, f_n))
-        x_pred = self.decoder(z_curr)
-        out_tensors = [z_curr, x_pred]
-        for h, f in new_states:
+        states = [
+            (flat_states[i * 2], flat_states[i * 2 + 1])
+            for i in range(num_layers)
+        ]
+        chunk_preds = []
+        for dt_step in chunk_dt_steps:
+            new_states = []
+            for i, block in enumerate(self.blocks):
+                z_curr, h_n, f_n = block.forward_step(
+                    z_curr, states[i][0], dt_step, states[i][1],
+                )
+                new_states.append((h_n, f_n))
+            states = new_states
+            x_pred = self.decoder(z_curr)
+            z_curr = self.encoder(x_pred)
+            chunk_preds.append(x_pred)
+
+        out_tensors = [z_curr] + chunk_preds
+        for h, f in states:
             out_tensors.extend([h, f])
         return tuple(out_tensors)
 
-    def forward_rollout(self, x_context, dt_context, dt_list):
+    def forward_rollout(self, x_context, dt_context, dt_list,
+                        chunk_size=1):
         B, T_in = x_context.shape[0], x_context.shape[1]
         device = x_context.device
         dt_ctx_seq = self._normalize_dt(dt_context, B, T_in, device)
@@ -307,29 +315,40 @@ class UniPhyModel(nn.Module):
                 z_ctx, states[i][0], dt_ctx_seq, states[i][1],
             )
             states[i] = (h_f, f_f)
+
         z_curr = z_ctx[:, -1]
+
         n_steps = len(dt_list)
+        dt_steps = [
+            self._normalize_dt(dt_k, B, 1, device).squeeze(1)
+            for dt_k in dt_list
+        ]
+
         preds = []
-        for step_idx, dt_k in enumerate(dt_list):
-            dt_step = self._normalize_dt(dt_k, B, 1, device).squeeze(1)
+        step = 0
+        while step < n_steps:
+            chunk_end = min(step + chunk_size, n_steps)
+            chunk_dt_steps = dt_steps[step:chunk_end]
+            chunk_len = len(chunk_dt_steps)
+
             flat_states = []
             for h, f in states:
                 flat_states.extend([h, f])
+
             outs = torch.utils.checkpoint.checkpoint(
-                self._rollout_step_fn,
-                z_curr, dt_step, *flat_states,
+                self._rollout_chunk_fn,
+                z_curr, chunk_dt_steps, *flat_states,
                 use_reentrant=False,
             )
+
             z_curr = outs[0]
-            x_pred = outs[1]
-            new_states = []
-            for i in range(self.depth):
-                new_states.append((outs[2 + i * 2], outs[3 + i * 2]))
-            states = new_states
-            preds.append(x_pred)
-            if step_idx < n_steps - 1:
-                z_curr = torch.utils.checkpoint.checkpoint(
-                    self.encoder, x_pred,
-                    use_reentrant=False,
-                )
+            for k in range(chunk_len):
+                preds.append(outs[1 + k])
+            states = [
+                (outs[1 + chunk_len + i * 2],
+                 outs[1 + chunk_len + i * 2 + 1])
+                for i in range(self.depth)
+            ]
+            step = chunk_end
+
         return torch.stack(preds, dim=1)

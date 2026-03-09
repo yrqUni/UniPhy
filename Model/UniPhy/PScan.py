@@ -5,12 +5,6 @@ import triton
 import triton.language as tl
 
 
-def next_power_of_2(n):
-    if n <= 0:
-        return 1
-    return 1 << (n - 1).bit_length()
-
-
 @triton.jit
 def complex_mul(ar, ai, br, bi):
     return ar * br - ai * bi, ar * bi + ai * br
@@ -63,9 +57,14 @@ def mat2x2_scan_combine(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 16}, num_warps=2),
+        triton.Config({"BLOCK_SIZE": 32}, num_warps=2),
+        triton.Config({"BLOCK_SIZE": 64}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
     ],
     key=["L"],
 )
@@ -86,10 +85,10 @@ def mat2x2_pscan_kernel(
     read_offs = L - 1 - offs if REVERSE else offs
 
     a00r = tl.load(
-        A_base + read_offs * stride_a_time + 0, mask=mask, other=1.0
+        A_base + read_offs * stride_a_time + 0, mask=mask, other=1.0,
     )
     a00i = tl.load(
-        A_base + read_offs * stride_a_time + 1, mask=mask, other=0.0
+        A_base + read_offs * stride_a_time + 1, mask=mask, other=0.0,
     )
     a01r = tl.load(
         A_base + read_offs * stride_a_time + stride_a_d2 + 0,
@@ -117,10 +116,10 @@ def mat2x2_pscan_kernel(
     )
 
     x00r = tl.load(
-        X_base + read_offs * stride_x_time + 0, mask=mask, other=0.0
+        X_base + read_offs * stride_x_time + 0, mask=mask, other=0.0,
     )
     x00i = tl.load(
-        X_base + read_offs * stride_x_time + 1, mask=mask, other=0.0
+        X_base + read_offs * stride_x_time + 1, mask=mask, other=0.0,
     )
     x01r = tl.load(
         X_base + read_offs * stride_x_time + stride_x_d2 + 0,
@@ -159,12 +158,8 @@ def mat2x2_pscan_kernel(
         combine_fn=mat2x2_scan_combine,
     )
 
-    tl.store(
-        Y_base + read_offs * stride_x_time + 0, y00r, mask=mask
-    )
-    tl.store(
-        Y_base + read_offs * stride_x_time + 1, y00i, mask=mask
-    )
+    tl.store(Y_base + read_offs * stride_x_time + 0, y00r, mask=mask)
+    tl.store(Y_base + read_offs * stride_x_time + 1, y00i, mask=mask)
     tl.store(
         Y_base + read_offs * stride_x_time + stride_x_d2 + 0,
         y01r, mask=mask,
@@ -196,7 +191,7 @@ def run_mat2x2_pscan_torch(A_complex, X_complex, reverse=False):
     Y = torch.zeros_like(X_complex)
     indices = range(L - 1, -1, -1) if reverse else range(L)
     acc = torch.zeros(
-        B, D1, D2, dtype=X_complex.dtype, device=X_complex.device
+        B, D1, D2, dtype=X_complex.dtype, device=X_complex.device,
     )
     for i in indices:
         acc = torch.bmm(A_complex[:, i], acc) + X_complex[:, i]
@@ -206,14 +201,13 @@ def run_mat2x2_pscan_torch(A_complex, X_complex, reverse=False):
 
 def run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     Y_real = torch.empty_like(X_real)
-    BLOCK_SIZE = max(16, next_power_of_2(L))
     mat2x2_pscan_kernel[(A_real.shape[0],)](
         A_real, X_real, Y_real,
         A_real.stride(0), A_real.stride(1),
         A_real.stride(2), A_real.stride(3),
         X_real.stride(0), X_real.stride(1),
         X_real.stride(2), X_real.stride(3),
-        L, BLOCK_SIZE, reverse,
+        L, REVERSE=reverse,
     )
     return Y_real
 
@@ -230,8 +224,8 @@ class _PScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, X, is_diag):
         B, L, C, D1, D2_x = X.shape
-        pad_d2 = (D2_x == 1)
-        pad_d1 = (D1 == 1)
+        pad_d2 = D2_x == 1
+        pad_d1 = D1 == 1
 
         ctx.is_diag = is_diag
         ctx.pad_d2 = pad_d2
@@ -249,7 +243,7 @@ class _PScanFunction(torch.autograd.Function):
 
         if pad_d1:
             A_padded = F.pad(
-                A_mat, (0, 1, 0, 1), mode="constant", value=0.0
+                A_mat, (0, 1, 0, 1), mode="constant", value=0.0,
             )
             A_padded[..., -1, -1] = 1.0
             A_mat = A_padded
@@ -257,10 +251,10 @@ class _PScanFunction(torch.autograd.Function):
         D1_pad, D2_pad = X_in.shape[-2], X_in.shape[-1]
 
         A_flat = A_mat.permute(0, 2, 1, 3, 4).reshape(
-            B * C, L, A_mat.shape[-2], A_mat.shape[-1]
+            B * C, L, A_mat.shape[-2], A_mat.shape[-1],
         )
         X_flat = X_in.permute(0, 2, 1, 3, 4).reshape(
-            B * C, L, D1_pad, D2_pad
+            B * C, L, D1_pad, D2_pad,
         )
 
         A_real = torch.view_as_real(A_flat).contiguous()
@@ -270,7 +264,7 @@ class _PScanFunction(torch.autograd.Function):
 
         Y_flat = torch.view_as_complex(Y_real.contiguous())
         Y_full = Y_flat.reshape(
-            B, C, L, D1_pad, D2_pad
+            B, C, L, D1_pad, D2_pad,
         ).permute(0, 2, 1, 3, 4).contiguous()
 
         if pad_d1:
@@ -281,7 +275,7 @@ class _PScanFunction(torch.autograd.Function):
         ctx.save_for_backward(
             A_mat,
             Y_flat.reshape(
-                B, C, L, D1_pad, D2_pad
+                B, C, L, D1_pad, D2_pad,
             ).permute(0, 2, 1, 3, 4).contiguous(),
         )
         ctx.B, ctx.L, ctx.C = B, L, C
@@ -299,37 +293,37 @@ class _PScanFunction(torch.autograd.Function):
         grad_Y_in = grad_Y
         if ctx.pad_d1:
             grad_Y_in = F.pad(
-                grad_Y_in, (0, 0, 0, 1), mode="constant", value=0.0
+                grad_Y_in, (0, 0, 0, 1), mode="constant", value=0.0,
             )
         if ctx.pad_d2:
             grad_Y_in = F.pad(
-                grad_Y_in, (0, 1), mode="constant", value=0.0
+                grad_Y_in, (0, 1), mode="constant", value=0.0,
             )
 
         D1 = A_mat.shape[-2]
         I = torch.eye(
-            D1, dtype=A_mat.dtype, device=A_mat.device
+            D1, dtype=A_mat.dtype, device=A_mat.device,
         ).reshape(1, 1, 1, D1, D1).expand(B, 1, C, D1, D1)
         A_shift = torch.cat([A_mat[:, 1:], I], dim=1)
         A_H = A_shift.conj().transpose(-1, -2)
 
         A_H_flat = A_H.permute(0, 2, 1, 3, 4).reshape(
-            B * C, L, D1, D1
+            B * C, L, D1, D1,
         )
         grad_Y_flat = grad_Y_in.permute(0, 2, 1, 3, 4).reshape(
-            B * C, L, D1_pad, D2_pad
+            B * C, L, D1_pad, D2_pad,
         )
 
         A_H_real = torch.view_as_real(A_H_flat.resolve_conj()).contiguous()
         grad_Y_real = torch.view_as_real(grad_Y_flat).contiguous()
 
         grad_X_real = run_mat2x2_pscan(
-            A_H_real, grad_Y_real, L, reverse=True
+            A_H_real, grad_Y_real, L, reverse=True,
         )
 
         grad_X_flat = torch.view_as_complex(grad_X_real.contiguous())
         grad_X_full = grad_X_flat.reshape(
-            B, C, L, D1_pad, D2_pad
+            B, C, L, D1_pad, D2_pad,
         ).permute(0, 2, 1, 3, 4).contiguous()
 
         if ctx.pad_d1:
@@ -339,13 +333,13 @@ class _PScanFunction(torch.autograd.Function):
         )
 
         Y_prev = torch.cat(
-            [torch.zeros_like(Y_saved[:, :1]), Y_saved[:, :-1]], dim=1
+            [torch.zeros_like(Y_saved[:, :1]), Y_saved[:, :-1]], dim=1,
         )
         grad_X_for_A = grad_X_flat.reshape(
-            B, C, L, D1_pad, D2_pad
+            B, C, L, D1_pad, D2_pad,
         ).permute(0, 2, 1, 3, 4).contiguous()
         grad_A_full = torch.einsum(
-            "blcij,blckj->blcik", grad_X_for_A, Y_prev.conj()
+            "blcij,blckj->blcik", grad_X_for_A, Y_prev.conj(),
         )
 
         if ctx.pad_d1:
@@ -365,7 +359,7 @@ def pscan(A, X):
     if squeeze_output:
         X = X.unsqueeze(-1)
 
-    is_diag = (A.ndim == 4)
+    is_diag = A.ndim == 4
 
     Y = _PScanFunction.apply(A, X, is_diag)
 
