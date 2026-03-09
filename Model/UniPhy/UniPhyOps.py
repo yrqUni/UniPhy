@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -40,11 +39,9 @@ class ComplexSVDTransform(nn.Module):
         _, W_inv = self.get_matrix(h.dtype)
         return self.decode_with(h, W_inv)
 
-
 def _safe_forcing(exp_arg, lam, eps=1e-7):
     safe_lam = lam + eps * torch.sign(lam.real + eps).to(lam.dtype)
     return torch.expm1(exp_arg) / safe_lam
-
 
 class GlobalFluxTracker(nn.Module):
     def __init__(self, dim, dt_ref):
@@ -121,14 +118,12 @@ class GlobalFluxTracker(nn.Module):
         source, gate = self._compute_output(new_state)
         return new_state, source, gate
 
-
 def _compute_sde_scale(lam_re, dt_ratio, base_noise):
     two_lam = 2 * lam_re
     denom_safe = two_lam - 1e-8
     variance_factor = torch.expm1(two_lam * dt_ratio) / denom_safe
     std_scale = torch.sqrt(torch.clamp(variance_factor, min=1e-8))
     return base_noise * std_scale
-
 
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref, sde_mode, init_noise_scale):
@@ -225,7 +220,6 @@ class TemporalPropagator(nn.Module):
                 noise_re * final_scale, noise_im * final_scale,
             )
         return noise_re * final_scale
-
 
 class RiemannianCliffordConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding,

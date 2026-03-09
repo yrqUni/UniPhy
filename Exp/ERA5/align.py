@@ -34,13 +34,11 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-
 class SpeedColumn(ProgressColumn):
     def render(self, task):
         if task.speed is None:
             return Text("0.00 it/s", style="progress.data.speed")
         return Text(f"{task.speed:.2f} it/s", style="progress.data.speed")
-
 
 def setup_logging(log_path, rank):
     logger = logging.getLogger("align")
@@ -59,13 +57,11 @@ def setup_logging(log_path, rank):
         logger.addHandler(logging.NullHandler())
     return logger
 
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 def _get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps):
     """渐进式课程：随训练进度逐步解锁更细的时间步长。
@@ -80,7 +76,6 @@ def _get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps):
     if epoch < total_epochs // 3:
         unlock_count = max(1, n // 2)
     return sorted_steps[:unlock_count]
-
 
 def align_step(
     model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
@@ -174,7 +169,6 @@ def align_step(
     }
     return metrics
 
-
 def save_checkpoint(model, optimizer, epoch, global_step, cfg, path):
     state_dict = (
         model.module.state_dict()
@@ -190,7 +184,6 @@ def save_checkpoint(model, optimizer, epoch, global_step, cfg, path):
     }
     torch.save(state, path)
 
-
 def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
     if (batch_idx + 1) % grad_accum_steps != 0:
         torch.nn.utils.clip_grad_norm_(
@@ -198,7 +191,6 @@ def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
         )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
 
 def align(cfg):
     dist.init_process_group(backend="nccl")
@@ -385,6 +377,7 @@ def align(cfg):
                 total=len(train_loader),
             )
 
+        batch_idx = -1
         for batch_idx, batch in enumerate(train_loader):
             metrics = align_step(
                 model, batch, optimizer, cfg,
@@ -461,12 +454,10 @@ def align(cfg):
     train_dataset.cleanup()
     dist.destroy_process_group()
 
-
 def main():
     with open("align.yaml", "r") as f:
         cfg = yaml.safe_load(f)
     align(cfg)
-
 
 if __name__ == "__main__":
     main()

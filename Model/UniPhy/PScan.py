@@ -4,11 +4,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def complex_mul(ar, ai, br, bi):
     return ar * br - ai * bi, ar * bi + ai * br
-
 
 @triton.jit
 def mat2x2_scan_combine(
@@ -53,7 +51,6 @@ def mat2x2_scan_combine(
         c00r, c00i, c01r, c01i, c10r, c10i, c11r, c11i,
         z00r, z00i, z01r, z01i, z10r, z10i, z11r, z11i,
     )
-
 
 @triton.autotune(
     configs=[
@@ -185,19 +182,22 @@ def mat2x2_pscan_kernel(
         y11i, mask=mask,
     )
 
-
 def run_mat2x2_pscan_torch(A_complex, X_complex, reverse=False):
     B, L, D1, D2 = X_complex.shape
     Y = torch.zeros_like(X_complex)
-    indices = range(L - 1, -1, -1) if reverse else range(L)
     acc = torch.zeros(
         B, D1, D2, dtype=X_complex.dtype, device=X_complex.device,
     )
-    for i in indices:
-        acc = torch.bmm(A_complex[:, i], acc) + X_complex[:, i]
-        Y[:, i] = acc
+    if reverse:
+        for i in range(L - 1, -1, -1):
+            a_h = A_complex[:, i].conj().transpose(-1, -2)
+            acc = torch.bmm(a_h, acc) + X_complex[:, i]
+            Y[:, i] = acc
+    else:
+        for i in range(L):
+            acc = torch.bmm(A_complex[:, i], acc) + X_complex[:, i]
+            Y[:, i] = acc
     return Y
-
 
 def run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     Y_real = torch.empty_like(X_real)
@@ -211,14 +211,12 @@ def run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     )
     return Y_real
 
-
 def expand_diag_to_matrix(A_diag, D):
     shape = A_diag.shape[:-1] + (D, D)
     A_mat = torch.zeros(shape, dtype=A_diag.dtype, device=A_diag.device)
     idx = torch.arange(D, device=A_diag.device)
     A_mat[..., idx, idx] = A_diag
     return A_mat
-
 
 class _PScanFunction(torch.autograd.Function):
     @staticmethod
@@ -351,7 +349,6 @@ class _PScanFunction(torch.autograd.Function):
             else grad_A_full
         )
         return grad_A, grad_X, None
-
 
 def pscan(A, X):
     squeeze_output = X.ndim == 4

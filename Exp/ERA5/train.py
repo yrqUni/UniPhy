@@ -33,17 +33,14 @@ from ERA5 import ERA5Dataset
 from ModelUniPhy import UniPhyModel
 
 import warnings
-from contextlib import nullcontext
 
 warnings.filterwarnings("ignore")
-
 
 class SpeedColumn(ProgressColumn):
     def render(self, task):
         if task.speed is None:
             return Text("0.00 it/s", style="progress.data.speed")
         return Text(f"{task.speed:.2f} it/s", style="progress.data.speed")
-
 
 def setup_logging(log_path, rank):
     logger = logging.getLogger("train")
@@ -61,20 +58,17 @@ def setup_logging(log_path, rank):
         logger.addHandler(logging.NullHandler())
     return logger
 
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def build_lat_weights(H, W, device):
     lat = torch.linspace(-90, 90, H, device=device)
     weights = torch.cos(torch.deg2rad(lat))
     weights = weights / weights.mean()
     return weights.view(1, 1, 1, H, 1)
-
 
 def compute_crps(pred_ensemble, target):
     M = pred_ensemble.shape[0]
@@ -90,7 +84,6 @@ def compute_crps(pred_ensemble, target):
     else:
         loss = mae
     return loss
-
 
 def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
                lat_weights):
@@ -177,7 +170,6 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
     }
     return metrics
 
-
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg,
                     path):
     state_dict = (
@@ -196,7 +188,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg,
         "cfg": cfg,
     }
     torch.save(state, path)
-
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -218,7 +209,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
             pass
     return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
 
-
 def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
     if (batch_idx + 1) % grad_accum_steps != 0:
         torch.nn.utils.clip_grad_norm_(
@@ -226,14 +216,6 @@ def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
         )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
-
-
-def _ddp_sync_context(model, batch_idx, grad_accum_steps):
-    is_sync_step = (batch_idx + 1) % grad_accum_steps == 0
-    if is_sync_step or not hasattr(model, "no_sync"):
-        return nullcontext()
-    return model.no_sync()
 
 def train(cfg):
     dist.init_process_group(backend="nccl")
@@ -286,7 +268,13 @@ def train(cfg):
         ensemble_size=cfg["model"]["ensemble_size"],
     ).cuda()
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(
+        model,
+        device_ids=[local_rank],
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True,
+        static_graph=True,
+    )
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -393,12 +381,12 @@ def train(cfg):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
+        batch_idx = -1
         for batch_idx, batch in enumerate(train_loader):
-            with _ddp_sync_context(model, batch_idx, grad_accum_steps):
-                metrics = train_step(
-                    model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
-                    lat_weights,
-                )
+            metrics = train_step(
+                model, batch, optimizer, cfg, grad_accum_steps, batch_idx,
+                lat_weights,
+            )
             global_step += 1
 
             if (
@@ -487,12 +475,10 @@ def train(cfg):
     train_dataset.cleanup()
     dist.destroy_process_group()
 
-
 def main():
     with open("train.yaml", "r") as f:
         cfg = yaml.safe_load(f)
     train(cfg)
-
 
 if __name__ == "__main__":
     main()

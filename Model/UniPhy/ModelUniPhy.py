@@ -5,7 +5,6 @@ from UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from UniPhyOps import TemporalPropagator, RiemannianCliffordConv2d
 from UniPhyFFN import UniPhyFeedForwardNetwork
 
-
 class SpatialGateModulator(nn.Module):
     def __init__(self, dim, h_patches, w_patches):
         super().__init__()
@@ -23,13 +22,14 @@ class SpatialGateModulator(nn.Module):
     def _forward_single(self, gate_global, source_global, x_local):
         x_cat = torch.cat([x_local.real, x_local.imag], dim=-1)
         B, H, W, D2 = x_cat.shape
+        D = D2 // 2
         spatial_feat = x_cat.permute(0, 3, 1, 2)
         spatial_gate = self.spatial_proj(spatial_feat)
         spatial_gate = spatial_gate.permute(0, 2, 3, 1)
         gate_combined = gate_global.unsqueeze(1).unsqueeze(2) * spatial_gate
-        source_exp = source_global.unsqueeze(1).unsqueeze(2).expand(
-            B, H, W, D2 // 2,
-        )
+        src_re = source_global.real.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+        src_im = source_global.imag.unsqueeze(1).unsqueeze(2).expand(B, H, W, D)
+        source_exp = torch.complex(src_re, src_im)
         return x_local * gate_combined + source_exp * (1 - gate_combined)
 
     def forward(self, gate_global, source_global, x_local):
@@ -41,7 +41,6 @@ class SpatialGateModulator(nn.Module):
             out = self._forward_single(gate_flat, source_flat, x_flat)
             return out.reshape(B, T, H, W, D)
         return self._forward_single(gate_global, source_global, x_local)
-
 
 class UniPhyBlock(nn.Module):
     def __init__(self, dim, expand, img_height, img_width, kernel_size,
@@ -184,7 +183,6 @@ class UniPhyBlock(nn.Module):
         z_next = x_curr + x_out
         return z_next, h_next.reshape(B * H * W, 1, D), flux_next
 
-
 class UniPhyModel(nn.Module):
     def __init__(
         self, in_channels, out_channels, embed_dim, expand=4, depth=8,
@@ -278,14 +276,14 @@ class UniPhyModel(nn.Module):
             return out, z
         return out
 
-    def _rollout_chunk_fn(self, z_curr, chunk_dt_steps, *flat_states):
+    def _rollout_chunk_fn(self, z_curr, chunk_dt_stacked, *flat_states):
         num_layers = self.depth
         states = [
             (flat_states[i * 2], flat_states[i * 2 + 1])
             for i in range(num_layers)
         ]
         chunk_preds = []
-        for dt_step in chunk_dt_steps:
+        for dt_step in chunk_dt_stacked.unbind(0):
             new_states = []
             for i, block in enumerate(self.blocks):
                 z_curr, h_n, f_n = block.forward_step(
@@ -328,8 +326,8 @@ class UniPhyModel(nn.Module):
         step = 0
         while step < n_steps:
             chunk_end = min(step + chunk_size, n_steps)
-            chunk_dt_steps = dt_steps[step:chunk_end]
-            chunk_len = len(chunk_dt_steps)
+            chunk_len = chunk_end - step
+            chunk_dt_stacked = torch.stack(dt_steps[step:chunk_end], dim=0)
 
             flat_states = []
             for h, f in states:
@@ -337,7 +335,7 @@ class UniPhyModel(nn.Module):
 
             outs = torch.utils.checkpoint.checkpoint(
                 self._rollout_chunk_fn,
-                z_curr, chunk_dt_steps, *flat_states,
+                z_curr, chunk_dt_stacked, *flat_states,
                 use_reentrant=False,
             )
 

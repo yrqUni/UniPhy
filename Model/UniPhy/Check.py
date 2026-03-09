@@ -1,7 +1,6 @@
 import torch
 from ModelUniPhy import UniPhyModel
 
-
 def full_serial_inference(model, x_context, dt_context, dt_list):
     B, T_in = x_context.shape[0], x_context.shape[1]
     device = x_context.device
@@ -10,7 +9,11 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
     dtype = z_all.dtype
     states = model._init_states(B, device, dtype)
 
-    dt_ctx_val = float(dt_context) if isinstance(dt_context, (float, int)) else dt_context.item()
+    dt_ctx_val = (
+        float(dt_context)
+        if isinstance(dt_context, (float, int))
+        else dt_context.item()
+    )
 
     for t in range(T_in):
         z_in = z_all[:, t]
@@ -22,8 +25,7 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
             )
             states[i] = (h_next, flux_next)
 
-    x_last = x_context[:, -1]
-    z_curr = model.encoder(x_last)
+    z_curr = z_in
 
     preds = []
     for dt_k in dt_list:
@@ -43,7 +45,6 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
         preds.append(pred)
 
     return torch.stack(preds, dim=1)
-
 
 def check_precision_robustness():
     print("=" * 60)
@@ -118,8 +119,7 @@ def check_precision_robustness():
 
     return passed
 
-
 if __name__ == "__main__":
     success = check_precision_robustness()
     exit(0 if success else 1)
-    
+
