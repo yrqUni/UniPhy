@@ -295,6 +295,10 @@ class UniPhyModel(nn.Module):
         preds = []
         for step_idx, dt_k in enumerate(dt_list):
             dt_step = self._normalize_dt(dt_k, B, 1, device).squeeze(1)
+            states = [
+                (h.detach().requires_grad_(), f.detach().requires_grad_())
+                for h, f in states
+            ]
             new_states = []
             for i, block in enumerate(self.blocks):
                 z_curr, h_n, f_n = block.forward_step(
