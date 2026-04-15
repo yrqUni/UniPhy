@@ -1,0 +1,9 @@
+torch>=2.6,<3
+triton>=3.2,<4
+numpy>=1.26,<3
+PyYAML>=6,<7
+rich>=13,<14
+matplotlib>=3.8,<4
+scipy>=1.12,<2
+seaborn>=0.13,<1
+imageio>=2.34,<3
