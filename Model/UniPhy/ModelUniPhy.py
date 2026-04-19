@@ -148,7 +148,9 @@ class UniPhyBlock(nn.Module):
         delta = self.ffn(x_complex)
         return x_4d + delta
 
-    def _normalize_block_noise_seq(self, noise_seq, batch_size, steps, dim, height, width):
+    def _normalize_block_noise_seq(
+        self, noise_seq, batch_size, steps, dim, height, width
+    ):
         if noise_seq is None:
             return None
         if tuple(noise_seq.shape) == (batch_size, steps, height, width, dim):
@@ -199,7 +201,9 @@ class UniPhyBlock(nn.Module):
         forcing = self.spatial_gate(gate_seq, source_seq, x_eigen)
 
         op_decay, op_forcing = self.prop.get_transition_operators_seq(dt_seq)
-        op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(batch_size, steps, height, width, dim)
+        op_decay = op_decay.unsqueeze(2).unsqueeze(3).expand(
+            batch_size, steps, height, width, dim
+        )
         op_forcing = (
             op_forcing.unsqueeze(2)
             .unsqueeze(3)
@@ -207,7 +211,9 @@ class UniPhyBlock(nn.Module):
         )
 
         u_t = forcing * op_forcing
-        noise_seq = self._normalize_block_noise_seq(noise_seq, batch_size, steps, dim, height, width)
+        noise_seq = self._normalize_block_noise_seq(
+            noise_seq, batch_size, steps, dim, height, width
+        )
         u_t = u_t + self.prop.generate_stochastic_term_seq(
             u_t.shape,
             dt_seq,
@@ -221,15 +227,23 @@ class UniPhyBlock(nn.Module):
         u_t0 = u_t[:, 0] + h_contrib_t0
         u_t = torch.cat([u_t0.unsqueeze(1), u_t[:, 1:]], dim=1)
 
-        a_scan = op_decay.permute(0, 2, 3, 1, 4).reshape(batch_size * height * width, steps, dim, 1)
-        x_scan = u_t.permute(0, 2, 3, 1, 4).reshape(batch_size * height * width, steps, dim, 1)
-        u_out = pscan(a_scan, x_scan).reshape(batch_size, height, width, steps, dim).permute(0, 3, 1, 2, 4)
+        a_scan = op_decay.permute(0, 2, 3, 1, 4).reshape(
+            batch_size * height * width, steps, dim, 1
+        )
+        x_scan = u_t.permute(0, 2, 3, 1, 4).reshape(
+            batch_size * height * width, steps, dim, 1
+        )
+        u_out = pscan(a_scan, x_scan).reshape(
+            batch_size, height, width, steps, dim
+        ).permute(0, 3, 1, 2, 4)
 
         h_out = u_out[:, -1].reshape(batch_size * height * width, 1, dim)
         decoded = self._decode_sequence(u_out, basis_w_inv)
         decoded_flat = decoded.reshape(batch_size * steps, dim, height, width)
         decoded_with_residual_flat = self._apply_temporal_decode(decoded_flat)
-        decoded_with_residual = decoded_with_residual_flat.reshape(batch_size, steps, dim, height, width)
+        decoded_with_residual = decoded_with_residual_flat.reshape(
+            batch_size, steps, dim, height, width
+        )
         combined = self._combine_output(x, decoded, decoded_with_residual)
         zero_mask = _expand_batch_mask(_dt_is_zero(dt_seq), combined.ndim)
         combined = torch.where(zero_mask, x, combined)
@@ -255,11 +269,17 @@ class UniPhyBlock(nn.Module):
         forcing = self.spatial_gate(gate, source, x_eigen)
 
         op_decay, op_forcing = self.prop.get_transition_operators_step(dt_step)
-        op_decay = op_decay.unsqueeze(1).unsqueeze(2).expand(batch_size, height, width, dim)
-        op_forcing = op_forcing.unsqueeze(1).unsqueeze(2).expand(batch_size, height, width, dim)
+        op_decay = op_decay.unsqueeze(1).unsqueeze(2).expand(
+            batch_size, height, width, dim
+        )
+        op_forcing = op_forcing.unsqueeze(1).unsqueeze(2).expand(
+            batch_size, height, width, dim
+        )
 
         h_prev_hw = h_prev.reshape(batch_size, height, width, dim)
-        noise_step = self._normalize_block_noise_step(noise_step, batch_size, dim, height, width)
+        noise_step = self._normalize_block_noise_step(
+            noise_step, batch_size, dim, height, width
+        )
         noise = self.prop.generate_stochastic_term_step(
             h_prev_hw.shape,
             dt_step,
@@ -372,7 +392,12 @@ class UniPhyModel(nn.Module):
     def _normalize_dt(self, dt, batch_size, steps, device):
         dtype = self.skip_spatial_proj[0].weight.dtype
         if isinstance(dt, (float, int)):
-            return torch.full((batch_size, steps), float(dt), device=device, dtype=dtype)
+            return torch.full(
+                (batch_size, steps),
+                float(dt),
+                device=device,
+                dtype=dtype,
+            )
         dt = dt.detach().to(device=device, dtype=dtype)
         if dt.ndim == 0:
             return dt.expand(batch_size, steps).contiguous()
@@ -410,7 +435,8 @@ class UniPhyModel(nn.Module):
             )
         if tuple(noise.shape) != tuple(expected_shape):
             raise ValueError(
-                f"Noise shape mismatch: expected {tuple(expected_shape)}, got {tuple(noise.shape)}"
+                "Noise shape mismatch: expected "
+                f"{tuple(expected_shape)}, got {tuple(noise.shape)}"
             )
         if latent.ndim == 5:
             return noise.permute(0, 1, 3, 4, 2).contiguous()
@@ -425,20 +451,36 @@ class UniPhyModel(nn.Module):
                 device=self.skip_spatial_proj[0].weight.device,
                 dtype=self.skip_spatial_proj[0].weight.dtype,
             )
-        expected_shape = (batch_size, steps, self.embed_dim, self.h_patches, self.w_patches)
+        expected_shape = (
+            batch_size,
+            steps,
+            self.embed_dim,
+            self.h_patches,
+            self.w_patches,
+        )
         if tuple(noise.shape) != expected_shape:
             raise ValueError(
-                f"Rollout noise shape mismatch: expected {expected_shape}, got {tuple(noise.shape)}"
+                "Rollout noise shape mismatch: expected "
+                f"{expected_shape}, got {tuple(noise.shape)}"
             )
         return noise.permute(0, 1, 3, 4, 2).contiguous()
 
     def sample_noise(self, x):
         if x.ndim == 5:
-            shape = (x.shape[0], x.shape[1], self.embed_dim, self.h_patches, self.w_patches)
+            shape = (
+                x.shape[0],
+                x.shape[1],
+                self.embed_dim,
+                self.h_patches,
+                self.w_patches,
+            )
         elif x.ndim == 4:
             shape = (x.shape[0], self.embed_dim, self.h_patches, self.w_patches)
         else:
-            raise ValueError(f"Unsupported input rank for explicit noise sampling: {x.ndim}")
+            raise ValueError(
+                "Unsupported input rank for explicit noise sampling: "
+                f"{x.ndim}"
+            )
         return torch.randn(shape, device=x.device, dtype=x.dtype)
 
     def sample_rollout_noise(self, batch_size, steps, device, dtype=torch.float32):
@@ -467,9 +509,12 @@ class UniPhyModel(nn.Module):
             ],
             dim=1,
         )
-        gate = self.skip_context_proj(dec_ctx).to(z_dec.real.dtype).unsqueeze(-1).unsqueeze(-1)
+        gate = self.skip_context_proj(dec_ctx).to(z_dec.real.dtype)
+        gate = gate.unsqueeze(-1).unsqueeze(-1)
         delta_mag = (z_skip - z_dec).abs()
-        gate = torch.sigmoid(gate + self.skip_spatial_proj(delta_mag).to(z_dec.real.dtype))
+        gate = torch.sigmoid(
+            gate + self.skip_spatial_proj(delta_mag).to(z_dec.real.dtype)
+        )
         return z_dec * (1.0 - gate) + z_skip * gate
 
     def _apply_decoder_skip(self, z_dec, z_skip):
@@ -478,7 +523,9 @@ class UniPhyModel(nn.Module):
         if z_dec.ndim == 5:
             batch_size, steps, dim, height, width = z_dec.shape
             z_dec_flat = z_dec.contiguous().view(batch_size * steps, dim, height, width)
-            z_skip_flat = z_skip.contiguous().view(batch_size * steps, dim, height, width)
+            z_skip_flat = z_skip.contiguous().view(
+                batch_size * steps, dim, height, width
+            )
             z_out_flat = self._skip_gate_4d(z_dec_flat, z_skip_flat)
             return z_out_flat.view(batch_size, steps, dim, height, width)
         return self._skip_gate_4d(z_dec, z_skip)
@@ -521,7 +568,9 @@ class UniPhyModel(nn.Module):
             return out, latent
         return out
 
-    def _rollout_chunk_fn(self, z_curr, z_skip, x_curr, chunk_dt_stacked, chunk_noise, *flat_states):
+    def _rollout_chunk_fn(
+        self, z_curr, z_skip, x_curr, chunk_dt_stacked, chunk_noise, *flat_states
+    ):
         num_layers = self.depth
         states = [
             (flat_states[i * 2], flat_states[i * 2 + 1])
@@ -568,7 +617,9 @@ class UniPhyModel(nn.Module):
         dt_ctx_seq_full = self._normalize_dt(dt_context, batch_size, steps_in, device)
         self._validate_dt(dt_ctx_seq_full)
         z_ctx_full = self.encoder(x_context)
-        noise_ctx_full = self._normalize_noise(z_ctx_full, z_context, allow_missing=steps_in <= 1)
+        noise_ctx_full = self._normalize_noise(
+            z_ctx_full, z_context, allow_missing=steps_in <= 1
+        )
         z_skip = z_ctx_full[:, -1]
         dtype = complex_dtype_for(z_ctx_full.dtype)
         states = self._init_states(batch_size, device, dtype)
@@ -625,7 +676,11 @@ class UniPhyModel(nn.Module):
             chunk_end = min(step + chunk_size, n_steps)
             chunk_len = chunk_end - step
             chunk_dt_stacked = torch.stack(dt_steps[step:chunk_end], dim=0)
-            chunk_noise = rollout_noise[:, step:chunk_end] if rollout_noise is not None else None
+            chunk_noise = (
+                rollout_noise[:, step:chunk_end]
+                if rollout_noise is not None
+                else None
+            )
 
             flat_states = []
             for h_state, flux_state in states:
@@ -646,7 +701,10 @@ class UniPhyModel(nn.Module):
             x_curr = outs[1]
             for offset in range(chunk_len):
                 step_idx = step + offset
-                if step_idx >= output_offset and (step_idx - output_offset) % output_stride == 0:
+                if (
+                    step_idx >= output_offset
+                    and (step_idx - output_offset) % output_stride == 0
+                ):
                     preds.append(outs[2 + offset])
             states = [
                 (outs[2 + chunk_len + i * 2], outs[2 + chunk_len + i * 2 + 1])
