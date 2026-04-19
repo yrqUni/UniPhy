@@ -23,6 +23,7 @@ def run():
     x_scan = u_t_a.permute(0, 2, 3, 1, 4).reshape(
         batch_size * height * width, steps, dim, 1
     )
+    out_a = pscan(a_scan, x_scan)
     out_a = out_a.reshape(batch_size, height, width, steps, dim).permute(
         0, 3, 1, 2, 4
     )

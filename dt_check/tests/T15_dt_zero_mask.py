@@ -34,10 +34,11 @@ def run():
         )
         h_prev, flux_prev = states[0]
         dt_step = torch.zeros(batch_size, device=device)
+        z_expected = model.blocks[0]._apply_spatial(z_curr)
         z_next, _, _ = model.blocks[0].forward_step(
             z_curr, h_prev, dt_step, flux_prev
         )
-        err_c = float((z_next - z_curr).abs().max().item())
+        err_c = float((z_next - z_expected).abs().max().item())
     max_err = max(err_a, err_t0, err_t2, err_c)
     passed = (
         err_a < 1e-6

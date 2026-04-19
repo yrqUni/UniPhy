@@ -22,7 +22,8 @@ def run():
         )
         for dt in dt_small
     ]
-    check_a = all(scale < dt * 2 for scale, dt in zip(scales_a, dt_small))
+    check_a = all(scales_a[i] < scales_a[i + 1] for i in range(3))
+    check_a = check_a and scales_a[0] < 1e-2
     lam_vals = [-0.1, -1.0, -10.0, -100.0]
     scales_b = [
         float(

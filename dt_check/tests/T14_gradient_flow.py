@@ -15,8 +15,13 @@ def run():
     batch_size = 2
     x_pixels = torch.randn(batch_size, 2, 4, 721, 1440, device=device)
     dt = torch.full((batch_size, 2), 6.0, device=device)
-    out = model.forward(x_pixels, dt)
-    loss = out.real.sum() if out.is_complex() else out.sum()
+    noise = model.sample_noise(x_pixels)
+    out, latent = model.forward(x_pixels, dt, z=noise, return_latent=True)
+    out_loss = out.real.square().mean() if out.is_complex() else out.square().mean()
+    latent_loss = latent.real.square().mean()
+    if latent.is_complex():
+        latent_loss = latent_loss + latent.imag.square().mean()
+    loss = out_loss + latent_loss
     loss.backward()
     params = {
         "lam_re": model.blocks[0].prop.lam_re,

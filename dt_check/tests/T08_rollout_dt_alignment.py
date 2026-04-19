@@ -23,9 +23,9 @@ def run():
         dtype = complex_dtype_for(z_ctx_full.dtype)
         h0, flux0 = model._init_states(batch_size, device, dtype)[0]
         _, h_a, _ = block.forward(z_ctx, h0, dt_ctx_seq, flux0)
-        z_curr = z_ctx_full[:, 0]
         h_b, flux_b = h0, flux0
-        for _ in range(steps_in - 1):
+        for step_idx in range(steps_in - 1):
+            z_curr = z_ctx_full[:, step_idx]
             z_curr, h_b, flux_b = block.forward_step(
                 z_curr,
                 h_b,

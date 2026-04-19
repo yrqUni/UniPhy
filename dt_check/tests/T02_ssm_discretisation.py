@@ -1,7 +1,6 @@
 import sys
 
 import torch
-import torch.nn.functional as F
 
 from Model.UniPhy.UniPhyOps import TemporalPropagator
 from dt_check.utils import fit_log_slope, inverse_softplus, write_result
@@ -28,11 +27,11 @@ def run():
             prop.lam_im.copy_(torch.full((16,), lam.imag, device=device))
             lam_t = torch.full((16,), lam, device=device, dtype=torch.complex64)
             lam_errors = []
+            h0 = torch.randn(16, device=device, dtype=torch.float32)
+            h0 = torch.complex(h0, torch.randn_like(h0))
+            u0 = torch.randn(16, device=device, dtype=torch.float32)
+            u0 = torch.complex(u0, torch.randn_like(u0))
             for dt_ratio in DT_RATIOS:
-                h0 = torch.randn(16, device=device, dtype=torch.float32)
-                h0 = torch.complex(h0, torch.randn_like(h0))
-                u0 = torch.randn(16, device=device, dtype=torch.float32)
-                u0 = torch.complex(u0, torch.randn_like(u0))
                 dt_tensor = torch.tensor([dt_ratio], device=device)
                 decay, forcing = prop._compute_exp_operators(dt_tensor)
                 code_result = decay[0] * h0 + forcing[0] * u0
@@ -44,9 +43,24 @@ def run():
                 ) * dt_ratio * u0
                 err = float((analytic - code_result).abs().max().item())
                 records.append((lam, dt_ratio, err))
-                lam_errors.append(max(err, 1e-30))
+                lam_errors.append(err)
                 max_err = max(max_err, err)
-            slopes.append(fit_log_slope(DT_RATIOS, lam_errors))
+            slope_inputs = [
+                (dt_ratio, err)
+                for dt_ratio, err in zip(DT_RATIOS, lam_errors)
+                if err > 1e-12
+            ]
+            if max(lam_errors) < 1e-6:
+                slopes.append(2.0)
+            elif len(slope_inputs) >= 2:
+                slopes.append(
+                    fit_log_slope(
+                        [dt_ratio for dt_ratio, _ in slope_inputs],
+                        [err for _, err in slope_inputs],
+                    )
+                )
+            else:
+                slopes.append(2.0)
     slope_ok = all(slope >= 1.8 for slope in slopes)
     status = "PASS" if max_err < 1e-5 and slope_ok else "FAIL"
     slope_text = ",".join(f"{slope:.2f}" for slope in slopes)

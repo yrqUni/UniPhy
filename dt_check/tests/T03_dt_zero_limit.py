@@ -13,21 +13,21 @@ def run():
     torch.manual_seed(42)
     dt_values = [1e-8, 1e-7, 1e-6, 1e-5]
     lam = torch.complex(
-        torch.full((8,), -0.5, device=device),
-        torch.full((8,), 0.3, device=device),
+        torch.full((8,), -0.5, device=device, dtype=torch.float64),
+        torch.full((8,), 0.3, device=device, dtype=torch.float64),
     )
     max_residual = 0.0
     passed = True
     for dt_ratio in dt_values:
-        dt_t = torch.tensor([dt_ratio], device=device)
+        dt_t = torch.tensor([dt_ratio], device=device, dtype=torch.float64)
         exp_arg = lam * dt_ratio
         decay = torch.exp(exp_arg)
         forcing = _safe_forcing(exp_arg, dt_t)
         decay_ok = bool(((decay - 1).abs() < 1e-4).all().item())
         forcing_ok = bool((forcing.abs() < dt_ratio * 2).all().item())
-        h0 = torch.randn(8, device=device, dtype=torch.float32)
+        h0 = torch.randn(8, device=device, dtype=torch.float64)
         h0 = torch.complex(h0, torch.randn_like(h0))
-        u = torch.randn(8, device=device, dtype=torch.float32)
+        u = torch.randn(8, device=device, dtype=torch.float64)
         u = torch.complex(u, torch.randn_like(u))
         h_next = decay * h0 + forcing * u
         h_linear = h0 + dt_ratio * (lam * h0 + u)
