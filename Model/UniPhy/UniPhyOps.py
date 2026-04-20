@@ -54,8 +54,8 @@ class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        n = torch.arange(dim).float()
-        k = torch.arange(dim).float().reshape(-1, 1)
+        n = torch.arange(dim, dtype=torch.float64)
+        k = torch.arange(dim, dtype=torch.float64).reshape(-1, 1)
         dft = torch.exp(-2j * torch.pi * n * k / dim) / (dim**0.5)
         dft_inv = dft.conj().transpose(-1, -2).contiguous()
         self.register_buffer("dft_re", dft.real.clone())
@@ -71,40 +71,46 @@ class ComplexSVDTransform(nn.Module):
     def get_alpha(self):
         return torch.sigmoid(self.alpha_logit)
 
-    def get_biorthogonal_pair(self, dtype):
+    def get_matrix(self, dtype):
         eye = torch.eye(self.dim, device=self.w_re.device, dtype=dtype)
         scale = self.dim**-0.5
-        u = eye + torch.complex(self.w_re, self.w_im).to(dtype) * scale
-        v_raw = eye + torch.complex(self.w_inv_re, self.w_inv_im).to(dtype) * scale
-        v_dag_raw = v_raw.conj().transpose(-1, -2)
-        cross = v_dag_raw @ u
-        v_dag = torch.linalg.solve(cross, v_dag_raw)
-        return u, v_dag
-
-    def get_matrix(self, dtype):
-        u, v_dag = self.get_biorthogonal_pair(dtype)
         dft_w = torch.complex(self.dft_re, self.dft_im).to(dtype)
+        dft_inv = torch.complex(self.dft_inv_re, self.dft_inv_im).to(dtype)
         alpha = self.get_alpha().to(dft_w.real.dtype)
-        learned_w = u @ v_dag
-        w = (1.0 - alpha) * learned_w + alpha * dft_w
-        w_inv = torch.linalg.inv(w)
+        beta = 1.0 - alpha
+        alpha_scale = (1.0 + alpha * 1e-3).to(dtype)
+        perturb = beta * torch.complex(self.w_re, self.w_im).to(dtype) * scale
+        learned = eye + perturb
+        perturb_sq = perturb @ perturb
+        perturb_cu = perturb_sq @ perturb
+        perturb_qd = perturb_cu @ perturb
+        learned_inv = eye - perturb + perturb_sq - perturb_cu + perturb_qd
+        w = alpha_scale * (dft_w @ learned)
+        inv_correction = beta * torch.complex(self.w_inv_re, self.w_inv_im).to(dtype)
+        w_inv = ((learned_inv + inv_correction * scale) @ dft_inv) / alpha_scale
         return w, w_inv
 
     def encode_with(self, x, matrix):
         if not x.is_complex():
             x = torch.complex(x, torch.zeros_like(x))
-        return torch.einsum("...d,de->...e", x, matrix)
+        work_dtype = (
+            torch.complex128 if matrix.dtype == torch.complex64 else matrix.dtype
+        )
+        out = torch.einsum(
+            "...d,de->...e", x.to(work_dtype), matrix.to(work_dtype)
+        )
+        return out.to(matrix.dtype)
 
     def decode_with(self, h, matrix_inv):
-        return torch.einsum("...d,de->...e", h, matrix_inv)
-
-    def encode(self, x):
-        matrix, _ = self.get_matrix(complex_dtype_for(x.dtype))
-        return self.encode_with(x, matrix)
-
-    def decode(self, h):
-        _, matrix_inv = self.get_matrix(h.dtype)
-        return self.decode_with(h, matrix_inv)
+        work_dtype = (
+            torch.complex128
+            if matrix_inv.dtype == torch.complex64
+            else matrix_inv.dtype
+        )
+        out = torch.einsum(
+            "...d,de->...e", h.to(work_dtype), matrix_inv.to(work_dtype)
+        )
+        return out.to(matrix_inv.dtype)
 
 
 def _safe_forcing(exp_arg, dt_ratio, eps=1e-7):
@@ -253,14 +259,17 @@ class TemporalPropagator(nn.Module):
             raise ValueError("explicit noise is required")
         if noise.shape[-1] != self.dim:
             raise ValueError(
-                f"noise latent dimension mismatch: expected {self.dim}, got {noise.shape[-1]}"
+                "noise latent dimension mismatch: expected "
+                f"{self.dim}, got {noise.shape[-1]}"
             )
         if noise.is_complex():
             noise_complex = noise.to(dtype)
         else:
             real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
             noise_real = noise.to(real_dtype)
-            noise_complex = torch.complex(noise_real, torch.zeros_like(noise_real)).to(dtype)
+            noise_complex = torch.complex(
+                noise_real, torch.zeros_like(noise_real)
+            ).to(dtype)
         reduce_dims = tuple(range(1, noise_complex.ndim))
         if reduce_dims:
             mag_sq = noise_complex.real.square() + noise_complex.imag.square()
@@ -268,12 +277,15 @@ class TemporalPropagator(nn.Module):
             noise_complex = noise_complex / rms
         return noise_complex
 
-    def generate_stochastic_term_seq(self, shape, dt_seq, dtype, h_state, noise_seq=None):
+    def generate_stochastic_term_seq(
+        self, shape, dt_seq, dtype, h_state, noise_seq=None
+    ):
         if noise_seq is None:
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
         if tuple(noise_seq.shape) != tuple(shape):
             raise ValueError(
-                f"noise shape mismatch for sequence term: expected {tuple(shape)}, got {tuple(noise_seq.shape)}"
+                "noise shape mismatch for sequence term: expected "
+                f"{tuple(shape)}, got {tuple(noise_seq.shape)}"
             )
         _, _, _, _, dim = shape
         lam_re = self._get_effective_lambda().real
@@ -299,7 +311,8 @@ class TemporalPropagator(nn.Module):
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
         if tuple(noise_step.shape) != tuple(shape):
             raise ValueError(
-                f"noise shape mismatch for step term: expected {tuple(shape)}, got {tuple(noise_step.shape)}"
+                "noise shape mismatch for step term: expected "
+                f"{tuple(shape)}, got {tuple(noise_step.shape)}"
             )
         _, _, _, dim = shape
         lam_re = self._get_effective_lambda().real
