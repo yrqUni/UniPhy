@@ -5,13 +5,35 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 
-from Model.UniPhy.ModelUniPhy import (
+
+def _imports():
+    from Model.UniPhy.ModelUniPhy import (
+        UniPhyBlock,
+        UniPhyModel,
+        _dt_is_zero,
+        _expand_batch_mask,
+    )
+    from Model.UniPhy.UniPhyOps import ComplexSVDTransform, complex_dtype_for
+
+    return (
+        UniPhyBlock,
+        UniPhyModel,
+        _dt_is_zero,
+        _expand_batch_mask,
+        ComplexSVDTransform,
+        complex_dtype_for,
+    )
+
+
+(
     UniPhyBlock,
     UniPhyModel,
     _dt_is_zero,
     _expand_batch_mask,
-)
-from Model.UniPhy.UniPhyOps import ComplexSVDTransform, complex_dtype_for
+    ComplexSVDTransform,
+    complex_dtype_for,
+) = _imports()
+
 
 LOG_DIR = "/nfs/Agent_dt_check/logs"
 ORIGINAL_FORWARD = UniPhyBlock.forward

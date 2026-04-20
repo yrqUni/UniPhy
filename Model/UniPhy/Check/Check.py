@@ -197,8 +197,6 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
     return torch.stack(preds, dim=1)
 
 
-# Group 1: parallel-serial consistency
-
 def check_parallel_vs_serial_forward():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(11)
@@ -212,7 +210,6 @@ def check_parallel_vs_serial_forward():
     diff = _max_diff(out_parallel, out_serial)
     passed = diff < 1e-10
     return passed, f"max_diff={diff:.3e}"
-
 
 
 def check_rollout_vs_serial():
@@ -239,7 +236,6 @@ def check_rollout_vs_serial():
     return passed, f"max_diff={diff:.3e}"
 
 
-
 def check_flux_scan_equivalence():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(13)
@@ -249,11 +245,13 @@ def check_flux_scan_equivalence():
         torch.randn(batch_size, steps, dim, device=device, dtype=torch.float64),
         torch.randn(batch_size, steps, dim, device=device, dtype=torch.float64),
     )
-    dt_seq = torch.rand(batch_size, steps, device=device, dtype=torch.float64) * 1.5 + 0.1
+    dt_seq = torch.rand(batch_size, steps, device=device,
+                        dtype=torch.float64) * 1.5 + 0.1
     flux0 = tracker.get_initial_state(batch_size, device, torch.complex128)
     scan_a, scan_x = tracker.get_scan_operators(x_mean_seq, dt_seq)
     flux_scan = pscan(scan_a, scan_x).squeeze(-1)
-    flux_scan = flux_scan + flux0.unsqueeze(1) * torch.cumprod(scan_a.squeeze(-1), dim=1)
+    flux_scan = flux_scan + \
+        flux0.unsqueeze(1) * torch.cumprod(scan_a.squeeze(-1), dim=1)
 
     flux_serial = []
     flux_state = flux0
@@ -270,23 +268,24 @@ def check_flux_scan_equivalence():
     return passed, f"max_diff={diff:.3e}"
 
 
-
 def check_temporal_propagator_scan_vs_serial():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(14)
-    prop = TemporalPropagator(dim=32, dt_ref=1.0, init_noise_scale=0.01).to(device).double()
+    prop = TemporalPropagator(
+        dim=32, dt_ref=1.0, init_noise_scale=0.01).to(device).double()
     dt_seq = torch.rand(3, 5, device=device, dtype=torch.float64) * 1.5 + 0.1
     decay_seq, forcing_seq = prop.get_transition_operators_seq(dt_seq)
     max_decay = 0.0
     max_forcing = 0.0
     for step_idx in range(dt_seq.shape[1]):
-        decay_step, forcing_step = prop.get_transition_operators_step(dt_seq[:, step_idx])
+        decay_step, forcing_step = prop.get_transition_operators_step(
+            dt_seq[:, step_idx])
         max_decay = max(max_decay, _max_diff(decay_seq[:, step_idx], decay_step))
-        max_forcing = max(max_forcing, _max_diff(forcing_seq[:, step_idx], forcing_step))
+        max_forcing = max(max_forcing, _max_diff(
+            forcing_seq[:, step_idx], forcing_step))
     diff = max(max_decay, max_forcing)
     passed = diff < 1e-12
     return passed, f"max_diff={diff:.3e}"
-
 
 
 def check_multi_scale_mixer_real_imag_independence():
@@ -298,15 +297,15 @@ def check_multi_scale_mixer_real_imag_independence():
     x = torch.complex(real, imag)
     with torch.no_grad():
         out = mixer(x)
-        expected_real = real + mixer._forward_real(real) * mixer.output_scale.to(real.dtype)
-        expected_imag = imag + mixer._forward_real(imag) * mixer.output_scale.to(imag.dtype)
+        expected_real = real + \
+            mixer._forward_real(real) * mixer.output_scale.to(real.dtype)
+        expected_imag = imag + \
+            mixer._forward_real(imag) * mixer.output_scale.to(imag.dtype)
         expected = torch.complex(expected_real, expected_imag)
     diff = _max_diff(out, expected)
     passed = diff < 1e-14
     return passed, f"max_diff={diff:.3e}"
 
-
-# Group 2: time-step semantics
 
 def check_dt_zero_is_identity():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -320,7 +319,6 @@ def check_dt_zero_is_identity():
     diff = _max_diff(out, x)
     passed = diff < 1e-12
     return passed, f"max_diff={diff:.3e}"
-
 
 
 def check_dt_scaling_changes_output():
@@ -337,7 +335,6 @@ def check_dt_scaling_changes_output():
     diff = _mean_diff(out_small, out_large)
     passed = diff > 1e-6
     return passed, f"mean_diff={diff:.3e}"
-
 
 
 def check_rollout_horizon_semantics():
@@ -360,7 +357,6 @@ def check_rollout_horizon_semantics():
     diff = _max_diff(first_pred, serial[:, 0])
     passed = diff < 1e-10
     return passed, f"max_diff={diff:.3e}"
-
 
 
 def check_rollout_stride_offset():
@@ -390,7 +386,6 @@ def check_rollout_stride_offset():
     return passed, f"max_diff={diff:.3e}"
 
 
-
 def check_context_dt_scalar_vs_tensor():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(25)
@@ -410,7 +405,6 @@ def check_context_dt_scalar_vs_tensor():
     return passed, f"max_diff={diff:.3e}"
 
 
-
 def check_small_eigenvalue_limits():
     dt_ratio = torch.tensor([0.25, 1.5], dtype=torch.float64)
     exp_arg = torch.zeros(2, dtype=torch.complex128)
@@ -427,7 +421,6 @@ def check_small_eigenvalue_limits():
     return passed, f"max_diff={diff:.3e}"
 
 
-
 def check_negative_dt_rejected():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(26)
@@ -440,14 +433,14 @@ def check_negative_dt_rejected():
     return False, "negative_dt_not_rejected"
 
 
-
 def check_dt_normalize_shapes():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_check_model(device, torch.float64)
     batch_size = 3
     steps = 4
     scalar = model._normalize_dt(1.0, batch_size, steps, device)
-    zero_dim = model._normalize_dt(torch.tensor(2.0, device=device, dtype=torch.float64), batch_size, steps, device)
+    zero_dim = model._normalize_dt(torch.tensor(
+        2.0, device=device, dtype=torch.float64), batch_size, steps, device)
     batch_vec = model._normalize_dt(
         torch.tensor([0.5, 1.0, 1.5], device=device, dtype=torch.float64),
         batch_size,
@@ -455,23 +448,37 @@ def check_dt_normalize_shapes():
         device,
     )
     full = model._normalize_dt(
-        torch.arange(batch_size * steps, device=device, dtype=torch.float64).reshape(batch_size, steps),
+        torch.arange(batch_size * steps, device=device,
+                     dtype=torch.float64).reshape(batch_size, steps),
         batch_size,
         steps,
         device,
     )
-    shapes_ok = all(tensor.shape == (batch_size, steps) for tensor in [scalar, zero_dim, batch_vec, full])
+    shapes_ok = all(tensor.shape == (batch_size, steps)
+                    for tensor in [scalar, zero_dim, batch_vec, full])
     values_ok = (
-        torch.allclose(scalar, torch.full((batch_size, steps), 1.0, device=device, dtype=torch.float64))
-        and torch.allclose(zero_dim, torch.full((batch_size, steps), 2.0, device=device, dtype=torch.float64))
-        and torch.allclose(batch_vec[:, 0], torch.tensor([0.5, 1.0, 1.5], device=device, dtype=torch.float64))
-        and torch.allclose(full, torch.arange(batch_size * steps, device=device, dtype=torch.float64).reshape(batch_size, steps))
+        torch.allclose(
+            scalar,
+            torch.full((batch_size, steps), 1.0, device=device, dtype=torch.float64),
+        )
+        and torch.allclose(
+            zero_dim,
+            torch.full((batch_size, steps), 2.0, device=device, dtype=torch.float64),
+        )
+        and torch.allclose(
+            batch_vec[:, 0],
+            torch.tensor([0.5, 1.0, 1.5], device=device, dtype=torch.float64),
+        )
+        and torch.allclose(
+            full,
+            torch.arange(
+                batch_size * steps, device=device, dtype=torch.float64
+            ).reshape(batch_size, steps),
+        )
     )
     passed = shapes_ok and values_ok
     return passed, f"shapes_ok={shapes_ok} values_ok={values_ok}"
 
-
-# Group 3: parameter/global consistency
 
 def check_dt_ref_consistency():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -479,11 +486,12 @@ def check_dt_ref_consistency():
     values = []
     for block in model.blocks:
         values.append(float(block.prop.dt_ref))
-        if float(block.prop.dt_ref) != float(block.prop.flux_tracker.dt_ref):
+        if float(block.prop.dt_ref) != float(
+            block.prop.flux_tracker.dt_ref
+        ):
             return False, "block_dt_ref_mismatch"
     passed = max(values) - min(values) == 0.0
     return passed, f"dt_ref_values={values}"
-
 
 
 def check_noise_scale_consistency():
@@ -496,7 +504,6 @@ def check_noise_scale_consistency():
     variance = float(values.var(unbiased=False).item()) if values.numel() > 1 else 0.0
     passed = variance < 1e-6
     return passed, f"variance={variance:.3e} values={values.tolist()}"
-
 
 
 def check_state_dimension_consistency():
@@ -513,7 +520,6 @@ def check_state_dimension_consistency():
     return True, f"h_shape={expected_h} flux_shape={expected_flux}"
 
 
-
 def check_no_duplicate_parameter_names():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_check_model(device)
@@ -521,7 +527,6 @@ def check_no_duplicate_parameter_names():
     unique = len(set(names))
     passed = unique == len(names)
     return passed, f"count={len(names)} unique={unique}"
-
 
 
 def check_no_dead_parameters():
@@ -536,7 +541,6 @@ def check_no_dead_parameters():
     return passed, f"bad_names={bad}"
 
 
-
 def check_basis_is_scalar_alpha():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_check_model(device)
@@ -544,12 +548,14 @@ def check_basis_is_scalar_alpha():
     for block_idx, block in enumerate(model.blocks):
         basis = block.prop.basis
         if basis.alpha_logit.shape != torch.Size([]):
-            bad.append(f"block={block_idx} alpha_shape={tuple(basis.alpha_logit.shape)}")
-        if hasattr(basis, "spectral_mod") and getattr(basis, "spectral_mod") is not None:
+            bad.append(
+                f"block={block_idx} alpha_shape={tuple(basis.alpha_logit.shape)}")
+        if hasattr(basis, "spectral_mod") and getattr(
+            basis, "spectral_mod"
+        ) is not None:
             bad.append(f"block={block_idx} spectral_mod_present")
     passed = not bad
     return passed, f"issues={bad}"
-
 
 
 def check_single_spatial_mixer_type():
@@ -558,13 +564,13 @@ def check_single_spatial_mixer_type():
     bad = []
     for block_idx, block in enumerate(model.blocks):
         if not isinstance(block.spatial_mixer, MultiScaleSpatialMixer):
-            bad.append(f"block={block_idx} wrong_type={type(block.spatial_mixer).__name__}")
+            bad.append(
+                f"block={block_idx} wrong_type={type(block.spatial_mixer).__name__}")
         for name in ["spatial_cliff", "spatial_pool", "norm_spatial"]:
             if hasattr(block, name):
                 bad.append(f"block={block_idx} has_{name}")
     passed = not bad
     return passed, f"issues={bad}"
-
 
 
 def check_single_flux_tracker_type():
@@ -574,7 +580,11 @@ def check_single_flux_tracker_type():
     extra_name = "Multi" + "Slot" + "FluxTracker"
     for block_idx, block in enumerate(model.blocks):
         if not isinstance(block.prop.flux_tracker, GlobalFluxTracker):
-            bad.append(f"block={block_idx} wrong_flux={type(block.prop.flux_tracker).__name__}")
+            bad.append(
+                "block="
+                f"{block_idx} wrong_flux="
+                f"{type(block.prop.flux_tracker).__name__}"
+            )
     extra = [
         type(module).__name__
         for _, module in model.named_modules()
@@ -584,38 +594,38 @@ def check_single_flux_tracker_type():
     return passed, f"issues={bad + extra}"
 
 
-
 def check_encoder_has_no_metric():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_check_model(device)
-    present = [name for name in _forbidden_encoder_names() if hasattr(model.encoder, name)]
+    present = [name for name in _forbidden_encoder_names()
+               if hasattr(model.encoder, name)]
     passed = not present
     return passed, f"present={present}"
-
 
 
 def check_skip_is_inlined():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_check_model(device)
-    has_required = hasattr(model, "skip_context_proj") and hasattr(model, "skip_spatial_proj")
+    has_required = hasattr(model, "skip_context_proj") and hasattr(
+        model, "skip_spatial_proj")
     has_wrapper = hasattr(model, "decoder_skip_gate")
     passed = has_required and not has_wrapper
     return passed, f"has_required={has_required} has_wrapper={has_wrapper}"
 
 
-# Group 4: architecture verification
-
 def check_no_variant_attributes():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_check_model(device)
     present = []
-    for prefix, module in [("model", model)] + [(f"block_{idx}", block) for idx, block in enumerate(model.blocks)]:
+    for prefix, module in [
+        ("model", model),
+        *[(f"block_{idx}", block) for idx, block in enumerate(model.blocks)],
+    ]:
         for name in _no_variant_attr_names():
             if hasattr(module, name):
                 present.append(f"{prefix}.{name}")
     passed = not present
     return passed, f"present={present}"
-
 
 
 def check_no_deprecated_submodules():
@@ -631,13 +641,11 @@ def check_no_deprecated_submodules():
     return passed, f"modules={bad}"
 
 
-
 def check_constructor_has_no_variant_param():
     names = inspect.signature(UniPhyModel.__init__).parameters.keys()
     bad = [name for name in _forbidden_constructor_params() if name in names]
     passed = not bad
     return passed, f"params={list(names)}"
-
 
 
 def check_block_constructor_has_no_variant_param():
@@ -647,11 +655,11 @@ def check_block_constructor_has_no_variant_param():
     return passed, f"params={list(names)}"
 
 
-
 def check_all_parameters_require_grad():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_check_model(device)
-    frozen = [name for name, param in model.named_parameters() if not param.requires_grad]
+    frozen = [name for name, param in model.named_parameters()
+              if not param.requires_grad]
     passed = not frozen
     return passed, f"frozen={frozen}"
 
