@@ -1,14 +1,12 @@
 # UniPhy
 
-UniPhy is a continuous spatiotemporal model built for probabilistic forecasting of physical systems, with a primary application to global weather prediction on ERA5 data.
+UniPhy is a continuous spatiotemporal model for probabilistic forecasting of physical fields, with demonstrated application to global weather prediction on ERA5 data.
 
-The core design centers on a complex-valued state-space formulation with exact continuous-time discretization, enabling the model to operate at **arbitrary timesteps** with a single set of weights. Temporal dynamics are governed by learnable spectral bases (biorthogonal by construction), global flux memory propagated via parallel scan, and physics-informed stochastic forcing whose magnitude scales consistently with `dt`.
+Most existing data-driven forecasters commit to a fixed integration step at training time, which limits their flexibility at inference and prevents principled uncertainty quantification across scales. UniPhy addresses both limitations through a complex-valued state-space formulation whose transition operators are derived from the exact matrix exponential, making the dynamics well-defined at any timestep with a single set of parameters.
 
-## Architecture
+## Method
 
-- **Encoder** — metric-free patch embedding with learned positional encodings
-- **Latent blocks** — spectral temporal propagation, multi-scale spatial mixing, and global flux tracking operating jointly in the complex domain
-- **Decoder** — pixel-shuffle reconstruction with an adaptive skip connection from the encoder
+Temporal evolution is carried out in a learned biorthogonal spectral basis, where each latent dimension follows an independent complex-valued linear ODE. Global information is aggregated and injected through a flux memory module whose recurrence is computed in $O(\log T)$ depth via a Triton parallel-scan kernel. Stochastic forcing is incorporated directly into the state update, with noise magnitude that scales consistently with the integration step, recovering deterministic dynamics in the zero-noise limit. Spatial structure is captured by a multi-scale depthwise mixing operator applied at every block. At inference, independent ensemble members are obtained by conditioning on distinct noise realizations, with no architectural modification.
 
 ## Training
 
