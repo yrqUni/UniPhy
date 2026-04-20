@@ -54,8 +54,8 @@ class ComplexSVDTransform(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        n = torch.arange(dim).float()
-        k = torch.arange(dim).float().reshape(-1, 1)
+        n = torch.arange(dim, dtype=torch.float64)
+        k = torch.arange(dim, dtype=torch.float64).reshape(-1, 1)
         dft = torch.exp(-2j * torch.pi * n * k / dim) / (dim**0.5)
         dft_inv = dft.conj().transpose(-1, -2).contiguous()
         self.register_buffer("dft_re", dft.real.clone())
@@ -77,29 +77,40 @@ class ComplexSVDTransform(nn.Module):
         dft_w = torch.complex(self.dft_re, self.dft_im).to(dtype)
         dft_inv = torch.complex(self.dft_inv_re, self.dft_inv_im).to(dtype)
         alpha = self.get_alpha().to(dft_w.real.dtype)
-        w_learned = eye + torch.complex(self.w_re, self.w_im).to(dtype) * scale
-        w = (1.0 - alpha) * w_learned + alpha * dft_w
-        w_inv_learned = eye + torch.complex(
-            self.w_inv_re, self.w_inv_im
-        ).to(dtype) * scale
-        w_inv = (1.0 - alpha) * w_inv_learned + alpha * dft_inv
+        beta = 1.0 - alpha
+        alpha_scale = (1.0 + alpha * 1e-3).to(dtype)
+        perturb = beta * torch.complex(self.w_re, self.w_im).to(dtype) * scale
+        learned = eye + perturb
+        perturb_sq = perturb @ perturb
+        perturb_cu = perturb_sq @ perturb
+        perturb_qd = perturb_cu @ perturb
+        learned_inv = eye - perturb + perturb_sq - perturb_cu + perturb_qd
+        w = alpha_scale * (dft_w @ learned)
+        inv_correction = beta * torch.complex(self.w_inv_re, self.w_inv_im).to(dtype)
+        w_inv = ((learned_inv + inv_correction * scale) @ dft_inv) / alpha_scale
         return w, w_inv
 
     def encode_with(self, x, matrix):
         if not x.is_complex():
             x = torch.complex(x, torch.zeros_like(x))
-        return torch.einsum("...d,de->...e", x, matrix)
+        work_dtype = (
+            torch.complex128 if matrix.dtype == torch.complex64 else matrix.dtype
+        )
+        out = torch.einsum(
+            "...d,de->...e", x.to(work_dtype), matrix.to(work_dtype)
+        )
+        return out.to(matrix.dtype)
 
     def decode_with(self, h, matrix_inv):
-        return torch.einsum("...d,de->...e", h, matrix_inv)
-
-    def encode(self, x):
-        matrix, _ = self.get_matrix(complex_dtype_for(x.dtype))
-        return self.encode_with(x, matrix)
-
-    def decode(self, h):
-        _, matrix_inv = self.get_matrix(h.dtype)
-        return self.decode_with(h, matrix_inv)
+        work_dtype = (
+            torch.complex128
+            if matrix_inv.dtype == torch.complex64
+            else matrix_inv.dtype
+        )
+        out = torch.einsum(
+            "...d,de->...e", h.to(work_dtype), matrix_inv.to(work_dtype)
+        )
+        return out.to(matrix_inv.dtype)
 
 
 def _safe_forcing(exp_arg, dt_ratio, eps=1e-7):

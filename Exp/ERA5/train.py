@@ -143,7 +143,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
         ensemble_std = torch.tensor(0.0, device=device)
         loss = l1_loss
 
-    basis_reg_coeff = cfg["train"].get("basis_reg_coeff", 0.01)
+    basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.01)
     basis_reg = torch.tensor(0.0, device=device)
     for block in infer_model.blocks:
         basis_dtype = complex_dtype_for(next(block.parameters()).dtype)
@@ -151,7 +151,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
         eye = torch.eye(W.shape[0], device=device, dtype=W.dtype)
         basis_reg = basis_reg + (W @ W_inv - eye).abs().pow(2).mean()
     basis_reg = basis_reg / max(1, len(infer_model.blocks))
-    loss = loss + basis_reg_coeff * basis_reg
+    loss = loss + basis_reg_weight * basis_reg
 
     (loss / grad_accum_steps).backward()
 

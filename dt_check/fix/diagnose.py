@@ -75,7 +75,7 @@ def _forward_no_checkpoint(self, x, h_prev, dt_seq, flux_prev, noise_seq=None):
     decoded_with_residual = decoded_with_residual_flat.reshape(
         batch_size, steps, dim, height, width
     )
-    combined = self._combine_output(x, decoded, decoded_with_residual)
+    combined = decoded_with_residual
     zero_mask = _expand_batch_mask(_dt_is_zero(dt_seq), combined.ndim)
     combined = torch.where(zero_mask, x, combined)
     return combined, h_out, flux_out

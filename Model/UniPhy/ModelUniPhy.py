@@ -107,14 +107,10 @@ class UniPhyBlock(nn.Module):
         self,
         dim,
         expand,
-        img_height,
-        img_width,
-        kernel_size,
         dt_ref,
         init_noise_scale,
     ):
         super().__init__()
-        del img_height, img_width, kernel_size
         self.spatial_mixer = MultiScaleSpatialMixer(dim)
         self.norm_temporal = nn.LayerNorm(dim * 2)
         self.prop = TemporalPropagator(
@@ -125,10 +121,6 @@ class UniPhyBlock(nn.Module):
         self.ffn = UniPhyFeedForwardNetwork(dim, expand)
         self.spatial_gate = SpatialGateModulator(dim)
         self.flux_pool = FluxSpatialPool(dim)
-
-    def _combine_output(self, input_state, decoded_state, decoded_with_residual):
-        del input_state, decoded_state
-        return decoded_with_residual
 
     def _decode_state(self, h_state, basis_w_inv):
         return self.prop.basis.decode_with(h_state, basis_w_inv).permute(0, 3, 1, 2)
@@ -244,7 +236,7 @@ class UniPhyBlock(nn.Module):
         decoded_with_residual = decoded_with_residual_flat.reshape(
             batch_size, steps, dim, height, width
         )
-        combined = self._combine_output(x, decoded, decoded_with_residual)
+        combined = decoded_with_residual
         zero_mask = _expand_batch_mask(_dt_is_zero(dt_seq), combined.ndim)
         combined = torch.where(zero_mask, x, combined)
 
@@ -291,7 +283,7 @@ class UniPhyBlock(nn.Module):
         h_next = h_prev_hw * op_decay + forcing * op_forcing + noise
         decoded = self._decode_state(h_next, basis_w_inv)
         decoded_with_residual = self._apply_temporal_decode(decoded)
-        z_next = self._combine_output(x_curr, decoded, decoded_with_residual)
+        z_next = decoded_with_residual
         zero_mask = _expand_batch_mask(_dt_is_zero(dt_step), z_next.ndim)
         z_next = torch.where(zero_mask, x_curr, z_next)
         return z_next, h_next.reshape(batch_size * height * width, 1, dim), flux_next
@@ -352,9 +344,6 @@ class UniPhyModel(nn.Module):
                 UniPhyBlock(
                     dim=embed_dim,
                     expand=expand,
-                    img_height=self.h_patches,
-                    img_width=self.w_patches,
-                    kernel_size=3,
                     dt_ref=dt_ref,
                     init_noise_scale=init_noise_scale,
                 )

@@ -27,7 +27,7 @@ train:
   grad_accum_steps: 1
   use_scheduler: false
   use_tf32: true
-  basis_reg_coeff: 0.01
+  basis_reg_weight: 0.01
 
 logging:
   log_every: 1

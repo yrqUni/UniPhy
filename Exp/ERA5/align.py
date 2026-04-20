@@ -40,7 +40,6 @@ warnings.filterwarnings("ignore")
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "align.yaml")
 
 
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=CONFIG_PATH)
@@ -63,7 +62,6 @@ class SpeedColumn(ProgressColumn):
         return Text(f"{task.speed:.2f} it/s", style="progress.data.speed")
 
 
-
 def setup_logging(log_path, rank):
     logger = logging.getLogger("align")
     logger.setLevel(logging.INFO)
@@ -80,13 +78,11 @@ def setup_logging(log_path, rank):
     return logger
 
 
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 
 def _get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps):
@@ -97,7 +93,6 @@ def _get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps):
     if epoch < total_epochs // 3:
         unlock_count = max(1, n // 2)
     return sorted_steps[:unlock_count]
-
 
 
 def compute_crps(pred_ensemble, target):
@@ -117,13 +112,11 @@ def compute_crps(pred_ensemble, target):
     return mae
 
 
-
 def build_lat_weights(h, device):
     lat = torch.linspace(-90, 90, h, device=device)
     weights = torch.cos(torch.deg2rad(lat))
     weights = weights / weights.mean()
     return weights.view(1, 1, 1, h, 1)
-
 
 
 def load_matching_pretrained_weights(model, ckpt_state):
@@ -137,12 +130,15 @@ def load_matching_pretrained_weights(model, ckpt_state):
         for name, tensor in clean_state.items()
         if name in target_state and target_state[name].shape == tensor.shape
     }
-    missing = sorted(name for name in target_state.keys() if name not in matched_state)
-    skipped = sorted(name for name, tensor in clean_state.items() if name not in matched_state)
+    missing = sorted(
+        name for name in target_state.keys() if name not in matched_state
+    )
+    skipped = sorted(
+        name for name, tensor in clean_state.items() if name not in matched_state
+    )
     target_state.update(matched_state)
     model.load_state_dict(target_state)
     return missing, skipped
-
 
 
 def load_alignment_checkpoint(path, model, optimizer=None):
@@ -159,7 +155,6 @@ def load_alignment_checkpoint(path, model, optimizer=None):
     saved_epoch = int(ckpt.get("epoch", -1))
     start_epoch = max(0, saved_epoch + 1)
     return start_epoch, int(ckpt.get("global_step", 0))
-
 
 
 def align_step(
@@ -190,7 +185,9 @@ def align_step(
     dt_ctx = dt_data[:, :cond_steps]
 
     max_t = min(max_tgt_steps, x_targets.shape[1])
-    available_sub_steps = _get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps)
+    available_sub_steps = _get_curriculum_sub_steps(
+        epoch, total_epochs, all_sub_steps
+    )
     sub_step = random.choice(available_sub_steps)
     max_t_for_step = max(1, min(max_t, max_rollout_steps // sub_step))
     target_t = random.randint(1, max_t_for_step)
@@ -206,7 +203,9 @@ def align_step(
     infer_model = model.module if hasattr(model, "module") else model
     output_offset = sub_step - 1
     x_tgt_aligned = x_targets[:, :target_t]
-    lat_weights_cpu = build_lat_weights(x_tgt_aligned.shape[-2], torch.device("cpu"))
+    lat_weights_cpu = build_lat_weights(
+        x_tgt_aligned.shape[-2], torch.device("cpu")
+    )
     target_cpu = x_tgt_aligned.detach().cpu()
 
     cached_preds = []
@@ -237,7 +236,9 @@ def align_step(
             pred_seq = pred_seq.real if pred_seq.is_complex() else pred_seq
             pred_seq = pred_seq[:, :target_t]
         pred_cpu = pred_seq.detach().cpu()
-        pred_sum_cpu = pred_cpu.clone() if pred_sum_cpu is None else pred_sum_cpu + pred_cpu
+        pred_sum_cpu = (
+            pred_cpu.clone() if pred_sum_cpu is None else pred_sum_cpu + pred_cpu
+        )
         mae_sum = mae_sum + (pred_cpu - target_cpu).abs().mean()
         for prev_pred in cached_preds:
             pairwise_sum = pairwise_sum + (pred_cpu - prev_pred).abs().mean()
@@ -283,7 +284,9 @@ def align_step(
             for other_idx, other_pred in enumerate(cached_preds):
                 if other_idx == member_idx:
                     continue
-                pairwise_i = pairwise_i + (pred_seq - other_pred.to(device)).abs().mean()
+                pairwise_i = pairwise_i + (
+                    pred_seq - other_pred.to(device)
+                ).abs().mean()
             crps_loss = crps_loss - pairwise_i / (ensemble_size * ensemble_size)
         (crps_loss / grad_accum_steps).backward()
         if device.type == "cuda":
@@ -314,7 +317,6 @@ def align_step(
     }
 
 
-
 def save_checkpoint(model, optimizer, epoch, global_step, cfg, path):
     state_dict = (
         model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -329,7 +331,6 @@ def save_checkpoint(model, optimizer, epoch, global_step, cfg, path):
     torch.save(state, path)
 
 
-
 def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
     if batch_idx >= 0 and (batch_idx + 1) % grad_accum_steps != 0:
         torch.nn.utils.clip_grad_norm_(
@@ -338,7 +339,6 @@ def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
         )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
 
 
 def align(cfg):
@@ -370,9 +370,16 @@ def align(cfg):
     pretrained_path = cfg["alignment"].get("pretrained_ckpt", "")
     pretrained_state = None
     if pretrained_path and os.path.exists(pretrained_path):
-        pretrained_state = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+        pretrained_state = torch.load(
+            pretrained_path,
+            map_location="cpu",
+            weights_only=False,
+        )
         if rank == 0:
-            logger.info(f"Loaded Stage I checkpoint for initialization: {pretrained_path}")
+            logger.info(
+                "Loaded Stage I checkpoint for initialization: "
+                f"{pretrained_path}"
+            )
 
     model = UniPhyModel(
         in_channels=cfg["model"]["in_channels"],
@@ -391,8 +398,10 @@ def align(cfg):
         missing, skipped = load_matching_pretrained_weights(model, pretrained_state)
         if rank == 0:
             logger.info(
-                "Initialized from Stage I checkpoint with shape-compatible weights: "
-                f"loaded={len(model.state_dict()) - len(missing)} missing={len(missing)} skipped={len(skipped)}"
+                "Initialized from Stage I checkpoint with "
+                "shape-compatible weights: "
+                f"loaded={len(model.state_dict()) - len(missing)} "
+                f"missing={len(missing)} skipped={len(skipped)}"
             )
 
     model = DDP(
@@ -465,7 +474,8 @@ def align(cfg):
         if rank == 0:
             min_dt_min = cfg["alignment"]["target_dt"] / max(unlocked) * 60
             logger.info(
-                f"Epoch {epoch + 1}: unlocked sub_steps={unlocked}, finest dt={min_dt_min:.1f}min"
+                f"Epoch {epoch + 1}: unlocked sub_steps={unlocked}, "
+                f"finest dt={min_dt_min:.1f}min"
             )
 
         progress = None
@@ -481,7 +491,9 @@ def align(cfg):
                 TimeRemainingColumn(),
             )
             progress.start()
-            task_id = progress.add_task(f"Epoch {epoch + 1}/{epochs}", total=len(train_loader))
+            task_id = progress.add_task(
+                f"Epoch {epoch + 1}/{epochs}", total=len(train_loader)
+            )
 
         batch_idx = -1
         for batch_idx, batch in enumerate(train_loader):
@@ -511,8 +523,9 @@ def align(cfg):
                     progress.console.print(log_msg)
                     logger.info(log_msg)
 
-            if cfg.get("runtime", {}).get("max_steps") is not None and global_step >= int(
-                cfg["runtime"]["max_steps"]
+            if (
+                cfg.get("runtime", {}).get("max_steps") is not None
+                and global_step >= int(cfg["runtime"]["max_steps"])
             ):
                 stop_early = True
                 break
@@ -540,7 +553,9 @@ def align(cfg):
             break
 
     if rank == 0:
-        final_ckpt_path = os.path.join(cfg["logging"]["ckpt_dir"], "align_final.pt")
+        final_ckpt_path = os.path.join(
+            cfg["logging"]["ckpt_dir"], "align_final.pt"
+        )
         save_checkpoint(
             model,
             optimizer,
@@ -553,7 +568,6 @@ def align(cfg):
 
     train_dataset.cleanup()
     dist.destroy_process_group()
-
 
 
 def main():
@@ -571,7 +585,6 @@ def main():
         max_steps=args.max_steps,
     )
     align(cfg)
-
 
 
 if __name__ == "__main__":
