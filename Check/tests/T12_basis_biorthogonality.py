@@ -18,7 +18,7 @@ def run():
     torch.manual_seed(42)
     basis = ComplexSVDTransform(dim=32).to(device)
     optimizer = torch.optim.SGD(
-        [basis.w_re, basis.w_im, basis.w_inv_re, basis.w_inv_im, basis.alpha_logit],
+        [basis.w_re, basis.w_im, basis.alpha_logit],
         lr=1e-3,
     )
     identity = torch.eye(32, dtype=torch.complex128, device=device)

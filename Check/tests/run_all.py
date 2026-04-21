@@ -28,6 +28,7 @@ TEST_MODULES = [
     ("T15", "T15_dt_zero_mask", "T"),
     ("T16", "T16_negative_dt_rejection", "T"),
     ("T17", "T17_numerical_regression", "T"),
+    ("T18", "T18_basis_inverse_under_randomized_params", "T"),
     ("S01", "S01_parallel_serial_consistency", "S"),
     ("S02", "S02_timestep_semantics", "S"),
     ("S03", "S03_parameter_consistency", "S"),

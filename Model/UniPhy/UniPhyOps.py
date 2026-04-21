@@ -51,9 +51,11 @@ class MultiScaleSpatialMixer(nn.Module):
 
 
 class ComplexSVDTransform(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, neumann_terms=8, rho_max=0.5):
         super().__init__()
         self.dim = dim
+        self.neumann_terms = neumann_terms
+        self.rho_max = rho_max
         n = torch.arange(dim, dtype=torch.float64)
         k = torch.arange(dim, dtype=torch.float64).reshape(-1, 1)
         dft = torch.exp(-2j * torch.pi * n * k / dim) / (dim**0.5)
@@ -64,31 +66,37 @@ class ComplexSVDTransform(nn.Module):
         self.register_buffer("dft_inv_im", dft_inv.imag.clone())
         self.w_re = nn.Parameter(torch.zeros(dim, dim))
         self.w_im = nn.Parameter(torch.zeros(dim, dim))
-        self.w_inv_re = nn.Parameter(torch.zeros(dim, dim))
-        self.w_inv_im = nn.Parameter(torch.zeros(dim, dim))
         self.alpha_logit = nn.Parameter(torch.tensor(2.0))
 
     def get_alpha(self):
         return torch.sigmoid(self.alpha_logit)
 
+    def _get_bounded_perturbation(self, dtype, beta):
+        raw = torch.complex(torch.tanh(self.w_re), torch.tanh(self.w_im)).to(dtype)
+        raw = raw * (self.dim**-0.5)
+        norm = torch.linalg.matrix_norm(raw, ord=2)
+        safe_norm = torch.clamp(norm, min=torch.finfo(raw.real.dtype).eps)
+        scale = torch.clamp(self.rho_max / safe_norm, max=1.0)
+        return beta.to(raw.real.dtype) * raw * scale
+
     def get_matrix(self, dtype):
         eye = torch.eye(self.dim, device=self.w_re.device, dtype=dtype)
-        scale = self.dim**-0.5
         dft_w = torch.complex(self.dft_re, self.dft_im).to(dtype)
         dft_inv = torch.complex(self.dft_inv_re, self.dft_inv_im).to(dtype)
         alpha = self.get_alpha().to(dft_w.real.dtype)
         beta = 1.0 - alpha
         alpha_scale = (1.0 + alpha * 1e-3).to(dtype)
-        perturb = beta * torch.complex(self.w_re, self.w_im).to(dtype) * scale
+        perturb = self._get_bounded_perturbation(dtype, beta)
         learned = eye + perturb
-        perturb_sq = perturb @ perturb
-        perturb_cu = perturb_sq @ perturb
-        perturb_qd = perturb_cu @ perturb
-        learned_inv = eye - perturb + perturb_sq - perturb_cu + perturb_qd
+        learned_inv = eye
+        series_term = eye
+        for _ in range(self.neumann_terms):
+            series_term = -series_term @ perturb
+            learned_inv = learned_inv + series_term
         w = alpha_scale * (dft_w @ learned)
-        inv_correction = beta * torch.complex(self.w_inv_re, self.w_inv_im).to(dtype)
-        w_inv = ((learned_inv + inv_correction * scale) @ dft_inv) / alpha_scale
+        w_inv = (learned_inv @ dft_inv) / alpha_scale
         return w, w_inv
+
 
     def encode_with(self, x, matrix):
         if not x.is_complex():
