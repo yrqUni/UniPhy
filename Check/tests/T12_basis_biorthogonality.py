@@ -26,7 +26,10 @@ def run():
         broken_inverse = w_inv_good * 1.25
         residual_broken = float((w_good @ broken_inverse - identity).abs().max().item())
     passed = residual_good < 1e-8 and residual_broken > 1e-2
-    max_err = max(residual_good, 0.0 if residual_broken > 1e-2 else 1e-2 - residual_broken)
+    max_err = max(
+        residual_good,
+        0.0 if residual_broken > 1e-2 else 1e-2 - residual_broken,
+    )
     status = "PASS" if passed else "FAIL"
     detail = f"residual_good={residual_good:.2e} residual_broken={residual_broken:.2e}"
     return status, max_err, detail

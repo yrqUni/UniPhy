@@ -135,7 +135,10 @@ def main():
         )
     ]
     summary_lines.extend(
-        f"{entry['status']} {entry['id']} max_error={format_max_error(entry['max_error'])}"
+        (
+            f"{entry['status']} {entry['id']} "
+            f"max_error={format_max_error(entry['max_error'])}"
+        )
         for entry in results
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +146,10 @@ def main():
     if args.json_out:
         json_path = Path(args.json_out)
         json_path.parent.mkdir(parents=True, exist_ok=True)
-        json_path.write_text(json.dumps(build_json_report(results, args), indent=2) + "\n", encoding="utf-8")
+        json_path.write_text(
+            json.dumps(build_json_report(results, args), indent=2) + "\n",
+            encoding="utf-8",
+        )
     return 0 if fail_count == 0 else 1
 
 
