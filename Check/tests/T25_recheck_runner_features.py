@@ -1,37 +1,39 @@
-import subprocess
 import sys
 from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import REPO_DIR, write_result
+    from Check.utils import run_source_guard, write_result
 else:
-    from ..utils import REPO_DIR, write_result
+    from ..utils import run_source_guard, write_result
 
 TEST_ID = "T25"
-RUNNER = "Check/tests/run_all.py"
-T17 = "Check/tests/T17_numerical_regression.py"
+TARGET = "Check/tests/run_all.py"
+T17_TARGET = "Check/tests/T17_numerical_regression.py"
 
 
 def run():
-    runner_source = subprocess.check_output(
-        ["git", "-C", str(REPO_DIR), "show", f"HEAD:{RUNNER}"],
-        text=True,
+    status_a, _, detail_a = run_source_guard(
+        TEST_ID,
+        TARGET,
+        {
+            "json_out": lambda source: "--json-out" in source,
+            "json_write": lambda source: (
+                "json.dumps(build_json_report(results, args)" in source
+            ),
+        },
     )
-    t17_source = subprocess.check_output(
-        ["git", "-C", str(REPO_DIR), "show", f"HEAD:{T17}"],
-        text=True,
+    status_b, _, detail_b = run_source_guard(
+        TEST_ID,
+        T17_TARGET,
+        {
+            "regen_flag": lambda source: "--regenerate" in source,
+            "sha256": lambda source: "sha256=" in source,
+        },
     )
-    has_json_out = '--json-out' in runner_source
-    has_json_write = 'json.dumps(build_json_report(results, args)' in runner_source
-    has_regen_flag = '--regenerate' in t17_source
-    has_sha256 = 'sha256=' in t17_source
-    passed = has_json_out and has_json_write and has_regen_flag and has_sha256
+    passed = status_a == "PASS" and status_b == "PASS"
     max_err = 0.0 if passed else 1.0
-    detail = (
-        f"json_out={has_json_out} json_write={has_json_write} "
-        f"regen_flag={has_regen_flag} sha256={has_sha256}"
-    )
+    detail = f"{detail_a} {detail_b}"
     status = "PASS" if passed else "FAIL"
     return status, max_err, detail
 

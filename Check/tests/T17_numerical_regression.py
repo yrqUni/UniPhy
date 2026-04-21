@@ -1,6 +1,5 @@
 import argparse
 import hashlib
-import os
 import sys
 from pathlib import Path
 
@@ -48,8 +47,8 @@ def compute_outputs(device):
 
 def run(regenerate=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    payload = compute_outputs(device)
     if regenerate:
+        payload = compute_outputs(device)
         GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         torch.save(payload, GOLDEN_PATH)
         sha = file_sha256(GOLDEN_PATH)
@@ -58,6 +57,7 @@ def run(regenerate=False):
     if not GOLDEN_PATH.exists():
         detail = f"missing golden file: {GOLDEN_PATH}"
         return "SKIP", "-", detail
+    payload = compute_outputs(device)
     golden = torch.load(GOLDEN_PATH, map_location="cpu", weights_only=True)
     err_fwd = float((payload["fwd"] - golden["fwd"]).abs().max().item())
     err_roll = float((payload["roll"] - golden["roll"]).abs().max().item())

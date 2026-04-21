@@ -1,28 +1,27 @@
-import subprocess
 import sys
 from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import REPO_DIR, write_result
+    from Check.utils import run_source_guard, write_result
 else:
-    from ..utils import REPO_DIR, write_result
+    from ..utils import run_source_guard, write_result
 
 TEST_ID = "T22"
 TARGET = "Model/UniPhy/PScan.py"
 
 
 def run():
-    source = subprocess.check_output(
-        ["git", "-C", str(REPO_DIR), "show", f"HEAD:{TARGET}"],
-        text=True,
+    return run_source_guard(
+        TEST_ID,
+        TARGET,
+        {
+            "squeeze_output_path": lambda source: "squeeze_output = X.ndim == 4" in source,
+            "squeeze_return": lambda source: (
+                "return Y.squeeze(-1) if squeeze_output else Y" in source
+            ),
+        },
     )
-    has_docstring = "Run the parallel scan recurrence; D=1 and trailing width 1 are padded internally." in source
-    passed = has_docstring
-    max_err = 0.0 if passed else 1.0
-    detail = f"pscan_docstring_present={has_docstring}"
-    status = "PASS" if passed else "FAIL"
-    return status, max_err, detail
 
 
 if __name__ == "__main__":

@@ -20,9 +20,6 @@ def run():
     with torch.no_grad():
         basis.w_re.copy_(torch.randn_like(basis.w_re))
         basis.w_im.copy_(torch.randn_like(basis.w_im))
-        if hasattr(basis, "w_inv_re"):
-            basis.w_inv_re.copy_(torch.randn_like(basis.w_inv_re))
-            basis.w_inv_im.copy_(torch.randn_like(basis.w_inv_im))
         w, w_inv = basis.get_matrix(torch.complex128)
         identity = torch.eye(32, dtype=torch.complex128, device=device)
         err_left = float((w @ w_inv - identity).abs().max().item())
