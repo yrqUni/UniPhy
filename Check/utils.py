@@ -1,6 +1,5 @@
-import os
-import subprocess
 from pathlib import Path
+import subprocess
 
 import torch
 
@@ -21,7 +20,7 @@ def format_max_error(value):
 def write_result(test_id, status, max_error, detail, log_dir=LOG_DIR):
     if status not in {"PASS", "FAIL", "SKIP"}:
         raise ValueError(f"invalid status: {status}")
-    os.makedirs(log_dir, exist_ok=True)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
     payload = (
         "\n".join(
             [
@@ -39,15 +38,12 @@ def write_result(test_id, status, max_error, detail, log_dir=LOG_DIR):
     return path
 
 
-def read_head_source(relative_path):
-    return subprocess.check_output(
-        ["git", "-C", str(REPO_DIR), "show", f"HEAD:{relative_path}"],
-        text=True,
-    )
+def read_source(relative_path):
+    return (REPO_DIR / relative_path).read_text(encoding="utf-8")
 
 
 def run_source_guard(test_id, relative_path, checks):
-    source = read_head_source(relative_path)
+    source = read_source(relative_path)
     outcomes = {name: check(source) for name, check in checks.items()}
     passed = all(outcomes.values())
     max_err = 0.0 if passed else 1.0
@@ -85,7 +81,7 @@ def make_tiny_model(device, seed=42):
         embed_dim=8,
         expand=2,
         depth=1,
-        patch_size=[7, 15],
+        patch_size=(7, 15),
         img_height=721,
         img_width=1440,
         dt_ref=6.0,

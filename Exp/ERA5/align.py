@@ -24,11 +24,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-if __package__ in {None, ""}:
-    sys.path.insert(
-        0,
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
-    )
 
 from Exp.ERA5.ERA5 import ERA5Dataset
 from Exp.ERA5.runtime_config import build_runtime_cfg
@@ -121,37 +116,20 @@ def build_lat_weights(h, device):
 
 def load_matching_pretrained_weights(model, ckpt_state):
     if ckpt_state is None:
-        return [], []
-    state_dict = ckpt_state.get("model", ckpt_state)
-    clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    target_state = model.state_dict()
-    matched_state = {
-        name: tensor
-        for name, tensor in clean_state.items()
-        if name in target_state and target_state[name].shape == tensor.shape
-    }
-    missing = sorted(
-        name for name in target_state.keys() if name not in matched_state
-    )
-    skipped = sorted(
-        name for name, tensor in clean_state.items() if name not in matched_state
-    )
-    target_state.update(matched_state)
-    model.load_state_dict(target_state)
-    return missing, skipped
+        raise ValueError("Pretrained checkpoint is required")
+    if "model" not in ckpt_state:
+        raise ValueError("Checkpoint missing model state_dict")
+    model.load_state_dict(ckpt_state["model"], strict=True)
 
 
 def load_alignment_checkpoint(path, model, optimizer=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    state_dict = ckpt.get("model", ckpt)
-    clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    if "model" not in ckpt:
+        raise ValueError("Checkpoint missing model state_dict")
     target = model.module if hasattr(model, "module") else model
-    target.load_state_dict(clean_state, strict=False)
+    target.load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:
-        try:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        except Exception:
-            pass
+        optimizer.load_state_dict(ckpt["optimizer"])
     saved_epoch = int(ckpt.get("epoch", -1))
     start_epoch = max(0, saved_epoch + 1)
     return start_epoch, int(ckpt.get("global_step", 0))
@@ -366,7 +344,9 @@ def align(cfg):
 
     pretrained_path = cfg["alignment"].get("pretrained_ckpt", "")
     pretrained_state = None
-    if pretrained_path and os.path.exists(pretrained_path):
+    if pretrained_path:
+        if not os.path.exists(pretrained_path):
+            raise FileNotFoundError(pretrained_path)
         pretrained_state = torch.load(
             pretrained_path,
             map_location="cpu",
@@ -392,13 +372,11 @@ def align(cfg):
     ).cuda()
 
     if pretrained_state is not None:
-        missing, skipped = load_matching_pretrained_weights(model, pretrained_state)
+        load_matching_pretrained_weights(model, pretrained_state)
         if rank == 0:
             logger.info(
-                "Initialized from Stage I checkpoint with "
-                "shape-compatible weights: "
-                f"loaded={len(model.state_dict()) - len(missing)} "
-                f"missing={len(missing)} skipped={len(skipped)}"
+                "Initialized from Stage I checkpoint with strict weight loading: "
+                f"{pretrained_path}"
             )
 
     model = DDP(

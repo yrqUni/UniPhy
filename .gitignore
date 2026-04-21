@@ -5,4 +5,4 @@ logs/
 *.log
 .DS_Store
 mission/
-dt_check/golden/
+Check/golden/golden.pt

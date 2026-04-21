@@ -145,28 +145,24 @@ class UniPhyBlock(nn.Module):
     ):
         if noise_seq is None:
             return None
-        if tuple(noise_seq.shape) == (batch_size, steps, height, width, dim):
-            return noise_seq
-        if tuple(noise_seq.shape) == (batch_size, steps, dim, height, width):
-            return noise_seq.permute(0, 1, 3, 4, 2).contiguous()
-        raise ValueError(
-            "Noise shape mismatch: expected "
-            f"{(batch_size, steps, height, width, dim)} or "
-            f"{(batch_size, steps, dim, height, width)}, got {tuple(noise_seq.shape)}"
-        )
+        expected_shape = (batch_size, steps, height, width, dim)
+        if tuple(noise_seq.shape) != expected_shape:
+            raise ValueError(
+                "Noise shape mismatch: expected "
+                f"{expected_shape}, got {tuple(noise_seq.shape)}"
+            )
+        return noise_seq
 
     def _normalize_block_noise_step(self, noise_step, batch_size, dim, height, width):
         if noise_step is None:
             return None
-        if tuple(noise_step.shape) == (batch_size, height, width, dim):
-            return noise_step
-        if tuple(noise_step.shape) == (batch_size, dim, height, width):
-            return noise_step.permute(0, 2, 3, 1).contiguous()
-        raise ValueError(
-            "Noise shape mismatch: expected "
-            f"{(batch_size, height, width, dim)} or "
-            f"{(batch_size, dim, height, width)}, got {tuple(noise_step.shape)}"
-        )
+        expected_shape = (batch_size, height, width, dim)
+        if tuple(noise_step.shape) != expected_shape:
+            raise ValueError(
+                "Noise shape mismatch: expected "
+                f"{expected_shape}, got {tuple(noise_step.shape)}"
+            )
+        return noise_step
 
     def forward(self, x, h_prev, dt_seq, flux_prev, noise_seq=None):
         batch_size, steps, dim, height, width = x.shape
@@ -306,10 +302,10 @@ class UniPhyModel(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.depth = depth
-        if isinstance(patch_size, (tuple, list)):
+        if isinstance(patch_size, tuple):
             ph, pw = patch_size
         else:
-            ph = pw = patch_size
+            raise ValueError("patch_size must be a tuple of (ph, pw)")
         self.h_patches = (img_height + (ph - img_height % ph) % ph) // ph
         self.w_patches = (img_width + (pw - img_width % pw) % pw) // pw
         self.encoder = UniPhyEncoder(
@@ -380,101 +376,90 @@ class UniPhyModel(nn.Module):
 
     def _normalize_dt(self, dt, batch_size, steps, device):
         dtype = self.skip_spatial_proj[0].weight.dtype
-        if isinstance(dt, (float, int)):
-            return torch.full(
-                (batch_size, steps),
-                float(dt),
-                device=device,
-                dtype=dtype,
-            )
         dt = dt.detach().to(device=device, dtype=dtype)
-        if dt.ndim == 0:
-            return dt.expand(batch_size, steps).contiguous()
-        if dt.ndim == 1:
-            if dt.shape[0] == batch_size:
-                return dt.unsqueeze(1).expand(batch_size, steps).contiguous()
-            return dt.unsqueeze(0).expand(batch_size, steps).contiguous()
+        expected_shape = (batch_size, steps)
+        if dt.ndim != 2 or tuple(dt.shape) != expected_shape:
+            raise ValueError(
+                f"Sequence dt must have shape {expected_shape}, got {tuple(dt.shape)}"
+            )
+        return dt
+
+    def _normalize_step_dt(self, dt, batch_size, device):
+        dtype = self.skip_spatial_proj[0].weight.dtype
+        dt = dt.detach().to(device=device, dtype=dtype)
+        if dt.ndim != 1 or dt.shape[0] != batch_size:
+            raise ValueError(
+                f"Step dt must have shape {(batch_size,)}, got {tuple(dt.shape)}"
+            )
         return dt
 
     def _noise_shape_from_latent(self, latent):
-        if latent.ndim in {4, 5}:
-            return latent.shape
-        raise ValueError(f"Unsupported latent rank for noise shape: {latent.ndim}")
+        if latent.ndim != 5:
+            raise ValueError(
+                f"Unsupported latent rank for noise shape: {latent.ndim}"
+            )
+        return (
+            latent.shape[0],
+            latent.shape[1],
+            latent.shape[3],
+            latent.shape[4],
+            latent.shape[2],
+        )
 
-    def _normalize_noise(self, latent, noise, allow_missing=False):
-        del allow_missing
+    def _normalize_noise(self, latent, noise):
         expected_shape = self._noise_shape_from_latent(latent)
         if noise is None:
-            if latent.ndim == 5:
-                return torch.zeros(
-                    (
-                        latent.shape[0],
-                        latent.shape[1],
-                        latent.shape[3],
-                        latent.shape[4],
-                        latent.shape[2],
-                    ),
-                    device=latent.device,
-                    dtype=latent.dtype,
-                )
             return torch.zeros(
-                (latent.shape[0], latent.shape[2], latent.shape[3], latent.shape[1]),
+                expected_shape,
                 device=latent.device,
                 dtype=latent.dtype,
             )
-        if tuple(noise.shape) != tuple(expected_shape):
+        if tuple(noise.shape) != expected_shape:
             raise ValueError(
                 "Noise shape mismatch: expected "
-                f"{tuple(expected_shape)}, got {tuple(noise.shape)}"
+                f"{expected_shape}, got {tuple(noise.shape)}"
             )
-        if latent.ndim == 5:
-            return noise.permute(0, 1, 3, 4, 2).contiguous()
-        return noise.permute(0, 2, 3, 1).contiguous()
+        return noise
 
-    def _normalize_rollout_noise(self, noise, steps, batch_size, allow_missing=False):
-        if noise is None:
-            if allow_missing:
-                return None
-            return torch.zeros(
-                (batch_size, steps, self.h_patches, self.w_patches, self.embed_dim),
-                device=self.skip_spatial_proj[0].weight.device,
-                dtype=self.skip_spatial_proj[0].weight.dtype,
-            )
+    def _normalize_rollout_noise(self, noise, steps, batch_size):
         expected_shape = (
             batch_size,
             steps,
-            self.embed_dim,
             self.h_patches,
             self.w_patches,
+            self.embed_dim,
         )
+        if noise is None:
+            return torch.zeros(
+                expected_shape,
+                device=self.skip_spatial_proj[0].weight.device,
+                dtype=self.skip_spatial_proj[0].weight.dtype,
+            )
         if tuple(noise.shape) != expected_shape:
             raise ValueError(
                 "Rollout noise shape mismatch: expected "
                 f"{expected_shape}, got {tuple(noise.shape)}"
             )
-        return noise.permute(0, 1, 3, 4, 2).contiguous()
+        return noise
 
     def sample_noise(self, x):
-        if x.ndim == 5:
-            shape = (
-                x.shape[0],
-                x.shape[1],
-                self.embed_dim,
-                self.h_patches,
-                self.w_patches,
-            )
-        elif x.ndim == 4:
-            shape = (x.shape[0], self.embed_dim, self.h_patches, self.w_patches)
-        else:
+        if x.ndim != 5:
             raise ValueError(
-                "Unsupported input rank for explicit noise sampling: "
+                "Explicit noise sampling expects [B, T, C, H, W] input, got rank "
                 f"{x.ndim}"
             )
+        shape = (
+            x.shape[0],
+            x.shape[1],
+            self.h_patches,
+            self.w_patches,
+            self.embed_dim,
+        )
         return torch.randn(shape, device=x.device, dtype=x.dtype)
 
     def sample_rollout_noise(self, batch_size, steps, device, dtype=torch.float32):
         return torch.randn(
-            (batch_size, steps, self.embed_dim, self.h_patches, self.w_patches),
+            (batch_size, steps, self.h_patches, self.w_patches, self.embed_dim),
             device=device,
             dtype=dtype,
         )
@@ -517,7 +502,7 @@ class UniPhyModel(nn.Module):
             )
             z_out_flat = self._skip_gate_4d(z_dec_flat, z_skip_flat)
             return z_out_flat.view(batch_size, steps, dim, height, width)
-        return self._skip_gate_4d(z_dec, z_skip)
+        raise ValueError("Decoder skip expects 5D latent tensors")
 
     def forward(self, x, dt, z=None, return_latent=False):
         batch_size, steps = x.shape[0], x.shape[1]
@@ -579,7 +564,12 @@ class UniPhyModel(nn.Module):
                 )
                 new_states.append((h_next, flux_next))
             states = new_states
-            x_pred = self.decoder(self._apply_decoder_skip(z_curr, z_skip))
+            x_pred = self.decoder(
+                self._apply_decoder_skip(
+                    z_curr.unsqueeze(1),
+                    z_skip.unsqueeze(1),
+                )
+            )[:, 0]
             zero_mask = _expand_batch_mask(_dt_is_zero(dt_step), x_pred.ndim)
             x_pred = torch.where(zero_mask, x_curr, x_pred)
             x_curr = x_pred
@@ -606,9 +596,7 @@ class UniPhyModel(nn.Module):
         dt_ctx_seq_full = self._normalize_dt(dt_context, batch_size, steps_in, device)
         self._validate_dt(dt_ctx_seq_full)
         z_ctx_full = self.encoder(x_context)
-        noise_ctx_full = self._normalize_noise(
-            z_ctx_full, z_context, allow_missing=steps_in <= 1
-        )
+        noise_ctx_full = self._normalize_noise(z_ctx_full, z_context)
         z_skip = z_ctx_full[:, -1]
         dtype = complex_dtype_for(z_ctx_full.dtype)
         states = self._init_states(batch_size, device, dtype)
@@ -646,10 +634,9 @@ class UniPhyModel(nn.Module):
             z_rollout,
             n_steps,
             batch_size,
-            allow_missing=n_steps == 0,
         )
         dt_steps = [
-            self._normalize_dt(dt_k, batch_size, 1, device).squeeze(1)
+            self._normalize_step_dt(dt_k, batch_size, device)
             for dt_k in dt_list
         ]
         for dt_step in dt_steps:

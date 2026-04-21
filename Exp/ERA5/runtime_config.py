@@ -1,5 +1,4 @@
 import copy
-import os
 from typing import Dict, List, Optional
 
 import yaml
@@ -10,7 +9,6 @@ PRESSURE_LEVELS = ["925", "850", "500", "100"]
 CHANNEL_NAMES = SURFACE_VARS + [
     f"{var}{level}" for var in PRESSURE_BASE_VARS for level in PRESSURE_LEVELS
 ]
-
 DEFAULT_TRAIN_YEAR_RANGE = [2000, 2008]
 DEFAULT_TEST_YEAR_RANGE = [2009, 2009]
 
@@ -47,9 +45,6 @@ def resolve_data_input_dir(
 ) -> str:
     if override:
         return override
-    env_value = os.environ.get("UNIPHY_ERA5_DATA")
-    if env_value:
-        return env_value
     return str(cfg["data"]["input_dir"])
 
 
@@ -60,9 +55,6 @@ def resolve_train_year_range(
     parsed = parse_year_range(override)
     if parsed is not None:
         return parsed
-    env_parsed = parse_year_range(os.environ.get("UNIPHY_TRAIN_YEAR_RANGE"))
-    if env_parsed is not None:
-        return env_parsed
     cfg_years = cfg["data"].get("year_range")
     if cfg_years:
         return [int(cfg_years[0]), int(cfg_years[1])]
@@ -73,10 +65,13 @@ def resolve_eval_year_range(override: Optional[str] = None) -> List[int]:
     parsed = parse_year_range(override)
     if parsed is not None:
         return parsed
-    env_parsed = parse_year_range(os.environ.get("UNIPHY_EVAL_YEAR_RANGE"))
-    if env_parsed is not None:
-        return env_parsed
     return list(DEFAULT_TEST_YEAR_RANGE)
+
+
+def get_device(device: Optional[str] = None):
+    if device is not None:
+        return device
+    return "cuda" if __import__("torch").cuda.is_available() else "cpu"
 
 
 def build_runtime_cfg(
@@ -98,11 +93,9 @@ def build_runtime_cfg(
     cfg.setdefault("runtime", {})
     cfg["data"]["input_dir"] = resolve_data_input_dir(cfg, data_input_dir)
     cfg["data"]["year_range"] = resolve_train_year_range(cfg, train_year_range)
-
     offsets = parse_float_list(sample_offsets_hours)
     if offsets is not None:
         cfg["data"]["sample_offsets_hours"] = offsets
-
     if epochs is not None:
         cfg["train"]["epochs"] = int(epochs)
     if log_path is not None:
@@ -116,3 +109,4 @@ def build_runtime_cfg(
         cfg["alignment"]["pretrained_ckpt"] = pretrained_ckpt
     cfg["runtime"]["max_steps"] = None if max_steps is None else int(max_steps)
     return cfg
+

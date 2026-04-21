@@ -1,11 +1,7 @@
 import sys
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import write_result
-else:
-    from ..utils import write_result
+from Check.utils import write_result
 
 import torch
 from Model.UniPhy.UniPhyOps import GlobalFluxTracker

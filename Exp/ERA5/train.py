@@ -25,11 +25,6 @@ from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-if __package__ in {None, ""}:
-    sys.path.insert(
-        0,
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
-    )
 
 from Exp.ERA5.ERA5 import ERA5Dataset
 from Exp.ERA5.runtime_config import build_runtime_cfg
@@ -58,7 +53,6 @@ def parse_args():
     parser.add_argument("--log-path", default=None)
     parser.add_argument("--ckpt-dir", default=None)
     parser.add_argument("--ckpt-path", default=None)
-    parser.add_argument("--resume", default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     return parser.parse_args()
 
@@ -193,19 +187,14 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    clean_state = {k.replace("module.", ""): v for k, v in ckpt["model"].items()}
+    if "model" not in ckpt:
+        raise ValueError("Checkpoint missing model state_dict")
     target = model.module if hasattr(model, "module") else model
-    target.load_state_dict(clean_state, strict=False)
+    target.load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:
-        try:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        except Exception:
-            pass
+        optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
-        try:
-            scheduler.load_state_dict(ckpt["scheduler"])
-        except Exception:
-            pass
+        scheduler.load_state_dict(ckpt["scheduler"])
     saved_epoch = int(ckpt.get("epoch", -1))
     start_epoch = max(0, saved_epoch + 1)
     return start_epoch, ckpt.get("global_step", 0)
@@ -465,7 +454,6 @@ def train(cfg):
 
 def main():
     args = parse_args()
-    resume_path = args.resume or args.ckpt_path
     cfg = build_runtime_cfg(
         args.config,
         data_input_dir=args.data_input_dir,
@@ -474,7 +462,7 @@ def main():
         epochs=args.epochs,
         log_path=args.log_path,
         ckpt_dir=args.ckpt_dir,
-        ckpt_path=resume_path,
+        ckpt_path=args.ckpt_path,
         max_steps=args.max_steps,
     )
     train(cfg)

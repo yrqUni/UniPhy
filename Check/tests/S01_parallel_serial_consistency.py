@@ -2,11 +2,7 @@ import inspect
 import sys
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import write_result
-else:
-    from ..utils import write_result
+from Check.utils import write_result
 
 import torch
 
@@ -97,7 +93,12 @@ def _manual_forward(model, x, dt):
                 flux_prev,
             )
             states[block_idx] = (h_next, flux_next)
-        out_step = model.decoder(model._apply_decoder_skip(z_step, z_skip))
+        out_step = model.decoder(
+            model._apply_decoder_skip(
+                z_step.unsqueeze(1),
+                z_skip.unsqueeze(1),
+            )
+        )[:, 0]
         zero_mask = _broadcast_zero_mask(dt_step.abs() <= 1e-12, out_step.ndim)
         out_step = torch.where(zero_mask, x[:, step_idx], out_step)
         outputs.append(out_step)
@@ -131,7 +132,7 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
     x_curr = x_context[:, -1]
     preds = []
     for dt_step in dt_list:
-        dt_value = model._normalize_dt(dt_step, batch_size, 1, device).squeeze(1)
+        dt_value = model._normalize_step_dt(dt_step, batch_size, device)
         for block_idx, block in enumerate(model.blocks):
             h_prev, flux_prev = states[block_idx]
             z_curr, h_next, flux_next = block.forward_step(
@@ -141,7 +142,12 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
                 flux_prev,
             )
             states[block_idx] = (h_next, flux_next)
-        pred = model.decoder(model._apply_decoder_skip(z_curr, z_skip))
+        pred = model.decoder(
+            model._apply_decoder_skip(
+                z_curr.unsqueeze(1),
+                z_skip.unsqueeze(1),
+            )
+        )[:, 0]
         zero_mask = _broadcast_zero_mask(dt_value.abs() <= 1e-12, pred.ndim)
         pred = torch.where(zero_mask, x_curr, pred)
         x_curr = pred

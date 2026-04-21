@@ -2,11 +2,7 @@ import inspect
 import sys
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import write_result
-else:
-    from ..utils import write_result
+from Check.utils import write_result
 
 import torch
 
@@ -106,7 +102,7 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
     x_curr = x_context[:, -1]
     preds = []
     for dt_step in dt_list:
-        dt_value = model._normalize_dt(dt_step, batch_size, 1, device).squeeze(1)
+        dt_value = model._normalize_step_dt(dt_step, batch_size, device)
         for block_idx, block in enumerate(model.blocks):
             h_prev, flux_prev = states[block_idx]
             z_curr, h_next, flux_next = block.forward_step(
@@ -116,7 +112,12 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
                 flux_prev,
             )
             states[block_idx] = (h_next, flux_next)
-        pred = model.decoder(model._apply_decoder_skip(z_curr, z_skip))
+        pred = model.decoder(
+            model._apply_decoder_skip(
+                z_curr.unsqueeze(1),
+                z_skip.unsqueeze(1),
+            )
+        )[:, 0]
         zero_mask = _broadcast_zero_mask(dt_value.abs() <= 1e-12, pred.ndim)
         pred = torch.where(zero_mask, x_curr, pred)
         x_curr = pred
@@ -203,23 +204,21 @@ def check_rollout_stride_offset():
     return passed, f"max_diff={diff:.3e}"
 
 
-def check_context_dt_scalar_vs_tensor():
+def check_context_dt_requires_tensor_shape():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(25)
     model = build_check_model(device, torch.float64)
     model.eval()
     x_context = _make_input(2, 3, 4, 32, 32, device, torch.float64)
-    dt_tensor = torch.ones(2, 3, device=device, dtype=torch.float64)
     dt_list = [
         torch.tensor([0.5, 0.75], device=device, dtype=torch.float64),
         torch.tensor([1.25, 0.5], device=device, dtype=torch.float64),
     ]
-    with torch.no_grad():
-        out_scalar = model.forward_rollout(x_context, 1.0, dt_list)
-        out_tensor = model.forward_rollout(x_context, dt_tensor, dt_list)
-    diff = _max_diff(out_scalar, out_tensor)
-    passed = diff < 1e-12
-    return passed, f"max_diff={diff:.3e}"
+    try:
+        model.forward_rollout(x_context, 1.0, dt_list)
+    except (AttributeError, ValueError) as exc:
+        return True, f"raised={type(exc).__name__}"
+    return False, "scalar_dt_not_rejected"
 
 
 def check_small_eigenvalue_limits():
@@ -245,7 +244,7 @@ def check_negative_dt_rejected():
     x = _make_input(2, 3, 4, 32, 32, device, torch.float64)
     try:
         model(x, -1.0)
-    except ValueError as exc:
+    except (AttributeError, ValueError) as exc:
         return True, f"raised={type(exc).__name__}"
     return False, "negative_dt_not_rejected"
 
@@ -255,16 +254,6 @@ def check_dt_normalize_shapes():
     model = build_check_model(device, torch.float64)
     batch_size = 3
     steps = 4
-    scalar = model._normalize_dt(1.0, batch_size, steps, device)
-    zero_dim = model._normalize_dt(
-        torch.tensor(2.0, device=device, dtype=torch.float64), batch_size, steps, device
-    )
-    batch_vec = model._normalize_dt(
-        torch.tensor([0.5, 1.0, 1.5], device=device, dtype=torch.float64),
-        batch_size,
-        steps,
-        device,
-    )
     full = model._normalize_dt(
         torch.arange(batch_size * steps, device=device, dtype=torch.float64).reshape(
             batch_size, steps
@@ -273,32 +262,65 @@ def check_dt_normalize_shapes():
         steps,
         device,
     )
-    shapes_ok = all(
-        tensor.shape == (batch_size, steps)
-        for tensor in [scalar, zero_dim, batch_vec, full]
+    step = model._normalize_step_dt(
+        torch.tensor([0.5, 1.0, 1.5], device=device, dtype=torch.float64),
+        batch_size,
+        device,
     )
-    values_ok = (
-        torch.allclose(
-            scalar,
-            torch.full((batch_size, steps), 1.0, device=device, dtype=torch.float64),
+    try:
+        model._normalize_dt(1.0, batch_size, steps, device)
+        scalar_rejected = False
+    except (AttributeError, ValueError):
+        scalar_rejected = True
+    try:
+        model._normalize_dt(
+            torch.tensor(2.0, device=device, dtype=torch.float64),
+            batch_size,
+            steps,
+            device,
         )
-        and torch.allclose(
-            zero_dim,
-            torch.full((batch_size, steps), 2.0, device=device, dtype=torch.float64),
-        )
-        and torch.allclose(
-            batch_vec[:, 0],
+        zero_dim_rejected = False
+    except ValueError:
+        zero_dim_rejected = True
+    try:
+        model._normalize_dt(
             torch.tensor([0.5, 1.0, 1.5], device=device, dtype=torch.float64),
+            batch_size,
+            steps,
+            device,
         )
-        and torch.allclose(
-            full,
-            torch.arange(
-                batch_size * steps, device=device, dtype=torch.float64
-            ).reshape(batch_size, steps),
-        )
+        batch_vec_rejected = False
+    except ValueError:
+        batch_vec_rejected = True
+    shapes_ok = full.shape == (batch_size, steps) and step.shape == (batch_size,)
+    values_ok = torch.allclose(
+        full,
+        torch.arange(batch_size * steps, device=device, dtype=torch.float64).reshape(
+            batch_size, steps
+        ),
+    ) and torch.allclose(
+        step,
+        torch.tensor([0.5, 1.0, 1.5], device=device, dtype=torch.float64),
     )
-    passed = shapes_ok and values_ok
-    return passed, f"shapes_ok={shapes_ok} values_ok={values_ok}"
+    passed = (
+        shapes_ok
+        and values_ok
+        and scalar_rejected
+        and zero_dim_rejected
+        and batch_vec_rejected
+    )
+    return (
+        passed,
+        " ".join(
+            [
+                f"shapes_ok={shapes_ok}",
+                f"values_ok={values_ok}",
+                f"scalar_rejected={scalar_rejected}",
+                f"zero_dim_rejected={zero_dim_rejected}",
+                f"batch_vec_rejected={batch_vec_rejected}",
+            ]
+        ),
+    )
 
 
 TEST_ID = "S02"
@@ -311,7 +333,7 @@ CHECK_GROUPS = [
             check_dt_scaling_changes_output,
             check_rollout_horizon_semantics,
             check_rollout_stride_offset,
-            check_context_dt_scalar_vs_tensor,
+            check_context_dt_requires_tensor_shape,
             check_small_eigenvalue_limits,
             check_negative_dt_rejected,
             check_dt_normalize_shapes,

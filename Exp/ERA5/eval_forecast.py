@@ -1,24 +1,14 @@
 import argparse
 import json
 import math
-import os
-import sys
 import time
 
 import torch
 from torch.utils.data import DataLoader
 
-if __package__ in {None, ""}:
-    sys.path.insert(
-        0,
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
-    )
-
 from Exp.ERA5.ERA5 import ERA5Dataset
-from Exp.ERA5.runtime_config import CHANNEL_NAMES, resolve_eval_year_range
-from Exp.ERA5.exp.exp_utils import get_data_input_dir, get_device
+from Exp.ERA5.runtime_config import CHANNEL_NAMES, get_device, resolve_eval_year_range
 from Model.UniPhy.ModelUniPhy import UniPhyModel
-
 
 VALID_MODEL_ARGS = {
     "in_channels",
@@ -32,7 +22,6 @@ VALID_MODEL_ARGS = {
     "dt_ref",
     "init_noise_scale",
 }
-
 DEFAULT_MODEL_CFG = {
     "in_channels": 30,
     "out_channels": 30,
@@ -65,29 +54,23 @@ def parse_args():
     return parser.parse_args()
 
 
-
 def parse_int_list(text):
     return [int(part.strip()) for part in text.split(",") if part.strip()]
 
 
-
 def build_model_from_checkpoint(ckpt_path, device):
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    checkpoint_cfg = checkpoint.get("cfg", {})
-    model_cfg = dict(DEFAULT_MODEL_CFG)
-    model_cfg.update(checkpoint_cfg.get("model", {}))
-    state_dict = checkpoint.get("model", checkpoint)
-    if "encoder.pos_emb" in state_dict:
-        model_cfg["embed_dim"] = state_dict["encoder.pos_emb"].shape[1]
+    if "cfg" not in checkpoint or "model" not in checkpoint["cfg"]:
+        raise ValueError("Checkpoint missing cfg.model")
+    if "model" not in checkpoint:
+        raise ValueError("Checkpoint missing model state_dict")
+    model_cfg = dict(checkpoint["cfg"]["model"])
     filtered_cfg = {k: v for k, v in model_cfg.items() if k in VALID_MODEL_ARGS}
-    if "patch_size" in filtered_cfg:
-        filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
+    filtered_cfg["patch_size"] = tuple(filtered_cfg["patch_size"])
     model = UniPhyModel(**filtered_cfg).to(device)
-    clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_state, strict=False)
+    model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
-    return model, checkpoint_cfg, model_cfg
-
+    return model, checkpoint["cfg"], model_cfg
 
 
 def build_eval_dataset(data_input_dir, eval_year_range, model_cfg, cond_steps, lead_times):
@@ -112,7 +95,6 @@ def build_eval_dataset(data_input_dir, eval_year_range, model_cfg, cond_steps, l
     return dataset, lead_deltas
 
 
-
 def build_lat_weights(height, device):
     lat = torch.linspace(-90, 90, height, device=device)
     weights = torch.cos(torch.deg2rad(lat)).clamp_min(1e-6)
@@ -120,16 +102,16 @@ def build_lat_weights(height, device):
     return weights.view(1, 1, height, 1)
 
 
-
 def weighted_channel_mean(values, lat_weights):
     return (values * lat_weights).mean(dim=(-2, -1))
-
 
 
 def compute_channel_crps(pred_ensemble, target, lat_weights):
     ensemble_size = pred_ensemble.shape[0]
     target_exp = target.unsqueeze(0)
-    mae = weighted_channel_mean((pred_ensemble - target_exp).abs(), lat_weights).mean(dim=0)
+    mae = weighted_channel_mean((pred_ensemble - target_exp).abs(), lat_weights).mean(
+        dim=0
+    )
     if ensemble_size <= 1:
         return mae
     idx_i, idx_j = torch.triu_indices(
@@ -146,7 +128,6 @@ def compute_channel_crps(pred_ensemble, target, lat_weights):
     return mae - pairwise * num_pairs / (ensemble_size * ensemble_size)
 
 
-
 def compute_channel_acc(pred, target, climatology, lat_weights):
     pred_anom = pred - climatology
     target_anom = target - climatology
@@ -155,7 +136,6 @@ def compute_channel_acc(pred, target, climatology, lat_weights):
     target_energy = (target_anom.square() * lat_weights).sum(dim=(-2, -1))
     denom = torch.sqrt(pred_energy * target_energy).clamp_min(1e-8)
     return numerator / denom
-
 
 
 def safe_channel_values(values, *, metric_name, fill_value=-1.0):
@@ -171,15 +151,12 @@ def safe_channel_values(values, *, metric_name, fill_value=-1.0):
     return safe_values, invalid_count
 
 
-
 def format_metric_dict(metric_dict):
     return {str(key): round(float(value), 6) for key, value in metric_dict.items()}
 
 
-
 def format_invalid_metric_counts(invalid_counts):
     return {key: int(value) for key, value in invalid_counts.items() if int(value) > 0}
-
 
 
 def summarize_channel_metrics(channel_names, per_channel_metrics):
@@ -187,10 +164,12 @@ def summarize_channel_metrics(channel_names, per_channel_metrics):
     for idx, name in enumerate(channel_names):
         entry = {"channel": name}
         for metric_name, metric_values in per_channel_metrics.items():
-            entry[metric_name] = {str(lead): round(float(metric_values[lead][idx]), 6) for lead in metric_values}
+            entry[metric_name] = {
+                str(lead): round(float(metric_values[lead][idx]), 6)
+                for lead in metric_values
+            }
         summary.append(entry)
     return summary
-
 
 
 def print_summary(result):
@@ -229,7 +208,6 @@ def print_summary(result):
     print("=" * 88)
 
 
-
 def main():
     args = parse_args()
     lead_times = parse_int_list(args.lead_times)
@@ -237,20 +215,16 @@ def main():
         raise ValueError("lead_times must be non-empty")
     if any(curr <= prev for prev, curr in zip(lead_times[:-1], lead_times[1:])):
         raise ValueError("lead_times must be strictly increasing")
-
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = get_device()
-
+    device = torch.device(get_device(args.device))
     model, checkpoint_cfg, model_cfg = build_model_from_checkpoint(
         args.checkpoint,
         device,
     )
-
     cond_steps = int(checkpoint_cfg.get("alignment", {}).get("condition_steps", 1))
     eval_year_range = resolve_eval_year_range(args.eval_year_range)
-    data_input_dir = get_data_input_dir(args.data_input_dir or "./data/ERA5")
+    if args.data_input_dir is None:
+        raise ValueError("--data-input-dir is required")
+    data_input_dir = args.data_input_dir
     dataset, lead_deltas = build_eval_dataset(
         data_input_dir,
         eval_year_range,
@@ -258,7 +232,6 @@ def main():
         cond_steps,
         lead_times,
     )
-
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -266,14 +239,17 @@ def main():
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-
-    ensemble_size = int(args.ensemble_size or model_cfg.get("ensemble_size", DEFAULT_MODEL_CFG["ensemble_size"]))
+    ensemble_size = int(
+        args.ensemble_size or model_cfg.get("ensemble_size", DEFAULT_MODEL_CFG["ensemble_size"])
+    )
     channel_names = CHANNEL_NAMES[: int(model_cfg.get("out_channels", len(CHANNEL_NAMES)))]
     height = int(model_cfg.get("img_height", DEFAULT_MODEL_CFG["img_height"]))
     width = int(model_cfg.get("img_width", DEFAULT_MODEL_CFG["img_width"]))
     if len(channel_names) != int(model_cfg.get("out_channels", len(channel_names))):
-        channel_names = [f"ch_{idx}" for idx in range(int(model_cfg.get("out_channels", len(channel_names))))]
-
+        channel_names = [
+            f"ch_{idx}"
+            for idx in range(int(model_cfg.get("out_channels", len(channel_names))))
+        ]
     climatology_sum = torch.zeros(
         len(lead_times),
         len(channel_names),
@@ -282,7 +258,6 @@ def main():
         dtype=torch.float32,
     )
     sample_count = 0
-
     for batch_idx, (data, _) in enumerate(loader):
         if args.max_samples is not None and sample_count >= args.max_samples:
             break
@@ -294,10 +269,8 @@ def main():
         sample_count += data.shape[0]
         if (batch_idx + 1) % max(1, args.log_every) == 0:
             print(f"climatology batches={batch_idx + 1} samples={sample_count}")
-
     if sample_count == 0:
         raise RuntimeError("No evaluation samples available")
-
     climatology = climatology_sum / float(sample_count)
     lat_weights = build_lat_weights(height, device)
     mse_sum = torch.zeros(len(lead_times), len(channel_names), dtype=torch.float64)
@@ -306,7 +279,6 @@ def main():
     processed = 0
     dt_ref = float(model_cfg.get("dt_ref", 6.0))
     started_at = time.time()
-
     with torch.no_grad():
         for batch_idx, (data, dt_data) in enumerate(loader):
             if args.max_samples is not None and processed >= args.max_samples:
@@ -315,7 +287,6 @@ def main():
             if remaining is not None and data.shape[0] > remaining:
                 data = data[:remaining]
                 dt_data = dt_data[:remaining]
-
             data = data.to(device, non_blocking=True).float()
             dt_data = dt_data.to(device, non_blocking=True).float()
             x_context = data[:, :cond_steps]
@@ -323,6 +294,102 @@ def main():
             dt_context = dt_data[:, :cond_steps]
             batch_size = x_context.shape[0]
             dt_list = [
+                torch.full(
+                    (batch_size,),
+                    delta,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                for delta in lead_deltas
+            ]
+            ensemble_preds = []
+            for _ in range(ensemble_size):
+                z_context = model.sample_noise(x_context)
+                z_rollout = model.sample_rollout_noise(
+                    batch_size,
+                    len(dt_list),
+                    device,
+                    dtype=x_context.dtype,
+                )
+                pred_seq = model.forward_rollout(
+                    x_context,
+                    dt_context,
+                    dt_list,
+                    z_context=z_context,
+                    z_rollout=z_rollout,
+                    chunk_size=args.chunk_size,
+                )
+                pred_seq = pred_seq.real if pred_seq.is_complex() else pred_seq
+                ensemble_preds.append(pred_seq)
+            pred_ensemble = torch.stack(ensemble_preds, dim=0)
+            pred_mean = pred_ensemble.mean(dim=0)
+            target = x_targets[:, : len(lead_times)]
+            squared_error = (pred_mean - target).square()
+            mse_sum += weighted_channel_mean(squared_error, lat_weights).double().sum(dim=0).cpu()
+            crps = compute_channel_crps(pred_ensemble, target, lat_weights)
+            crps, _ = safe_channel_values(crps, metric_name="crps")
+            crps_sum += crps.double().cpu() * batch_size
+            climatology_target = climatology.to(device).unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+            acc = compute_channel_acc(pred_mean, target, climatology_target, lat_weights)
+            acc, _ = safe_channel_values(acc, metric_name="acc")
+            acc_sum += acc.double().cpu() * batch_size
+            processed += batch_size
+            if (batch_idx + 1) % max(1, args.log_every) == 0:
+                elapsed = time.time() - started_at
+                print(
+                    f"eval batches={batch_idx + 1} samples={processed} elapsed_sec={elapsed:.1f}"
+                )
+    overall_rmse = {}
+    overall_acc = {}
+    overall_crps = {}
+    per_channel_rmse = {}
+    per_channel_acc = {}
+    per_channel_crps = {}
+    for lead_idx, lead in enumerate(lead_times):
+        rmse_channels = torch.sqrt(mse_sum[lead_idx] / float(processed))
+        acc_channels = acc_sum[lead_idx] / float(processed)
+        crps_channels = crps_sum[lead_idx] / float(processed)
+        rmse_channels, _ = safe_channel_values(rmse_channels, metric_name="rmse")
+        acc_channels, _ = safe_channel_values(acc_channels, metric_name="acc")
+        crps_channels, _ = safe_channel_values(crps_channels, metric_name="crps")
+        overall_rmse[str(lead)] = float(rmse_channels.mean().item())
+        overall_acc[str(lead)] = float(acc_channels.mean().item())
+        overall_crps[str(lead)] = float(crps_channels.mean().item())
+        per_channel_rmse[lead] = rmse_channels.tolist()
+        per_channel_acc[lead] = acc_channels.tolist()
+        per_channel_crps[lead] = crps_channels.tolist()
+    result = {
+        "checkpoint": args.checkpoint,
+        "eval_year_range": eval_year_range,
+        "num_samples": processed,
+        "ensemble_size": ensemble_size,
+        "lead_times_hours": lead_times,
+        "params": int(sum(param.numel() for param in model.parameters())),
+        "overall": {
+            "rmse": format_metric_dict(overall_rmse),
+            "acc": format_metric_dict(overall_acc),
+            "crps": format_metric_dict(overall_crps),
+        },
+        "per_channel": summarize_channel_metrics(
+            channel_names,
+            {
+                "rmse": per_channel_rmse,
+                "acc": per_channel_acc,
+                "crps": per_channel_crps,
+            },
+        ),
+        "invalid_metric_counts": format_invalid_metric_counts({}),
+    }
+    print_summary(result)
+    if args.output_json:
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(result, handle, indent=2)
+            handle.write("\n")
+
+
+if __name__ == "__main__":
+    main()
+
                 torch.full((batch_size,), float(delta), device=device, dtype=torch.float32)
                 for delta in lead_deltas
             ]

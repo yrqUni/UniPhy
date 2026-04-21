@@ -1,11 +1,7 @@
 import sys
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import fit_log_slope, make_tiny_model, write_result
-else:
-    from ..utils import fit_log_slope, make_tiny_model, write_result
+from Check.utils import fit_log_slope, make_tiny_model, write_result
 
 import torch
 from Model.UniPhy.ModelUniPhy import complex_dtype_for
@@ -31,12 +27,15 @@ def run():
                 z_curr, h_prev, dt_6, flux_prev
             )
             states[0] = (h_next, flux_next)
-            z_dec = model._apply_decoder_skip(z_curr, z_skip)
-            pred = model.decoder(z_dec)
+            z_dec = model._apply_decoder_skip(
+                z_curr.unsqueeze(1),
+                z_skip.unsqueeze(1),
+            )
+            pred = model.decoder(z_dec)[:, 0]
             preds_a.append(pred.real if pred.is_complex() else pred)
         preds_a = torch.stack(preds_a, dim=1)
         dt_list = [dt_6] * 24
-        preds_b = model.forward_rollout(x_init, dt_6.unsqueeze(1), dt_list)
+        preds_b = model.forward_rollout(x_init, dt_6.view(batch_size, 1), dt_list)
         preds_b = preds_b.real if preds_b.is_complex() else preds_b
     points = [1, 4, 8, 24]
     errs = []

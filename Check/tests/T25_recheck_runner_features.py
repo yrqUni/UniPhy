@@ -1,11 +1,7 @@
 import sys
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import run_source_guard, write_result
-else:
-    from ..utils import run_source_guard, write_result
+from Check.utils import run_source_guard, write_result
 
 TEST_ID = "T25"
 TARGET = "Check/tests/run_all.py"
@@ -29,6 +25,7 @@ def run():
         {
             "regen_flag": lambda source: "--regenerate" in source,
             "sha256": lambda source: "sha256=" in source,
+            "missing_is_fail": lambda source: 'return "FAIL", "-", detail' in source,
         },
     )
     passed = status_a == "PASS" and status_b == "PASS"

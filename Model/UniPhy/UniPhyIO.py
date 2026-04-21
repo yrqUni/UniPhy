@@ -8,10 +8,7 @@ from .UniPhyFFN import build_activation
 class FlexiblePadder(nn.Module):
     def __init__(self, patch_size):
         super().__init__()
-        if isinstance(patch_size, int):
-            self.ph = self.pw = patch_size
-        else:
-            self.ph, self.pw = patch_size
+        self.ph, self.pw = patch_size
 
     def forward(self, x):
         h, w = x.shape[-2:]
@@ -32,11 +29,8 @@ class UniPhyEncoder(nn.Module):
         img_width,
     ):
         super().__init__()
-        if isinstance(patch_size, (tuple, list)):
-            self.ph, self.pw = patch_size
-        else:
-            self.ph = self.pw = patch_size
-        self.padder = FlexiblePadder((self.ph, self.pw))
+        self.ph, self.pw = patch_size
+        self.padder = FlexiblePadder(patch_size)
         self.proj = nn.Conv2d(
             in_ch,
             embed_dim,
@@ -75,13 +69,11 @@ class UniPhyEncoder(nn.Module):
         return torch.complex(x, torch.zeros_like(x))
 
     def forward(self, x):
-        if x.ndim == 5:
-            batch_size, steps, channels, height, width = x.shape
-            x_flat = x.reshape(batch_size * steps, channels, height, width)
-            z = self._encode_4d(x_flat)
-            _, dim, h_patches, w_patches = z.shape
-            return z.reshape(batch_size, steps, dim, h_patches, w_patches)
-        return self._encode_4d(x)
+        batch_size, steps, channels, height, width = x.shape
+        x_flat = x.reshape(batch_size * steps, channels, height, width)
+        z = self._encode_4d(x_flat)
+        _, dim, h_patches, w_patches = z.shape
+        return z.reshape(batch_size, steps, dim, h_patches, w_patches)
 
 
 class _PixelShuffleStage(nn.Module):
@@ -134,10 +126,7 @@ class UniPhyEnsembleDecoder(nn.Module):
         img_width,
     ):
         super().__init__()
-        if isinstance(patch_size, (tuple, list)):
-            self.ph, self.pw = patch_size
-        else:
-            self.ph = self.pw = patch_size
+        self.ph, self.pw = patch_size
         self.img_height = img_height
         self.img_width = img_width
         self.latent_proj = nn.Conv2d(
@@ -183,10 +172,8 @@ class UniPhyEnsembleDecoder(nn.Module):
         return out[..., : self.img_height, : self.img_width]
 
     def forward(self, z):
-        if z.ndim == 5:
-            batch_size, steps, dim, h_patches, w_patches = z.shape
-            z_flat = z.contiguous().view(batch_size * steps, dim, h_patches, w_patches)
-            out = self._decode_4d(z_flat)
-            _, out_channels, height, width = out.shape
-            return out.view(batch_size, steps, out_channels, height, width)
-        return self._decode_4d(z)
+        batch_size, steps, dim, h_patches, w_patches = z.shape
+        z_flat = z.contiguous().view(batch_size * steps, dim, h_patches, w_patches)
+        out = self._decode_4d(z_flat)
+        _, out_channels, height, width = out.shape
+        return out.view(batch_size, steps, out_channels, height, width)

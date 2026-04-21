@@ -1,11 +1,7 @@
 import sys
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import complex_randn, write_result
-else:
-    from ..utils import complex_randn, write_result
+from Check.utils import complex_randn, write_result
 
 import torch
 from Model.UniPhy.PScan import pscan

@@ -194,8 +194,8 @@ Zero-valued max errors are expected for tests that are exact-by-construction (T0
 ```bash
 git clone git@github.com:yrqUni/UniPhy.git
 cd UniPhy
-python Check/tests/T17_numerical_regression.py --regenerate
-python Check/tests/run_all.py --tests T S \
+python -m Check.tests.T17_numerical_regression --regenerate
+python -m Check.tests.run_all --tests T S \
     --log-dir /tmp/uniphy_check_logs \
     --json-out /tmp/uniphy_check_logs/results.json
 ```
@@ -203,6 +203,6 @@ python Check/tests/run_all.py --tests T S \
 Single-test examples:
 
 ```bash
-python Check/tests/T18_basis_inverse_under_randomized_params.py
-python Check/tests/S05_pscan_correctness.py
+python -m Check.tests.T18_basis_inverse_under_randomized_params
+python -m Check.tests.S05_pscan_correctness
 ```

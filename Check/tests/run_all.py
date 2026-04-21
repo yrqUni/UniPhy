@@ -7,11 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import LOG_DIR, format_max_error, write_result
-else:
-    from ..utils import LOG_DIR, format_max_error, write_result
+from Check.utils import LOG_DIR, format_max_error, write_result
 
 TEST_MODULES = [
     ("T01", "T01_phi1_stability", "T"),

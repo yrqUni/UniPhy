@@ -3,11 +3,7 @@ import hashlib
 import sys
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from Check.utils import REPO_DIR, make_tiny_model, write_result
-else:
-    from ..utils import REPO_DIR, make_tiny_model, write_result
+from Check.utils import REPO_DIR, make_tiny_model, write_result
 
 import torch
 
@@ -56,7 +52,7 @@ def run(regenerate=False):
         return "PASS", 0.0, detail
     if not GOLDEN_PATH.exists():
         detail = f"missing golden file: {GOLDEN_PATH}"
-        return "SKIP", "-", detail
+        return "FAIL", "-", detail
     payload = compute_outputs(device)
     golden = torch.load(GOLDEN_PATH, map_location="cpu", weights_only=True)
     err_fwd = float((payload["fwd"] - golden["fwd"]).abs().max().item())
