@@ -17,33 +17,19 @@ def run():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
     basis = ComplexSVDTransform(dim=32).to(device)
-    optimizer = torch.optim.SGD(
-        [basis.w_re, basis.w_im, basis.alpha_logit],
-        lr=1e-3,
-    )
     identity = torch.eye(32, dtype=torch.complex128, device=device)
     with torch.no_grad():
-        w0, w_inv0 = basis.get_matrix(torch.complex128)
-        residual_0 = float((w0 @ w_inv0 - identity).abs().max().item())
-    for _ in range(100):
-        x = torch.randn(8, 32, device=device)
-        x = torch.complex(x, torch.randn_like(x))
-        w, w_inv = basis.get_matrix(torch.complex64)
-        h = basis.encode_with(x, w)
-        x_rec = basis.decode_with(h, w_inv)
-        loss = (x_rec - x).abs().pow(2).sum()
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    with torch.no_grad():
-        w1, w_inv1 = basis.get_matrix(torch.complex128)
-        residual_100 = float((w1 @ w_inv1 - identity).abs().max().item())
-        cond = float(torch.linalg.cond(w1).item())
-    detail = (
-        f"residual_0={residual_0:.2e} residual_100={residual_100:.2e} "
-        f"cond={cond:.1f}"
-    )
-    return "PASS", residual_100, detail
+        basis.w_re.copy_(torch.randn_like(basis.w_re))
+        basis.w_im.copy_(torch.randn_like(basis.w_im))
+        w_good, w_inv_good = basis.get_matrix(torch.complex128)
+        residual_good = float((w_good @ w_inv_good - identity).abs().max().item())
+        broken_inverse = w_inv_good * 1.25
+        residual_broken = float((w_good @ broken_inverse - identity).abs().max().item())
+    passed = residual_good < 1e-8 and residual_broken > 1e-2
+    max_err = max(residual_good, 0.0 if residual_broken > 1e-2 else 1e-2 - residual_broken)
+    status = "PASS" if passed else "FAIL"
+    detail = f"residual_good={residual_good:.2e} residual_broken={residual_broken:.2e}"
+    return status, max_err, detail
 
 
 if __name__ == "__main__":
