@@ -29,9 +29,8 @@ def run():
         out_roll = model.forward_rollout(x_pixels[:, :1], dt[:, :1], dt_list)
         out_roll_r = out_roll.real if out_roll.is_complex() else out_roll
     if not GOLDEN_PATH.exists():
-        GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"fwd": out_fwd_r.cpu(), "roll": out_roll_r.cpu()}, GOLDEN_PATH)
-        return "PASS", 0.0, "golden values saved"
+        detail = f"missing golden file: {GOLDEN_PATH}"
+        return "SKIP", "-", detail
     golden = torch.load(GOLDEN_PATH, map_location="cpu", weights_only=True)
     err_fwd = float((out_fwd_r.cpu() - golden["fwd"]).abs().max().item())
     err_roll = float((out_roll_r.cpu() - golden["roll"]).abs().max().item())
