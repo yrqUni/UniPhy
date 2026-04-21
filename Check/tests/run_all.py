@@ -1,7 +1,10 @@
 import argparse
 import importlib
+import json
 import socket
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -29,8 +32,11 @@ TEST_MODULES = [
     ("T16", "T16_negative_dt_rejection", "T"),
     ("T17", "T17_numerical_regression", "T"),
     ("T18", "T18_basis_inverse_under_randomized_params", "T"),
+    ("T21", "T21_crps_gradient_decomposition", "T"),
+    ("T22", "T22_pscan_padding_contract", "T"),
     ("T23", "T23_t12_is_not_trivial", "T"),
     ("T24", "T24_t17_missing_golden_policy", "T"),
+    ("T25", "T25_recheck_runner_features", "T"),
     ("S01", "S01_parallel_serial_consistency", "S"),
     ("S02", "S02_timestep_semantics", "S"),
     ("S03", "S03_parameter_consistency", "S"),
@@ -43,6 +49,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tests", nargs="*", default=None)
     parser.add_argument("--log-dir", default=LOG_DIR)
+    parser.add_argument("--json-out", default=None)
     return parser.parse_args()
 
 
@@ -65,12 +72,32 @@ def resolve_tests(requested):
     return selected
 
 
+def build_json_report(results, args):
+    return {
+        "commit": "UNKNOWN",
+        "branch": "math-fixes",
+        "date": datetime.now().isoformat(),
+        "node": socket.gethostname().split(".", maxsplit=1)[0],
+        "device": "UNKNOWN",
+        "env": {},
+        "summary": {
+            "total": len(results),
+            "pass": sum(entry["status"] == "PASS" for entry in results),
+            "fail": sum(entry["status"] == "FAIL" for entry in results),
+            "skip": sum(entry["status"] == "SKIP" for entry in results),
+        },
+        "tests": results,
+        "log_dir": str(Path(args.log_dir)),
+    }
+
+
 def main():
     args = parse_args()
     results = []
     selected = resolve_tests(args.tests)
     for test_id, module_name, series in selected:
         module = importlib.import_module(f"Check.tests.{module_name}")
+        started = time.time()
         try:
             if series == "S":
                 status, pass_count, total = module.run()
@@ -84,10 +111,21 @@ def main():
             max_error = "-"
             detail = f"{type(exc).__name__}: {exc}"
             write_result(test_id, status, max_error, detail, log_dir=args.log_dir)
-        results.append((status, test_id, max_error))
-    pass_count = sum(status == "PASS" for status, _, _ in results)
-    fail_count = sum(status == "FAIL" for status, _, _ in results)
-    skip_count = sum(status == "SKIP" for status, _, _ in results)
+        duration = time.time() - started
+        results.append(
+            {
+                "id": test_id,
+                "name": module_name,
+                "status": status,
+                "max_error": max_error,
+                "duration_sec": duration,
+                "log": str(Path(args.log_dir) / f"{test_id}_result.txt"),
+                "detail": detail,
+            }
+        )
+    pass_count = sum(entry["status"] == "PASS" for entry in results)
+    fail_count = sum(entry["status"] == "FAIL" for entry in results)
+    skip_count = sum(entry["status"] == "SKIP" for entry in results)
     hostname = socket.gethostname().split(".", maxsplit=1)[0]
     summary_path = Path(args.log_dir) / f"node_{hostname}_summary.txt"
     summary_lines = [
@@ -97,11 +135,15 @@ def main():
         )
     ]
     summary_lines.extend(
-        f"{status} {test_id} max_error={format_max_error(max_error)}"
-        for status, test_id, max_error in results
+        f"{entry['status']} {entry['id']} max_error={format_max_error(entry['max_error'])}"
+        for entry in results
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    if args.json_out:
+        json_path = Path(args.json_out)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(build_json_report(results, args), indent=2) + "\n", encoding="utf-8")
     return 0 if fail_count == 0 else 1
 
 
