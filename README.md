@@ -257,13 +257,6 @@ python Check/tests/T17_numerical_regression.py --regenerate
 python Check/tests/run_all.py --tests T S --log-dir /tmp/uniphy_check_logs --json-out /tmp/uniphy_check_logs/results.json
 ```
 
-## Known issues / open questions
-
-- The duplicated `Model/UniPhy/Check/dt_check/` tree still exists and should either be archived explicitly or removed in a future cleanup.
-- Stage I → Stage II transfer is intentionally partial because of the `embed_dim` mismatch, but that training design should be confirmed by the researcher as a long-term choice.
-- `align_step()` still uses repeated CPU↔GPU copies as a memory tradeoff. This audit did not benchmark alternatives.
-- Historical no-complex ablation artifacts referenced by the mission text were not present locally, so that ablation question remains unresolved.
-
 ## Citation
 
 ```bibtex
