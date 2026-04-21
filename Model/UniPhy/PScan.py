@@ -458,6 +458,7 @@ class _PScanFunction(torch.autograd.Function):
 
 
 def pscan(A, X):
+    """Run the parallel scan recurrence; D=1 and trailing width 1 are padded internally."""
     squeeze_output = X.ndim == 4
 
     if squeeze_output:
