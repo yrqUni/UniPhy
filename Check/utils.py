@@ -39,6 +39,23 @@ def write_result(test_id, status, max_error, detail, log_dir=LOG_DIR):
     return path
 
 
+def read_head_source(relative_path):
+    return subprocess.check_output(
+        ["git", "-C", str(REPO_DIR), "show", f"HEAD:{relative_path}"],
+        text=True,
+    )
+
+
+def run_source_guard(test_id, relative_path, checks):
+    source = read_head_source(relative_path)
+    outcomes = {name: check(source) for name, check in checks.items()}
+    passed = all(outcomes.values())
+    max_err = 0.0 if passed else 1.0
+    detail = " ".join(f"{name}={value}" for name, value in outcomes.items())
+    status = "PASS" if passed else "FAIL"
+    return status, max_err, detail
+
+
 def assert_close(a, b, atol, label=""):
     del label
     diff = (a - b).abs()

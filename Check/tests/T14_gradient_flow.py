@@ -36,8 +36,6 @@ def run():
         "base_noise": model.blocks[0].prop.base_noise,
         "w_re": model.blocks[0].prop.basis.w_re,
         "w_im": model.blocks[0].prop.basis.w_im,
-        "w_inv_re": model.blocks[0].prop.basis.w_inv_re,
-        "w_inv_im": model.blocks[0].prop.basis.w_inv_im,
         "alpha_logit": model.blocks[0].prop.basis.alpha_logit,
         "decay_re": model.blocks[0].prop.flux_tracker.decay_re,
         "decay_im": model.blocks[0].prop.flux_tracker.decay_im,

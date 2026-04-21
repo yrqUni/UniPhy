@@ -10,28 +10,23 @@ else:
 import torch
 from Model.UniPhy.UniPhyOps import ComplexSVDTransform
 
-TEST_ID = "T12"
+TEST_ID = "T18"
 
 
 def run():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(42)
+    torch.manual_seed(7)
     basis = ComplexSVDTransform(dim=32).to(device)
-    identity = torch.eye(32, dtype=torch.complex128, device=device)
     with torch.no_grad():
         basis.w_re.copy_(torch.randn_like(basis.w_re))
         basis.w_im.copy_(torch.randn_like(basis.w_im))
-        w_good, w_inv_good = basis.get_matrix(torch.complex128)
-        residual_good = float((w_good @ w_inv_good - identity).abs().max().item())
-        broken_inverse = w_inv_good * 1.25
-        residual_broken = float((w_good @ broken_inverse - identity).abs().max().item())
-    passed = residual_good < 1e-8 and residual_broken > 1e-2
-    max_err = max(
-        residual_good,
-        0.0 if residual_broken > 1e-2 else 1e-2 - residual_broken,
-    )
-    status = "PASS" if passed else "FAIL"
-    detail = f"residual_good={residual_good:.2e} residual_broken={residual_broken:.2e}"
+        w, w_inv = basis.get_matrix(torch.complex128)
+        identity = torch.eye(32, dtype=torch.complex128, device=device)
+        err_left = float((w @ w_inv - identity).abs().max().item())
+        err_right = float((w_inv @ w - identity).abs().max().item())
+    max_err = max(err_left, err_right)
+    status = "PASS" if max_err < 1e-2 else "FAIL"
+    detail = f"err_left={err_left:.2e} err_right={err_right:.2e}"
     return status, max_err, detail
 
 

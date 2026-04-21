@@ -1,4 +1,5 @@
-import os
+import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -14,8 +15,21 @@ TEST_ID = "T17"
 GOLDEN_PATH = REPO_DIR / "Check" / "golden" / "golden.pt"
 
 
-def run():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--regenerate", action="store_true")
+    return parser.parse_args()
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def compute_outputs(device):
     model = make_tiny_model(device, seed=42)
     model.eval()
     torch.manual_seed(0)
@@ -28,13 +42,25 @@ def run():
         dt_list = [torch.full((batch_size,), 6.0, device=device)] * 2
         out_roll = model.forward_rollout(x_pixels[:, :1], dt[:, :1], dt_list)
         out_roll_r = out_roll.real if out_roll.is_complex() else out_roll
-    if not GOLDEN_PATH.exists():
+    return {"fwd": out_fwd_r.cpu(), "roll": out_roll_r.cpu()}
+
+
+def run(regenerate=False):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if regenerate:
+        payload = compute_outputs(device)
         GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"fwd": out_fwd_r.cpu(), "roll": out_roll_r.cpu()}, GOLDEN_PATH)
-        return "PASS", 0.0, "golden values saved"
+        torch.save(payload, GOLDEN_PATH)
+        sha = file_sha256(GOLDEN_PATH)
+        detail = f"golden regenerated sha256={sha}"
+        return "PASS", 0.0, detail
+    if not GOLDEN_PATH.exists():
+        detail = f"missing golden file: {GOLDEN_PATH}"
+        return "SKIP", "-", detail
+    payload = compute_outputs(device)
     golden = torch.load(GOLDEN_PATH, map_location="cpu", weights_only=True)
-    err_fwd = float((out_fwd_r.cpu() - golden["fwd"]).abs().max().item())
-    err_roll = float((out_roll_r.cpu() - golden["roll"]).abs().max().item())
+    err_fwd = float((payload["fwd"] - golden["fwd"]).abs().max().item())
+    err_roll = float((payload["roll"] - golden["roll"]).abs().max().item())
     max_err = max(err_fwd, err_roll)
     status = "PASS" if max_err < 1e-5 else "FAIL"
     detail = f"err_fwd={err_fwd:.2e} err_roll={err_roll:.2e}"
@@ -42,6 +68,7 @@ def run():
 
 
 if __name__ == "__main__":
-    status, max_error, detail = run()
+    args = parse_args()
+    status, max_error, detail = run(regenerate=args.regenerate)
     write_result(TEST_ID, status, max_error, detail)
     sys.exit(0 if status == "PASS" else 1)

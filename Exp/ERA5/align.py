@@ -275,9 +275,6 @@ def align_step(
         )
         pred_seq = pred_seq.real if pred_seq.is_complex() else pred_seq
         pred_seq = pred_seq[:, :target_t]
-        other_sum = (pred_sum_cpu - cached_preds[member_idx]).to(device)
-        pred_mean = (pred_seq + other_sum) / ensemble_size
-        del pred_mean
         crps_loss = (pred_seq - x_tgt_aligned).abs().mean() / ensemble_size
         if ensemble_size > 1:
             pairwise_i = torch.tensor(0.0, device=device)
