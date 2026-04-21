@@ -2,155 +2,246 @@
 
 ## Overview
 
-This suite verifies the temporal dynamics used by UniPhy. It covers the discretized state-space operators, basis transforms, timestep semantics, recurrent rollout behavior, gradient propagation, and the parallel-scan implementation that underpins the sequential and batched update paths.
+This is the rev-2 verification report for UniPhy after the 2026-04-21 mathematical audit. The suite now separates numerical operator checks, numerical system checks, and static regression guards so that readers can see which tests measure floating-point behavior, which tests enforce source-level contracts, and which newly added checks catch the failure modes the previous 22/22 PASS report missed.
+
+## What changed since rev-1
+
+- **M2**: Replaced the soft inverse path in `ComplexSVDTransform` with a bounded shared perturbation and Neumann-derived inverse. Commit `895d76c`. New tests: T18. Existing tests updated: T12, T14.
+- **D1**: Replaced the always-pass `T12` implementation with a real assertion-based biorthogonality check and added a committed-source guard. Commit `f009e00`. New tests: T23. Existing tests updated: T12.
+- **D2**: Removed T17's self-authorizing missing-golden behavior and added a committed-source guard for the policy. Commit `09fa310`. New tests: T24. Existing tests updated: T17.
+- **B2**: Deleted the dead `pred_mean` path in `align_step` and documented why the implemented CRPS pairwise term already matches the standard formula. Commit `ee742b9`. New tests: T21.
+- **A3**: Documented the `pscan()` singleton-padding contract and added a committed-source guard for it. Commit `e3c6a02`. New tests: T22.
+- **step4 infrastructure**: Added explicit `T17 --regenerate` support and `run_all.py --json-out` so rev-2 results can be reproduced and exported as structured JSON. Commit `4ae5d18`. New tests: T25.
 
 ## Mathematical Background
 
-UniPhy evolves a continuous-time complex state-space model:
+UniPhy evolves the continuous-time complex state-space model
 
-$$\frac{dh}{dt} = \lambda h + u(t), \qquad \lambda = \lambda_{\mathrm{re}} + i\lambda_{\mathrm{im}}, \qquad \lambda_{\mathrm{re}} < 0$$
+$$
+\frac{dh}{dt} = \lambda h + u(t), \qquad \lambda = \lambda_{\mathrm{re}} + i\lambda_{\mathrm{im}}, \qquad \lambda_{\mathrm{re}} < 0.
+$$
 
-For a step size `dt`, the exact discretization used by the operator tests is:
+The discretization **actually implemented by the source code** is
 
-$$h_t = e^{\lambda \, dt} h_{t-1} + \phi_1(\lambda \, dt) \, dt \, u_t, \qquad \phi_1(z) = \frac{e^z - 1}{z}$$
+$$
+h_t = \exp(\lambda \tau)\, h_{t-1} + \tau\,\phi_1(\lambda \tau)\,u_t,
+\qquad \tau = \frac{dt}{dt_{\mathrm{ref}}},
+\qquad \phi_1(z) = \frac{e^z - 1}{z}.
+$$
 
-For small $|z|$, UniPhy evaluates $\phi_1$ with the Taylor expansion:
+**Important:** `lambda` is **per-`dt_ref` normalized**, not per hour. In the default ERA5 configuration `dt_ref = 6.0` hours, so internal time is measured in 6-hour reference units. The dimensional analysis and practical implications are expanded in the project README.
 
-$$\phi_1(z) \approx 1 + \frac{z}{2} + \frac{z^2}{6}$$
+For small $|z|$, the forcing helper uses the explicit stabilized Taylor branch
 
-which is the stabilized branch exercised by `T01` and `T03`.
+$$
+\phi_1(z) \approx 1 + \frac{z}{2} + \frac{z^2}{6}, \qquad \text{for } |z| \le 10^{-7}.
+$$
 
-The learnable complex basis matrices are built by `ComplexSVDTransform.get_matrix()` with:
+After fix M2, the learnable basis transform is implemented as a bounded perturbation of the stored DFT basis. Let
 
-$$\alpha = \sigma(\alpha_{\mathrm{logit}}), \qquad \beta = 1 - \alpha, \qquad s = \mathrm{dim}^{-1/2}$$
+$$
+\alpha = \sigma(\alpha_{\mathrm{logit}}),
+\qquad \beta = 1 - \alpha,
+\qquad a = 1 + 10^{-3}\alpha,
+\qquad s = \mathrm{dim}^{-1/2}.
+$$
 
-Let:
+The bounded perturbation uses raw trainable matrices passed through a bounded map $\Phi$ (here `tanh`) and a spectral cap $\rho_{\max}$:
 
-$$\Delta = \beta \,(W_{\mathrm{re}} + i W_{\mathrm{im}}) \, s, \qquad L = I + \Delta$$
+$$
+\Delta = \beta\,\Phi(W_{\mathrm{re,raw}}, W_{\mathrm{im,raw}})\, s,
+\qquad \|\Delta\|_2 \le \rho_{\max}.
+$$
 
-and define the truncated inverse series used in the source code as:
+Then
 
-$$L^{-1}_{(4)} = I - \Delta + \Delta^2 - \Delta^3 + \Delta^4$$
+$$
+L = I + \Delta,
+\qquad
+L^{-1}_{(N)} = \sum_{k=0}^{N} (-\Delta)^k,
+$$
 
-With:
+and the returned matrices are
 
-$$a = 1 + 10^{-3}\alpha, \qquad C = \beta \,(W^{-1}_{\mathrm{re}} + i W^{-1}_{\mathrm{im}}) \, s$$
+$$
+W = a\,(D_{\mathrm{FT}} L),
+\qquad
+W^{-1} = \frac{L^{-1}_{(N)} D_{\mathrm{FT}}^{-1}}{a}.
+$$
 
-the matrices returned by the implementation are:
+The truncation error obeys the Neumann-series remainder bound
 
-$$W = a \,(D_{\mathrm{FT}} L), \qquad W^{-1} = \frac{(L^{-1}_{(4)} + C) D_{\mathrm{FT}}^{-1}}{a}$$
+$$
+\|W W^{-1} - I\|_F = O(\rho_{\max}^{N+1}),
+$$
 
-Here $D_{\mathrm{FT}}$ and $D_{\mathrm{FT}}^{-1}$ are the stored discrete Fourier transform basis matrices from `UniPhyOps.py`.
+so `neumann_terms` trades extra matrix multiplies for tighter inverse accuracy.
+
+The stochastic term is a reparameterized OU-style increment. The caller supplies an external noise tensor, the implementation normalizes it by RMS, and then scales it by the timestep-dependent square root of the discretized variance:
+
+$$
+\sigma(\tau) = \mathrm{base\_noise}\,\sqrt{\tau\,\phi_1(2\lambda_{\mathrm{re}}\tau)}.
+$$
+
+`pscan()` implements the standard affine linear recurrence combine rule for
+
+$$
+S_t = A_t S_{t-1} + X_t,
+$$
+
+with associative combine
+
+$$
+(B,Y) \star (A,X) = (BA, BX + Y).
+$$
+
+Internally, the scan pads singleton state dimension `D=1` and trailing width `1` to the minimum matrix shape required by the Triton kernel, then strips the padding on output.
 
 ## Test Catalogue
 
-### Operator-level Tests
+### Numerical operator tests
 
-| ID  | Name | What is Verified | Tolerance |
-|-----|------|------------------|-----------|
+| ID | Name | What is Verified | Tolerance |
+|---|---|---|---|
 | T01 | `phi1_stability` | Stabilized $\phi_1$ matches the float64 reference near zero | `1e-5` relative |
-| T02 | `ssm_discretisation` | The discrete propagator matches the analytic SSM solution | `1e-5` |
+| T02 | `ssm_discretisation` | The normalized discrete propagator matches the analytic SSM solution | `1e-5` |
 | T03 | `dt_zero_limit` | As $dt \to 0$, decay approaches identity and forcing approaches zero | asymptotic |
 | T04 | `variable_dt_pscan` | Parallel scan matches sequential recurrence for variable timesteps | `1e-4` |
 | T05 | `hprev_injection_equivalence` | Initial hidden-state injection matches direct recurrence construction | `1e-5` |
 | T06 | `flux_prev_compensation` | Flux carry-over compensation matches explicit recurrence | `1e-4` |
-| T07 | `cumprod_decay_purity` | The decay operator is separated cleanly from the forcing term | `1e-6` |
+| T07 | `cumprod_decay_purity` | Flux decay operator matches its closed-form exponential branch | exact algebraic check |
 | T08 | `rollout_dt_alignment` | Context-state timestep indexing matches the stepped update path | `1e-4` |
-| T09 | `forward_vs_step_single` | `forward()` and `forward_step()` agree for a single step | `1e-4` |
-| T10 | `forward_vs_rollout_multistep` | Autoregressive rollout matches chained single-step updates | `1e-4` |
-| T11 | `basis_encode_decode_identity` | Basis encode/decode is numerically close to identity | `1e-4` |
-| T12 | `basis_biorthogonality` | The learned basis pair remains numerically biorthogonal | recorded |
+| T09 | `forward_vs_step_single` | `forward()` and `forward_step()` agree for a single deterministic step | exact implementation equivalence |
+| T10 | `forward_vs_rollout_multistep` | Autoregressive rollout matches chained single-step updates | exact implementation equivalence |
+| T11 | `basis_encode_decode_identity` | Basis encode/decode stays numerically close to identity on the fixed implementation | `1e-4` |
+| T12 | `basis_biorthogonality` | The fixed basis pair rejects a deliberately broken inverse and preserves a correct one | assertion-based |
 | T13 | `sde_scale_physics` | Diffusion scale varies monotonically with timestep and damping | assertions |
-| T14 | `gradient_flow` | All temporal parameters receive non-zero gradients | none |
-| T15 | `dt_zero_mask` | Zero-timestep outputs preserve the input exactly | `1e-6` |
+| T14 | `gradient_flow` | All temporal parameters that remain in the fixed model receive gradients | none |
+| T15 | `dt_zero_mask` | Zero-timestep outputs preserve the input exactly while non-zero steps do not | exact mask + nontriviality check |
 | T16 | `negative_dt_rejection` | Negative timesteps are rejected with `ValueError` | all cases |
-| T17 | `numerical_regression` | Forward outputs remain stable against the materialized golden tensors | `1e-5` |
+| T17 | `numerical_regression` | Current outputs match the regenerated golden tensors | `1e-5` |
+| T18 | `basis_inverse_under_randomized_params` **(new)** | Randomized basis perturbations still produce a valid inverse on the fixed implementation | `1e-2` |
 
-### System-level Tests
+### Static regression guards
 
-| ID  | Name | What is Verified |
-|-----|------|------------------|
-| S01 | `parallel_serial_consistency` | Parallel and serial execution agree for `forward`, `forward_rollout`, flux scan, temporal propagator scan, and spatial mixing |
-| S02 | `timestep_semantics` | Zero-step identity, timestep scaling, rollout indexing, stride and offset rules, scalar-versus-tensor dt handling, small-eigenvalue limits, negative-dt rejection, and dt normalization shapes |
-| S03 | `parameter_consistency` | `dt_ref`, noise scales, state dimensions, parameter naming, basis alpha shape, mixer and tracker types, encoder state, skip wiring, and fixed numerical constants |
-| S04 | `architecture_verification` | Removal of deprecated variants, constructor signature cleanup, gradient requirements, prohibition of `linalg.solve` and `linalg.inv`, and absence of legacy helper methods |
-| S05 | `pscan_correctness` | Parallel-scan forward and backward agreement, shape coverage, long-sequence behavior, and 4D-input semantics |
+| ID | Name | What is Verified | Tolerance |
+|---|---|---|---|
+| T21 | `crps_gradient_decomposition` **(new)** | `align.py` no longer contains the dead `pred_mean` path and documents the CRPS pairwise term | source-text guard |
+| T22 | `pscan_padding_contract` **(new)** | `pscan()` retains the singleton-padding docstring contract | source-text guard |
+| T23 | `t12_is_not_trivial` **(new)** | `T12` no longer contains the old unconditional-pass structure | source-text guard |
+| T24 | `t17_missing_golden_policy` **(new)** | `T17` no longer self-authorizes missing goldens | source-text guard |
+| T25 | `recheck_runner_features` **(new)** | `run_all.py` supports `--json-out`, and `T17` supports `--regenerate` with SHA256 reporting | source-text guard |
+
+### Numerical system tests
+
+| ID | Name | What is Verified | Tolerance |
+|---|---|---|---|
+| S01 | `parallel_serial_consistency` | Parallel and serial execution agree for `forward`, `forward_rollout`, flux scan, temporal propagator scan, and spatial mixing | float64 reference checks |
+| S02 | `timestep_semantics` | Zero-step identity, timestep scaling, rollout indexing, stride/offset rules, scalar-vs-tensor dt handling, small-eigenvalue limits, negative-dt rejection, and dt normalization shapes | mixed numerical/assertion checks |
+| S03 | `parameter_consistency` | `dt_ref`, noise scales, state dimensions, parameter naming, basis alpha shape, mixer/tracker types, encoder state, skip wiring, and fixed numerical constants | assertions |
+| S04 | `architecture_verification` | Removal of deprecated variants, constructor signature cleanup, and absence of forbidden linear-algebra helpers | source/constructor assertions |
+| S05 | `pscan_correctness` | Parallel-scan forward/backward agreement, shape coverage, long-sequence behavior, and 4D-input semantics | numerical + shape checks |
+
+*Static guards (T21–T25) protect against future regression in the checked source contracts. They do not validate floating-point operator correctness on their own; that role remains with the numerical operator and system tests above.*
 
 ## Results
 
 | Field | Value |
-|-------|-------|
-| commit | `ac5205bb696b8457f08248498ff73ee4bcd4cc99` |
-| branch | `main` |
-| date | 2026-04-20 |
+|---|---|
+| commit | `4ae5d18cf565b2487cfe0d2c6df39cf008c9b5d5` |
+| branch | `math-fixes` |
+| date | `2026-04-21` |
 | node | `172.16.0.21` |
-| device | GPU 0 |
-| python | 3.12.12 |
-| torch | 2.9.1+cu128 |
-| cuda | 12.8 |
-| run_all | **22 / 22 PASS, 0 FAIL, 0 SKIP** |
+| device | `NVIDIA A800-SXM4-80GB` |
+| python | `3.12.12` |
+| torch | `2.9.1+cu128` |
+| triton | `3.5.1` |
+| cuda | `12.8` |
+| run_all | **28 / 28 PASS, 0 FAIL, 0 SKIP** |
 
-### Operator-level Results
+### Results breakdown
 
-| ID  | Name | Status | Max Error |
-|-----|------|--------|-----------|
-| T01 | `phi1_stability` | ✅ PASS | `1.347725e-07` |
-| T02 | `ssm_discretisation` | ✅ PASS | `5.331202e-07` |
-| T03 | `dt_zero_limit` | ✅ PASS | `5.746428e-11` |
-| T04 | `variable_dt_pscan` | ✅ PASS | `4.915125e-07` |
-| T05 | `hprev_injection_equivalence` | ✅ PASS | `4.768372e-07` |
-| T06 | `flux_prev_compensation` | ✅ PASS | `2.665601e-07` |
-| T07 | `cumprod_decay_purity` | ✅ PASS | `0.000000e+00` |
-| T08 | `rollout_dt_alignment` | ✅ PASS | `1.408168e-05` |
-| T09 | `forward_vs_step_single` | ✅ PASS | `0.000000e+00` |
-| T10 | `forward_vs_rollout_multistep` | ✅ PASS | `0.000000e+00` |
-| T11 | `basis_encode_decode_identity` | ✅ PASS | `6.491098e-07` |
-| T12 | `basis_biorthogonality` | ✅ PASS | `3.407730e-11` |
-| T13 | `sde_scale_physics` | ✅ PASS | `0.000000e+00` |
-| T14 | `gradient_flow` | ✅ PASS | `0.000000e+00` |
-| T15 | `dt_zero_mask` | ✅ PASS | `0.000000e+00` |
-| T16 | `negative_dt_rejection` | ✅ PASS | `0.000000e+00` |
-| T17 | `numerical_regression` | ✅ PASS | `0.000000e+00` |
+- Numerical operator tests: **18 / 18 PASS**
+- Static regression guards: **5 / 5 PASS**
+- Numerical system tests: **5 / 5 PASS**
 
-### System-level Results
+### Numerical operator results
 
-| ID  | Name | Status | Max Error |
-|-----|------|--------|-----------|
-| S01 | `parallel_serial_consistency` | ✅ PASS | — |
-| S02 | `timestep_semantics` | ✅ PASS | — |
-| S03 | `parameter_consistency` | ✅ PASS | — |
-| S04 | `architecture_verification` | ✅ PASS | — |
-| S05 | `pscan_correctness` | ✅ PASS | — |
+| ID | Name | Status | Max Error |
+|---|---|---|---:|
+| T01 | `phi1_stability` | PASS | `1.347725e-07` |
+| T02 | `ssm_discretisation` | PASS | `5.331202e-07` |
+| T03 | `dt_zero_limit` | PASS | `5.746428e-11` |
+| T04 | `variable_dt_pscan` | PASS | `4.915125e-07` |
+| T05 | `hprev_injection_equivalence` | PASS | `4.768372e-07` |
+| T06 | `flux_prev_compensation` | PASS | `2.665601e-07` |
+| T07 | `cumprod_decay_purity` | PASS | `0.000000e+00`* |
+| T08 | `rollout_dt_alignment` | PASS | `1.408168e-05` |
+| T09 | `forward_vs_step_single` | PASS | `0.000000e+00`* |
+| T10 | `forward_vs_rollout_multistep` | PASS | `0.000000e+00`* |
+| T11 | `basis_encode_decode_identity` | PASS | `7.378708e-07` |
+| T12 | `basis_biorthogonality` | PASS | `3.779047e-14` |
+| T13 | `sde_scale_physics` | PASS | `0.000000e+00`* |
+| T14 | `gradient_flow` | PASS | `0.000000e+00`* |
+| T15 | `dt_zero_mask` | PASS | `0.000000e+00`* |
+| T16 | `negative_dt_rejection` | PASS | `0.000000e+00`* |
+| T17 | `numerical_regression` | **PASS (trivially, post-regenerate); real coverage begins on subsequent runs** | `0.000000e+00`* |
+| T18 | `basis_inverse_under_randomized_params` **(new)** | PASS | `1.579590e-14` |
+
+### Static regression guard results
+
+| ID | Name | Status | Max Error |
+|---|---|---|---:|
+| T21 | `crps_gradient_decomposition` **(new)** | PASS | `0.000000e+00`* |
+| T22 | `pscan_padding_contract` **(new)** | PASS | `0.000000e+00`* |
+| T23 | `t12_is_not_trivial` **(new)** | PASS | `0.000000e+00`* |
+| T24 | `t17_missing_golden_policy` **(new)** | PASS | `0.000000e+00`* |
+| T25 | `recheck_runner_features` **(new)** | PASS | `0.000000e+00`* |
+
+### Numerical system results
+
+| ID | Name | Status | Max Error |
+|---|---|---|---|
+| S01 | `parallel_serial_consistency` | PASS | — |
+| S02 | `timestep_semantics` | PASS | — |
+| S03 | `parameter_consistency` | PASS | — |
+| S04 | `architecture_verification` | PASS | — |
+| S05 | `pscan_correctness` | PASS | — |
+
+### Meta-verification
+
+The suite now demonstrates that it can catch a real reverted defect. Reverting the M2 basis fix on a throwaway branch and rerunning `T18` produced a failure with `err_left=7.46e-02` and `err_right=7.51e-02` (`/nfs/B/logs/recheck/meta_T18_should_fail.log`). Restoring `math-fixes` immediately re-passed `T18` with `err_left=1.58e-14` and `err_right=1.44e-14` (`/nfs/B/logs/recheck/meta_T18_repass.log`).
+
+\* `0.000000e+00` is expected here because the test is exact-by-construction (`T07`, `T09`, `T10`, `T15`, `T17`) or because the reported scalar is a count/guard outcome rather than a floating-point drift metric (`T13`, `T14`, `T16`, `T21`–`T25`). See `ANALYSIS.md` for the full per-test justification list.
 
 ## Reproduction
-
-Clone the repository and use the root-level `Check/` package:
 
 ```bash
 git clone git@github.com:yrqUni/UniPhy.git
 cd UniPhy
+git checkout math-fixes
+python Check/tests/T17_numerical_regression.py --regenerate
+python Check/tests/run_all.py --tests T S \
+    --log-dir /tmp/uniphy_check_logs \
+    --json-out /tmp/uniphy_check_logs/results.json
 ```
 
-Run the full operator and system suite:
+Single-test examples:
 
 ```bash
-python Check/tests/run_all.py --tests T S --log-dir /tmp/uniphy_check_logs
-```
-
-> The numerical regression check materializes `Check/golden/golden.pt` on first run and compares against it on subsequent runs.
-
-Run a single system group through its `__main__` entry:
-
-```bash
+python Check/tests/T18_basis_inverse_under_randomized_params.py
 python Check/tests/S05_pscan_correctness.py
-```
-
-Run a single operator test directly:
-
-```bash
-python Check/tests/T11_basis_encode_decode_identity.py
 ```
 
 ## Environment
 
-The reported results were collected on node `172.16.0.21` with `CUDA_VISIBLE_DEVICES=0`, Python `3.12.12`, PyTorch `2.9.1+cu128`, and CUDA `12.8` in the `tch` conda environment.
+```json
+{"cuda": "12.8", "device": "NVIDIA A800-SXM4-80GB", "numpy": "2.3.4", "python": "3.12.12", "torch": "2.9.1+cu128", "triton": "3.5.1"}
+```
+
+## Known limitations
+
+- The duplicated `Model/UniPhy/Check/dt_check/` tree was not deleted in this audit. Future cleanup should decide whether it remains as archival evidence or moves to a separate archive location.
+- Stage I (`embed_dim=128`) to Stage II (`embed_dim=512`) transfer is only a partial warm start because `load_matching_pretrained_weights()` copies only shape-matching tensors.
+- `align_step()` still uses repeated CPU↔GPU transfers as a memory tradeoff. This audit did not benchmark or optimize that path.
+- Historical no-complex ablation artifacts referenced by the mission text were not present locally, so that ablation concern could not be audited here.
