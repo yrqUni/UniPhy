@@ -276,8 +276,6 @@ def align_step(
         pred_seq = pred_seq.real if pred_seq.is_complex() else pred_seq
         pred_seq = pred_seq[:, :target_t]
         other_sum = (pred_sum_cpu - cached_preds[member_idx]).to(device)
-        pred_mean = (pred_seq + other_sum) / ensemble_size
-        del pred_mean
         crps_loss = (pred_seq - x_tgt_aligned).abs().mean() / ensemble_size
         if ensemble_size > 1:
             pairwise_i = torch.tensor(0.0, device=device)
@@ -287,6 +285,8 @@ def align_step(
                 pairwise_i = pairwise_i + (
                     pred_seq - other_pred.to(device)
                 ).abs().mean()
+            # pairwise_i sums over j != k, so dividing by M^2 already matches
+            # the standard 0.5 * E|X-X'| CRPS spread term.
             crps_loss = crps_loss - pairwise_i / (ensemble_size * ensemble_size)
         (crps_loss / grad_accum_steps).backward()
         if device.type == "cuda":
