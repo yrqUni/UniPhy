@@ -92,6 +92,16 @@ A self-contained test suite is provided in `Check/`:
 python Check/tests/run_all.py --tests T S --log-dir /tmp/uniphy_check_logs --json-out /tmp/uniphy_check_logs/results.json
 ```
 
+## Acknowledgements
+
+The development of UniPhy was supported by the following organizations, in no particular order.
+
+- **中国科学院计算机网络信息中心 – 国家超级计算（中国科学院）中心**  
+  [Computer Network Information Center, Chinese Academy of Sciences – National Supercomputing Center (Chinese Academy of Sciences)](https://cnic.cas.cn/jgsz/kyywbm/cjjszxyxyyyfws/)
+
+- **北京积算科技有限公司**  
+  [Beijing iCompify Technology Co., Ltd.](https://www.icompify.com/)
+
 ## Citation
 
 ```bibtex
