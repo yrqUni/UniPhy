@@ -300,6 +300,8 @@ class UniPhyModel(nn.Module):
         init_noise_scale,
     ):
         super().__init__()
+        if dt_ref <= 0:
+            raise ValueError("dt_ref must be positive")
         self.embed_dim = embed_dim
         self.depth = depth
         if isinstance(patch_size, tuple):
@@ -630,6 +632,8 @@ class UniPhyModel(nn.Module):
         x_curr = x_context[:, -1]
 
         n_steps = len(dt_list)
+        if n_steps == 0:
+            raise ValueError("dt_list must be non-empty")
         rollout_noise = self._normalize_rollout_noise(
             z_rollout,
             n_steps,
@@ -643,6 +647,7 @@ class UniPhyModel(nn.Module):
             self._validate_dt(dt_step)
         output_stride = max(1, int(output_stride))
         output_offset = int(output_offset)
+        chunk_size = max(1, int(chunk_size))
         if use_checkpoint:
             chunk_size = 1
 
@@ -688,4 +693,8 @@ class UniPhyModel(nn.Module):
             ]
             step = chunk_end
 
+        if not preds:
+            raise ValueError(
+                "No rollout outputs selected; check dt_list, output_stride, and output_offset"
+            )
         return torch.stack(preds, dim=1)

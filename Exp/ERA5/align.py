@@ -408,6 +408,7 @@ def align(cfg):
             break
 
     if rank == 0:
+        final_epoch = max(start_epoch, epoch if 'epoch' in locals() else start_epoch - 1)
         final_ckpt_path = os.path.join(
             cfg["logging"]["ckpt_dir"],
             "align_final.pt",
@@ -415,7 +416,7 @@ def align(cfg):
         save_checkpoint(
             model,
             optimizer,
-            max(start_epoch, epochs - 1),
+            final_epoch,
             global_step,
             cfg,
             final_ckpt_path,

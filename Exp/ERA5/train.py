@@ -294,12 +294,13 @@ def train(cfg):
             break
 
     if rank == 0:
+        final_epoch = max(start_epoch, epoch if 'epoch' in locals() else start_epoch - 1)
         final_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
         save_checkpoint(
             model,
             optimizer,
             scheduler,
-            epochs,
+            final_epoch,
             global_step,
             cfg,
             final_path,

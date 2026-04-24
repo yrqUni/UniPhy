@@ -134,6 +134,8 @@ def _safe_forcing(exp_arg, dt_ratio, eps=1e-7):
 class GlobalFluxTracker(nn.Module):
     def __init__(self, dim, dt_ref):
         super().__init__()
+        if dt_ref <= 0:
+            raise ValueError("dt_ref must be positive")
         self.dim = dim
         self.dt_ref = dt_ref
         self.memory_slots = 1
@@ -220,6 +222,8 @@ def _compute_sde_scale(lam_re, dt_ratio, base_noise, eps=1e-7):
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref, init_noise_scale):
         super().__init__()
+        if dt_ref <= 0:
+            raise ValueError("dt_ref must be positive")
         self.dim = dim
         self.dt_ref = dt_ref
         self.basis = ComplexSVDTransform(dim)
