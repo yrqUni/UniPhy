@@ -85,8 +85,6 @@ def parse_year_range(text: Optional[str]) -> Optional[List[int]]:
     if len(parts) == 1:
         value = int(parts[0])
         return [value, value]
-    if len(parts) != 2:
-        raise ValueError(f"Invalid year range: {text}")
     return [int(parts[0]), int(parts[1])]
 
 

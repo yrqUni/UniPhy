@@ -40,10 +40,6 @@ def parse_int_list(text):
 
 def build_model_from_checkpoint(ckpt_path, device):
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "cfg" not in checkpoint or "model" not in checkpoint["cfg"]:
-        raise ValueError("Checkpoint missing cfg.model")
-    if "model" not in checkpoint:
-        raise ValueError("Checkpoint missing model state_dict")
     model_cfg = dict(checkpoint["cfg"]["model"])
     model = build_uniphy_model(model_cfg, device=device)
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -207,10 +203,6 @@ def print_summary(result):
 def main():
     args = parse_args()
     lead_times = parse_int_list(args.lead_times)
-    if not lead_times:
-        raise ValueError("lead_times must be non-empty")
-    if any(curr <= prev for prev, curr in zip(lead_times[:-1], lead_times[1:])):
-        raise ValueError("lead_times must be strictly increasing")
 
     device = torch.device(get_device(args.device))
     model, checkpoint_cfg, model_cfg = build_model_from_checkpoint(
@@ -219,9 +211,6 @@ def main():
     )
     cond_steps = int(checkpoint_cfg.get("alignment", {}).get("condition_steps", 1))
     eval_year_range = resolve_eval_year_range(args.eval_year_range)
-    if args.data_input_dir is None:
-        raise ValueError("--data-input-dir is required")
-
     dataset, lead_deltas = build_eval_dataset(
         args.data_input_dir,
         eval_year_range,
@@ -273,9 +262,6 @@ def main():
         sample_count += data.shape[0]
         if (batch_idx + 1) % max(1, args.log_every) == 0:
             print(f"climatology batches={batch_idx + 1} samples={sample_count}")
-
-    if sample_count == 0:
-        raise RuntimeError("No evaluation samples available")
 
     climatology = climatology_sum / float(sample_count)
     climatology = climatology.to(device)

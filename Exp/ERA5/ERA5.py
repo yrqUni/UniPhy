@@ -34,22 +34,6 @@ class ERA5Dataset(Dataset):
             self.sample_offsets_hours = [
                 float(offset) for offset in sample_offsets_hours
             ]
-            if len(self.sample_offsets_hours) != self.sample_k:
-                raise ValueError(
-                    "sample_offsets_hours length must match sample_k"
-                )
-            if any(offset < 0.0 for offset in self.sample_offsets_hours):
-                raise ValueError("sample_offsets_hours must be non-negative")
-            if any(
-                curr <= prev
-                for prev, curr in zip(
-                    self.sample_offsets_hours[:-1],
-                    self.sample_offsets_hours[1:],
-                )
-            ):
-                raise ValueError(
-                    "sample_offsets_hours must be strictly increasing"
-                )
             self.sample_positions = [
                 offset / self.dt_ref for offset in self.sample_offsets_hours
             ]

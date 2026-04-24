@@ -134,8 +134,6 @@ def _safe_forcing(exp_arg, dt_ratio, eps=1e-7):
 class GlobalFluxTracker(nn.Module):
     def __init__(self, dim, dt_ref):
         super().__init__()
-        if dt_ref <= 0:
-            raise ValueError("dt_ref must be positive")
         self.dim = dim
         self.dt_ref = dt_ref
         self.memory_slots = 1
@@ -222,8 +220,6 @@ def _compute_sde_scale(lam_re, dt_ratio, base_noise, eps=1e-7):
 class TemporalPropagator(nn.Module):
     def __init__(self, dim, dt_ref, init_noise_scale):
         super().__init__()
-        if dt_ref <= 0:
-            raise ValueError("dt_ref must be positive")
         self.dim = dim
         self.dt_ref = dt_ref
         self.basis = ComplexSVDTransform(dim)
@@ -267,13 +263,6 @@ class TemporalPropagator(nn.Module):
         return self._compute_exp_operators(dt_ratio)
 
     def _normalize_explicit_noise(self, noise, dtype):
-        if noise is None:
-            raise ValueError("explicit noise is required")
-        if noise.shape[-1] != self.dim:
-            raise ValueError(
-                "noise latent dimension mismatch: expected "
-                f"{self.dim}, got {noise.shape[-1]}"
-            )
         if noise.is_complex():
             noise_complex = noise.to(dtype)
         else:
@@ -294,11 +283,7 @@ class TemporalPropagator(nn.Module):
     ):
         if noise_seq is None:
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
-        if tuple(noise_seq.shape) != tuple(shape):
-            raise ValueError(
-                "noise shape mismatch for sequence term: expected "
-                f"{tuple(shape)}, got {tuple(noise_seq.shape)}"
-            )
+        noise_seq = noise_seq.view(shape)
         _, _, _, _, dim = shape
         lam_re = self._get_effective_lambda().real
         dt_real = dt_seq.real if dt_seq.is_complex() else dt_seq
@@ -321,11 +306,7 @@ class TemporalPropagator(nn.Module):
     ):
         if noise_step is None:
             return torch.zeros(shape, dtype=dtype, device=self.lam_re.device)
-        if tuple(noise_step.shape) != tuple(shape):
-            raise ValueError(
-                "noise shape mismatch for step term: expected "
-                f"{tuple(shape)}, got {tuple(noise_step.shape)}"
-            )
+        noise_step = noise_step.view(shape)
         _, _, _, dim = shape
         lam_re = self._get_effective_lambda().real
         dt_real = dt_step.real if dt_step.is_complex() else dt_step

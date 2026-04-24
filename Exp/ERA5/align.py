@@ -39,17 +39,11 @@ def setup_logging(log_path, rank):
 
 
 def load_matching_pretrained_weights(model, ckpt_state):
-    if ckpt_state is None:
-        raise ValueError("Pretrained checkpoint is required")
-    if "model" not in ckpt_state:
-        raise ValueError("Checkpoint missing model state_dict")
     model.load_state_dict(ckpt_state["model"], strict=True)
 
 
 def load_alignment_checkpoint(path, model, optimizer=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if "model" not in ckpt:
-        raise ValueError("Checkpoint missing model state_dict")
     target = model.module if hasattr(model, "module") else model
     target.load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:
@@ -263,8 +257,6 @@ def align(cfg):
     pretrained_path = cfg["alignment"].get("pretrained_ckpt", "")
     pretrained_state = None
     if pretrained_path:
-        if not os.path.exists(pretrained_path):
-            raise FileNotFoundError(pretrained_path)
         pretrained_state = torch.load(
             pretrained_path,
             map_location="cpu",

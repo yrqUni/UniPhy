@@ -119,8 +119,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if "model" not in ckpt:
-        raise ValueError("Checkpoint missing model state_dict")
     target = model.module if hasattr(model, "module") else model
     target.load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:

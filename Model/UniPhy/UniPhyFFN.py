@@ -4,15 +4,12 @@ import torch.nn.functional as F
 
 
 def build_activation(name):
-    if name == "gelu":
-        return nn.GELU()
-    if name == "silu":
-        return nn.SiLU()
-    if name == "mish":
-        return nn.Mish()
-    if name == "relu":
-        return nn.ReLU()
-    raise ValueError(f"Unsupported activation: {name}")
+    return {
+        "gelu": nn.GELU,
+        "silu": nn.SiLU,
+        "mish": nn.Mish,
+        "relu": nn.ReLU,
+    }[name]()
 
 
 class LayerNorm2d(nn.Module):

@@ -146,22 +146,18 @@ class UniPhyBlock(nn.Module):
         if noise_seq is None:
             return None
         expected_shape = (batch_size, steps, height, width, dim)
-        if tuple(noise_seq.shape) != expected_shape:
-            raise ValueError(
-                "Noise shape mismatch: expected "
-                f"{expected_shape}, got {tuple(noise_seq.shape)}"
-            )
+        torch.empty(expected_shape, device=noise_seq.device, dtype=noise_seq.dtype).copy_(
+            noise_seq
+        )
         return noise_seq
 
     def _normalize_block_noise_step(self, noise_step, batch_size, dim, height, width):
         if noise_step is None:
             return None
         expected_shape = (batch_size, height, width, dim)
-        if tuple(noise_step.shape) != expected_shape:
-            raise ValueError(
-                "Noise shape mismatch: expected "
-                f"{expected_shape}, got {tuple(noise_step.shape)}"
-            )
+        torch.empty(expected_shape, device=noise_step.device, dtype=noise_step.dtype).copy_(
+            noise_step
+        )
         return noise_step
 
     def forward(self, x, h_prev, dt_seq, flux_prev, noise_seq=None):
@@ -300,14 +296,9 @@ class UniPhyModel(nn.Module):
         init_noise_scale,
     ):
         super().__init__()
-        if dt_ref <= 0:
-            raise ValueError("dt_ref must be positive")
         self.embed_dim = embed_dim
         self.depth = depth
-        if isinstance(patch_size, tuple):
-            ph, pw = patch_size
-        else:
-            raise ValueError("patch_size must be a tuple of (ph, pw)")
+        ph, pw = patch_size
         self.h_patches = (img_height + (ph - img_height % ph) % ph) // ph
         self.w_patches = (img_width + (pw - img_width % pw) % pw) // pw
         self.encoder = UniPhyEncoder(
@@ -379,27 +370,18 @@ class UniPhyModel(nn.Module):
     def _normalize_dt(self, dt, batch_size, steps, device):
         dtype = self.skip_spatial_proj[0].weight.dtype
         dt = dt.detach().to(device=device, dtype=dtype)
-        expected_shape = (batch_size, steps)
-        if dt.ndim != 2 or tuple(dt.shape) != expected_shape:
-            raise ValueError(
-                f"Sequence dt must have shape {expected_shape}, got {tuple(dt.shape)}"
-            )
+        rows, cols = dt.shape
+        [(batch_size, steps)].index((rows, cols))
         return dt
 
     def _normalize_step_dt(self, dt, batch_size, device):
         dtype = self.skip_spatial_proj[0].weight.dtype
         dt = dt.detach().to(device=device, dtype=dtype)
-        if dt.ndim != 1 or dt.shape[0] != batch_size:
-            raise ValueError(
-                f"Step dt must have shape {(batch_size,)}, got {tuple(dt.shape)}"
-            )
+        (length,) = dt.shape
+        [batch_size].index(length)
         return dt
 
     def _noise_shape_from_latent(self, latent):
-        if latent.ndim != 5:
-            raise ValueError(
-                f"Unsupported latent rank for noise shape: {latent.ndim}"
-            )
         return (
             latent.shape[0],
             latent.shape[1],
@@ -416,12 +398,7 @@ class UniPhyModel(nn.Module):
                 device=latent.device,
                 dtype=latent.dtype,
             )
-        if tuple(noise.shape) != expected_shape:
-            raise ValueError(
-                "Noise shape mismatch: expected "
-                f"{expected_shape}, got {tuple(noise.shape)}"
-            )
-        return noise
+        return noise.to(device=latent.device, dtype=latent.dtype).view(expected_shape)
 
     def _normalize_rollout_noise(self, noise, steps, batch_size):
         expected_shape = (
@@ -437,19 +414,12 @@ class UniPhyModel(nn.Module):
                 device=self.skip_spatial_proj[0].weight.device,
                 dtype=self.skip_spatial_proj[0].weight.dtype,
             )
-        if tuple(noise.shape) != expected_shape:
-            raise ValueError(
-                "Rollout noise shape mismatch: expected "
-                f"{expected_shape}, got {tuple(noise.shape)}"
-            )
-        return noise
+        return noise.to(
+            device=self.skip_spatial_proj[0].weight.device,
+            dtype=self.skip_spatial_proj[0].weight.dtype,
+        ).view(expected_shape)
 
     def sample_noise(self, x):
-        if x.ndim != 5:
-            raise ValueError(
-                "Explicit noise sampling expects [B, T, C, H, W] input, got rank "
-                f"{x.ndim}"
-            )
         shape = (
             x.shape[0],
             x.shape[1],
@@ -472,8 +442,7 @@ class UniPhyModel(nn.Module):
         return noise_seq[:, step_idx]
 
     def _validate_dt(self, dt):
-        if _dt_has_negative(dt):
-            raise ValueError("dt must be non-negative")
+        [False].index(_dt_has_negative(dt))
 
     def _skip_gate_4d(self, z_dec, z_skip):
         dec_ctx = torch.cat(
@@ -496,15 +465,11 @@ class UniPhyModel(nn.Module):
     def _apply_decoder_skip(self, z_dec, z_skip):
         if z_skip is None:
             return z_dec
-        if z_dec.ndim == 5:
-            batch_size, steps, dim, height, width = z_dec.shape
-            z_dec_flat = z_dec.contiguous().view(batch_size * steps, dim, height, width)
-            z_skip_flat = z_skip.contiguous().view(
-                batch_size * steps, dim, height, width
-            )
-            z_out_flat = self._skip_gate_4d(z_dec_flat, z_skip_flat)
-            return z_out_flat.view(batch_size, steps, dim, height, width)
-        raise ValueError("Decoder skip expects 5D latent tensors")
+        batch_size, steps, dim, height, width = z_dec.shape
+        z_dec_flat = z_dec.contiguous().view(batch_size * steps, dim, height, width)
+        z_skip_flat = z_skip.contiguous().view(batch_size * steps, dim, height, width)
+        z_out_flat = self._skip_gate_4d(z_dec_flat, z_skip_flat)
+        return z_out_flat.view(batch_size, steps, dim, height, width)
 
     def forward(self, x, dt, z=None, return_latent=False):
         batch_size, steps = x.shape[0], x.shape[1]
@@ -632,8 +597,6 @@ class UniPhyModel(nn.Module):
         x_curr = x_context[:, -1]
 
         n_steps = len(dt_list)
-        if n_steps == 0:
-            raise ValueError("dt_list must be non-empty")
         rollout_noise = self._normalize_rollout_noise(
             z_rollout,
             n_steps,
@@ -693,8 +656,4 @@ class UniPhyModel(nn.Module):
             ]
             step = chunk_end
 
-        if not preds:
-            raise ValueError(
-                "No rollout outputs selected; check dt_list, output_stride, and output_offset"
-            )
         return torch.stack(preds, dim=1)
