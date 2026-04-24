@@ -90,17 +90,17 @@ class ComplexConvFFN(nn.Module):
 
     def forward(self, x):
         if x.is_complex():
-            re = x.real
-            im = x.imag
+            re = x.real.contiguous()
+            im = x.imag.contiguous()
         else:
-            re = x
-            im = torch.zeros_like(x)
+            re = x.contiguous()
+            im = torch.zeros_like(re)
         h_re = self.fc1_re(re) - self.fc1_im(im)
         h_im = self.fc1_re(im) + self.fc1_im(re)
         h_re = self.dw_conv_re(h_re)
         h_im = self.dw_conv_im(h_im)
-        h_re = self.activation(h_re)
-        h_im = self.activation(h_im)
+        h_re = self.activation(h_re).contiguous()
+        h_im = self.activation(h_im).contiguous()
         out_re = self.fc2_re(h_re) - self.fc2_im(h_im)
         out_im = self.fc2_re(h_im) + self.fc2_im(h_re)
         return torch.complex(out_re, out_im)

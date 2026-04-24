@@ -1,34 +1,26 @@
-import argparse
-import logging
 import os
-import random
-import sys
 import warnings
 
-import numpy as np
 import torch
-import torch.distributed as dist
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    ProgressColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.text import Text
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import lr_scheduler
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-
 
 from Exp.ERA5.ERA5 import ERA5Dataset
-from Exp.ERA5.runtime_config import build_runtime_cfg
-from Model.UniPhy.ModelUniPhy import UniPhyModel
+from Exp.ERA5.runtime_config import (
+    build_adamw_optimizer,
+    build_distributed_loader,
+    build_lat_weights,
+    build_progress,
+    build_rank_console,
+    build_runtime_arg_parser,
+    build_runtime_cfg,
+    build_uniphy_model,
+    compute_crps,
+    flush_remaining_grads,
+    init_distributed,
+    setup_file_logger,
+    should_stop_early,
+    wrap_ddp,
+)
 from Model.UniPhy.UniPhyOps import complex_dtype_for
 
 warnings.filterwarnings("ignore")
@@ -36,71 +28,12 @@ warnings.filterwarnings("ignore")
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "train.yaml")
 
 
-class SpeedColumn(ProgressColumn):
-    def render(self, task):
-        if task.speed is None:
-            return Text("0.00 it/s", style="progress.data.speed")
-        return Text(f"{task.speed:.2f} it/s", style="progress.data.speed")
-
-
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument("--data-input-dir", default=None)
-    parser.add_argument("--train-year-range", default=None)
-    parser.add_argument("--sample-offsets-hours", default=None)
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--log-path", default=None)
-    parser.add_argument("--ckpt-dir", default=None)
-    parser.add_argument("--ckpt-path", default=None)
-    parser.add_argument("--max-steps", type=int, default=None)
-    return parser.parse_args()
+    return build_runtime_arg_parser(CONFIG_PATH).parse_args()
 
 
 def setup_logging(log_path, rank):
-    logger = logging.getLogger("train")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    if rank == 0:
-        fh = logging.FileHandler(os.path.join(log_path, "train_metrics.log"))
-        fh.setLevel(logging.INFO)
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
-    else:
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def build_lat_weights(H, W, device):
-    lat = torch.linspace(-90, 90, H, device=device)
-    weights = torch.cos(torch.deg2rad(lat))
-    weights = weights / weights.mean()
-    return weights.view(1, 1, 1, H, 1)
-
-
-def compute_crps(pred_ensemble, target):
-    ensemble_size = pred_ensemble.shape[0]
-    target_exp = target.unsqueeze(0)
-    mae = (pred_ensemble - target_exp).abs().mean()
-    if ensemble_size > 1:
-        idx_i, idx_j = torch.triu_indices(
-            ensemble_size,
-            ensemble_size,
-            offset=1,
-            device=target.device,
-        )
-        pairwise_diff = (pred_ensemble[idx_i] - pred_ensemble[idx_j]).abs().mean()
-        num_pairs = idx_i.shape[0]
-        return mae - pairwise_diff * num_pairs / (ensemble_size * ensemble_size)
-    return mae
+    return setup_file_logger("train", log_path, rank, "train_metrics.log")
 
 
 def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_weights):
@@ -158,7 +91,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-    metrics = {
+    return {
         "loss": loss.item(),
         "l1_loss": l1_loss.item(),
         "crps_loss": crps_loss.item(),
@@ -167,7 +100,6 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
         "grad_norm": grad_norm,
         "ensemble_std": ensemble_std.item(),
     }
-    return metrics
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
@@ -200,30 +132,9 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     return start_epoch, ckpt.get("global_step", 0)
 
 
-def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
-    if batch_idx >= 0 and (batch_idx + 1) % grad_accum_steps != 0:
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            cfg["train"]["grad_clip"],
-        )
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-
 def train(cfg):
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    set_seed(42 + rank)
-
-    devnull = open(os.devnull, "w")
-    if rank == 0:
-        os.makedirs(cfg["logging"]["log_path"], exist_ok=True)
-        console = Console() if sys.stdout.isatty() else Console(file=devnull)
-    else:
-        console = Console(file=devnull)
+    rank, world_size, local_rank, device = init_distributed()
+    console, devnull = build_rank_console(rank)
 
     logger = setup_logging(cfg["logging"]["log_path"], rank)
     if rank == 0:
@@ -233,27 +144,8 @@ def train(cfg):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    model = UniPhyModel(
-        in_channels=cfg["model"]["in_channels"],
-        out_channels=cfg["model"]["out_channels"],
-        embed_dim=cfg["model"]["embed_dim"],
-        expand=cfg["model"]["expand"],
-        depth=cfg["model"]["depth"],
-        patch_size=tuple(cfg["model"]["patch_size"]),
-        img_height=cfg["model"]["img_height"],
-        img_width=cfg["model"]["img_width"],
-        dt_ref=cfg["model"]["dt_ref"],
-        init_noise_scale=cfg["model"]["init_noise_scale"],
-    ).cuda()
-
-    model = DDP(
-        model,
-        device_ids=[local_rank],
-        find_unused_parameters=False,
-        gradient_as_bucket_view=True,
-        static_graph=True,
-        broadcast_buffers=False,
-    )
+    model = build_uniphy_model(cfg["model"], device=device)
+    model = wrap_ddp(model, local_rank)
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -265,28 +157,14 @@ def train(cfg):
         dt_ref=cfg["model"]["dt_ref"],
         sample_offsets_hours=cfg["data"].get("sample_offsets_hours"),
     )
-    train_sampler = DistributedSampler(
+    train_sampler, train_loader = build_distributed_loader(
         train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg["train"]["batch_size"],
-        sampler=train_sampler,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-        drop_last=True,
+        cfg["train"]["batch_size"],
+        world_size,
+        rank,
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        weight_decay=float(cfg["train"]["weight_decay"]),
-    )
+    optimizer = build_adamw_optimizer(model, cfg)
     grad_accum_steps = cfg["train"]["grad_accum_steps"]
     epochs = cfg["train"]["epochs"]
 
@@ -317,25 +195,12 @@ def train(cfg):
     if rank == 0:
         os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
 
-    lat_weights = build_lat_weights(
-        cfg["model"]["img_height"],
-        cfg["model"]["img_width"],
-        torch.device(f"cuda:{local_rank}"),
-    )
+    lat_weights = build_lat_weights(cfg["model"]["img_height"], device)
 
     progress = None
     task_id = None
     if rank == 0:
-        progress = Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            SpeedColumn(),
-            console=console,
-        )
+        progress = build_progress(console=console)
         progress.start()
         task_id = progress.add_task(
             "Training",
@@ -396,17 +261,14 @@ def train(cfg):
                     )
                     logger.info(f"Saved checkpoint: {save_path}")
 
-            if (
-                cfg.get("runtime", {}).get("max_steps") is not None
-                and global_step >= int(cfg["runtime"]["max_steps"])
-            ):
+            if should_stop_early(cfg, global_step):
                 stop_early = True
                 break
 
         flush_remaining_grads(
             model,
             optimizer,
-            cfg,
+            cfg["train"]["grad_clip"],
             batch_idx,
             grad_accum_steps,
         )
@@ -427,7 +289,7 @@ def train(cfg):
             )
             logger.info(f"Epoch {epoch + 1} finished. Saved checkpoint.")
 
-        dist.barrier()
+        torch.distributed.barrier()
         if stop_early:
             break
 
@@ -449,7 +311,8 @@ def train(cfg):
         progress.stop()
 
     train_dataset.cleanup()
-    dist.destroy_process_group()
+    torch.distributed.destroy_process_group()
+    devnull.close()
 
 
 def main():

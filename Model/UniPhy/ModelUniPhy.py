@@ -63,7 +63,7 @@ class SpatialGateModulator(nn.Module):
             dim,
         )
         source_field = torch.complex(src_re, src_im)
-        spatial_feat = x_cat.permute(0, 3, 1, 2)
+        spatial_feat = x_cat.permute(0, 3, 1, 2).contiguous()
         spatial_gate = self.spatial_proj(spatial_feat).permute(0, 2, 3, 1)
         gate_combined = gate_global.unsqueeze(1).unsqueeze(2) * spatial_gate
         return x_local * gate_combined + source_field * (1 - gate_combined)

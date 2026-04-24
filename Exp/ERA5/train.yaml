@@ -9,11 +9,11 @@ model:
   img_width: 1440
   dt_ref: 6.0
   init_noise_scale: 0.0001
-  ensemble_size: 4
+  ensemble_size: 1
 
 data:
-  input_dir: "./data/ERA5"
-  year_range: [2000, 2009]
+  input_dir: "/nfs/ERA5_data/data_norm"
+  year_range: [2000, 2000]
   window_size: 10
   sample_k: 5
   look_ahead: 2
@@ -22,7 +22,7 @@ train:
   batch_size: 1
   lr: 1.0e-4
   weight_decay: 0.05
-  epochs: 256
+  epochs: 1
   grad_clip: 128.0
   grad_accum_steps: 1
   use_scheduler: false
@@ -31,7 +31,7 @@ train:
 
 logging:
   log_every: 1
-  ckpt_step: 0.5
-  log_path: "./uniphy/logs"
-  ckpt_dir: "./uniphy/ckpt"
+  ckpt_step: 1.0
+  log_path: "/tmp/uniphy/logs"
+  ckpt_dir: "/tmp/uniphy/ckpt"
   ckpt: ""

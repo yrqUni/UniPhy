@@ -1,33 +1,25 @@
-import argparse
-import logging
 import math
 import os
 import random
-import sys
 import warnings
 
-import numpy as np
 import torch
-import torch.distributed as dist
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    ProgressColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.text import Text
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-
 
 from Exp.ERA5.ERA5 import ERA5Dataset
-from Exp.ERA5.runtime_config import build_runtime_cfg
-from Model.UniPhy.ModelUniPhy import UniPhyModel
+from Exp.ERA5.runtime_config import (
+    build_adamw_optimizer,
+    build_distributed_loader,
+    build_lat_weights,
+    build_progress,
+    build_runtime_arg_parser,
+    build_runtime_cfg,
+    build_uniphy_model,
+    flush_remaining_grads,
+    init_distributed,
+    setup_file_logger,
+    should_stop_early,
+    wrap_ddp,
+)
 from Model.UniPhy.UniPhyOps import complex_dtype_for
 
 warnings.filterwarnings("ignore")
@@ -36,82 +28,14 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "align.yaml")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument("--data-input-dir", default=None)
-    parser.add_argument("--train-year-range", default=None)
-    parser.add_argument("--sample-offsets-hours", default=None)
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--log-path", default=None)
-    parser.add_argument("--ckpt-dir", default=None)
-    parser.add_argument("--ckpt-path", default=None)
-    parser.add_argument("--pretrained-ckpt", default=None)
-    parser.add_argument("--max-steps", type=int, default=None)
-    return parser.parse_args()
-
-
-class SpeedColumn(ProgressColumn):
-    def render(self, task):
-        if task.speed is None:
-            return Text("0.00 it/s", style="progress.data.speed")
-        return Text(f"{task.speed:.2f} it/s", style="progress.data.speed")
+    return build_runtime_arg_parser(
+        CONFIG_PATH,
+        include_pretrained_ckpt=True,
+    ).parse_args()
 
 
 def setup_logging(log_path, rank):
-    logger = logging.getLogger("align")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    if rank == 0:
-        os.makedirs(log_path, exist_ok=True)
-        fh = logging.FileHandler(os.path.join(log_path, "align.log"))
-        fh.setLevel(logging.INFO)
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
-    else:
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def _get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps):
-    sorted_steps = sorted(all_sub_steps)
-    n = len(sorted_steps)
-    progress = epoch / max(total_epochs - 1, 1)
-    unlock_count = max(1, math.ceil(progress * n))
-    if epoch < total_epochs // 3:
-        unlock_count = max(1, n // 2)
-    return sorted_steps[:unlock_count]
-
-
-def compute_crps(pred_ensemble, target):
-    ensemble_size = pred_ensemble.shape[0]
-    target_exp = target.unsqueeze(0)
-    mae = (pred_ensemble - target_exp).abs().mean()
-    if ensemble_size > 1:
-        idx_i, idx_j = torch.triu_indices(
-            ensemble_size,
-            ensemble_size,
-            offset=1,
-            device=target.device,
-        )
-        pairwise_diff = (pred_ensemble[idx_i] - pred_ensemble[idx_j]).abs().mean()
-        num_pairs = idx_i.shape[0]
-        return mae - pairwise_diff * num_pairs / (ensemble_size * ensemble_size)
-    return mae
-
-
-def build_lat_weights(h, device):
-    lat = torch.linspace(-90, 90, h, device=device)
-    weights = torch.cos(torch.deg2rad(lat))
-    weights = weights / weights.mean()
-    return weights.view(1, 1, 1, h, 1)
+    return setup_file_logger("align", log_path, rank, "align.log")
 
 
 def load_matching_pretrained_weights(model, ckpt_state):
@@ -133,6 +57,16 @@ def load_alignment_checkpoint(path, model, optimizer=None):
     saved_epoch = int(ckpt.get("epoch", -1))
     start_epoch = max(0, saved_epoch + 1)
     return start_epoch, int(ckpt.get("global_step", 0))
+
+
+def get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps):
+    sorted_steps = sorted(all_sub_steps)
+    n = len(sorted_steps)
+    progress = epoch / max(total_epochs - 1, 1)
+    unlock_count = max(1, math.ceil(progress * n))
+    if epoch < total_epochs // 3:
+        unlock_count = max(1, n // 2)
+    return sorted_steps[:unlock_count]
 
 
 def align_step(
@@ -163,8 +97,10 @@ def align_step(
     dt_ctx = dt_data[:, :cond_steps]
 
     max_t = min(max_tgt_steps, x_targets.shape[1])
-    available_sub_steps = _get_curriculum_sub_steps(
-        epoch, total_epochs, all_sub_steps
+    available_sub_steps = get_curriculum_sub_steps(
+        epoch,
+        total_epochs,
+        all_sub_steps,
     )
     sub_step = random.choice(available_sub_steps)
     max_t_for_step = max(1, min(max_t, max_rollout_steps // sub_step))
@@ -181,9 +117,7 @@ def align_step(
     infer_model = model.module if hasattr(model, "module") else model
     output_offset = sub_step - 1
     x_tgt_aligned = x_targets[:, :target_t]
-    lat_weights_cpu = build_lat_weights(
-        x_tgt_aligned.shape[-2], torch.device("cpu")
-    )
+    lat_weights_cpu = build_lat_weights(x_tgt_aligned.shape[-2], torch.device("cpu"))
     target_cpu = x_tgt_aligned.detach().cpu()
 
     cached_preds = []
@@ -306,24 +240,8 @@ def save_checkpoint(model, optimizer, epoch, global_step, cfg, path):
     torch.save(state, path)
 
 
-def flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps):
-    if batch_idx >= 0 and (batch_idx + 1) % grad_accum_steps != 0:
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            cfg["train"]["grad_clip"],
-        )
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-
 def align(cfg):
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    set_seed(42 + rank)
-
+    rank, world_size, local_rank, device = init_distributed()
     logger = setup_logging(cfg["logging"]["log_path"], rank)
     cond_steps = cfg["alignment"]["condition_steps"]
     max_tgt_steps = cfg["alignment"]["max_target_steps"]
@@ -358,19 +276,7 @@ def align(cfg):
                 f"{pretrained_path}"
             )
 
-    model = UniPhyModel(
-        in_channels=cfg["model"]["in_channels"],
-        out_channels=cfg["model"]["out_channels"],
-        embed_dim=cfg["model"]["embed_dim"],
-        expand=cfg["model"]["expand"],
-        depth=cfg["model"]["depth"],
-        patch_size=tuple(cfg["model"]["patch_size"]),
-        img_height=cfg["model"]["img_height"],
-        img_width=cfg["model"]["img_width"],
-        dt_ref=cfg["model"]["dt_ref"],
-        init_noise_scale=cfg["model"]["init_noise_scale"],
-    ).cuda()
-
+    model = build_uniphy_model(cfg["model"], device=device)
     if pretrained_state is not None:
         load_matching_pretrained_weights(model, pretrained_state)
         if rank == 0:
@@ -378,15 +284,7 @@ def align(cfg):
                 "Initialized from Stage I checkpoint with strict weight loading: "
                 f"{pretrained_path}"
             )
-
-    model = DDP(
-        model,
-        device_ids=[local_rank],
-        find_unused_parameters=False,
-        gradient_as_bucket_view=True,
-        static_graph=True,
-        broadcast_buffers=False,
-    )
+    model = wrap_ddp(model, local_rank)
 
     train_dataset = ERA5Dataset(
         input_dir=cfg["data"]["input_dir"],
@@ -398,28 +296,14 @@ def align(cfg):
         dt_ref=cfg["model"]["dt_ref"],
         sample_offsets_hours=cfg["data"].get("sample_offsets_hours"),
     )
-    train_sampler = DistributedSampler(
+    train_sampler, train_loader = build_distributed_loader(
         train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg["train"]["batch_size"],
-        sampler=train_sampler,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-        drop_last=True,
+        cfg["train"]["batch_size"],
+        world_size,
+        rank,
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        weight_decay=float(cfg["train"]["weight_decay"]),
-    )
+    optimizer = build_adamw_optimizer(model, cfg)
     grad_accum_steps = cfg["train"]["grad_accum_steps"]
     epochs = cfg["train"]["epochs"]
     log_every = cfg["logging"]["log_every"]
@@ -445,7 +329,7 @@ def align(cfg):
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        unlocked = _get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps)
+        unlocked = get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps)
         if rank == 0:
             min_dt_min = cfg["alignment"]["target_dt"] / max(unlocked) * 60
             logger.info(
@@ -456,18 +340,11 @@ def align(cfg):
         progress = None
         task_id = None
         if rank == 0:
-            progress = Progress(
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TaskProgressColumn(),
-                SpeedColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-            )
+            progress = build_progress()
             progress.start()
             task_id = progress.add_task(
-                f"Epoch {epoch + 1}/{epochs}", total=len(train_loader)
+                f"Epoch {epoch + 1}/{epochs}",
+                total=len(train_loader),
             )
 
         batch_idx = -1
@@ -498,14 +375,17 @@ def align(cfg):
                     progress.console.print(log_msg)
                     logger.info(log_msg)
 
-            if (
-                cfg.get("runtime", {}).get("max_steps") is not None
-                and global_step >= int(cfg["runtime"]["max_steps"])
-            ):
+            if should_stop_early(cfg, global_step):
                 stop_early = True
                 break
 
-        flush_remaining_grads(model, optimizer, cfg, batch_idx, grad_accum_steps)
+        flush_remaining_grads(
+            model,
+            optimizer,
+            cfg["train"]["grad_clip"],
+            batch_idx,
+            grad_accum_steps,
+        )
 
         if rank == 0:
             progress.stop()
@@ -523,13 +403,14 @@ def align(cfg):
             )
             logger.info(f"Saved checkpoint: {ckpt_save_path}")
 
-        dist.barrier()
+        torch.distributed.barrier()
         if stop_early:
             break
 
     if rank == 0:
         final_ckpt_path = os.path.join(
-            cfg["logging"]["ckpt_dir"], "align_final.pt"
+            cfg["logging"]["ckpt_dir"],
+            "align_final.pt",
         )
         save_checkpoint(
             model,
@@ -542,7 +423,7 @@ def align(cfg):
         logger.info(f"Saved final checkpoint: {final_ckpt_path}")
 
     train_dataset.cleanup()
-    dist.destroy_process_group()
+    torch.distributed.destroy_process_group()
 
 
 def main():
