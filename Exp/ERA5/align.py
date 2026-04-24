@@ -1,7 +1,6 @@
 import math
 import os
 import random
-import warnings
 
 import torch
 
@@ -22,8 +21,6 @@ from Exp.ERA5.runtime_config import (
 )
 from Model.UniPhy.UniPhyOps import complex_dtype_for
 
-warnings.filterwarnings("ignore")
-
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "align.yaml")
 
 
@@ -36,10 +33,6 @@ def parse_args():
 
 def setup_logging(log_path, rank):
     return setup_file_logger("align", log_path, rank, "align.log")
-
-
-def load_matching_pretrained_weights(model, ckpt_state):
-    model.load_state_dict(ckpt_state["model"], strict=True)
 
 
 def load_alignment_checkpoint(path, model, optimizer=None):
@@ -246,12 +239,12 @@ def align(cfg):
     if rank == 0:
         logger.info("=" * 60)
         logger.info("UniPhy Alignment Training")
-        logger.info(f"  Condition Steps:   {cond_steps}")
-        logger.info(f"  Max Target Steps:  {max_tgt_steps}")
-        logger.info(f"  Sample K:          {sample_k}")
-        logger.info(f"  Sub Steps:         {all_sub_steps}")
-        logger.info(f"  Max Rollout Steps: {cfg['alignment']['max_rollout_steps']}")
-        logger.info(f"  Chunk Size:        {cfg['alignment']['chunk_size']}")
+        logger.info(f"Condition Steps={cond_steps}")
+        logger.info(f"Max Target Steps={max_tgt_steps}")
+        logger.info(f"Sample K={sample_k}")
+        logger.info(f"Sub Steps={all_sub_steps}")
+        logger.info(f"Max Rollout Steps={cfg['alignment']['max_rollout_steps']}")
+        logger.info(f"Chunk Size={cfg['alignment']['chunk_size']}")
         logger.info("=" * 60)
 
     pretrained_path = cfg["alignment"].get("pretrained_ckpt", "")
@@ -262,20 +255,12 @@ def align(cfg):
             map_location="cpu",
             weights_only=False,
         )
-        if rank == 0:
-            logger.info(
-                "Loaded Stage I checkpoint for initialization: "
-                f"{pretrained_path}"
-            )
 
     model = build_uniphy_model(cfg["model"], device=device)
     if pretrained_state is not None:
-        load_matching_pretrained_weights(model, pretrained_state)
+        model.load_state_dict(pretrained_state["model"], strict=True)
         if rank == 0:
-            logger.info(
-                "Initialized from Stage I checkpoint with strict weight loading: "
-                f"{pretrained_path}"
-            )
+            logger.info(f"Initialized from checkpoint={pretrained_path}")
     model = wrap_ddp(model, local_rank)
 
     train_dataset = ERA5Dataset(
@@ -310,7 +295,7 @@ def align(cfg):
             optimizer,
         )
         if rank == 0:
-            logger.info(f"Resumed alignment checkpoint: {resume_path}")
+            logger.info(f"Resumed alignment checkpoint={resume_path}")
 
     if rank == 0:
         os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
@@ -325,8 +310,7 @@ def align(cfg):
         if rank == 0:
             min_dt_min = cfg["alignment"]["target_dt"] / max(unlocked) * 60
             logger.info(
-                f"Epoch {epoch + 1}: unlocked sub_steps={unlocked}, "
-                f"finest dt={min_dt_min:.1f}min"
+                f"Epoch {epoch + 1}: unlocked sub_steps={unlocked}, finest dt={min_dt_min:.1f}min"
             )
 
         progress = None
@@ -393,14 +377,13 @@ def align(cfg):
                 cfg,
                 ckpt_save_path,
             )
-            logger.info(f"Saved checkpoint: {ckpt_save_path}")
+            logger.info(f"Saved checkpoint={ckpt_save_path}")
 
         torch.distributed.barrier()
         if stop_early:
             break
 
     if rank == 0:
-        final_epoch = max(start_epoch, epoch if 'epoch' in locals() else start_epoch - 1)
         final_ckpt_path = os.path.join(
             cfg["logging"]["ckpt_dir"],
             "align_final.pt",
@@ -408,12 +391,12 @@ def align(cfg):
         save_checkpoint(
             model,
             optimizer,
-            final_epoch,
+            max(start_epoch, epochs - 1),
             global_step,
             cfg,
             final_ckpt_path,
         )
-        logger.info(f"Saved final checkpoint: {final_ckpt_path}")
+        logger.info(f"Saved final checkpoint={final_ckpt_path}")
 
     train_dataset.cleanup()
     torch.distributed.destroy_process_group()

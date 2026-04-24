@@ -6,3 +6,5 @@ logs/
 .DS_Store
 mission/
 Check/golden/golden.pt
+.claude/
+uniphy/

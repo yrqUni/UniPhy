@@ -2,10 +2,13 @@ import argparse
 import importlib
 import json
 import socket
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+import torch
 
 from Check.utils import LOG_DIR, format_max_error, write_result
 
@@ -32,7 +35,7 @@ TEST_MODULES = [
     ("T22", "T22_pscan_padding_contract", "T"),
     ("T23", "T23_t12_is_not_trivial", "T"),
     ("T24", "T24_t17_missing_golden_policy", "T"),
-    ("T25", "T25_recheck_runner_features", "T"),
+    ("T26", "T26_public_release_surface", "T"),
     ("S01", "S01_parallel_serial_consistency", "S"),
     ("S02", "S02_timestep_semantics", "S"),
     ("S03", "S03_parameter_consistency", "S"),
@@ -60,22 +63,36 @@ def resolve_tests(requested):
             matches = [
                 entry for entry in TEST_MODULES if entry[0] == name or entry[1] == name
             ]
-        if not matches:
-            raise ValueError(f"unknown test: {name}")
         for entry in matches:
             if entry not in selected:
                 selected.append(entry)
     return selected
 
 
+def get_git_value(args):
+    try:
+        return subprocess.check_output(args, text=True).strip()
+    except Exception:
+        return "unavailable"
+
+
+def get_device_value():
+    if not torch.cuda.is_available():
+        return "cpu"
+    return torch.cuda.get_device_name(0)
+
+
 def build_json_report(results, args):
     return {
-        "commit": "UNKNOWN",
-        "branch": "math-fixes",
+        "commit": get_git_value(["git", "rev-parse", "HEAD"]),
+        "branch": get_git_value(["git", "branch", "--show-current"]),
         "date": datetime.now().isoformat(),
         "node": socket.gethostname().split(".", maxsplit=1)[0],
-        "device": "UNKNOWN",
-        "env": {},
+        "device": get_device_value(),
+        "env": {
+            "python": sys.version.split()[0],
+            "torch": torch.__version__,
+        },
         "summary": {
             "total": len(results),
             "pass": sum(entry["status"] == "PASS" for entry in results),

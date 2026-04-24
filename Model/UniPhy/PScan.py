@@ -285,19 +285,6 @@ def mat2x2_pscan_kernel(
     )
 
 
-def run_mat2x2_pscan_torch(A_complex, X_complex, reverse=False):
-    B, L, D1, D2 = X_complex.shape
-    Y = torch.zeros_like(X_complex)
-    indices = range(L - 1, -1, -1) if reverse else range(L)
-    acc = torch.zeros(
-        B, D1, D2, dtype=X_complex.dtype, device=X_complex.device
-    )
-    for i in indices:
-        acc = torch.bmm(A_complex[:, i], acc) + X_complex[:, i]
-        Y[:, i] = acc
-    return Y
-
-
 def run_mat2x2_pscan(A_real, X_real, L, reverse=False):
     Y_real = torch.empty_like(X_real)
     BLOCK_SIZE = max(16, next_power_of_2(L))

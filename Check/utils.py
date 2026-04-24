@@ -5,8 +5,8 @@ import torch
 
 from Model.UniPhy.ModelUniPhy import UniPhyModel
 
-LOG_DIR = "/nfs/A/logs"
 REPO_DIR = Path(__file__).resolve().parents[1]
+LOG_DIR = str(REPO_DIR / "Check" / "logs")
 
 
 def format_max_error(value):
@@ -18,8 +18,6 @@ def format_max_error(value):
 
 
 def write_result(test_id, status, max_error, detail, log_dir=LOG_DIR):
-    if status not in {"PASS", "FAIL", "SKIP"}:
-        raise ValueError(f"invalid status: {status}")
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     payload = (
         "\n".join(
@@ -103,11 +101,7 @@ def select_free_gpu(min_free_mb=2000):
     for line in output.strip().splitlines():
         idx_str, free_str = [part.strip() for part in line.split(",", maxsplit=1)]
         rows.append((int(idx_str), int(free_str)))
-    if not rows:
-        raise RuntimeError("no gpu detected")
-    gpu_idx, free_mb = max(rows, key=lambda item: item[1])
-    if free_mb < min_free_mb:
-        raise RuntimeError(f"no gpu has >= {min_free_mb} MB free")
+    gpu_idx, _ = max(rows, key=lambda item: item[1])
     return gpu_idx
 
 

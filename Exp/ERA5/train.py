@@ -1,5 +1,4 @@
 import os
-import warnings
 
 import torch
 from torch.optim import lr_scheduler
@@ -22,8 +21,6 @@ from Exp.ERA5.runtime_config import (
     wrap_ddp,
 )
 from Model.UniPhy.UniPhyOps import complex_dtype_for
-
-warnings.filterwarnings("ignore")
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "train.yaml")
 
@@ -186,7 +183,7 @@ def train(cfg):
             scheduler,
         )
         if rank == 0:
-            logger.info(f"Resumed from checkpoint: {ckpt_path}")
+            logger.info(f"Resumed from checkpoint={ckpt_path}")
 
     log_every = cfg["logging"]["log_every"]
     save_interval = max(1, int(len(train_loader) * cfg["logging"]["ckpt_step"]))
@@ -257,7 +254,7 @@ def train(cfg):
                         cfg,
                         save_path,
                     )
-                    logger.info(f"Saved checkpoint: {save_path}")
+                    logger.info(f"Saved checkpoint={save_path}")
 
             if should_stop_early(cfg, global_step):
                 stop_early = True
@@ -285,28 +282,25 @@ def train(cfg):
                 cfg,
                 epoch_path,
             )
-            logger.info(f"Epoch {epoch + 1} finished. Saved checkpoint.")
+            logger.info(f"Saved checkpoint={epoch_path}")
 
         torch.distributed.barrier()
         if stop_early:
             break
 
     if rank == 0:
-        final_epoch = max(start_epoch, epoch if 'epoch' in locals() else start_epoch - 1)
         final_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
         save_checkpoint(
             model,
             optimizer,
             scheduler,
-            final_epoch,
+            epochs,
             global_step,
             cfg,
             final_path,
         )
-        logger.info(f"Training Completed. Final checkpoint: {final_path}")
-        progress.console.print(
-            f"[bold green]Training Completed. Final checkpoint: {final_path}"
-        )
+        logger.info(f"Saved final checkpoint={final_path}")
+        progress.console.print(f"Saved final checkpoint={final_path}")
         progress.stop()
 
     train_dataset.cleanup()
