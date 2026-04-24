@@ -1,5 +1,4 @@
 from pathlib import Path
-import subprocess
 
 import torch
 
@@ -86,23 +85,6 @@ def make_tiny_model(device, seed=42):
         init_noise_scale=1e-4,
     )
     return model.to(device).eval()
-
-
-def select_free_gpu(min_free_mb=2000):
-    output = subprocess.check_output(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,memory.free",
-            "--format=csv,noheader,nounits",
-        ],
-        text=True,
-    )
-    rows = []
-    for line in output.strip().splitlines():
-        idx_str, free_str = [part.strip() for part in line.split(",", maxsplit=1)]
-        rows.append((int(idx_str), int(free_str)))
-    gpu_idx, _ = max(rows, key=lambda item: item[1])
-    return gpu_idx
 
 
 def complex_randn(shape, device, dtype=torch.complex64):

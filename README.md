@@ -21,7 +21,7 @@ Stage II:
 torchrun --nproc_per_node=<num_gpus> -m Exp.ERA5.align --data-input-dir <data_dir> --pretrained-ckpt <stage1_ckpt>
 ```
 
-Stage II strict-loads the Stage I checkpoint. The model configuration must match exactly.
+Stage II strict-loads the Stage I checkpoint weights. Model architecture fields must match the checkpoint.
 
 ## Evaluation
 
