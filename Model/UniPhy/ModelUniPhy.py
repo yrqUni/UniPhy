@@ -243,6 +243,7 @@ class UniPhyBlock(nn.Module):
 
     def forward_step(self, x_curr, h_prev, dt_step, flux_prev, noise_step=None):
         batch_size, dim, height, width = x_curr.shape
+        x_input = x_curr
 
         x_curr = self._apply_spatial(x_curr)
 
@@ -284,7 +285,9 @@ class UniPhyBlock(nn.Module):
         decoded_with_residual = self._apply_temporal_decode(decoded)
         z_next = decoded_with_residual
         zero_mask = _expand_batch_mask(_dt_is_zero(dt_step), z_next.ndim)
-        z_next = torch.where(zero_mask, x_curr, z_next)
+        z_next = torch.where(zero_mask, x_input, z_next)
+        h_next = torch.where(zero_mask, h_prev_hw, h_next)
+        flux_next = torch.where(_expand_batch_mask(_dt_is_zero(dt_step), flux_next.ndim), flux_prev, flux_next)
         return z_next, h_next.reshape(batch_size * height * width, 1, dim), flux_next
 
 
@@ -444,14 +447,19 @@ class UniPhyModel(nn.Module):
             self.w_patches,
             self.embed_dim,
         )
-        return torch.randn(shape, device=x.device, dtype=x.dtype)
+        noise_dtype = complex_dtype_for(x.dtype)
+        real_dtype = torch.float64 if noise_dtype == torch.complex128 else torch.float32
+        real = torch.randn(shape, device=x.device, dtype=real_dtype)
+        imag = torch.randn(shape, device=x.device, dtype=real_dtype)
+        return torch.complex(real, imag).to(noise_dtype)
 
     def sample_rollout_noise(self, batch_size, steps, device, dtype=torch.float32):
-        return torch.randn(
-            (batch_size, steps, self.h_patches, self.w_patches, self.embed_dim),
-            device=device,
-            dtype=dtype,
-        )
+        shape = (batch_size, steps, self.h_patches, self.w_patches, self.embed_dim)
+        noise_dtype = complex_dtype_for(dtype)
+        real_dtype = torch.float64 if noise_dtype == torch.complex128 else torch.float32
+        real = torch.randn(shape, device=device, dtype=real_dtype)
+        imag = torch.randn(shape, device=device, dtype=real_dtype)
+        return torch.complex(real, imag).to(noise_dtype)
 
     def _noise_step(self, noise_seq, step_idx):
         if noise_seq is None:

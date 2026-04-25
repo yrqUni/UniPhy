@@ -85,6 +85,28 @@ def run():
     y_4d = pscan(a_diag, x_4d)
     shape_ok = y_4d.shape == x_4d.shape
 
+    invalid_cases = [
+        (
+            torch.randn(2, 16, 4, device=device, dtype=torch.complex64),
+            x_diag,
+        ),
+        (
+            a_diag,
+            torch.randn(2, 16, 4, device=device, dtype=torch.complex64),
+        ),
+        (
+            torch.randn(2, 16, 4, 2, 3, device=device, dtype=torch.complex64),
+            x_mat,
+        ),
+    ]
+    invalid_ok = 0
+    for a_invalid, x_invalid in invalid_cases:
+        try:
+            pscan(a_invalid, x_invalid)
+        except ValueError:
+            invalid_ok += 1
+    invalid_passed = invalid_ok == len(invalid_cases)
+
     max_err = max(err_diag, err_mat, err_diag_grad, err_mat_grad)
     passed = (
         err_diag < 1e-4
@@ -92,11 +114,12 @@ def run():
         and err_diag_grad < 1e-3
         and err_mat_grad < 1e-3
         and shape_ok
+        and invalid_passed
     )
     detail = (
         f"err_diag={err_diag:.2e} err_mat={err_mat:.2e} "
         f"err_diag_grad={err_diag_grad:.2e} err_mat_grad={err_mat_grad:.2e} "
-        f"shape_ok={shape_ok}"
+        f"shape_ok={shape_ok} invalid_cases={invalid_ok}/{len(invalid_cases)}"
     )
     return ("PASS" if passed else "FAIL"), max_err, detail
 

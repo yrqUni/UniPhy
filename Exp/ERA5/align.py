@@ -139,6 +139,7 @@ def align_step(
     ensemble_stack = torch.stack(ensemble_preds, dim=0)
     pred_mean = ensemble_stack.mean(dim=0)
 
+    l1_loss = ((pred_mean - x_tgt_aligned).abs() * lat_weights).mean()
     pred_mean_cpu = pred_mean.detach().cpu()
     l1 = ((pred_mean_cpu - target_cpu).abs() * lat_weights_cpu).mean()
     mse = (((pred_mean_cpu - target_cpu) ** 2) * lat_weights_cpu).mean()
@@ -147,7 +148,7 @@ def align_step(
         crps_loss = compute_weighted_crps(ensemble_stack, x_tgt_aligned, lat_weights)
         loss = crps_loss
     else:
-        crps_loss = l1.to(device)
+        crps_loss = l1_loss
         loss = crps_loss
     basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.0)
     basis_residual = compute_basis_residual(model)

@@ -96,7 +96,17 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
     }
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    epoch,
+    global_step,
+    cfg,
+    path,
+    *,
+    resume_safe=True,
+):
     state_dict = (
         model.module.state_dict() if hasattr(model, "module") else model.state_dict()
     )
@@ -107,6 +117,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
         "epoch": epoch,
         "global_step": global_step,
         "cfg": cfg,
+        "resume_safe": bool(resume_safe),
     }
     torch.save(state, path)
 
@@ -119,6 +130,8 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
+    if not bool(ckpt.get("resume_safe", True)):
+        raise ValueError("resume_unsupported_for_step_checkpoint")
     saved_epoch = int(ckpt.get("epoch", -1))
     saved_step = int(ckpt.get("global_step", 0))
     return max(0, saved_epoch + 1), saved_step
@@ -252,6 +265,7 @@ def train(cfg):
                         global_step,
                         cfg,
                         save_path,
+                        resume_safe=False,
                     )
                     logger.info(f"Saved checkpoint={save_path}")
 

@@ -78,12 +78,22 @@ def build_eval_dataset(
     return dataset, lead_deltas
 
 
-def compute_channel_acc(pred, target, climatology, lat_weights):
+def compute_channel_acc_terms(pred, target, climatology, lat_weights):
     pred_anom = pred - climatology
     target_anom = target - climatology
     numerator = (pred_anom * target_anom * lat_weights).sum(dim=(-2, -1))
     pred_energy = (pred_anom.square() * lat_weights).sum(dim=(-2, -1))
     target_energy = (target_anom.square() * lat_weights).sum(dim=(-2, -1))
+    return numerator, pred_energy, target_energy
+
+
+def compute_channel_acc(pred, target, climatology, lat_weights):
+    numerator, pred_energy, target_energy = compute_channel_acc_terms(
+        pred,
+        target,
+        climatology,
+        lat_weights,
+    )
     denom = torch.sqrt(pred_energy * target_energy).clamp_min(1e-8)
     return numerator / denom
 
@@ -242,7 +252,19 @@ def main():
         dtype=torch.float64,
         device=device,
     )
-    acc_sum = torch.zeros(
+    acc_numerator_sum = torch.zeros(
+        len(lead_times),
+        len(channel_names),
+        dtype=torch.float64,
+        device=device,
+    )
+    acc_pred_energy_sum = torch.zeros(
+        len(lead_times),
+        len(channel_names),
+        dtype=torch.float64,
+        device=device,
+    )
+    acc_target_energy_sum = torch.zeros(
         len(lead_times),
         len(channel_names),
         dtype=torch.float64,
@@ -320,7 +342,10 @@ def main():
             weighted_mse = weighted_channel_mean(squared_error, lat_weights)
             mse_sum += weighted_mse.double().sum(dim=0)
             overall_weighted_mse_sum += (
-                (squared_error * lat_weights).mean(dim=(-3, -2, -1)).double().sum(dim=0)
+                (squared_error * lat_weights)
+                .mean(dim=(-3, -2, -1))
+                .double()
+                .sum(dim=0)
             )
 
             crps = compute_channelwise_crps(pred_ensemble, target, lat_weights)
@@ -334,14 +359,15 @@ def main():
                 -1,
                 -1,
             )
-            acc = compute_channel_acc(
+            acc_numerator, acc_pred_energy, acc_target_energy = compute_channel_acc_terms(
                 pred_mean,
                 target,
                 climatology_target,
                 lat_weights,
             )
-            acc, _ = safe_channel_values(acc, metric_name="acc")
-            acc_sum += acc.double().sum(dim=0)
+            acc_numerator_sum += acc_numerator.double().sum(dim=0)
+            acc_pred_energy_sum += acc_pred_energy.double().sum(dim=0)
+            acc_target_energy_sum += acc_target_energy.double().sum(dim=0)
 
             processed += batch_size
             if (batch_idx + 1) % max(1, args.log_every) == 0:
@@ -360,7 +386,10 @@ def main():
     invalid_metric_counts = {"rmse": 0, "acc": 0, "crps": 0}
     for lead_idx, lead in enumerate(lead_times):
         rmse_channels = torch.sqrt(mse_sum[lead_idx] / float(processed))
-        acc_channels = acc_sum[lead_idx] / float(processed)
+        acc_denom = torch.sqrt(
+            acc_pred_energy_sum[lead_idx] * acc_target_energy_sum[lead_idx]
+        ).clamp_min(1e-8)
+        acc_channels = acc_numerator_sum[lead_idx] / acc_denom
         crps_channels = crps_sum[lead_idx] / float(processed)
         rmse_channels, rmse_invalid = safe_channel_values(
             rmse_channels,
