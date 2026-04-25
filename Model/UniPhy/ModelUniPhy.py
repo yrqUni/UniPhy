@@ -22,6 +22,11 @@ def _dt_has_negative(dt, tol=1e-12):
     return bool((dt_real < -tol).any().item())
 
 
+def _dt_has_nonfinite(dt):
+    dt_real = dt.real if torch.is_complex(dt) else dt
+    return not bool(torch.isfinite(dt_real).all().item())
+
+
 def _expand_batch_mask(mask, target_ndim):
     while mask.ndim < target_ndim:
         mask = mask.unsqueeze(-1)
@@ -442,6 +447,7 @@ class UniPhyModel(nn.Module):
         return noise_seq[:, step_idx]
 
     def _validate_dt(self, dt):
+        [False].index(_dt_has_nonfinite(dt))
         [False].index(_dt_has_negative(dt))
 
     def _skip_gate_4d(self, z_dec, z_skip):
