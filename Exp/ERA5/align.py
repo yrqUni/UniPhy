@@ -13,13 +13,15 @@ from Exp.ERA5.runtime_config import (
     build_runtime_arg_parser,
     build_runtime_cfg,
     build_uniphy_model,
+    compute_basis_residual,
+    compute_crps,
     flush_remaining_grads,
+    get_unwrapped_model,
     init_distributed,
     setup_file_logger,
     should_stop_early,
     wrap_ddp,
 )
-from Model.UniPhy.UniPhyOps import complex_dtype_for
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "align.yaml")
 
@@ -101,18 +103,13 @@ def align_step(
         for _ in range(n_iters)
     ]
 
-    infer_model = model.module if hasattr(model, "module") else model
+    infer_model = get_unwrapped_model(model)
     output_offset = sub_step - 1
     x_tgt_aligned = x_targets[:, :target_t]
     lat_weights_cpu = build_lat_weights(x_tgt_aligned.shape[-2], torch.device("cpu"))
     target_cpu = x_tgt_aligned.detach().cpu()
 
-    cached_preds = []
-    cached_noises = []
-    pred_sum_cpu = None
-    mae_sum = torch.tensor(0.0)
-    pairwise_sum = torch.tensor(0.0)
-
+    ensemble_preds = []
     for _ in range(ensemble_size):
         z_context = infer_model.sample_noise(x_ctx)
         z_rollout = infer_model.sample_rollout_noise(
@@ -121,47 +118,6 @@ def align_step(
             device,
             dtype=x_ctx.dtype,
         )
-        with torch.no_grad():
-            pred_seq = infer_model.forward_rollout(
-                x_ctx,
-                dt_ctx,
-                dt_list,
-                z_context=z_context,
-                z_rollout=z_rollout,
-                chunk_size=chunk_size,
-                output_stride=sub_step,
-                output_offset=output_offset,
-            )
-            pred_seq = pred_seq.real if pred_seq.is_complex() else pred_seq
-            pred_seq = pred_seq[:, :target_t]
-        pred_cpu = pred_seq.detach().cpu()
-        pred_sum_cpu = (
-            pred_cpu.clone() if pred_sum_cpu is None else pred_sum_cpu + pred_cpu
-        )
-        mae_sum = mae_sum + (pred_cpu - target_cpu).abs().mean()
-        for prev_pred in cached_preds:
-            pairwise_sum = pairwise_sum + (pred_cpu - prev_pred).abs().mean()
-        cached_preds.append(pred_cpu)
-        cached_noises.append((z_context, z_rollout))
-
-    pred_mean_cpu = pred_sum_cpu / ensemble_size
-    mse = ((pred_mean_cpu - target_cpu) ** 2 * lat_weights_cpu).mean()
-    l1 = ((pred_mean_cpu - target_cpu).abs() * lat_weights_cpu).mean()
-    crps = mae_sum / ensemble_size - pairwise_sum / (ensemble_size * ensemble_size)
-    loss = crps
-
-    basis_residual = torch.tensor(0.0, device=device)
-    for block in infer_model.blocks:
-        basis_dtype = complex_dtype_for(next(block.parameters()).dtype)
-        W, W_inv = block.prop.basis.get_matrix(basis_dtype)
-        eye = torch.eye(W.shape[0], device=device, dtype=W.dtype)
-        basis_residual = basis_residual + (W @ W_inv - eye).abs().mean()
-    basis_residual = basis_residual / max(len(infer_model.blocks), 1)
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    for member_idx, (z_context, z_rollout) in enumerate(cached_noises):
         pred_seq = infer_model.forward_rollout(
             x_ctx,
             dt_ctx,
@@ -173,20 +129,19 @@ def align_step(
             output_offset=output_offset,
         )
         pred_seq = pred_seq.real if pred_seq.is_complex() else pred_seq
-        pred_seq = pred_seq[:, :target_t]
-        crps_loss = (pred_seq - x_tgt_aligned).abs().mean() / ensemble_size
-        if ensemble_size > 1:
-            pairwise_i = torch.tensor(0.0, device=device)
-            for other_idx, other_pred in enumerate(cached_preds):
-                if other_idx == member_idx:
-                    continue
-                pairwise_i = pairwise_i + (
-                    pred_seq - other_pred.to(device)
-                ).abs().mean()
-            crps_loss = crps_loss - pairwise_i / (ensemble_size * ensemble_size)
-        (crps_loss / grad_accum_steps).backward()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        ensemble_preds.append(pred_seq[:, :target_t])
+
+    ensemble_stack = torch.stack(ensemble_preds, dim=0)
+    pred_mean = ensemble_stack.mean(dim=0)
+
+    l1 = ((pred_mean.detach().cpu() - target_cpu).abs() * lat_weights_cpu).mean()
+    mse = (((pred_mean.detach().cpu() - target_cpu) ** 2) * lat_weights_cpu).mean()
+
+    crps_loss = compute_crps(ensemble_stack, x_tgt_aligned)
+    basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.0)
+    basis_residual = compute_basis_residual(model)
+    loss = crps_loss + basis_reg_weight * basis_residual
+    (loss / grad_accum_steps).backward()
 
     grad_norm = 0.0
     if (batch_idx + 1) % grad_accum_steps == 0:
@@ -200,7 +155,7 @@ def align_step(
     return {
         "loss": loss.item(),
         "l1": l1.item(),
-        "crps": crps.item(),
+        "crps": crps_loss.item(),
         "rmse": torch.sqrt(mse).item(),
         "cond_steps": cond_steps,
         "target_t": target_t,
@@ -245,6 +200,9 @@ def align(cfg):
         logger.info(f"Sub Steps={all_sub_steps}")
         logger.info(f"Max Rollout Steps={cfg['alignment']['max_rollout_steps']}")
         logger.info(f"Chunk Size={cfg['alignment']['chunk_size']}")
+        logger.info(
+            f"Basis Reg Weight={cfg['train'].get('basis_reg_weight', 0.0):.4f}"
+        )
         logger.info("=" * 60)
 
     pretrained_path = cfg["alignment"].get("pretrained_ckpt", "")
@@ -310,7 +268,8 @@ def align(cfg):
         if rank == 0:
             min_dt_min = cfg["alignment"]["target_dt"] / max(unlocked) * 60
             logger.info(
-                f"Epoch {epoch + 1}: unlocked sub_steps={unlocked}, finest dt={min_dt_min:.1f}min"
+                f"Epoch {epoch + 1}: unlocked sub_steps={unlocked}, "
+                f"finest dt={min_dt_min:.1f}min"
             )
 
         progress = None
@@ -346,7 +305,8 @@ def align(cfg):
                         f"dt={metrics['dt_minutes']:.1f}min n={metrics['n_iters']} "
                         f"T={metrics['total_dt']:.0f}h | Loss: {metrics['loss']:.4f} "
                         f"L1: {metrics['l1']:.4f} CRPS: {metrics['crps']:.4f} "
-                        f"RMSE: {metrics['rmse']:.4f}"
+                        f"RMSE: {metrics['rmse']:.4f} "
+                        f"Basis: {metrics['basis_residual']:.4f}"
                     )
                     progress.console.print(log_msg)
                     logger.info(log_msg)
@@ -421,3 +381,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

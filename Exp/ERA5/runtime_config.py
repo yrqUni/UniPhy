@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from Model.UniPhy.ModelUniPhy import UniPhyModel
+from Model.UniPhy.UniPhyOps import complex_dtype_for
 
 SURFACE_VARS = ["TCWV", "U10", "V10", "T2", "MSLP", "SP"]
 PRESSURE_BASE_VARS = ["VV", "U", "V", "RH", "T", "Z"]
@@ -163,21 +164,66 @@ def build_lat_weights(height, device):
     return weights.view(1, 1, 1, height, 1)
 
 
+def _crps_pairwise_stats(ensemble_size, device):
+    if ensemble_size <= 1:
+        return None, None, 0.0
+    idx_i, idx_j = torch.triu_indices(
+        ensemble_size,
+        ensemble_size,
+        offset=1,
+        device=device,
+    )
+    scale = float(idx_i.shape[0]) / float(ensemble_size * ensemble_size)
+    return idx_i, idx_j, scale
+
+
 def compute_crps(pred_ensemble, target):
     ensemble_size = pred_ensemble.shape[0]
     target_exp = target.unsqueeze(0)
     mae = (pred_ensemble - target_exp).abs().mean()
-    if ensemble_size > 1:
-        idx_i, idx_j = torch.triu_indices(
-            ensemble_size,
-            ensemble_size,
-            offset=1,
-            device=target.device,
+    idx_i, idx_j, scale = _crps_pairwise_stats(ensemble_size, target.device)
+    if idx_i is None:
+        return mae
+    pairwise_diff = (pred_ensemble[idx_i] - pred_ensemble[idx_j]).abs().mean()
+    return mae - pairwise_diff * scale
+
+
+def compute_channelwise_crps(pred_ensemble, target, lat_weights):
+    ensemble_size = pred_ensemble.shape[0]
+    target_exp = target.unsqueeze(0)
+    mae = weighted_channel_mean((pred_ensemble - target_exp).abs(), lat_weights).mean(
+        dim=0
+    )
+    idx_i, idx_j, scale = _crps_pairwise_stats(ensemble_size, pred_ensemble.device)
+    if idx_i is None:
+        return mae
+    pairwise = weighted_channel_mean(
+        (pred_ensemble[idx_i] - pred_ensemble[idx_j]).abs(),
+        lat_weights,
+    ).mean(dim=0)
+    return mae - pairwise * scale
+
+
+def get_unwrapped_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def compute_basis_residual(model):
+    target = get_unwrapped_model(model)
+    device = next(target.parameters()).device
+    basis_residual = torch.tensor(0.0, device=device)
+    for block in target.blocks:
+        basis_dtype = complex_dtype_for(next(block.parameters()).dtype)
+        basis_w, basis_w_inv = block.prop.basis.get_matrix(basis_dtype)
+        eye = torch.eye(basis_w.shape[0], device=device, dtype=basis_w.dtype)
+        basis_residual = basis_residual + (
+            (basis_w @ basis_w_inv - eye).abs().pow(2).mean()
         )
-        pairwise_diff = (pred_ensemble[idx_i] - pred_ensemble[idx_j]).abs().mean()
-        num_pairs = idx_i.shape[0]
-        return mae - pairwise_diff * num_pairs / (ensemble_size * ensemble_size)
-    return mae
+    return basis_residual / max(len(target.blocks), 1)
+
+
+def weighted_channel_mean(values, lat_weights):
+    return (values * lat_weights).mean(dim=(-2, -1))
 
 
 def setup_file_logger(name, log_path, rank, filename):

@@ -136,8 +136,7 @@ class UniPhyBlock(nn.Module):
     def _apply_spatial(self, x_4d):
         return self.spatial_mixer(x_4d)
 
-    def _apply_temporal_decode(self, x_4d, source=None, gate=None):
-        del source, gate
+    def _apply_temporal_decode(self, x_4d):
         x_real = torch.cat([x_4d.real, x_4d.imag], dim=1)
         x_norm = self.norm_temporal(x_real.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_re, x_im = torch.chunk(x_norm, 2, dim=1)

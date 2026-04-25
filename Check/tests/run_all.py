@@ -1,6 +1,6 @@
-import argparse
 import importlib
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -12,40 +12,12 @@ import torch
 
 from Check.utils import LOG_DIR, format_max_error, write_result
 
-TEST_MODULES = [
-    ("T01", "T01_phi1_stability", "T"),
-    ("T02", "T02_ssm_discretisation", "T"),
-    ("T03", "T03_dt_zero_limit", "T"),
-    ("T04", "T04_variable_dt_pscan", "T"),
-    ("T05", "T05_hprev_injection_equivalence", "T"),
-    ("T06", "T06_flux_prev_compensation", "T"),
-    ("T07", "T07_cumprod_decay_purity", "T"),
-    ("T08", "T08_rollout_dt_alignment", "T"),
-    ("T09", "T09_forward_vs_step_single", "T"),
-    ("T10", "T10_forward_vs_rollout_multistep", "T"),
-    ("T11", "T11_basis_encode_decode_identity", "T"),
-    ("T12", "T12_basis_biorthogonality", "T"),
-    ("T13", "T13_sde_scale_physics", "T"),
-    ("T14", "T14_gradient_flow", "T"),
-    ("T15", "T15_dt_zero_mask", "T"),
-    ("T16", "T16_negative_dt_rejection", "T"),
-    ("T17", "T17_numerical_regression", "T"),
-    ("T18", "T18_basis_inverse_under_randomized_params", "T"),
-    ("T21", "T21_crps_gradient_decomposition", "T"),
-    ("T22", "T22_pscan_padding_contract", "T"),
-    ("T23", "T23_t12_is_not_trivial", "T"),
-    ("T24", "T24_t17_missing_golden_policy", "T"),
-    ("T25", "T25_recheck_runner_features", "T"),
-    ("T26", "T26_dt_nonfinite_rejection", "T"),
-    ("S01", "S01_parallel_serial_consistency", "S"),
-    ("S02", "S02_timestep_semantics", "S"),
-    ("S03", "S03_parameter_consistency", "S"),
-    ("S04", "S04_architecture_verification", "S"),
-    ("S05", "S05_pscan_correctness", "S"),
-]
+TEST_PATTERN = re.compile(r"^T(\d+)_.*\.py$")
 
 
 def parse_args():
+    import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--tests", nargs="*", default=None)
     parser.add_argument("--log-dir", default=LOG_DIR)
@@ -53,28 +25,51 @@ def parse_args():
     return parser.parse_args()
 
 
+def discover_tests():
+    tests_dir = Path(__file__).resolve().parent
+    discovered = []
+    for path in sorted(tests_dir.glob("T*.py")):
+        match = TEST_PATTERN.match(path.name)
+        if match is None:
+            continue
+        test_number = int(match.group(1))
+        discovered.append((test_number, path.stem))
+    if not discovered:
+        raise ValueError("no numerical tests discovered")
+    expected = list(range(1, len(discovered) + 1))
+    observed = [number for number, _ in discovered]
+    if observed != expected:
+        raise ValueError(
+            f"test numbering must be consecutive from 1: observed={observed}"
+        )
+    return discovered
+
+
 def resolve_tests(requested):
+    discovered = discover_tests()
     if not requested:
-        return TEST_MODULES
+        return discovered
     selected = []
+    by_id = {f"T{number:02d}": entry for number, entry in discovered}
+    by_name = {name: (number, name) for number, name in discovered}
     for name in requested:
-        if name in {"T", "S"}:
-            matches = [entry for entry in TEST_MODULES if entry[0].startswith(name)]
-        else:
-            matches = [
-                entry for entry in TEST_MODULES if entry[0] == name or entry[1] == name
-            ]
-        if not matches:
-            raise ValueError(f"unknown test: {name}")
-        for entry in matches:
-            if entry not in selected:
-                selected.append(entry)
+        if name in by_id:
+            selected.append(by_id[name])
+            continue
+        if name in by_name:
+            selected.append(by_name[name])
+            continue
+        raise ValueError(f"unknown test: {name}")
     return selected
 
 
 def get_git_value(args):
     try:
-        return subprocess.check_output(args, text=True).strip()
+        return subprocess.check_output(
+            args,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
     except Exception:
         return "unavailable"
 
@@ -111,16 +106,12 @@ def main():
     args = parse_args()
     results = []
     selected = resolve_tests(args.tests)
-    for test_id, module_name, series in selected:
+    for test_number, module_name in selected:
         module = importlib.import_module(f"Check.tests.{module_name}")
         started = time.time()
+        test_id = f"T{test_number:02d}"
         try:
-            if series == "S":
-                status, pass_count, total = module.run()
-                max_error = "-"
-                detail = f"pass_count={pass_count} total={total}"
-            else:
-                status, max_error, detail = module.run()
+            status, max_error, detail = module.run()
             write_result(test_id, status, max_error, detail, log_dir=args.log_dir)
         except Exception as exc:
             status = "FAIL"

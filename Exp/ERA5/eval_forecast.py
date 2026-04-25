@@ -12,6 +12,7 @@ from Exp.ERA5.runtime_config import (
     CHANNEL_NAMES,
     DEFAULT_MODEL_CFG,
     build_uniphy_model,
+    compute_channelwise_crps,
     get_device,
     resolve_eval_year_range,
 )
@@ -80,32 +81,6 @@ def build_lat_weights(height, device):
     weights = torch.cos(torch.deg2rad(lat)).clamp_min(1e-6)
     weights = weights / weights.mean()
     return weights.view(1, 1, height, 1)
-
-
-def weighted_channel_mean(values, lat_weights):
-    return (values * lat_weights).mean(dim=(-2, -1))
-
-
-def compute_channel_crps(pred_ensemble, target, lat_weights):
-    ensemble_size = pred_ensemble.shape[0]
-    target_exp = target.unsqueeze(0)
-    mae = weighted_channel_mean((pred_ensemble - target_exp).abs(), lat_weights).mean(
-        dim=0
-    )
-    if ensemble_size <= 1:
-        return mae
-    idx_i, idx_j = torch.triu_indices(
-        ensemble_size,
-        ensemble_size,
-        offset=1,
-        device=pred_ensemble.device,
-    )
-    pairwise = weighted_channel_mean(
-        (pred_ensemble[idx_i] - pred_ensemble[idx_j]).abs(),
-        lat_weights,
-    ).mean(dim=0)
-    num_pairs = idx_i.shape[0]
-    return mae - pairwise * num_pairs / (ensemble_size * ensemble_size)
 
 
 def compute_channel_acc(pred, target, climatology, lat_weights):
@@ -338,11 +313,11 @@ def main():
             pred_mean = pred_ensemble.mean(dim=0)
             target = x_targets[:, : len(lead_times)]
             squared_error = (pred_mean - target).square()
-            mse_sum += weighted_channel_mean(squared_error, lat_weights).double().sum(
+            mse_sum += ((squared_error * lat_weights).mean(dim=(-2, -1))).double().sum(
                 dim=0
             )
 
-            crps = compute_channel_crps(pred_ensemble, target, lat_weights)
+            crps = compute_channelwise_crps(pred_ensemble, target, lat_weights)
             crps, _ = safe_channel_values(crps, metric_name="crps")
             crps_sum += crps.double().sum(dim=0)
 
@@ -442,3 +417,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

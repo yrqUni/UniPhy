@@ -13,6 +13,7 @@ from Exp.ERA5.runtime_config import (
     build_runtime_arg_parser,
     build_runtime_cfg,
     build_uniphy_model,
+    compute_basis_residual,
     compute_crps,
     flush_remaining_grads,
     init_distributed,
@@ -20,7 +21,6 @@ from Exp.ERA5.runtime_config import (
     should_stop_early,
     wrap_ddp,
 )
-from Model.UniPhy.UniPhyOps import complex_dtype_for
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "train.yaml")
 
@@ -68,13 +68,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
         loss = l1_loss
 
     basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.01)
-    basis_reg = torch.tensor(0.0, device=device)
-    for block in infer_model.blocks:
-        basis_dtype = complex_dtype_for(next(block.parameters()).dtype)
-        W, W_inv = block.prop.basis.get_matrix(basis_dtype)
-        eye = torch.eye(W.shape[0], device=device, dtype=W.dtype)
-        basis_reg = basis_reg + (W @ W_inv - eye).abs().pow(2).mean()
-    basis_reg = basis_reg / max(1, len(infer_model.blocks))
+    basis_reg = compute_basis_residual(model)
     loss = loss + basis_reg_weight * basis_reg
 
     (loss / grad_accum_steps).backward()
@@ -96,6 +90,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
         "rmse": torch.sqrt(mse_loss).item(),
         "grad_norm": grad_norm,
         "ensemble_std": ensemble_std.item(),
+        "basis_residual": basis_reg.item(),
     }
 
 
@@ -235,6 +230,7 @@ def train(cfg):
                         f"L1: {metrics['l1_loss']:.4f} | "
                         f"CRPS: {metrics['crps_loss']:.4f} | "
                         f"RMSE: {metrics['rmse']:.4f} | "
+                        f"Basis: {metrics['basis_residual']:.4f} | "
                         f"Grad: {metrics['grad_norm']:.4f} | "
                         f"LR: {current_lr:.2e}"
                     )
