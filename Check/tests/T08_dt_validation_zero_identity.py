@@ -56,7 +56,9 @@ def run():
                 ],
             )
         ),
-        expect_value_error(lambda: model._normalize_dt(torch.tensor(1.0), 2, 4, device)),
+        expect_value_error(
+            lambda: model._normalize_dt(torch.tensor(1.0), 2, 4, device)
+        ),
         expect_value_error(
             lambda: model._normalize_dt(
                 torch.tensor([0.5, 1.0], device=device, dtype=torch.float64),

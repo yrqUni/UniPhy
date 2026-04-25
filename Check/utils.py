@@ -36,43 +36,6 @@ def write_result(test_id, status, max_error, detail, log_dir=LOG_DIR):
     return path
 
 
-def assert_close(a, b, atol):
-    diff = (a - b).abs()
-    if diff.numel() == 0:
-        return 0.0, True
-    max_diff = float(diff.max().item())
-    passed = bool(torch.isfinite(diff).all().item() and max_diff <= atol)
-    return max_diff, passed
-
-
-def sequential_ssm_recurrence(decay_seq, x_seq, h0):
-    rows = []
-    state = h0
-    for step in range(decay_seq.shape[1]):
-        state = decay_seq[:, step] * state + x_seq[:, step]
-        rows.append(state)
-    return torch.stack(rows, dim=1)
-
-
-def make_tiny_model(device, seed=42):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    model = UniPhyModel(
-        in_channels=4,
-        out_channels=4,
-        embed_dim=8,
-        expand=2,
-        depth=1,
-        patch_size=(7, 15),
-        img_height=721,
-        img_width=1440,
-        dt_ref=6.0,
-        init_noise_scale=1e-4,
-    )
-    return model.to(device).eval()
-
-
 def build_check_model(device, dtype=torch.float64, seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -144,10 +107,6 @@ def make_dt(batch_size, steps, device, dtype):
 
 def max_diff(a, b):
     return float((a - b).abs().max().item())
-
-
-def mean_diff(a, b):
-    return float((a - b).abs().mean().item())
 
 
 def broadcast_mask(mask, target_ndim):

@@ -1,5 +1,4 @@
 torch>=2.6,<3
-triton>=3.2,<4
 numpy>=1.26,<3
 PyYAML>=6,<7
 rich>=13,<14

@@ -39,7 +39,7 @@ def setup_logging(log_path, rank):
 
 def load_alignment_checkpoint(path, model, optimizer=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    target = model.module if hasattr(model, "module") else model
+    target = get_unwrapped_model(model)
     target.load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -134,8 +134,9 @@ def align_step(
     ensemble_stack = torch.stack(ensemble_preds, dim=0)
     pred_mean = ensemble_stack.mean(dim=0)
 
-    l1 = ((pred_mean.detach().cpu() - target_cpu).abs() * lat_weights_cpu).mean()
-    mse = (((pred_mean.detach().cpu() - target_cpu) ** 2) * lat_weights_cpu).mean()
+    pred_mean_cpu = pred_mean.detach().cpu()
+    l1 = ((pred_mean_cpu - target_cpu).abs() * lat_weights_cpu).mean()
+    mse = (((pred_mean_cpu - target_cpu) ** 2) * lat_weights_cpu).mean()
 
     crps_loss = compute_crps(ensemble_stack, x_tgt_aligned)
     basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.0)

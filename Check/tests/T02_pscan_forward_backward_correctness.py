@@ -9,7 +9,7 @@ TEST_ID = "T02"
 
 
 def sequential_pscan_diag(a_diag, x):
-    batch_size, steps, channels, dim, width = x.shape
+    batch_size, steps, channels, dim, _ = x.shape
     a_mat = torch.zeros(
         batch_size,
         steps,
@@ -27,7 +27,10 @@ def sequential_pscan_diag(a_diag, x):
 def sequential_pscan_mat(a_mat, x):
     rows = [x[:, 0]]
     for step in range(1, x.shape[1]):
-        current = torch.einsum("bcij,bcjk->bcik", a_mat[:, step], rows[-1]) + x[:, step]
+        current = (
+            torch.einsum("bcij,bcjk->bcik", a_mat[:, step], rows[-1])
+            + x[:, step]
+        )
         rows.append(current)
     return torch.stack(rows, dim=1)
 
@@ -54,7 +57,10 @@ def run():
     x_diag_grad = x_diag.clone().requires_grad_(True)
     a_diag_ref_grad = a_diag.clone().requires_grad_(True)
     x_diag_ref_grad = x_diag.clone().requires_grad_(True)
-    sequential_pscan_diag(a_diag_ref_grad, x_diag_ref_grad).abs().pow(2).sum().backward()
+    sequential_pscan_diag(
+        a_diag_ref_grad,
+        x_diag_ref_grad,
+    ).abs().pow(2).sum().backward()
     pscan(a_diag_grad, x_diag_grad).abs().pow(2).sum().backward()
     err_diag_grad = max(
         max_diff(a_diag_ref_grad.grad, a_diag_grad.grad),
@@ -65,7 +71,10 @@ def run():
     x_mat_grad = x_mat.clone().requires_grad_(True)
     a_mat_ref_grad = a_mat.clone().requires_grad_(True)
     x_mat_ref_grad = x_mat.clone().requires_grad_(True)
-    sequential_pscan_mat(a_mat_ref_grad, x_mat_ref_grad).abs().pow(2).sum().backward()
+    sequential_pscan_mat(
+        a_mat_ref_grad,
+        x_mat_ref_grad,
+    ).abs().pow(2).sum().backward()
     pscan(a_mat_grad, x_mat_grad).abs().pow(2).sum().backward()
     err_mat_grad = max(
         max_diff(a_mat_ref_grad.grad, a_mat_grad.grad),

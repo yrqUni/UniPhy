@@ -16,6 +16,7 @@ from Exp.ERA5.runtime_config import (
     compute_basis_residual,
     compute_crps,
     flush_remaining_grads,
+    get_unwrapped_model,
     init_distributed,
     setup_file_logger,
     should_stop_early,
@@ -44,7 +45,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
     x_target = data[:, 1:]
     dt_input = dt_data[:, 1:]
 
-    infer_model = model.module if hasattr(model, "module") else model
+    infer_model = get_unwrapped_model(model)
 
     ensemble_preds = []
     for _ in range(ensemble_size):
@@ -111,7 +112,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, cfg, path):
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    target = model.module if hasattr(model, "module") else model
+    target = get_unwrapped_model(model)
     target.load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])

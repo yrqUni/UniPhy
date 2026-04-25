@@ -11,10 +11,12 @@ from Exp.ERA5.ERA5 import ERA5Dataset
 from Exp.ERA5.runtime_config import (
     CHANNEL_NAMES,
     DEFAULT_MODEL_CFG,
+    build_lat_weights,
     build_uniphy_model,
     compute_channelwise_crps,
     get_device,
     resolve_eval_year_range,
+    weighted_channel_mean,
 )
 
 
@@ -74,13 +76,6 @@ def build_eval_dataset(
         float(curr - prev) for prev, curr in zip(lead_times[:-1], lead_times[1:])
     ]
     return dataset, lead_deltas
-
-
-def build_lat_weights(height, device):
-    lat = torch.linspace(-90, 90, height, device=device)
-    weights = torch.cos(torch.deg2rad(lat)).clamp_min(1e-6)
-    weights = weights / weights.mean()
-    return weights.view(1, 1, height, 1)
 
 
 def compute_channel_acc(pred, target, climatology, lat_weights):
@@ -240,7 +235,7 @@ def main():
 
     climatology = climatology_sum / float(sample_count)
     climatology = climatology.to(device)
-    lat_weights = build_lat_weights(height, device)
+    lat_weights = build_lat_weights(height, device).squeeze(2)
     mse_sum = torch.zeros(
         len(lead_times),
         len(channel_names),
@@ -313,7 +308,7 @@ def main():
             pred_mean = pred_ensemble.mean(dim=0)
             target = x_targets[:, : len(lead_times)]
             squared_error = (pred_mean - target).square()
-            mse_sum += ((squared_error * lat_weights).mean(dim=(-2, -1))).double().sum(
+            mse_sum += weighted_channel_mean(squared_error, lat_weights).double().sum(
                 dim=0
             )
 
@@ -328,7 +323,12 @@ def main():
                 -1,
                 -1,
             )
-            acc = compute_channel_acc(pred_mean, target, climatology_target, lat_weights)
+            acc = compute_channel_acc(
+                pred_mean,
+                target,
+                climatology_target,
+                lat_weights,
+            )
             acc, _ = safe_channel_values(acc, metric_name="acc")
             acc_sum += acc.double().sum(dim=0)
 

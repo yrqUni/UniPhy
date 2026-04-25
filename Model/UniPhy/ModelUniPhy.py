@@ -5,7 +5,6 @@ from .PScan import pscan
 from .UniPhyFFN import UniPhyFeedForwardNetwork
 from .UniPhyIO import UniPhyEncoder, UniPhyEnsembleDecoder
 from .UniPhyOps import (
-    GlobalFluxTracker,
     MultiScaleSpatialMixer,
     TemporalPropagator,
     complex_dtype_for,
@@ -150,18 +149,22 @@ class UniPhyBlock(nn.Module):
         if noise_seq is None:
             return None
         expected_shape = (batch_size, steps, height, width, dim)
-        torch.empty(expected_shape, device=noise_seq.device, dtype=noise_seq.dtype).copy_(
-            noise_seq
-        )
+        torch.empty(
+            expected_shape,
+            device=noise_seq.device,
+            dtype=noise_seq.dtype,
+        ).copy_(noise_seq)
         return noise_seq
 
     def _normalize_block_noise_step(self, noise_step, batch_size, dim, height, width):
         if noise_step is None:
             return None
         expected_shape = (batch_size, height, width, dim)
-        torch.empty(expected_shape, device=noise_step.device, dtype=noise_step.dtype).copy_(
-            noise_step
-        )
+        torch.empty(
+            expected_shape,
+            device=noise_step.device,
+            dtype=noise_step.dtype,
+        ).copy_(noise_step)
         return noise_step
 
     def forward(self, x, h_prev, dt_seq, flux_prev, noise_seq=None):

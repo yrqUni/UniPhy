@@ -14,7 +14,11 @@ def run():
     torch.manual_seed(42)
 
     padder = FlexiblePadder((4, 3)).to(device)
-    x_pad = torch.arange(1 * 2 * 5 * 7, device=device, dtype=torch.float32).reshape(1, 2, 5, 7)
+    x_pad = torch.arange(
+        1 * 2 * 5 * 7,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(1, 2, 5, 7)
     padded = padder(x_pad)
     pad_shape_ok = padded.shape[-2:] == (8, 9)
     pad_err = max_diff(padded[..., :5, :7], x_pad)

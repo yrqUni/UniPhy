@@ -25,7 +25,7 @@ def run():
         torch.deg2rad(torch.linspace(-90, 90, 8, device=device))
     ).clamp_min(1e-6)
     lat_weights = (lat_weights / lat_weights.mean()).view(1, 1, 8, 1)
-    err_channel, actual_channel, expected_channel = compute_channelwise_crps_error(
+    err_channel, _, _ = compute_channelwise_crps_error(
         pred_channels,
         target_channels,
         lat_weights,

@@ -52,14 +52,18 @@ def resolve_tests(requested):
     selected = []
     by_id = {f"T{number:02d}": entry for number, entry in discovered}
     by_name = {name: (number, name) for number, name in discovered}
+    seen = set()
     for name in requested:
         if name in by_id:
-            selected.append(by_id[name])
+            entry = by_id[name]
+        elif name in by_name:
+            entry = by_name[name]
+        else:
+            raise ValueError(f"unknown test: {name}")
+        if entry in seen:
             continue
-        if name in by_name:
-            selected.append(by_name[name])
-            continue
-        raise ValueError(f"unknown test: {name}")
+        selected.append(entry)
+        seen.add(entry)
     return selected
 
 

@@ -1,6 +1,8 @@
 # UniPhy numerical verification
 
-The `Check/` directory contains the numerical verification suite for UniPhy. The suite is restricted to independent numerical contracts and is organized as a consecutive `T01`–`T13` sequence.
+The `Check/` directory contains the numerical verification suite for
+UniPhy. The suite is restricted to independent numerical contracts and
+is organized as a consecutive `T01`–`T13` sequence.
 
 ## Run
 
@@ -11,7 +13,8 @@ python -m Check.tests.run_all --log-dir <log_dir> --json-out <json_path>
 To run a subset:
 
 ```bash
-python -m Check.tests.run_all --tests T01 T09 T13 --log-dir <log_dir> --json-out <json_path>
+python -m Check.tests.run_all --tests T01 T09 T13 \
+  --log-dir <log_dir> --json-out <json_path>
 ```
 
 ## Coverage
@@ -43,7 +46,9 @@ Environment:
 Command:
 
 ```bash
-python -m Check.tests.run_all --log-dir /home/ruiqingyan/Agent/UniPhy/Check/logs --json-out /home/ruiqingyan/Agent/UniPhy/Check/logs/results.json
+python -m Check.tests.run_all \
+  --log-dir /home/ruiqingyan/Agent/UniPhy/Check/logs \
+  --json-out /home/ruiqingyan/Agent/UniPhy/Check/logs/results.json
 ```
 
 Summary:
@@ -71,4 +76,5 @@ Summary:
 | T12 | PASS | 7.45e-08 | IO and FFN shape/dtype contract |
 | T13 | PASS | 0.00e+00 | numerical regression baseline |
 
-Detailed artifacts are written to the log directory declared in the command above, including per-test result files and the JSON summary.
+Detailed artifacts are written to the declared log directory,
+including per-test result files and the JSON summary.

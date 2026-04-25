@@ -2,7 +2,14 @@ import sys
 
 import torch
 
-from Check.utils import build_check_model, full_serial_inference, make_dt, make_input, max_diff, write_result
+from Check.utils import (
+    build_check_model,
+    full_serial_inference,
+    make_dt,
+    make_input,
+    max_diff,
+    write_result,
+)
 
 TEST_ID = "T05"
 

@@ -23,25 +23,30 @@ def _validate_pscan_inputs(a, x):
     return a, x, is_diag, squeeze_output
 
 
-def _pscan_diag(a, x):
+def _scan_rows(x, advance_fn):
     state = torch.zeros_like(x[:, 0])
     rows = []
     for step in range(x.shape[1]):
-        state = a[:, step].unsqueeze(-1) * state + x[:, step]
-        rows.append(state)
-    return torch.stack(rows, dim=1)
-
-
-def _pscan_mat(a, x):
-    state = torch.zeros_like(x[:, 0])
-    rows = []
-    for step in range(x.shape[1]):
-        state = torch.einsum("bcij,bcjk->bcik", a[:, step], state) + x[:, step]
+        state = advance_fn(step, state)
         rows.append(state)
     return torch.stack(rows, dim=1)
 
 
 def pscan(a, x):
     a, x, is_diag, squeeze_output = _validate_pscan_inputs(a, x)
-    y = _pscan_diag(a, x) if is_diag else _pscan_mat(a, x)
+    if is_diag:
+        y = _scan_rows(
+            x,
+            lambda step, state: a[:, step].unsqueeze(-1) * state + x[:, step],
+        )
+    else:
+        y = _scan_rows(
+            x,
+            lambda step, state: torch.einsum(
+                "bcij,bcjk->bcik",
+                a[:, step],
+                state,
+            )
+            + x[:, step],
+        )
     return y.squeeze(-1) if squeeze_output else y

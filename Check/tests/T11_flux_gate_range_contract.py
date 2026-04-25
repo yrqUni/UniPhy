@@ -20,11 +20,16 @@ def run():
     dt_seq = torch.rand(batch_size, steps, device=device) * 1.5 + 0.1
     flux_prev = tracker.get_initial_state(batch_size, device, torch.complex64)
     with torch.no_grad():
-        scan_decay, scan_forcing = tracker.get_scan_operators(x_mean_seq, dt_seq)
-        flux_seq = torch.zeros(batch_size, steps, tracker.state_dim, device=device, dtype=torch.complex64)
+        flux_seq = torch.zeros(
+            batch_size,
+            steps,
+            tracker.state_dim,
+            device=device,
+            dtype=torch.complex64,
+        )
         flux_state = flux_prev
         for step in range(steps):
-            flux_state, _, gate_step = tracker.forward_step(
+            flux_state, _, _ = tracker.forward_step(
                 flux_state,
                 x_mean_seq[:, step],
                 dt_seq[:, step],

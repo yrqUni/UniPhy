@@ -1,27 +1,36 @@
 # UniPhy
 
-UniPhy is a continuous-time probabilistic forecasting model for physical fields, designed to model irregular temporal dynamics while preserving stable rollout behavior, calibrated ensemble objectives, and numerically verifiable operator contracts.
+UniPhy is a continuous-time probabilistic forecasting model for
+physical fields, designed to model irregular temporal dynamics while
+preserving stable rollout behavior, calibrated ensemble objectives,
+and numerically verifiable operator contracts.
 
 ## Highlights
 
-- Continuous-time latent dynamics with explicit transition operators and stochastic forcing
+- Continuous-time latent dynamics with explicit transition operators
+  and stochastic forcing
 - Probabilistic ensemble training for physical-field forecasting
-- ERA5 experiment pipeline for training, alignment, and forecast evaluation
-- Numerical verification suite covering transition operators, scan recurrences, rollout consistency, timestep semantics, CRPS consistency, data interpolation, and regression baselines
+- ERA5 experiment pipeline for training, alignment, and forecast
+  evaluation
+- Numerical verification suite covering transition operators, scan
+  recurrences, rollout consistency, timestep semantics, CRPS
+  consistency, data interpolation, and regression baselines
 
 ## Repository structure
 
-- `Model/UniPhy/` — model architecture, transition operators, basis transforms, encoder/decoder, and scan primitive
-- `Exp/ERA5/` — ERA5 training, alignment, evaluation, runtime configuration, and dataset loading
+- `Model/UniPhy/` — model architecture, transition operators, basis
+  transforms, encoder/decoder, and scan primitive
+- `Exp/ERA5/` — ERA5 training, alignment, evaluation, runtime
+  configuration, and dataset loading
 - `Check/` — numerical verification suite and result logs
 
 ## Requirements
 
 - Python 3.11+
 - NVIDIA GPU environment with CUDA support
-- PyTorch and Triton
+- PyTorch and project dependencies listed in `requirements.txt`
 
-Minimal Python dependencies are listed in `requirements.txt`. A Conda environment example is provided in `environment.yaml`.
+A Conda environment example is provided in `environment.yaml`.
 
 ## Data layout
 
@@ -38,7 +47,8 @@ ERA5 experiments expect NumPy files organized by year:
     ...
 ```
 
-Each `.npy` file is loaded as a time-major tensor sequence by `Exp/ERA5/ERA5.py`.
+Each `.npy` file is loaded as a time-major tensor sequence by
+`Exp/ERA5/ERA5.py`.
 
 ## Training
 
@@ -51,10 +61,13 @@ torchrun --nproc_per_node=<num_gpus> -m Exp.ERA5.train --data-input-dir <data_di
 Stage II alignment training:
 
 ```bash
-torchrun --nproc_per_node=<num_gpus> -m Exp.ERA5.align --data-input-dir <data_dir> --pretrained-ckpt <stage1_ckpt>
+torchrun --nproc_per_node=<num_gpus> -m Exp.ERA5.align \
+  --data-input-dir <data_dir> \
+  --pretrained-ckpt <stage1_ckpt>
 ```
 
-Stage II loads the Stage I checkpoint with strict parameter matching, so model architecture fields must remain consistent across stages.
+Stage II loads the Stage I checkpoint with strict parameter matching,
+so model architecture fields must remain consistent across stages.
 
 ## Evaluation
 
@@ -62,7 +75,8 @@ Stage II loads the Stage I checkpoint with strict parameter matching, so model a
 python -m Exp.ERA5.eval_forecast --checkpoint <ckpt> --data-input-dir <data_dir>
 ```
 
-The evaluation path reports RMSE, ACC, and CRPS over configurable lead times.
+The evaluation path reports RMSE, ACC, and CRPS over configurable lead
+times.
 
 ## Numerical verification
 
@@ -70,7 +84,8 @@ The evaluation path reports RMSE, ACC, and CRPS over configurable lead times.
 python -m Check.tests.run_all --log-dir <log_dir> --json-out <json_path>
 ```
 
-The suite is organized as a consecutive `T01`–`T13` numerical test set. Coverage includes:
+The suite is organized as a consecutive `T01`–`T13` numerical test
+set. Coverage includes:
 
 - transition-operator discretization
 - scan forward/backward correctness
