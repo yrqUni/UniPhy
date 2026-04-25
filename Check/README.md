@@ -41,7 +41,7 @@ Environment:
 - Device: `NVIDIA A800-SXM4-80GB`
 - Python: `3.12.12`
 - Torch: `2.9.1+cu128`
-- Date: `2026-04-25T16:26:42.231957`
+- Date: `2026-04-25T18:36:29.185972`
 
 Command:
 
@@ -71,11 +71,11 @@ Summary:
 | --- | --- | ---: | --- |
 | T01 | PASS | 5.83e-07 | transition operator and zero-step limit |
 | T02 | PASS | 2.90e-06 | scan forward/backward correctness |
-| T03 | PASS | 1.24e-16 | flux scan recurrence equivalence |
+| T03 | PASS | 2.22e-16 | flux scan recurrence equivalence |
 | T04 | PASS | 2.95e-13 | block forward/step consistency |
 | T05 | PASS | 4.09e-13 | rollout chunk/stride/offset invariance |
 | T06 | PASS | 2.46e-07 | basis roundtrip and inverse consistency |
-| T07 | PASS | 5.96e-08 | stochastic scaling and normalization |
+| T07 | PASS | 0.00e+00 | stochastic scaling and explicit-noise normalization |
 | T08 | PASS | 0.00e+00 | timestep validation and zero-identity |
 | T09 | PASS | 1.19e-07 | CRPS consistency across code paths |
 | T10 | PASS | 0.00e+00 | ERA5 interpolation and `dt` semantics |

@@ -50,25 +50,50 @@ def run():
     norm_real = prop._normalize_explicit_noise(noise_real, torch.complex64)
     norm_complex = prop._normalize_explicit_noise(noise_complex, torch.complex64)
     imag_real = float(norm_real.imag.abs().max().item())
-    rms_real = float(
-        torch.sqrt(
-            (norm_real.real.square() + norm_real.imag.square()).mean(dim=(1, 2, 3, 4))
-        )
-        .sub(1.0)
-        .abs()
-        .max()
-        .item()
+    complex_imag = float(norm_complex.imag.abs().mean().item())
+
+    seq_shape = (2, 3, 4, 5, 8)
+    dt_seq = torch.full((2, 3), 0.5, device=device)
+    h_state_seq = torch.ones(seq_shape, device=device, dtype=torch.complex64)
+    seq_noise = torch.complex(
+        torch.randn(seq_shape, device=device),
+        torch.randn(seq_shape, device=device),
     )
-    rms_complex = float(
-        torch.sqrt(
-            (norm_complex.real.square() + norm_complex.imag.square()).mean(
-                dim=(1, 2, 3, 4)
-            )
-        )
-        .sub(1.0)
-        .abs()
-        .max()
-        .item()
+    stochastic_seq = prop.generate_stochastic_term_seq(
+        seq_shape,
+        dt_seq,
+        torch.complex64,
+        h_state_seq,
+        noise_seq=seq_noise,
+    )
+    seq_zero = prop.generate_stochastic_term_seq(
+        seq_shape,
+        dt_seq,
+        torch.complex64,
+        h_state_seq,
+        noise_seq=torch.zeros(seq_shape, device=device, dtype=torch.complex64),
+    )
+
+    step_shape = (2, 4, 5, 8)
+    dt_step = torch.full((2,), 0.5, device=device)
+    h_state_step = torch.ones(step_shape, device=device, dtype=torch.complex64)
+    step_noise = torch.complex(
+        torch.randn(step_shape, device=device),
+        torch.randn(step_shape, device=device),
+    )
+    stochastic_step = prop.generate_stochastic_term_step(
+        step_shape,
+        dt_step,
+        torch.complex64,
+        h_state_step,
+        noise_step=step_noise,
+    )
+    step_zero = prop.generate_stochastic_term_step(
+        step_shape,
+        dt_step,
+        torch.complex64,
+        h_state_step,
+        noise_step=torch.zeros(step_shape, device=device, dtype=torch.complex64),
     )
 
     passed = (
@@ -76,13 +101,17 @@ def run():
         and all(scales_b[index] > scales_b[index + 1] for index in range(3))
         and err_c < 1e-5
         and imag_real == 0.0
-        and rms_real < 1e-4
-        and rms_complex < 1e-4
+        and complex_imag > 1e-3
+        and float(seq_zero.abs().max().item()) == 0.0
+        and float(step_zero.abs().max().item()) == 0.0
+        and float(stochastic_seq.abs().mean().item()) > 1e-3
+        and float(stochastic_step.abs().mean().item()) > 1e-3
     )
-    max_err = max(err_c, imag_real, rms_real, rms_complex)
+    max_err = max(err_c, imag_real)
     detail = (
         f"err_c={err_c:.2e} imag_real={imag_real:.2e} "
-        f"rms_real={rms_real:.2e} rms_complex={rms_complex:.2e}"
+        f"complex_imag={complex_imag:.2e} seq_mean={float(stochastic_seq.abs().mean().item()):.2e} "
+        f"step_mean={float(stochastic_step.abs().mean().item()):.2e}"
     )
     return ("PASS" if passed else "FAIL"), max_err, detail
 

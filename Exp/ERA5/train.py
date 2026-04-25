@@ -48,10 +48,11 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
     infer_model = get_unwrapped_model(model)
 
     ensemble_preds = []
-    for _ in range(ensemble_size):
-        noise = infer_model.sample_noise(x_input)
+    for member_idx in range(ensemble_size):
+        noise = None if ensemble_size == 1 else infer_model.sample_noise(x_input)
         out = model(x_input, dt_input, z=noise)
-        ensemble_preds.append(out.real if out.is_complex() else out)
+        out = out.real if out.is_complex() else out
+        ensemble_preds.append(out)
 
     ensemble_stack = torch.stack(ensemble_preds, dim=0)
     out_mean = ensemble_stack.mean(dim=0)
@@ -64,7 +65,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
         ensemble_std = ensemble_stack.std(dim=0).mean()
         loss = l1_loss + crps_loss
     else:
-        crps_loss = torch.tensor(0.0, device=device)
+        crps_loss = l1_loss
         ensemble_std = torch.tensor(0.0, device=device)
         loss = l1_loss
 
@@ -119,8 +120,8 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
     saved_epoch = int(ckpt.get("epoch", -1))
-    start_epoch = max(0, saved_epoch + 1)
-    return start_epoch, ckpt.get("global_step", 0)
+    saved_step = int(ckpt.get("global_step", 0))
+    return max(0, saved_epoch + 1), saved_step
 
 
 def train(cfg):
@@ -200,6 +201,7 @@ def train(cfg):
         )
 
     stop_early = False
+    last_completed_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs):
         train_sampler.set_epoch(epoch)
         model.train()
@@ -264,6 +266,7 @@ def train(cfg):
             batch_idx,
             grad_accum_steps,
         )
+        last_completed_epoch = epoch
 
         if rank == 0:
             epoch_path = os.path.join(
@@ -287,7 +290,7 @@ def train(cfg):
 
     if rank == 0:
         final_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
-        final_epoch = max(start_epoch, epochs - 1)
+        final_epoch = max(start_epoch - 1, last_completed_epoch)
         save_checkpoint(
             model,
             optimizer,

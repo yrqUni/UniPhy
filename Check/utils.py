@@ -2,7 +2,6 @@ from pathlib import Path
 
 import torch
 
-from Exp.ERA5.runtime_config import compute_channelwise_crps, compute_crps
 from Model.UniPhy.ModelUniPhy import UniPhyModel
 
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -229,12 +228,16 @@ def channelwise_crps_reference(pred_ensemble, target, lat_weights):
 
 
 def compute_crps_error(pred_ensemble, target):
+    from Exp.ERA5.runtime_config import compute_crps
+
     actual = compute_crps(pred_ensemble, target)
     expected = crps_reference(pred_ensemble, target)
     return max_diff(actual, expected), actual, expected
 
 
 def compute_channelwise_crps_error(pred_ensemble, target, lat_weights):
+    from Exp.ERA5.runtime_config import compute_channelwise_crps
+
     actual = compute_channelwise_crps(pred_ensemble, target, lat_weights)
     expected = channelwise_crps_reference(pred_ensemble, target, lat_weights)
     return max_diff(actual, expected), actual, expected

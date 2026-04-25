@@ -44,8 +44,8 @@ def load_alignment_checkpoint(path, model, optimizer=None):
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
     saved_epoch = int(ckpt.get("epoch", -1))
-    start_epoch = max(0, saved_epoch + 1)
-    return start_epoch, int(ckpt.get("global_step", 0))
+    saved_step = int(ckpt.get("global_step", 0))
+    return max(0, saved_epoch + 1), saved_step
 
 
 def get_curriculum_sub_steps(epoch, total_epochs, all_sub_steps):
@@ -111,13 +111,17 @@ def align_step(
     target_cpu = x_tgt_aligned.detach().cpu()
 
     ensemble_preds = []
-    for _ in range(ensemble_size):
-        z_context = infer_model.sample_noise(x_ctx)
-        z_rollout = infer_model.sample_rollout_noise(
-            batch_size,
-            n_iters,
-            device,
-            dtype=x_ctx.dtype,
+    for member_idx in range(ensemble_size):
+        z_context = None if ensemble_size == 1 else infer_model.sample_noise(x_ctx)
+        z_rollout = (
+            None
+            if ensemble_size == 1
+            else infer_model.sample_rollout_noise(
+                batch_size,
+                n_iters,
+                device,
+                dtype=x_ctx.dtype,
+            )
         )
         pred_seq = infer_model.forward_rollout(
             x_ctx,
@@ -139,10 +143,15 @@ def align_step(
     l1 = ((pred_mean_cpu - target_cpu).abs() * lat_weights_cpu).mean()
     mse = (((pred_mean_cpu - target_cpu) ** 2) * lat_weights_cpu).mean()
 
-    crps_loss = compute_weighted_crps(ensemble_stack, x_tgt_aligned, lat_weights)
+    if ensemble_size > 1:
+        crps_loss = compute_weighted_crps(ensemble_stack, x_tgt_aligned, lat_weights)
+        loss = crps_loss
+    else:
+        crps_loss = l1.to(device)
+        loss = crps_loss
     basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.0)
     basis_residual = compute_basis_residual(model)
-    loss = crps_loss + basis_reg_weight * basis_residual
+    loss = loss + basis_reg_weight * basis_residual
     (loss / grad_accum_steps).backward()
 
     grad_norm = 0.0
@@ -261,6 +270,7 @@ def align(cfg):
         os.makedirs(cfg["logging"]["ckpt_dir"], exist_ok=True)
 
     stop_early = False
+    last_completed_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs):
         train_sampler.set_epoch(epoch)
         model.train()
@@ -324,6 +334,7 @@ def align(cfg):
             batch_idx,
             grad_accum_steps,
         )
+        last_completed_epoch = epoch
 
         if rank == 0:
             progress.stop()
@@ -350,10 +361,11 @@ def align(cfg):
             cfg["logging"]["ckpt_dir"],
             "align_final.pt",
         )
+        final_epoch = max(start_epoch - 1, last_completed_epoch)
         save_checkpoint(
             model,
             optimizer,
-            max(start_epoch, epochs - 1),
+            final_epoch,
             global_step,
             cfg,
             final_ckpt_path,

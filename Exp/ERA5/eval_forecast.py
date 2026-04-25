@@ -254,6 +254,11 @@ def main():
         dtype=torch.float64,
         device=device,
     )
+    overall_weighted_mse_sum = torch.zeros(
+        len(lead_times),
+        dtype=torch.float64,
+        device=device,
+    )
     processed = 0
     started_at = time.time()
 
@@ -286,12 +291,16 @@ def main():
 
             ensemble_preds = []
             for _ in range(ensemble_size):
-                z_context = model.sample_noise(x_context)
-                z_rollout = model.sample_rollout_noise(
-                    batch_size,
-                    len(dt_list),
-                    device,
-                    dtype=x_context.dtype,
+                z_context = None if ensemble_size == 1 else model.sample_noise(x_context)
+                z_rollout = (
+                    None
+                    if ensemble_size == 1
+                    else model.sample_rollout_noise(
+                        batch_size,
+                        len(dt_list),
+                        device,
+                        dtype=x_context.dtype,
+                    )
                 )
                 pred_seq = model.forward_rollout(
                     x_context,
@@ -308,8 +317,10 @@ def main():
             pred_mean = pred_ensemble.mean(dim=0)
             target = x_targets[:, : len(lead_times)]
             squared_error = (pred_mean - target).square()
-            mse_sum += weighted_channel_mean(squared_error, lat_weights).double().sum(
-                dim=0
+            weighted_mse = weighted_channel_mean(squared_error, lat_weights)
+            mse_sum += weighted_mse.double().sum(dim=0)
+            overall_weighted_mse_sum += (
+                (squared_error * lat_weights).mean(dim=(-3, -2, -1)).double().sum(dim=0)
             )
 
             crps = compute_channelwise_crps(pred_ensemble, target, lat_weights)
@@ -366,7 +377,9 @@ def main():
         invalid_metric_counts["rmse"] += rmse_invalid
         invalid_metric_counts["acc"] += acc_invalid
         invalid_metric_counts["crps"] += crps_invalid
-        overall_rmse[str(lead)] = float(rmse_channels.mean().item())
+        overall_rmse[str(lead)] = float(
+            torch.sqrt(overall_weighted_mse_sum[lead_idx] / float(processed)).item()
+        )
         overall_acc[str(lead)] = float(acc_channels.mean().item())
         overall_crps[str(lead)] = float(crps_channels.mean().item())
         per_channel_rmse[lead] = rmse_channels.cpu().tolist()
@@ -417,4 +430,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

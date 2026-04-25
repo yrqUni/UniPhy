@@ -27,7 +27,24 @@ def run():
     dt_zero = torch.zeros(2, 4, device=device, dtype=torch.float64)
     with torch.no_grad():
         out = model(x, dt_zero)
+        latent_zero = model.encoder(x[:, :1])[:, 0]
+        states = model._init_states(2, device, latent_zero.dtype)
+        z_zero, h_zero, flux_zero = model.blocks[0].forward_step(
+            latent_zero,
+            states[0][0],
+            torch.zeros(2, device=device, dtype=torch.float64),
+            states[0][1],
+        )
+        rollout_zero = model.forward_rollout(
+            x[:, :2],
+            dt_zero[:, :2],
+            [torch.zeros(2, device=device, dtype=torch.float64)],
+        )
     err_zero = float((out - x).abs().max().item())
+    err_step = float((z_zero - latent_zero).abs().max().item())
+    err_state = float((h_zero - states[0][0]).abs().max().item())
+    err_flux = float((flux_zero - states[0][1]).abs().max().item())
+    err_rollout = float((rollout_zero[:, 0] - x[:, 1]).abs().max().item())
 
     invalid_results = [
         expect_value_error(
@@ -69,11 +86,26 @@ def run():
         ),
     ]
 
-    passed = err_zero < 1e-12 and all(invalid_results)
-    max_err = max(err_zero, float(len(invalid_results) - sum(invalid_results)))
+    passed = (
+        err_zero < 1e-12
+        and err_step < 1e-12
+        and err_state < 1e-12
+        and err_flux < 1e-12
+        and err_rollout < 1e-12
+        and all(invalid_results)
+    )
+    max_err = max(
+        err_zero,
+        err_step,
+        err_state,
+        err_flux,
+        err_rollout,
+        float(len(invalid_results) - sum(invalid_results)),
+    )
     detail = (
-        f"err_zero={err_zero:.2e} invalid_cases={sum(invalid_results)}/"
-        f"{len(invalid_results)}"
+        f"err_zero={err_zero:.2e} err_step={err_step:.2e} err_state={err_state:.2e} "
+        f"err_flux={err_flux:.2e} err_rollout={err_rollout:.2e} "
+        f"invalid_cases={sum(invalid_results)}/{len(invalid_results)}"
     )
     return ("PASS" if passed else "FAIL"), max_err, detail
 

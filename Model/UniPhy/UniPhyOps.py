@@ -264,19 +264,10 @@ class TemporalPropagator(nn.Module):
 
     def _normalize_explicit_noise(self, noise, dtype):
         if noise.is_complex():
-            noise_complex = noise.to(dtype)
-        else:
-            real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
-            noise_real = noise.to(real_dtype)
-            noise_complex = torch.complex(
-                noise_real, torch.zeros_like(noise_real)
-            ).to(dtype)
-        reduce_dims = tuple(range(1, noise_complex.ndim))
-        if reduce_dims:
-            mag_sq = noise_complex.real.square() + noise_complex.imag.square()
-            rms = torch.sqrt(mag_sq.mean(dim=reduce_dims, keepdim=True).clamp_min(1e-6))
-            noise_complex = noise_complex / rms
-        return noise_complex
+            return noise.to(dtype)
+        real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
+        noise_real = noise.to(real_dtype)
+        return torch.complex(noise_real, torch.zeros_like(noise_real)).to(dtype)
 
     def generate_stochastic_term_seq(
         self, shape, dt_seq, dtype, h_state, noise_seq=None
