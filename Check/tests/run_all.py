@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from Check.utils import LOG_DIR, format_max_error, read_source, run_source_guard, write_result
+from Check.utils import LOG_DIR, format_max_error, write_result
 
 TEST_MODULES = [
     ("T01", "T01_phi1_stability", "T"),
@@ -36,6 +36,7 @@ TEST_MODULES = [
     ("T23", "T23_t12_is_not_trivial", "T"),
     ("T24", "T24_t17_missing_golden_policy", "T"),
     ("T25", "T25_recheck_runner_features", "T"),
+    ("T26", "T26_dt_nonfinite_rejection", "T"),
     ("S01", "S01_parallel_serial_consistency", "S"),
     ("S02", "S02_timestep_semantics", "S"),
     ("S03", "S03_parameter_consistency", "S"),
