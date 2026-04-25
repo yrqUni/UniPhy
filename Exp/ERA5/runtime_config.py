@@ -188,6 +188,17 @@ def compute_crps(pred_ensemble, target):
     return mae - pairwise_diff * scale
 
 
+def compute_weighted_crps(pred_ensemble, target, weights):
+    ensemble_size = pred_ensemble.shape[0]
+    target_exp = target.unsqueeze(0)
+    mae = (weights * (pred_ensemble - target_exp).abs()).mean()
+    idx_i, idx_j, scale = _crps_pairwise_stats(ensemble_size, pred_ensemble.device)
+    if idx_i is None:
+        return mae
+    pairwise = (weights * (pred_ensemble[idx_i] - pred_ensemble[idx_j]).abs()).mean()
+    return mae - pairwise * scale
+
+
 def compute_channelwise_crps(pred_ensemble, target, lat_weights):
     ensemble_size = pred_ensemble.shape[0]
     target_exp = target.unsqueeze(0)

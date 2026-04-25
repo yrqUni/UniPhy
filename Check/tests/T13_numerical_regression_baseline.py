@@ -1,13 +1,17 @@
 import argparse
 import hashlib
 import sys
+from importlib import resources
+from pathlib import Path
 
 import torch
 
 from Check.utils import REPO_DIR, build_check_model, write_result
 
 TEST_ID = "T13"
-GOLDEN_PATH = REPO_DIR / "Check" / "golden" / "golden.pt"
+GOLDEN_DIR = REPO_DIR / "Check" / "golden"
+GOLDEN_PATH = GOLDEN_DIR / "golden.pt"
+PACKAGED_GOLDEN = "golden.pt"
 
 
 def parse_args():
@@ -47,20 +51,31 @@ def compute_outputs(device):
     return {"fwd": out_fwd_r.cpu(), "roll": out_roll_r.cpu()}
 
 
+def resolve_golden_path():
+    if GOLDEN_PATH.exists():
+        return GOLDEN_PATH
+    try:
+        package_path = resources.files("Check.golden") / PACKAGED_GOLDEN
+    except ModuleNotFoundError:
+        return None
+    return Path(str(package_path)) if package_path.is_file() else None
+
+
 def run(regenerate=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if regenerate:
         payload = compute_outputs(device)
-        GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
         torch.save(payload, GOLDEN_PATH)
         sha = file_sha256(GOLDEN_PATH)
         detail = f"golden regenerated sha256={sha}"
         return "PASS", 0.0, detail
-    if not GOLDEN_PATH.exists():
+    golden_path = resolve_golden_path()
+    if golden_path is None:
         detail = f"missing golden file: {GOLDEN_PATH}"
         return "FAIL", "-", detail
     payload = compute_outputs(device)
-    golden = torch.load(GOLDEN_PATH, map_location="cpu", weights_only=True)
+    golden = torch.load(golden_path, map_location="cpu", weights_only=True)
     err_fwd = float((payload["fwd"] - golden["fwd"]).abs().max().item())
     err_roll = float((payload["roll"] - golden["roll"]).abs().max().item())
     max_err = max(err_fwd, err_roll)

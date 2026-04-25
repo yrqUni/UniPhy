@@ -14,7 +14,7 @@ from Exp.ERA5.runtime_config import (
     build_runtime_cfg,
     build_uniphy_model,
     compute_basis_residual,
-    compute_crps,
+    compute_weighted_crps,
     flush_remaining_grads,
     get_unwrapped_model,
     init_distributed,
@@ -60,7 +60,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
     mse_loss = ((out_mean - x_target) ** 2 * lat_weights).mean()
 
     if ensemble_size > 1:
-        crps_loss = compute_crps(ensemble_stack, x_target)
+        crps_loss = compute_weighted_crps(ensemble_stack, x_target, lat_weights)
         ensemble_std = ensemble_stack.std(dim=0).mean()
         loss = l1_loss + crps_loss
     else:
@@ -287,11 +287,12 @@ def train(cfg):
 
     if rank == 0:
         final_path = os.path.join(cfg["logging"]["ckpt_dir"], "ckpt_final.pt")
+        final_epoch = max(start_epoch, epochs - 1)
         save_checkpoint(
             model,
             optimizer,
             scheduler,
-            epochs,
+            final_epoch,
             global_step,
             cfg,
             final_path,

@@ -14,7 +14,7 @@ from Exp.ERA5.runtime_config import (
     build_runtime_cfg,
     build_uniphy_model,
     compute_basis_residual,
-    compute_crps,
+    compute_weighted_crps,
     flush_remaining_grads,
     get_unwrapped_model,
     init_distributed,
@@ -106,7 +106,8 @@ def align_step(
     infer_model = get_unwrapped_model(model)
     output_offset = sub_step - 1
     x_tgt_aligned = x_targets[:, :target_t]
-    lat_weights_cpu = build_lat_weights(x_tgt_aligned.shape[-2], torch.device("cpu"))
+    lat_weights = build_lat_weights(x_tgt_aligned.shape[-2], device)
+    lat_weights_cpu = lat_weights.cpu()
     target_cpu = x_tgt_aligned.detach().cpu()
 
     ensemble_preds = []
@@ -138,7 +139,7 @@ def align_step(
     l1 = ((pred_mean_cpu - target_cpu).abs() * lat_weights_cpu).mean()
     mse = (((pred_mean_cpu - target_cpu) ** 2) * lat_weights_cpu).mean()
 
-    crps_loss = compute_crps(ensemble_stack, x_tgt_aligned)
+    crps_loss = compute_weighted_crps(ensemble_stack, x_tgt_aligned, lat_weights)
     basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.0)
     basis_residual = compute_basis_residual(model)
     loss = crps_loss + basis_reg_weight * basis_residual

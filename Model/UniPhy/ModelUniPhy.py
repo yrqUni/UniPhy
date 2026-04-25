@@ -377,15 +377,25 @@ class UniPhyModel(nn.Module):
     def _normalize_dt(self, dt, batch_size, steps, device):
         dtype = self.skip_spatial_proj[0].weight.dtype
         dt = dt.detach().to(device=device, dtype=dtype)
+        if dt.ndim != 2:
+            raise ValueError(f"dt_must_be_2d: got_ndim={dt.ndim}")
         rows, cols = dt.shape
-        [(batch_size, steps)].index((rows, cols))
+        if (rows, cols) != (batch_size, steps):
+            raise ValueError(
+                f"dt_shape_mismatch: expected={(batch_size, steps)} got={(rows, cols)}"
+            )
         return dt
 
     def _normalize_step_dt(self, dt, batch_size, device):
         dtype = self.skip_spatial_proj[0].weight.dtype
         dt = dt.detach().to(device=device, dtype=dtype)
+        if dt.ndim != 1:
+            raise ValueError(f"dt_step_must_be_1d: got_ndim={dt.ndim}")
         (length,) = dt.shape
-        [batch_size].index(length)
+        if length != batch_size:
+            raise ValueError(
+                f"dt_step_shape_mismatch: expected={batch_size} got={length}"
+            )
         return dt
 
     def _noise_shape_from_latent(self, latent):
@@ -449,8 +459,10 @@ class UniPhyModel(nn.Module):
         return noise_seq[:, step_idx]
 
     def _validate_dt(self, dt):
-        [False].index(_dt_has_nonfinite(dt))
-        [False].index(_dt_has_negative(dt))
+        if _dt_has_nonfinite(dt):
+            raise ValueError("dt_must_be_finite")
+        if _dt_has_negative(dt):
+            raise ValueError("dt_must_be_nonnegative")
 
     def _skip_gate_4d(self, z_dec, z_skip):
         dec_ctx = torch.cat(

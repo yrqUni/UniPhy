@@ -46,7 +46,7 @@ def run():
         dt_expected = torch.tensor([6.0, 3.0, 9.0, 6.0])
         err_dt = max_diff(dt, dt_expected)
 
-        dataset_train = ERA5Dataset(
+        dataset_eval = ERA5Dataset(
             input_dir=str(root),
             year_range=[2000, 2000],
             window_size=4,
@@ -56,15 +56,32 @@ def run():
             dt_ref=6.0,
             sample_offsets_hours=None,
         )
+        data_eval, dt_eval = dataset_eval[2]
+        expected_eval = torch.from_numpy(frames[2:5].copy())
+        err_eval = max_diff(data_eval, expected_eval)
+        err_eval_dt = max_diff(dt_eval, torch.tensor([6.0, 6.0, 6.0]))
+
+        dataset_train = ERA5Dataset(
+            input_dir=str(root),
+            year_range=[2000, 2000],
+            window_size=4,
+            sample_k=3,
+            look_ahead=0,
+            is_train=True,
+            dt_ref=6.0,
+            sample_offsets_hours=None,
+        )
+        dataset_train._sample_offsets = lambda: ([1, 2, 3], True)
         data_train, dt_train = dataset_train[2]
-        expected_train = torch.from_numpy(frames[2:5].copy())
+        expected_train = torch.from_numpy(frames[3:6].copy())
         err_train = max_diff(data_train, expected_train)
         err_train_dt = max_diff(dt_train, torch.tensor([6.0, 6.0, 6.0]))
 
-    max_err = max(err_interp, err_dt, err_train, err_train_dt)
+    max_err = max(err_interp, err_dt, err_eval, err_eval_dt, err_train, err_train_dt)
     passed = max_err < 1e-6
     detail = (
         f"err_interp={err_interp:.2e} err_dt={err_dt:.2e} "
+        f"err_eval={err_eval:.2e} err_eval_dt={err_eval_dt:.2e} "
         f"err_train={err_train:.2e} err_train_dt={err_train_dt:.2e}"
     )
     return ("PASS" if passed else "FAIL"), max_err, detail

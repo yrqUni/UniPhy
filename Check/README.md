@@ -41,14 +41,21 @@ Environment:
 - Device: `NVIDIA A800-SXM4-80GB`
 - Python: `3.12.12`
 - Torch: `2.9.1+cu128`
-- Date: `2026-04-25T15:30:38.920895`
+- Date: `2026-04-25T16:26:42.231957`
 
 Command:
 
 ```bash
 python -m Check.tests.run_all \
-  --log-dir /home/ruiqingyan/Agent/UniPhy/Check/logs \
-  --json-out /home/ruiqingyan/Agent/UniPhy/Check/logs/results.json
+  --log-dir <log_dir> \
+  --json-out <json_path>
+```
+
+Recorded command arguments for the latest run:
+
+```text
+--log-dir /home/ruiqingyan/Agent/UniPhy/Check/logs
+--json-out /home/ruiqingyan/Agent/UniPhy/Check/logs/results.json
 ```
 
 Summary:
@@ -64,7 +71,7 @@ Summary:
 | --- | --- | ---: | --- |
 | T01 | PASS | 5.83e-07 | transition operator and zero-step limit |
 | T02 | PASS | 2.90e-06 | scan forward/backward correctness |
-| T03 | PASS | 6.66e-08 | flux scan recurrence equivalence |
+| T03 | PASS | 1.24e-16 | flux scan recurrence equivalence |
 | T04 | PASS | 2.95e-13 | block forward/step consistency |
 | T05 | PASS | 4.09e-13 | rollout chunk/stride/offset invariance |
 | T06 | PASS | 2.46e-07 | basis roundtrip and inverse consistency |
