@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +39,7 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--chunk-size", type=int, default=6)
+    p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--device", default=None)
     p.add_argument("--output-json", required=True)
     return p.parse_args()
@@ -132,12 +134,15 @@ def evaluate(args):
     clim_sum = torch.zeros(len(lead_times), channels, height, width)
     clim_n = 0
     lead_indices = [lead // int(args.step_hours) - 1 for lead in lead_times]
+    t0 = time.time()
     for data, _ in clim_loader:
         if args.max_samples and clim_n >= args.max_samples:
             break
         target_steps = data[:, cond_steps:].float()
         clim_sum += target_steps[:, lead_indices].sum(dim=0).cpu()
         clim_n += data.shape[0]
+        if clim_n % max(1, args.log_every) == 0:
+            print(f"climatology samples={clim_n} elapsed={time.time() - t0:.1f}s", flush=True)
     climatology = (clim_sum / max(clim_n, 1)).to(device)
     lat_w = build_lat_weights(height, device).squeeze(2)
     mse_sum = torch.zeros(len(lead_times), channels, dtype=torch.float64, device=device)
@@ -170,18 +175,18 @@ def evaluate(args):
             n_members = 1 if deterministic else max(1, int(args.ensemble_size))
             for _ in range(n_members):
                 if args.mode == "direct":
-                    dt_list = [
-                        torch.full((batch_size,), float(lead), device=device)
-                        for lead in lead_times
-                    ]
-                    pred = model.forward_rollout(
-                        x_ctx,
-                        dt_ctx,
-                        dt_list,
-                        z_context=True,
-                        z_rollout=True,
-                        chunk_size=args.chunk_size,
-                    )
+                    direct_preds = []
+                    for lead in lead_times:
+                        pred_lead = model.forward_rollout(
+                            x_ctx,
+                            dt_ctx,
+                            [torch.full((batch_size,), float(lead), device=device)],
+                            z_context=True,
+                            z_rollout=True,
+                            chunk_size=args.chunk_size,
+                        )
+                        direct_preds.append(pred_lead[:, 0])
+                    pred = torch.stack(direct_preds, dim=1)
                 else:
                     dt_list = [
                         torch.full((batch_size,), float(args.step_hours), device=device)
@@ -209,6 +214,8 @@ def evaluate(args):
             acc_pe += pe.double().sum(dim=0)
             acc_te += te.double().sum(dim=0)
             processed += batch_size
+            if processed % max(1, args.log_every) == 0:
+                print(f"eval samples={processed} elapsed={time.time() - t0:.1f}s", flush=True)
     overall = {"rmse": {}, "acc": {}, "crps": {}}
     for i, lead in enumerate(lead_times):
         acc = acc_num[i] / torch.sqrt(acc_pe[i] * acc_te[i]).clamp_min(1e-8)
