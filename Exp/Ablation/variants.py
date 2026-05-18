@@ -69,10 +69,11 @@ def _build_swin_model(model_cfg: dict, device=None) -> SwinTransModel:
 
 def _build_convlstm_model(model_cfg: dict, device=None) -> ConvLSTMModel:
     cfg = _normalize_cfg(model_cfg)
+    hidden_dim = max(16, int(round(int(cfg["embed_dim"]) * 0.55)))
     model = ConvLSTMModel(
         in_channels=int(cfg["in_channels"]),
         out_channels=int(cfg["out_channels"]),
-        embed_dim=int(cfg["embed_dim"]),
+        embed_dim=hidden_dim,
         depth=int(cfg["depth"]),
         patch_size=tuple(cfg["patch_size"]),
         img_height=int(cfg["img_height"]),
