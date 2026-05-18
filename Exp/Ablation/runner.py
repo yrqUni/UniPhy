@@ -112,6 +112,40 @@ def train_step(
     else:
         basis_reg = torch.tensor(0.0, device=device)
 
+    rollout_weight = float(cfg["train"].get("rollout_loss_weight", 0.0))
+    rollout_loss = torch.tensor(0.0, device=device)
+    rollout_variants = (
+        "baseline",
+        "A1_no_dt",
+        "B1_complex_latent",
+        "B2_fixed_decay",
+        "C1_deterministic",
+        "C2_no_readout_residual",
+        "C3_constant_readout",
+        "D1_single_scale",
+        "D2_fixed_scale_weights",
+        "E1_l1_only",
+        "F1_etd1_integrator",
+    )
+    if rollout_weight > 0.0 and variant in rollout_variants and x_target.shape[1] > 1:
+        rollout_steps = min(
+            int(cfg["train"].get("rollout_loss_steps", x_target.shape[1])),
+            x_target.shape[1],
+        )
+        dt_rollout = [dt_input[:, i] for i in range(rollout_steps)]
+        rollout_pred = model.forward_rollout(
+            data[:, :1],
+            dt_data[:, :1],
+            dt_rollout,
+            z_context=None,
+            z_rollout=None,
+            chunk_size=rollout_steps,
+        )
+        rollout_pred = rollout_pred.real if torch.is_complex(rollout_pred) else rollout_pred
+        rollout_target = x_target[:, :rollout_steps]
+        rollout_loss = ((rollout_pred - rollout_target).abs() * lat_weights).mean()
+        loss = loss + rollout_weight * rollout_loss
+
     (loss / grad_accum_steps).backward()
 
     grad_norm = 0.0
@@ -130,6 +164,7 @@ def train_step(
         "grad_norm": grad_norm,
         "ensemble_std": ensemble_std.item(),
         "basis_residual": basis_reg.item(),
+        "rollout": rollout_loss.item(),
     }
 
 
@@ -290,6 +325,7 @@ def train(cfg, variant, num_workers=4, ckpt_path=None, pretrained_ckpt=None, see
                         f"Loss={metrics['loss']:.4f} L1={metrics['l1']:.4f} "
                         f"CRPS={metrics['crps']:.4f} RMSE={metrics['rmse']:.4f} "
                         f"Basis={metrics['basis_residual']:.4f} "
+                        f"Rollout={metrics['rollout']:.4f} "
                         f"Grad={metrics['grad_norm']:.4f}"
                     )
                     progress.console.print(msg)

@@ -29,6 +29,8 @@ train:
   use_scheduler: false
   use_tf32: true
   basis_reg_weight: 0.01
+  rollout_loss_weight: 0.15
+  rollout_loss_steps: 4
 
 logging:
   log_every: 1
