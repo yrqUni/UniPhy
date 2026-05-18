@@ -681,6 +681,31 @@ class UniPhyModel(nn.Module):
             )
         return dt
 
+    def _split_rollout_steps(self, dt_steps, allow_split=True):
+        if not allow_split:
+            return dt_steps, list(range(len(dt_steps)))
+        split_steps = []
+        output_indices = []
+        dt_ref = float(self.blocks[0].prop.dt_ref)
+        for dt_step in dt_steps:
+            ratio = dt_step.detach() / dt_ref
+            rounded = torch.round(ratio)
+            can_split = bool(
+                torch.isfinite(ratio).all().item()
+                and (ratio - rounded).abs().max().item() < 1e-6
+                and rounded.min().item() == rounded.max().item()
+                and rounded[0].item() > 1
+            )
+            if can_split:
+                parts = int(rounded[0].item())
+                sub_step = dt_step / parts
+                for _ in range(parts):
+                    split_steps.append(sub_step)
+            else:
+                split_steps.append(dt_step)
+            output_indices.append(len(split_steps) - 1)
+        return split_steps, output_indices
+
     def _noise_shape_from_latent(self, latent):
         return (
             latent.shape[0],
@@ -974,17 +999,21 @@ class UniPhyModel(nn.Module):
         states = self._init_states(batch_size, device, dtype)
         use_checkpoint = self.training and torch.is_grad_enabled()
 
-        n_steps = len(dt_list)
+        requested_dt_steps = [
+            self._normalize_step_dt(dt_k, batch_size, device) for dt_k in dt_list
+        ]
+        for dt_step in requested_dt_steps:
+            self._validate_dt(dt_step)
+        dt_steps, output_indices = self._split_rollout_steps(
+            requested_dt_steps,
+            allow_split=z_rollout is None or isinstance(z_rollout, bool),
+        )
+        n_steps = len(dt_steps)
         rollout_noise = self._normalize_rollout_noise(
             z_rollout,
             n_steps,
             batch_size,
         )
-        dt_steps = [
-            self._normalize_step_dt(dt_k, batch_size, device) for dt_k in dt_list
-        ]
-        for dt_step in dt_steps:
-            self._validate_dt(dt_step)
 
         if n_steps > 0:
             dt_next_steps = dt_steps[1:] + [dt_steps[-1]]
@@ -1041,6 +1070,10 @@ class UniPhyModel(nn.Module):
             chunk_size = 1
 
         preds = []
+        output_index_map = {
+            internal_idx: output_idx
+            for output_idx, internal_idx in enumerate(output_indices)
+        }
         step = 0
         while step < n_steps:
             chunk_end = min(step + chunk_size, n_steps)
@@ -1086,10 +1119,10 @@ class UniPhyModel(nn.Module):
             x_curr = outs[1]
             for offset in range(chunk_len):
                 step_idx = step + offset
-                if (
-                    step_idx >= output_offset
-                    and (step_idx - output_offset) % output_stride == 0
-                ):
+                output_idx = output_index_map.get(step_idx)
+                if output_idx is not None and output_idx >= output_offset and (
+                    output_idx - output_offset
+                ) % output_stride == 0:
                     preds.append(outs[2 + offset])
             states = [
                 (outs[2 + chunk_len + i * 2], outs[2 + chunk_len + i * 2 + 1])

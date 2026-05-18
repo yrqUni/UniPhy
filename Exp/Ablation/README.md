@@ -91,16 +91,16 @@ time from the same context. SwinTrans and ConvLSTM are evaluated as recursive
 
 | Model | Mode | 6 h RMSE | 12 h RMSE | 18 h RMSE | 24 h RMSE |
 |:--|:--|--:|--:|--:|--:|
-| UniPhy | Direct | 0.028079 | 0.035647 | 0.040717 | 0.044047 |
+| UniPhy | Direct | 0.028081 | 0.054402 | 0.075027 | 0.086508 |
 | UniPhy | Recursive | 0.028081 | 0.054402 | 0.075027 | 0.086508 |
 | SwinTrans | Recursive | 0.031179 | 0.039022 | 0.043511 | 0.046662 |
 | ConvLSTM | Recursive | 0.104625 | 0.104667 | 0.104675 | 0.104678 |
 
-The fixed interval study separates two capabilities. Direct continuous time
-prediction favors UniPhy at every evaluated lead time. Recursive 6 h rollout
-measures autonomous stability under repeated model feedback. UniPhy now uses
-the same skip-corrected latent state for decoding and subsequent dynamics,
-which improves autonomous rollout while preserving direct lead-time skill.
+The fixed interval study reports a single physical-time rollout path for
+UniPhy. Direct and recursive UniPhy evaluation are equivalent by construction
+when the requested lead time is an integer multiple of the reference interval.
+Under this fixed 6 h protocol, SwinTrans is the stronger 24 h fixed-interval
+baseline, while UniPhy keeps native support for continuous-time evaluation.
 
 ## Plan
 
