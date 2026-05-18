@@ -935,13 +935,11 @@ class UniPhyModel(nn.Module):
                 )
                 new_states.append((h_next, flux_next))
             states = new_states
-            z_curr = z_running
-            x_pred = self.decoder(
-                self._apply_decoder_skip(
-                    z_curr.unsqueeze(1),
-                    step_skip.unsqueeze(1),
-                )
+            z_curr = self._apply_decoder_skip(
+                z_running.unsqueeze(1),
+                step_skip.unsqueeze(1),
             )[:, 0]
+            x_pred = self.decoder(z_curr.unsqueeze(1))[:, 0]
             zero_mask = _expand_batch_mask(_dt_is_zero(dt_step), x_pred.ndim)
             x_pred = torch.where(zero_mask, x_curr, x_pred)
             x_curr = x_pred

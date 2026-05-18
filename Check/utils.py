@@ -193,13 +193,11 @@ def full_serial_inference(model, x_context, dt_context, dt_list):
             )
             new_states.append((h_next, flux_next))
         states = new_states
-        z_curr = z_running
-        pred = model.decoder(
-            model._apply_decoder_skip(
-                z_curr.unsqueeze(1),
-                step_skip.unsqueeze(1),
-            )
+        z_curr = model._apply_decoder_skip(
+            z_running.unsqueeze(1),
+            step_skip.unsqueeze(1),
         )[:, 0]
+        pred = model.decoder(z_curr.unsqueeze(1))[:, 0]
         zero_mask = broadcast_mask(dt_value.abs() <= 1e-12, pred.ndim)
         pred = torch.where(zero_mask, x_curr, pred)
         x_curr = pred

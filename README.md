@@ -150,7 +150,7 @@ irregular short, and irregular medium evaluation grids.
 
 SwinTrans and ConvLSTM are fixed interval operational baselines. They are
 evaluated on regular 6 h rollouts only. On the 2000 and 2001 to 2002 three
-year protocol, UniPhy direct prediction reaches 24 h RMSE 0.043473, compared
+year protocol, UniPhy direct prediction reaches 24 h RMSE 0.044047, compared
 with 0.046662 for recursive SwinTrans and 0.104678 for recursive ConvLSTM.
 
 See [Exp/Ablation](Exp/Ablation/README.md) for the protocol.
