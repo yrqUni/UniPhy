@@ -71,6 +71,25 @@ over correct the dissipative latent trajectory during free forecasts. The Euler
 transition variant is unstable at long lead time, supporting the exact
 dissipative transition used by the baseline.
 
+## Fixed Interval Result
+
+The fixed interval operational comparison uses the same 2000 and 2001 training
+years and 2002 evaluation year. UniPhy direct prediction evaluates each lead
+time from the same context. SwinTrans and ConvLSTM are evaluated as recursive
+6 h single frame baselines.
+
+| Model | Mode | 6 h RMSE | 12 h RMSE | 18 h RMSE | 24 h RMSE |
+|:--|:--|--:|--:|--:|--:|
+| UniPhy | Direct | 0.027801 | 0.035220 | 0.040205 | 0.043473 |
+| UniPhy | Recursive | 0.027801 | 0.101160 | 0.101064 | 0.100896 |
+| SwinTrans | Recursive | 0.031179 | 0.039022 | 0.043511 | 0.046662 |
+| ConvLSTM | Recursive | 0.104625 | 0.104667 | 0.104675 | 0.104678 |
+
+The fixed interval study separates two capabilities. Direct continuous time
+prediction favors UniPhy at every evaluated lead time, while the recursive
+result identifies free rollout stabilization as the primary target for future
+medium range refinement.
+
 ## Plan
 
 ```bash
