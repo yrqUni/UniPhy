@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/pytorch-%E2%89%A52.1-ee4c2c.svg)](https://pytorch.org/)
 [![Backend](https://img.shields.io/badge/backend-PyTorch%20%2B%20optional%20Triton-success.svg)](#requirements)
-[![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-CC%20BY%20NC%204.0-green.svg)](LICENSE)
 
 </div>
 
@@ -139,21 +139,19 @@ regression stability.
 
 ## Ablations
 
-The ablation suite evaluates the full model, controlled single factor variants,
-and fixed interval operational baselines. It supports paired seeds,
-reproducible run manifests, RMSE, ACC, CRPS, and publication ready CSV, LaTeX,
-and JSON summaries.
+The ablation suite separates controlled UniPhy variants from external
+fixed interval baselines. It supports paired seeds, reproducible run
+manifests, RMSE, ACC, CRPS, and publication ready CSV, LaTeX, and JSON
+summaries.
 
 The three year controlled protocol identifies the residual free dissipative
 baseline as the strongest model across standard, regular 6 h, regular 12 h,
 irregular short, and irregular medium evaluation grids.
 
-SwinTrans and ConvLSTM are provided as fixed interval operational baselines.
-They are evaluated on regular 6 h rollouts only, including direct UniPhy
-prediction to 12 h and 24 h and recursive fixed step prediction for all models.
-On the 2000 and 2001 to 2002 three year protocol, UniPhy direct prediction
-reaches 24 h RMSE 0.043473, compared with 0.046662 for recursive SwinTrans
-and 0.104678 for recursive ConvLSTM.
+SwinTrans and ConvLSTM are fixed interval operational baselines. They are
+evaluated on regular 6 h rollouts only. On the 2000 and 2001 to 2002 three
+year protocol, UniPhy direct prediction reaches 24 h RMSE 0.043473, compared
+with 0.046662 for recursive SwinTrans and 0.104678 for recursive ConvLSTM.
 
 See [Exp/Ablation](Exp/Ablation/README.md) for the protocol.
 

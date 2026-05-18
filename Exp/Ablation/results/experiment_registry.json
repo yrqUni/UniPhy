@@ -1,0 +1,51 @@
+{
+  "formal_uniphy_ablation": {
+    "scope": "Single factor UniPhy model comparisons",
+    "variants": [
+      "baseline",
+      "A1_no_dt",
+      "A2_discrete_rnn",
+      "B1_complex_latent",
+      "B2_fixed_decay",
+      "C1_deterministic",
+      "C2_no_readout_residual",
+      "C3_constant_readout",
+      "D1_single_scale",
+      "D2_fixed_scale_weights",
+      "E1_l1_only",
+      "F1_etd1_integrator"
+    ],
+    "training_years": [
+      2000,
+      2001
+    ],
+    "evaluation_years": [
+      2002
+    ],
+    "epochs": 10,
+    "ranking_source": "Exp/Ablation/results/final_residual_free_summary.json"
+  },
+  "fixed_interval_operational_baselines": {
+    "scope": "Regular 6 h comparison against external single frame and recurrent baselines",
+    "models": [
+      "UniPhy direct",
+      "UniPhy recursive",
+      "SwinTrans recursive",
+      "ConvLSTM recursive"
+    ],
+    "training_years": [
+      2000,
+      2001
+    ],
+    "evaluation_years": [
+      2002
+    ],
+    "epochs": 10,
+    "ranking_source": "Exp/Ablation/results/fixed_interval_operational_summary.json"
+  },
+  "diagnostic_studies": {
+    "scope": "Small scale probes and numerical diagnostics used for design decisions",
+    "use_for_final_ranking": false,
+    "included_in_public_tables": false
+  }
+}

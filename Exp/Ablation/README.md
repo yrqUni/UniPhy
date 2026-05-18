@@ -4,7 +4,18 @@ The UniPhy ablation suite is a controlled single factor protocol. Each variant
 changes one modeling choice while keeping data, optimization, model scale,
 ensemble size, lead times, and climatology fixed.
 
-## Variant Set
+## Experiment Set
+
+A to F are controlled UniPhy ablations. Each one changes a single modeling
+factor inside UniPhy and is valid for direct comparison against the baseline
+under matched data, seed, optimizer, horizon, and climatology settings.
+
+G1 and G2 are external fixed interval baselines. They are not UniPhy ablations
+and are reported only in the regular 6 h operational comparison.
+
+Short probes, connectivity checks, and rollout diagnostics guide model design.
+They are not used for final ranking and should not be mixed with the formal
+tables.
 
 | Group | Variant | Isolated factor |
 |:--|:--|:--|
@@ -86,9 +97,9 @@ time from the same context. SwinTrans and ConvLSTM are evaluated as recursive
 | ConvLSTM | Recursive | 0.104625 | 0.104667 | 0.104675 | 0.104678 |
 
 The fixed interval study separates two capabilities. Direct continuous time
-prediction favors UniPhy at every evaluated lead time, while the recursive
-result identifies free rollout stabilization as the primary target for future
-medium range refinement.
+prediction favors UniPhy at every evaluated lead time. Recursive 6 h rollout
+measures autonomous stability under repeated model feedback and is treated as
+a distinct stabilization objective.
 
 ## Plan
 
