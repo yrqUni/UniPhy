@@ -133,7 +133,8 @@ def train_step(
             x_target.shape[1],
         )
         dt_rollout = [dt_input[:, i] for i in range(rollout_steps)]
-        rollout_pred = model.forward_rollout(
+        rollout_model = get_unwrapped_model(model)
+        rollout_pred = rollout_model.forward_rollout(
             data[:, :1],
             dt_data[:, :1],
             dt_rollout,
