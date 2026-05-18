@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/pytorch-%E2%89%A52.1-ee4c2c.svg)](https://pytorch.org/)
 [![Backend](https://img.shields.io/badge/backend-PyTorch%20%2B%20optional%20Triton-success.svg)](#requirements)
-[![License](https://img.shields.io/badge/license-CC BY NC 4.0-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-green.svg)](LICENSE)
 
 </div>
 
@@ -31,7 +31,7 @@ protocol is organized as a controlled single factor study.
 | Adaptive spatial mixing | Local, regional, and large scale branches are combined through learned scale weights. |
 | Parallel scan | PScan dispatches to Triton on supported CUDA shapes and otherwise uses a Torch Tree implementation. |
 | Verification suite | Fifteen numerical tests cover discretization, stochastic scaling, scan equivalence, rollout invariants, and regression stability. |
-| Ablation protocol | Twelve controlled variants isolate the main modeling choices with reproducible manifests and table export. |
+| Ablation protocol | Controlled UniPhy variants and fixed interval SwinTrans and ConvLSTM baselines support reproducible model comparisons. |
 
 ## Installation
 
@@ -139,13 +139,18 @@ regression stability.
 
 ## Ablations
 
-The ablation suite evaluates the full model and twelve single factor variants.
-It supports paired seeds, reproducible run manifests, RMSE, ACC, CRPS, and
-publication ready CSV, LaTeX, and JSON summaries.
+The ablation suite evaluates the full model, controlled single factor variants,
+and fixed interval operational baselines. It supports paired seeds,
+reproducible run manifests, RMSE, ACC, CRPS, and publication ready CSV, LaTeX,
+and JSON summaries.
 
 The three year controlled protocol identifies the residual free dissipative
 baseline as the strongest model across standard, regular 6 h, regular 12 h,
 irregular short, and irregular medium evaluation grids.
+
+SwinTrans and ConvLSTM are provided as fixed interval operational baselines.
+They are evaluated on regular 6 h rollouts only, including direct UniPhy
+prediction to 12 h and 24 h and recursive fixed step prediction for all models.
 
 See [Exp/Ablation](Exp/Ablation/README.md) for the protocol.
 

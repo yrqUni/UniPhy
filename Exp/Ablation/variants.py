@@ -1,6 +1,8 @@
 from copy import deepcopy
 
 from Exp.ERA5.runtime_config import DEFAULT_MODEL_CFG
+from Model.ConvLSTM import ConvLSTMModel
+from Model.SwinTrans import SwinTransModel
 from Model.UniPhy.ModelUniPhy import UniPhyModel
 
 from .components import (
@@ -47,6 +49,38 @@ def _build_complex_model(model_cfg: dict, device=None) -> UniPhyModel:
     cfg = _normalize_cfg(model_cfg)
     cfg["latent_dynamics"] = "complex"
     return _build_base_model(cfg, device=device)
+
+
+def _build_swin_model(model_cfg: dict, device=None) -> SwinTransModel:
+    cfg = _normalize_cfg(model_cfg)
+    model = SwinTransModel(
+        in_channels=int(cfg["in_channels"]),
+        out_channels=int(cfg["out_channels"]),
+        embed_dim=int(cfg["embed_dim"]),
+        depth=int(cfg["depth"]),
+        patch_size=tuple(cfg["patch_size"]),
+        img_height=int(cfg["img_height"]),
+        img_width=int(cfg["img_width"]),
+    )
+    if device is not None:
+        model = model.to(device)
+    return model
+
+
+def _build_convlstm_model(model_cfg: dict, device=None) -> ConvLSTMModel:
+    cfg = _normalize_cfg(model_cfg)
+    model = ConvLSTMModel(
+        in_channels=int(cfg["in_channels"]),
+        out_channels=int(cfg["out_channels"]),
+        embed_dim=int(cfg["embed_dim"]),
+        depth=int(cfg["depth"]),
+        patch_size=tuple(cfg["patch_size"]),
+        img_height=int(cfg["img_height"]),
+        img_width=int(cfg["img_width"]),
+    )
+    if device is not None:
+        model = model.to(device)
+    return model
 
 
 TRAINING_ONLY_VARIANTS = {"E1_l1_only"}
@@ -99,6 +133,14 @@ VARIANTS: dict = {
     "F1_etd1_integrator": (
         "Exact dissipative transition replaced by a first-order Euler transition.",
         lambda cfg, dev: apply_etd1_integrator(_build_base_model(cfg, dev)),
+    ),
+    "G1_swin_transformer": (
+        "Swin-style window-attention fixed-interval single-frame predictor.",
+        lambda cfg, dev: _build_swin_model(cfg, dev),
+    ),
+    "G2_convlstm": (
+        "ConvLSTM fixed-interval recurrent predictor.",
+        lambda cfg, dev: _build_convlstm_model(cfg, dev),
     ),
 }
 

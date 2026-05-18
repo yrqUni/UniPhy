@@ -20,6 +20,8 @@ ensemble size, lead times, and climatology fixed.
 | Spatial coupling | `D2_fixed_scale_weights` | Adaptive multi scale weighting |
 | Training objective | `E1_l1_only` | CRPS ensemble objective |
 | Temporal integration | `F1_etd1_integrator` | Exact dissipative transition |
+| Operational baseline | `G1_swin_transformer` | Fixed interval Swin style single frame prediction |
+| Operational baseline | `G2_convlstm` | Fixed interval ConvLSTM recurrence |
 
 `protocol.py` stores the public variant specifications. `variants.py` maps
 those specifications to model builders.
@@ -44,6 +46,11 @@ The time sensitivity study should evaluate every final variant on regular and
 irregular lead time grids. Report the same trained checkpoint across all grids
 so that changes in RMSE, ACC, and CRPS isolate the effect of inference time
 intervals.
+
+SwinTrans and ConvLSTM are fixed interval baselines. They should not be used in
+irregular time interval comparisons. Their protocol is restricted to regular
+6 h data. Report UniPhy direct prediction to each lead time together with
+recursive 6 h rollout for UniPhy, SwinTrans, and ConvLSTM.
 
 ## Reference Result
 
@@ -154,6 +161,25 @@ The default grids include regular 6 h and 12 h intervals plus irregular short
 and medium range schedules. The same trained checkpoint is evaluated on every
 grid so that the result isolates inference time interval behavior.
 
+## Fixed Interval Baselines
+
+```bash
+python -m Exp.Ablation.fixed_interval_compare \
+    --variant G1_swin_transformer \
+    --checkpoint Exp/Ablation/results/G1_swin_transformer/seed_42/ckpt_final.pt \
+    --data-input-dir /data/ERA5 \
+    --climatology-dir /data/ERA5 \
+    --climatology-year-range 2000,2001 \
+    --eval-year-range 2002,2002 \
+    --lead-times 6,12,18,24 \
+    --step-hours 6 \
+    --mode recursive \
+    --output-json Exp/Ablation/results/G1_swin_transformer/seed_42/fixed_6h_recursive.json
+```
+
+Use `--mode direct` for UniPhy direct lead time evaluation and `--mode
+recursive` for 6 h autoregressive rollout.
+
 ## Files
 
 | File | Purpose |
@@ -165,3 +191,4 @@ grid so that the result isolates inference time interval behavior.
 | `runner.py` | Distributed training entry point. |
 | `eval.py` | RMSE, ACC, and CRPS evaluation. |
 | `compare.py` | Multi seed aggregation and table export. |
+| `fixed_interval_compare.py` | Fixed 6 h direct and recursive comparison for UniPhy, SwinTrans, and ConvLSTM. |

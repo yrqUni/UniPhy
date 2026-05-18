@@ -139,6 +139,24 @@ VARIANT_SPECS = {
         hypothesis="Exact continuous-time propagation improves stability when inference uses variable dt.",
         expected_effect="Worse RMSE and ACC at long lead times, especially for variable dt.",
     ),
+    "G1_swin_transformer": VariantSpec(
+        name="G1_swin_transformer",
+        group="G. Operational baselines",
+        label="G1: SwinTrans",
+        factor="Single-frame transformer baseline",
+        intervention="Replace UniPhy with a Swin-style window-attention single-frame predictor.",
+        hypothesis="A fixed-interval single-frame transformer is competitive for one-step prediction but lacks native continuous-time rollout.",
+        expected_effect="Competitive fixed-step short-horizon skill with weaker variable-time generalization.",
+    ),
+    "G2_convlstm": VariantSpec(
+        name="G2_convlstm",
+        group="G. Operational baselines",
+        label="G2: ConvLSTM",
+        factor="Traditional recurrent convolutional baseline",
+        intervention="Replace UniPhy with a ConvLSTM fixed-step recurrent predictor.",
+        hypothesis="A recurrent convolutional model provides a classical fixed-interval autoregressive baseline.",
+        expected_effect="Useful fixed-step reference with weaker medium-range stability than UniPhy.",
+    ),
 }
 
 

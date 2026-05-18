@@ -70,7 +70,12 @@ def train_step(
     x_target = data[:, 1:]
     dt_input = dt_data[:, 1:]
 
-    is_deterministic = variant in ("E1_l1_only", "C1_deterministic")
+    is_deterministic = variant in (
+        "E1_l1_only",
+        "C1_deterministic",
+        "G1_swin_transformer",
+        "G2_convlstm",
+    )
     n_members = 1 if is_deterministic else max(ensemble_size, 2)
 
     ensemble_preds = []
@@ -95,7 +100,12 @@ def train_step(
         ensemble_std = ensemble_stack.std(dim=0).mean()
         loss = l1_loss + crps_loss
 
-    basis_reg_weight = 0.0 if variant == "B1_complex_latent" else float(cfg["train"].get("basis_reg_weight", 0.01))
+    basis_free_variants = (
+        "B1_complex_latent",
+        "G1_swin_transformer",
+        "G2_convlstm",
+    )
+    basis_reg_weight = 0.0 if variant in basis_free_variants else float(cfg["train"].get("basis_reg_weight", 0.01))
     if basis_reg_weight > 0.0:
         basis_reg = compute_basis_residual(model)
         loss = loss + basis_reg_weight * basis_reg

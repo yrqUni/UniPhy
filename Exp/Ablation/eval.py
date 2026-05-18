@@ -148,7 +148,12 @@ def evaluate(args):
     ensemble_size = args.ensemble_size or int(
         model_cfg.get("ensemble_size", DEFAULT_MODEL_CFG["ensemble_size"])
     )
-    if args.variant in ("C1_deterministic", "E1_l1_only"):
+    if args.variant in (
+        "C1_deterministic",
+        "E1_l1_only",
+        "G1_swin_transformer",
+        "G2_convlstm",
+    ):
         ensemble_size = 1
 
     clim_dir = args.climatology_dir or args.data_input_dir
@@ -189,7 +194,12 @@ def evaluate(args):
     processed = 0
     t0 = time.time()
 
-    is_det = args.variant in ("C1_deterministic", "E1_l1_only")
+    is_det = args.variant in (
+        "C1_deterministic",
+        "E1_l1_only",
+        "G1_swin_transformer",
+        "G2_convlstm",
+    )
 
     with torch.no_grad():
         for batch_idx, (data, dt_data) in enumerate(loader):
