@@ -1,0 +1,27 @@
+{
+  "variant": "H1_dt_relaxation_rnn",
+  "status": "screened_out_after_one_epoch_probe",
+  "reason": "fixed_interval_24h_rmse_worse_than_baseline_and_A2",
+  "checkpoint": "runs/ablation/candidate_dt_relaxation/H1_dt_relaxation_rnn/seed_42_epoch1b/ckpt_final.pt",
+  "num_samples": 200,
+  "overall": {
+    "rmse": {
+      "6": 0.028944,
+      "12": 0.040056,
+      "18": 0.045942,
+      "24": 0.049768
+    },
+    "acc": {
+      "6": 0.735247,
+      "12": 0.620059,
+      "18": 0.539617,
+      "24": 0.479444
+    },
+    "crps": {
+      "6": 0.016828,
+      "12": 0.023133,
+      "18": 0.026641,
+      "24": 0.029076
+    }
+  }
+}
