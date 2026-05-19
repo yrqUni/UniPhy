@@ -204,9 +204,11 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
 def load_pretrained(path, model, rank, logger):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     target = get_unwrapped_model(model)
-    target.load_state_dict(ckpt["model"], strict=True)
+    incompatible = target.load_state_dict(ckpt["model"], strict=False)
     if rank == 0:
-        logger.info(f"Loaded pretrained ckpt={path}")
+        logger.info(
+            f"Loaded pretrained ckpt={path} missing_keys={len(incompatible.missing_keys)} unexpected_keys={len(incompatible.unexpected_keys)}"
+        )
 
 
 def train(cfg, variant, num_workers=4, ckpt_path=None, pretrained_ckpt=None, seed=42):
