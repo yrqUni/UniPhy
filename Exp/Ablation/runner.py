@@ -120,6 +120,7 @@ def train_step(
         "A2_discrete_rnn",
         "B1_complex_latent",
         "B2_fixed_decay",
+        "H1_dt_relaxation_rnn",
         "C1_deterministic",
         "C2_no_readout_residual",
         "C3_constant_readout",

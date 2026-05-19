@@ -144,6 +144,96 @@ class _RealElmanBlock(nn.Module):
         return z_next, h_next.reshape(batch_size * height * width, 1, dim), flux_next
 
 
+def apply_dt_relaxation_rnn(model, dim):
+    device = next(model.parameters()).device
+    new_blocks = []
+    for block in model.blocks:
+        new_blocks.append(_RealDtRelaxationBlock(block, dim).to(device))
+    model.blocks = nn.ModuleList(new_blocks)
+    return model
+
+
+class _RealDtRelaxationBlock(_RealElmanBlock):
+
+    def __init__(self, base_block, dim):
+        super().__init__(base_block, dim)
+        self.relax_logit = nn.Parameter(torch.zeros(dim))
+
+    def _relax_weight(self, dt, target_ndim):
+        rate = F.softplus(self.relax_logit).to(dt.dtype) / self.prop.dt_ref
+        while rate.ndim < target_ndim:
+            rate = rate.unsqueeze(0)
+        dt_view = dt
+        while dt_view.ndim < target_ndim:
+            dt_view = dt_view.unsqueeze(-1)
+        return 1.0 - torch.exp(-rate * dt_view)
+
+    def _candidate(self, h_prev_hw, forcing):
+        return torch.tanh(self.rnn_h(h_prev_hw) + self.rnn_u(forcing))
+
+    def forward(self, x, h_prev, dt_seq, flux_prev, noise_seq=None):
+        del flux_prev, noise_seq
+        batch_size, steps, dim, height, width = x.shape
+        x_real = x.real if torch.is_complex(x) else x
+        x_flat = x_real.contiguous().reshape(batch_size * steps, dim, height, width)
+        x_flat = self.spatial_mixer(x_flat)
+        x_seq = x_flat.reshape(batch_size, steps, dim, height, width)
+        x_hw = x_seq.permute(0, 1, 3, 4, 2).contiguous()
+        h_cur = h_prev.real if torch.is_complex(h_prev) else h_prev
+        h_cur = h_cur.contiguous().reshape(batch_size, height, width, dim)
+        rows = []
+        for t in range(steps):
+            dt_t = dt_seq[:, t]
+            cand = self._candidate(h_cur, x_hw[:, t])
+            weight = self._relax_weight(dt_t, 4)
+            h_next = h_cur + weight * (cand - h_cur)
+            zero_mask = _expand_batch_mask(_dt_is_zero(dt_t), h_next.ndim)
+            h_cur = torch.where(zero_mask, x_hw[:, t], h_next)
+            rows.append(h_cur)
+        seq = torch.stack(rows, dim=1)
+        lead_time = torch.cumsum(dt_seq, dim=1)
+        combined = self.base._decode_sequence(seq, lead_time)
+        zero_mask = _expand_batch_mask(_dt_is_zero(dt_seq), combined.ndim)
+        combined = torch.where(zero_mask, x_real, combined)
+        h_out = seq[:, -1].reshape(batch_size * height * width, 1, dim)
+        flux_out = seq[:, -1].mean(dim=(1, 2))
+        return combined, h_out, flux_out
+
+    def forward_step(
+        self,
+        x_curr,
+        x_next,
+        h_prev,
+        dt_step,
+        dt_next,
+        flux_prev,
+        noise_step=None,
+        lead_time=None,
+    ):
+        del x_next, dt_next, flux_prev, noise_step
+        batch_size, dim, height, width = x_curr.shape
+        x_real = x_curr.real if torch.is_complex(x_curr) else x_curr
+        x_mix = self.spatial_mixer(x_real.contiguous())
+        x_hw = x_mix.permute(0, 2, 3, 1).contiguous()
+        h_cur = h_prev.real if torch.is_complex(h_prev) else h_prev
+        h_cur = h_cur.contiguous().reshape(batch_size, height, width, dim)
+        cand = self._candidate(h_cur, x_hw)
+        weight = self._relax_weight(dt_step, 4)
+        h_next = h_cur + weight * (cand - h_cur)
+        zero_mask = _expand_batch_mask(_dt_is_zero(dt_step), h_next.ndim)
+        h_next = torch.where(zero_mask, x_hw, h_next)
+        if lead_time is None:
+            lead_time = dt_step
+        z_next = self.base._decode_sequence(h_next.unsqueeze(1), lead_time.unsqueeze(1))[:, 0]
+        z_next = torch.where(
+            _expand_batch_mask(_dt_is_zero(dt_step), z_next.ndim),
+            x_real,
+            z_next,
+        )
+        flux_next = h_next.mean(dim=(1, 2))
+        return z_next, h_next.reshape(batch_size * height * width, 1, dim), flux_next
+
+
 class DeterministicWrapper(nn.Module):
 
     def __init__(self, base_model: UniPhyModel):

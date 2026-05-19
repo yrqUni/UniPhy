@@ -8,6 +8,7 @@ from Model.UniPhy.ModelUniPhy import UniPhyModel
 from .components import (
     NoTimeDtWrapper,
     DeterministicWrapper,
+    apply_dt_relaxation_rnn,
     apply_etd1_integrator,
     apply_fixed_decay,
     apply_fixed_scale_weights,
@@ -103,6 +104,10 @@ VARIANTS: dict = {
         "Dissipative real latent replaced by the previous complex eigenspace pathway.",
         lambda cfg, dev: _build_complex_model(cfg, dev),
     ),
+    "H1_dt_relaxation_rnn": (
+        "Dt-scaled deterministic relaxation recurrence.",
+        lambda cfg, dev: _build_dt_relaxation_rnn(cfg, dev),
+    ),
     "B2_fixed_decay": (
         "Learned continuous decay spectrum replaced by a fixed reference decay.",
         lambda cfg, dev: apply_fixed_decay(_build_base_model(cfg, dev)),
@@ -152,6 +157,12 @@ def _build_discrete_rnn(model_cfg: dict, device=None) -> UniPhyModel:
     cfg = _normalize_cfg(model_cfg)
     model = _build_base_model(model_cfg, device=device)
     return apply_elman_rnn(model, int(cfg["embed_dim"]))
+
+
+def _build_dt_relaxation_rnn(model_cfg: dict, device=None) -> UniPhyModel:
+    cfg = _normalize_cfg(model_cfg)
+    model = _build_base_model(model_cfg, device=device)
+    return apply_dt_relaxation_rnn(model, int(cfg["embed_dim"]))
 
 
 def build_variant(variant: str, model_cfg: dict, device=None):
