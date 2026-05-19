@@ -1,5 +1,6 @@
 {
   "metric": "fixed_interval_recursive_6h_200_samples",
+  "status": "partial_until_B1_and_final_model_complete",
   "items": [
     {
       "variant": "A2_discrete_rnn",
@@ -64,6 +65,32 @@
         "12": 0.035945,
         "18": 0.04229,
         "24": 0.046153
+      }
+    },
+    {
+      "variant": "C3_constant_readout",
+      "num_samples": 200,
+      "rmse_24": 0.047256,
+      "acc_24": 0.517724,
+      "crps_24": 0.025225,
+      "rmse": {
+        "6": 0.030064,
+        "12": 0.037431,
+        "18": 0.043228,
+        "24": 0.047256
+      }
+    },
+    {
+      "variant": "C2_no_readout_residual",
+      "num_samples": 200,
+      "rmse_24": 0.048626,
+      "acc_24": 0.475479,
+      "crps_24": 0.026601,
+      "rmse": {
+        "6": 0.036144,
+        "12": 0.041134,
+        "18": 0.04546,
+        "24": 0.048626
       }
     }
   ]
