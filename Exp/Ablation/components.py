@@ -348,7 +348,7 @@ def apply_readout_residual(model: UniPhyModel) -> UniPhyModel:
     return model
 
 
-class _RealReadoutResidualBlock(nn.Module):
+class _RealReadoutResidualBlock(_RealEulerBlock):
 
     def _readout_weight(self, lead_time, target_ndim):
         rate = F.softplus(self.readout_decay_logit).to(lead_time.dtype)
