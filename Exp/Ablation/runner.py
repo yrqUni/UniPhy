@@ -117,6 +117,7 @@ def train_step(
     rollout_variants = (
         "baseline",
         "A1_no_dt",
+        "A2_discrete_rnn",
         "B1_complex_latent",
         "B2_fixed_decay",
         "C1_deterministic",
