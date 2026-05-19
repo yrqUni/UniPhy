@@ -13,9 +13,9 @@ under matched data, seed, optimizer, horizon, and climatology settings.
 G1 and G2 are external fixed interval baselines. They are not UniPhy ablations
 and are reported only in the regular 6 h operational comparison.
 
-Short probes, connectivity checks, and rollout diagnostics guide model design.
-They are not used for final ranking and should not be mixed with the formal
-tables.
+Compact diagnostic studies may be used to guide model design. Final rankings
+come only from matched formal protocols with fixed data, seed, checkpoint,
+lead times, and climatology.
 
 | Group | Variant | Isolated factor |
 |:--|:--|:--|
@@ -85,22 +85,39 @@ dissipative transition used by the baseline.
 ## Fixed Interval Result
 
 The fixed interval operational comparison uses the same 2000 and 2001 training
-years and 2002 evaluation year. UniPhy direct prediction evaluates each lead
-time from the same context. SwinTrans and ConvLSTM are evaluated as recursive
-6 h single frame baselines.
+years and 2002 evaluation year. UniPhy uses the residual free checkpoint with
+four rollout consistency refinement epochs. SwinTrans and ConvLSTM are
+evaluated as recursive 6 h single frame baselines.
 
-| Model | Mode | 6 h RMSE | 12 h RMSE | 18 h RMSE | 24 h RMSE |
-|:--|:--|--:|--:|--:|--:|
-| UniPhy | Direct | 0.028081 | 0.054402 | 0.075027 | 0.086508 |
-| UniPhy | Recursive | 0.028081 | 0.054402 | 0.075027 | 0.086508 |
-| SwinTrans | Recursive | 0.031179 | 0.039022 | 0.043511 | 0.046662 |
-| ConvLSTM | Recursive | 0.104625 | 0.104667 | 0.104675 | 0.104678 |
+| Model | Mode | 6 h RMSE | 12 h RMSE | 18 h RMSE | 24 h RMSE | 24 h ACC | 24 h CRPS |
+|:--|:--|--:|--:|--:|--:|--:|--:|
+| UniPhy | Recursive | 0.026888 | 0.035603 | 0.041741 | 0.045494 | 0.571267 | 0.026295 |
+| SwinTrans | Recursive | 0.031179 | 0.039022 | 0.043511 | 0.046662 | 0.561295 | 0.027208 |
+| ConvLSTM | Recursive | 0.104625 | 0.104667 | 0.104675 | 0.104678 | 0.020037 | 0.064339 |
 
-The fixed interval study reports a single physical-time rollout path for
-UniPhy. Direct and recursive UniPhy evaluation are equivalent by construction
-when the requested lead time is an integer multiple of the reference interval.
-Under this fixed 6 h protocol, SwinTrans is the stronger 24 h fixed-interval
-baseline, while UniPhy keeps native support for continuous-time evaluation.
+The fixed interval study reports a single physical time rollout path for
+UniPhy. Direct and recursive UniPhy evaluation are equivalent when the
+requested lead time is an integer multiple of the reference interval. On a
+matched 200 sample verification, 24 h direct RMSE is 0.046379 and recursive
+RMSE is 0.046375, which matches to rounded numerical precision.
+
+
+## Time Sensitivity Result
+
+The rollout refined UniPhy checkpoint is evaluated on the same 2002 target year
+across regular and irregular inference grids. This isolates the continuous
+time behavior of the learned dynamics from checkpoint or data changes.
+
+| Grid | Leads | Samples | 24 h or nearest RMSE | Longest lead RMSE |
+|:--|:--|--:|--:|--:|
+| Regular 6 h | 6, 12, 18, 24 | 1456 | 0.045044 | 0.045044 |
+| Regular 12 h | 12, 24, 36, 48 | 1452 | 0.045043 | 0.052977 |
+| Irregular short | 3, 9, 21, 33 | 1454 | 0.040720 at 21 h | 0.047154 |
+| Irregular medium | 6, 18, 42, 78, 120 | 1440 | 0.041277 at 18 h | 0.138930 |
+
+The 24 h result is stable across the regular 6 h and 12 h grids. Irregular
+grids show the expected growth of error with lead time while preserving native
+nonuniform interval evaluation.
 
 ## Plan
 
@@ -115,7 +132,7 @@ python -m Exp.Ablation.plan \
     --gpus <gpus>
 ```
 
-For the three year screening protocol:
+For the three year controlled protocol:
 
 ```bash
 python -m Exp.Ablation.plan \
@@ -172,8 +189,8 @@ python -m Exp.Ablation.compare \
     --output-json Exp/Ablation/results/summary.json
 ```
 
-`Exp/Ablation/results` is reserved for generated outputs from local
-experiments and concise public summaries.
+`Exp/Ablation/results` contains concise public summaries. Full local outputs
+should stay in run directories unless they are selected for release.
 
 ## Time Sensitivity
 

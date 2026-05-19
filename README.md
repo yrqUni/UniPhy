@@ -7,14 +7,15 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/pytorch-%E2%89%A52.1-ee4c2c.svg)](https://pytorch.org/)
 [![Backend](https://img.shields.io/badge/backend-PyTorch%20%2B%20optional%20Triton-success.svg)](#requirements)
-[![License](https://img.shields.io/badge/license-CC%20BY%20NC%204.0-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-CC--BY--NC%204.0-green.svg)](LICENSE)
 
 </div>
 
 UniPhy is a PyTorch research framework for probabilistic forecasting of
 spatio temporal physical fields. It combines continuous time dissipative latent
-dynamics, stochastic ensemble generation, adaptive spatial mixing, residual free
-latent readout, and efficient parallel scan execution.
+dynamics, stochastic ensemble generation, adaptive spatial mixing, rollout
+consistency refinement, residual free latent readout, and efficient parallel
+scan execution.
 
 The project is designed for transparent scientific use. Core numerical
 contracts are covered by a dedicated verification suite, and the ablation
@@ -145,14 +146,19 @@ manifests, RMSE, ACC, CRPS, and publication ready CSV, LaTeX, and JSON
 summaries.
 
 The three year controlled protocol identifies the residual free dissipative
-baseline as the strongest model across standard, regular 6 h, regular 12 h,
-irregular short, and irregular medium evaluation grids.
+baseline as the strongest UniPhy variant across standard, regular 6 h,
+regular 12 h, irregular short, and irregular medium evaluation grids. A
+rollout consistency refinement further aligns fixed interval forecasts with
+the semigroup structure expected from continuous time dynamics.
 
 SwinTrans and ConvLSTM are fixed interval operational baselines. They are
-evaluated on regular 6 h rollouts only. On the 2000 and 2001 to 2002 three
-year protocol, UniPhy direct and recursive evaluation are equivalent by
-construction and reach 24 h RMSE 0.086508. The fixed interval SwinTrans
-baseline reaches 0.046662, and ConvLSTM reaches 0.104678.
+evaluated on regular 6 h rollouts only. On the 2000 and 2001 to 2002 protocol,
+rollout refined UniPhy reaches 24 h RMSE 0.045494, ACC 0.571267, and CRPS
+0.026295. SwinTrans reaches 24 h RMSE 0.046662, ACC 0.561295, and CRPS
+0.027208. ConvLSTM reaches 24 h RMSE 0.104678. UniPhy direct and recursive
+fixed interval evaluation match to rounded numerical precision under the same
+checkpoint. The same UniPhy checkpoint also preserves consistent 24 h behavior
+on regular 6 h and 12 h inference grids, with RMSE 0.045044 and 0.045043.
 
 See [Exp/Ablation](Exp/Ablation/README.md) for the protocol.
 

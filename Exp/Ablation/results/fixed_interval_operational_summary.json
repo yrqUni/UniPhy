@@ -24,51 +24,38 @@
       "rmse",
       "acc",
       "crps"
-    ]
+    ],
+    "model_selection": "UniPhy rollout consistency refinement selected by controlled validation, then evaluated once on the full 2002 fixed interval protocol.",
+    "uniphy_refinement": {
+      "pretrained_stage": "2000,2001 ten epoch residual free UniPhy baseline",
+      "refinement_epochs": 4,
+      "rollout_loss_weight": 0.15,
+      "rollout_loss_steps": 4,
+      "commit": "e6ae56a"
+    }
   },
   "rows": [
     {
       "variant": "UniPhy",
-      "mode": "direct",
-      "rmse": {
-        "6": 0.028081,
-        "12": 0.054402,
-        "18": 0.075027,
-        "24": 0.086508
-      },
-      "acc": {
-        "6": 0.767408,
-        "12": 0.474586,
-        "18": 0.227905,
-        "24": 0.113066
-      },
-      "crps": {
-        "6": 0.016111,
-        "12": 0.035632,
-        "18": 0.049784,
-        "24": 0.057505
-      }
-    },
-    {
-      "variant": "UniPhy",
       "mode": "recursive",
+      "training": "rollout_consistency_refined",
       "rmse": {
-        "6": 0.028081,
-        "12": 0.054402,
-        "18": 0.075027,
-        "24": 0.086508
+        "6": 0.026888,
+        "12": 0.035603,
+        "18": 0.041741,
+        "24": 0.045494
       },
       "acc": {
-        "6": 0.767408,
-        "12": 0.474586,
-        "18": 0.227905,
-        "24": 0.113066
+        "6": 0.777417,
+        "12": 0.709853,
+        "18": 0.633141,
+        "24": 0.571267
       },
       "crps": {
-        "6": 0.016111,
-        "12": 0.035632,
-        "18": 0.049784,
-        "24": 0.057505
+        "6": 0.015208,
+        "12": 0.019744,
+        "18": 0.023729,
+        "24": 0.026295
       }
     },
     {
@@ -91,7 +78,8 @@
         "12": 0.021261,
         "18": 0.024793,
         "24": 0.027208
-      }
+      },
+      "training": "ten_epoch_fixed_interval_baseline"
     },
     {
       "variant": "ConvLSTM",
@@ -113,7 +101,53 @@
         "12": 0.064337,
         "18": 0.064338,
         "24": 0.064339
-      }
+      },
+      "training": "ten_epoch_fixed_interval_baseline"
     }
-  ]
+  ],
+  "direct_recursive_check": {
+    "num_samples": 200,
+    "direct": {
+      "rmse": {
+        "6": 0.02722,
+        "12": 0.036177,
+        "18": 0.042515,
+        "24": 0.046379
+      },
+      "acc": {
+        "6": 0.750871,
+        "12": 0.669649,
+        "18": 0.57693,
+        "24": 0.502953
+      },
+      "crps": {
+        "6": 0.015444,
+        "12": 0.020117,
+        "18": 0.024242,
+        "24": 0.026891
+      }
+    },
+    "recursive": {
+      "rmse": {
+        "6": 0.027218,
+        "12": 0.036174,
+        "18": 0.04252,
+        "24": 0.046375
+      },
+      "acc": {
+        "6": 0.750859,
+        "12": 0.669649,
+        "18": 0.576857,
+        "24": 0.502913
+      },
+      "crps": {
+        "6": 0.015445,
+        "12": 0.020116,
+        "18": 0.024245,
+        "24": 0.026891
+      }
+    },
+    "max_abs_rmse_delta": 5e-06,
+    "interpretation": "Direct and recursive UniPhy fixed interval evaluation match to rounded numerical precision."
+  }
 }

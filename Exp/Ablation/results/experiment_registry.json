@@ -47,5 +47,23 @@
     "scope": "Small scale probes and numerical diagnostics used for design decisions",
     "use_for_final_ranking": false,
     "included_in_public_tables": false
+  },
+  "time_sensitivity": {
+    "scope": "Regular and irregular inference time grids for the rollout consistency refined UniPhy checkpoint",
+    "model": "UniPhy",
+    "training_years": [
+      2000,
+      2001
+    ],
+    "evaluation_years": [
+      2002
+    ],
+    "grids": [
+      "regular_6h",
+      "regular_12h",
+      "irregular_short",
+      "irregular_medium"
+    ],
+    "ranking_source": "Exp/Ablation/results/time_sensitivity_summary.json"
   }
 }
