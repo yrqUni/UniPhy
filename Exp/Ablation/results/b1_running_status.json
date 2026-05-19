@@ -1,7 +1,13 @@
 {
   "variant": "B1_complex_latent",
-  "status": "running_formal_4_epoch",
-  "epoch1_checkpoint": "runs/ablation/formal_complete_rollout_consistency/B1_complex_latent/seed_42/ckpt_epoch1.pt",
+  "status": "resumed_formal_run_on_4_gpus_from_epoch2_checkpoint",
+  "resume_checkpoint": "runs/ablation/formal_complete_rollout_consistency/B1_complex_latent/seed_42/ckpt_epoch2.pt",
+  "active_gpus": [
+    4,
+    5,
+    6,
+    7
+  ],
   "final_checkpoint": "pending",
-  "latest_log_line": "2026-05-20 00:09:47,789 - INFO - [B1_complex_latent E002 B0022] Loss=0.0274 L1=0.0126 CRPS=0.0118 RMSE=0.0219 Basis=0.0000 Rollout=0.0196 Grad=0.4752"
+  "latest_log_line": "2026-05-20 07:10:08,754 - INFO - [B1_complex_latent E003 B0030] Loss=0.0321 L1=0.0148 CRPS=0.0139 RMSE=0.0268 Basis=0.0000 Rollout=0.0224 Grad=0.2120"
 }
