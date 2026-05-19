@@ -75,6 +75,15 @@ VARIANT_SPECS = {
         hypothesis="Channel-wise learned decay constants are necessary for multi-scale atmospheric memory.",
         expected_effect="Higher RMSE and lower ACC at 120 h and 240 h.",
     ),
+    "H1_dt_relaxation_rnn": VariantSpec(
+        name="H1_dt_relaxation_rnn",
+        group="H. Candidate dynamics",
+        label="H1: dt relaxation recurrence",
+        factor="Low-variance physical-time recurrence",
+        intervention="Replace stochastic latent propagation with a deterministic recurrence relaxed by 1 - exp(-lambda dt).",
+        hypothesis="A low-variance recurrence with explicit physical-time relaxation preserves the short-horizon skill of discrete recurrence while retaining dt sensitivity.",
+        expected_effect="Lower fixed-interval RMSE than stochastic UniPhy and better variable-dt behavior than dt-agnostic recurrence.",
+    ),
     "C1_deterministic": VariantSpec(
         name="C1_deterministic",
         group="C. Probabilistic dynamics",
