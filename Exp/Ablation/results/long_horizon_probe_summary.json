@@ -144,9 +144,39 @@
         "72": 1.109608,
         "120": 0.659158
       }
+    },
+    "optimizer_group_probe_360step": {
+      "rmse": {
+        "6": 0.098089,
+        "12": 0.102625,
+        "18": 0.106569,
+        "24": 0.109619,
+        "48": 0.118846,
+        "72": 1.104705,
+        "120": 1.079697
+      },
+      "acc": {
+        "6": 0.089905,
+        "12": 0.070342,
+        "18": 0.060303,
+        "24": 0.053721,
+        "48": 0.046542,
+        "72": 0.030503,
+        "120": 0.030124
+      },
+      "crps": {
+        "6": 0.065983,
+        "12": 0.070053,
+        "18": 0.072747,
+        "24": 0.075777,
+        "48": 0.082758,
+        "72": 0.868157,
+        "120": 0.863143
+      }
     }
   },
   "notes": {
-    "latent_consistency": "weight 0.05 became unstable during training; weight 0.005 remained trainable in a short probe but degraded recursive evaluation."
+    "latent_consistency": "weight 0.05 became unstable during training; weight 0.005 remained trainable in a short probe but degraded recursive evaluation.",
+    "optimizer_group_probe": "RNN-specific learning rate grouping alone did not recover skill; 6-24h and 72-120h both degraded sharply relative to the current deterministic baseline."
   }
 }
