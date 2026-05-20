@@ -44,6 +44,7 @@ def parse_args():
     p.add_argument("--config", default=CONFIG_PATH)
     p.add_argument("--data-input-dir", default=None)
     p.add_argument("--train-year-range", default=None)
+    p.add_argument("--sample-offsets-hours", default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--log-path", default=None)
@@ -371,6 +372,7 @@ def main():
         args.config,
         data_input_dir=args.data_input_dir,
         train_year_range=args.train_year_range,
+        sample_offsets_hours=args.sample_offsets_hours,
         epochs=args.epochs,
         log_path=args.log_path,
         ckpt_dir=args.ckpt_dir,
