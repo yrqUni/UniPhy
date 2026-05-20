@@ -326,10 +326,22 @@ def build_distributed_loader(
 
 
 def build_adamw_optimizer(model, cfg):
+    rnn_params = []
+    other_params = []
+    rnn_names = ("rnn_h.weight", "rnn_u.weight", "rnn_u.bias")
+    for name, param in model.named_parameters():
+        if any(key in name for key in rnn_names):
+            rnn_params.append(param)
+        else:
+            other_params.append(param)
+    base_lr = float(cfg["train"]["lr"])
+    weight_decay = float(cfg["train"]["weight_decay"])
     return torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        weight_decay=float(cfg["train"]["weight_decay"]),
+        [
+            {"params": other_params, "lr": base_lr},
+            {"params": rnn_params, "lr": base_lr * 3.0},
+        ],
+        weight_decay=weight_decay,
     )
 
 
