@@ -7,16 +7,10 @@ from Model.UniPhy.ModelUniPhy import UniPhyModel
 
 from .components import (
     NoTimeDtWrapper,
-    DeterministicWrapper,
-    apply_dt_relaxation_rnn,
-    apply_etd1_integrator,
-    apply_fixed_decay,
     apply_fixed_scale_weights,
-    apply_constant_readout,
-    apply_readout_residual,
     apply_single_scale_mixer,
 )
-from .protocol import VARIANT_ORDER, VARIANT_SPECS, get_variant_spec
+from .protocol import VARIANT_ORDER, get_variant_spec
 
 
 def _normalize_cfg(model_cfg: dict) -> dict:
@@ -43,9 +37,6 @@ def _build_base_model(model_cfg: dict, device=None) -> UniPhyModel:
         model = model.to(device)
     return model
 
-
-def _build_complex_model(model_cfg: dict, device=None) -> UniPhyModel:
-    return _build_base_model(model_cfg, device=device)
 
 def _build_swin_model(model_cfg: dict, device=None) -> SwinTransModel:
     cfg = _normalize_cfg(model_cfg)
@@ -82,90 +73,44 @@ def _build_convlstm_model(model_cfg: dict, device=None) -> ConvLSTMModel:
 
 TRAINING_ONLY_VARIANTS = {"E1_l1_only"}
 
-VARIANTS: dict = {
+
+VARIANTS = {
     "baseline": (
-        "Full UniPhy model, no modifications.",
+        "Active deterministic UniPhy model.",
         lambda cfg, dev: _build_base_model(cfg, dev),
     ),
     "A1_no_dt": (
-        "Variable dt replaced by constant dt_ref everywhere.",
+        "Every time interval is replaced by dt_ref.",
         lambda cfg, dev: NoTimeDtWrapper(_build_base_model(cfg, dev)),
     ),
-    "A2_discrete_rnn": (
-        "SDE propagator replaced by a plain Elman RNN (dt-agnostic).",
-        lambda cfg, dev: _build_discrete_rnn(cfg, dev),
-    ),
-    "B1_complex_latent": (
-        "Dissipative real latent replaced by the previous complex eigenspace pathway.",
-        lambda cfg, dev: _build_complex_model(cfg, dev),
-    ),
-    "H1_dt_relaxation_rnn": (
-        "Dt-scaled deterministic relaxation recurrence.",
-        lambda cfg, dev: _build_dt_relaxation_rnn(cfg, dev),
-    ),
-    "B2_fixed_decay": (
-        "Learned continuous decay spectrum replaced by a fixed reference decay.",
-        lambda cfg, dev: apply_fixed_decay(_build_base_model(cfg, dev)),
-    ),
-    "C1_deterministic": (
-        "Stochastic term zeroed; fully deterministic dynamics.",
-        lambda cfg, dev: DeterministicWrapper(_build_base_model(cfg, dev)),
-    ),
-    "C2_no_readout_residual": (
-        "Time-decayed latent readout residual added to each temporal block.",
-        lambda cfg, dev: apply_readout_residual(_build_base_model(cfg, dev)),
-    ),
-    "C3_constant_readout": (
-        "Readout residual kept constant across physical lead time.",
-        lambda cfg, dev: apply_constant_readout(_build_base_model(cfg, dev)),
-    ),
     "D1_single_scale": (
-        "MultiScaleSpatialMixer uses only the local 3×3 branch.",
+        "The spatial mixer keeps only the local branch.",
         lambda cfg, dev: apply_single_scale_mixer(_build_base_model(cfg, dev)),
     ),
     "D2_fixed_scale_weights": (
-        "Multi-scale spatial weights fixed to uniform branches.",
+        "The adaptive spatial scale gate is fixed to uniform logits.",
         lambda cfg, dev: apply_fixed_scale_weights(_build_base_model(cfg, dev)),
     ),
     "E1_l1_only": (
-        "L1 loss only; CRPS term removed from training objective.",
+        "The deterministic objective uses L1 only.",
         lambda cfg, dev: _build_base_model(cfg, dev),
     ),
-    "F1_etd1_integrator": (
-        "Exact dissipative transition replaced by a first-order Euler transition.",
-        lambda cfg, dev: apply_etd1_integrator(_build_base_model(cfg, dev)),
-    ),
     "G1_swin_transformer": (
-        "Swin-style window-attention fixed-interval single-frame predictor.",
+        "Swin style fixed interval single frame predictor.",
         lambda cfg, dev: _build_swin_model(cfg, dev),
     ),
     "G2_convlstm": (
-        "ConvLSTM fixed-interval recurrent predictor.",
+        "ConvLSTM fixed interval recurrent predictor.",
         lambda cfg, dev: _build_convlstm_model(cfg, dev),
     ),
 }
-
-
-def _build_discrete_rnn(model_cfg: dict, device=None) -> UniPhyModel:
-    from .components import apply_elman_rnn
-
-    cfg = _normalize_cfg(model_cfg)
-    model = _build_base_model(model_cfg, device=device)
-    return apply_elman_rnn(model, int(cfg["embed_dim"]))
-
-
-def _build_dt_relaxation_rnn(model_cfg: dict, device=None) -> UniPhyModel:
-    cfg = _normalize_cfg(model_cfg)
-    model = _build_base_model(model_cfg, device=device)
-    return apply_dt_relaxation_rnn(model, int(cfg["embed_dim"]))
 
 
 def build_variant(variant: str, model_cfg: dict, device=None):
     variant = str(variant).strip()
     if variant not in VARIANTS:
         raise ValueError(f"Unknown variant '{variant}'. Available: {sorted(VARIANTS)}")
-    _, builder = VARIANTS[variant]
-    return builder(model_cfg, device)
+    return VARIANTS[variant][1](model_cfg, device)
 
 
 def list_variants(include_baseline=True):
@@ -182,22 +127,7 @@ def describe_variant(variant: str) -> dict:
 
 
 def build_variant_optimizer(model, cfg: dict, variant: str):
-    from torch.optim import AdamW
+    del variant
     from Exp.ERA5.runtime_config import build_adamw_optimizer
 
-    if variant == "A2_discrete_rnn":
-        rnn_params, other_params = [], []
-        rnn_names = {"rnn_h.weight", "rnn_u.weight", "rnn_u.bias"}
-        for name, param in model.named_parameters():
-            if any(rn in name for rn in rnn_names):
-                rnn_params.append(param)
-            else:
-                other_params.append(param)
-        return AdamW(
-            [
-                {"params": other_params, "lr": float(cfg["train"]["lr"])},
-                {"params": rnn_params, "lr": float(cfg["train"]["lr"]) * 3.0},
-            ],
-            weight_decay=float(cfg["train"]["weight_decay"]),
-        )
     return build_adamw_optimizer(model, cfg)
