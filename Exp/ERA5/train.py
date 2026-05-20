@@ -13,7 +13,6 @@ from Exp.ERA5.runtime_config import (
     build_runtime_arg_parser,
     build_runtime_cfg,
     build_uniphy_model,
-    compute_basis_residual,
     compute_weighted_crps,
     distributed_barrier,
     flush_remaining_grads,
@@ -41,18 +40,12 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
     data = data.to(device, non_blocking=True).float()
     dt_data = dt_data.to(device, non_blocking=True).float()
 
-    ensemble_size = cfg["model"]["ensemble_size"]
     x_input = data[:, :-1]
     x_target = data[:, 1:]
     dt_input = dt_data[:, 1:]
 
-    ensemble_preds = []
-    for member_idx in range(max(ensemble_size, 2) if model.training else ensemble_size):
-        out = model(x_input, dt_input, z=True)
-        ensemble_preds.append(out)
-
-    ensemble_stack = torch.stack(ensemble_preds, dim=0)
-    out_mean = ensemble_stack.mean(dim=0)
+    out_mean = model(x_input, dt_input, z=None)
+    ensemble_stack = out_mean.unsqueeze(0)
 
     l1_loss = ((out_mean - x_target).abs() * lat_weights).mean()
     mse_loss = ((out_mean - x_target) ** 2 * lat_weights).mean()
@@ -61,9 +54,7 @@ def train_step(model, batch, optimizer, cfg, grad_accum_steps, batch_idx, lat_we
     ensemble_std = ensemble_stack.std(dim=0).mean()
     loss = l1_loss + crps_loss
 
-    basis_reg_weight = cfg["train"].get("basis_reg_weight", 0.01)
-    basis_reg = compute_basis_residual(model)
-    loss = loss + basis_reg_weight * basis_reg
+    basis_reg = torch.tensor(0.0, device=device)
 
     (loss / grad_accum_steps).backward()
 
@@ -238,7 +229,6 @@ def train(cfg):
                         f"L1: {metrics['l1_loss']:.4f} | "
                         f"CRPS: {metrics['crps_loss']:.4f} | "
                         f"RMSE: {metrics['rmse']:.4f} | "
-                        f"Basis: {metrics['basis_residual']:.4f} | "
                         f"Grad: {metrics['grad_norm']:.4f} | "
                         f"LR: {current_lr:.2e}"
                     )

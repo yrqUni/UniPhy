@@ -8,9 +8,7 @@ model:
   img_height: 721
   img_width: 1440
   dt_ref: 6.0
-  init_noise_scale: 0.0001
   ensemble_size: 1
-  latent_dynamics: real
 
 data:
   input_dir: "./data/ERA5"
@@ -28,7 +26,6 @@ train:
   grad_accum_steps: 1
   use_scheduler: false
   use_tf32: true
-  basis_reg_weight: 0.01
   rollout_loss_weight: 0.15
   rollout_loss_steps: 4
 

@@ -19,7 +19,6 @@ from Exp.ERA5.runtime_config import (
     build_progress,
     build_rank_console,
     build_runtime_cfg,
-    compute_basis_residual,
     compute_weighted_crps,
     distributed_barrier,
     flush_remaining_grads,
@@ -70,23 +69,11 @@ def train_step(
     x_target = data[:, 1:]
     dt_input = dt_data[:, 1:]
 
-    is_deterministic = variant in (
-        "E1_l1_only",
-        "C1_deterministic",
-        "G1_swin_transformer",
-        "G2_convlstm",
-    )
-    n_members = 1 if is_deterministic else max(ensemble_size, 2)
-
-    ensemble_preds = []
-    for _ in range(n_members):
-        z = None if is_deterministic else True
-        out = model(x_input, dt_input, z=z)
-        out = out.real if torch.is_complex(out) else out
-        ensemble_preds.append(out)
-
-    ensemble_stack = torch.stack(ensemble_preds, dim=0)
-    out_mean = ensemble_stack.mean(dim=0)
+    is_deterministic = True
+    del ensemble_size
+    out_mean = model(x_input, dt_input, z=None)
+    out_mean = out_mean.real if torch.is_complex(out_mean) else out_mean
+    ensemble_stack = out_mean.unsqueeze(0)
 
     l1_loss = ((out_mean - x_target).abs() * lat_weights).mean()
     mse_loss = ((out_mean - x_target) ** 2 * lat_weights).mean()
@@ -100,17 +87,7 @@ def train_step(
         ensemble_std = ensemble_stack.std(dim=0).mean()
         loss = l1_loss + crps_loss
 
-    basis_free_variants = (
-        "B1_complex_latent",
-        "G1_swin_transformer",
-        "G2_convlstm",
-    )
-    basis_reg_weight = 0.0 if variant in basis_free_variants else float(cfg["train"].get("basis_reg_weight", 0.01))
-    if basis_reg_weight > 0.0:
-        basis_reg = compute_basis_residual(model)
-        loss = loss + basis_reg_weight * basis_reg
-    else:
-        basis_reg = torch.tensor(0.0, device=device)
+    basis_reg = torch.tensor(0.0, device=device)
 
     rollout_weight = float(cfg["train"].get("rollout_loss_weight", 0.0))
     rollout_loss = torch.tensor(0.0, device=device)
@@ -329,7 +306,6 @@ def train(cfg, variant, num_workers=4, ckpt_path=None, pretrained_ckpt=None, see
                         f"[{variant} E{epoch+1:03d} B{batch_idx+1:04d}] "
                         f"Loss={metrics['loss']:.4f} L1={metrics['l1']:.4f} "
                         f"CRPS={metrics['crps']:.4f} RMSE={metrics['rmse']:.4f} "
-                        f"Basis={metrics['basis_residual']:.4f} "
                         f"Rollout={metrics['rollout']:.4f} "
                         f"Grad={metrics['grad_norm']:.4f}"
                     )

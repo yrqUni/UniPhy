@@ -38,8 +38,6 @@ def _build_base_model(model_cfg: dict, device=None) -> UniPhyModel:
         img_height=int(cfg["img_height"]),
         img_width=int(cfg["img_width"]),
         dt_ref=float(cfg["dt_ref"]),
-        init_noise_scale=float(cfg["init_noise_scale"]),
-        latent_dynamics=str(cfg.get("latent_dynamics", "real")),
     )
     if device is not None:
         model = model.to(device)
@@ -47,10 +45,7 @@ def _build_base_model(model_cfg: dict, device=None) -> UniPhyModel:
 
 
 def _build_complex_model(model_cfg: dict, device=None) -> UniPhyModel:
-    cfg = _normalize_cfg(model_cfg)
-    cfg["latent_dynamics"] = "complex"
-    return _build_base_model(cfg, device=device)
-
+    return _build_base_model(model_cfg, device=device)
 
 def _build_swin_model(model_cfg: dict, device=None) -> SwinTransModel:
     cfg = _normalize_cfg(model_cfg)
