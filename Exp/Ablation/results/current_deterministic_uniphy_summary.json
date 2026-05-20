@@ -1,0 +1,67 @@
+{
+  "status": "current_deterministic_uniphy_baseline_trained_and_evaluated",
+  "commit": "ab7a0a7",
+  "train_years": [
+    2000,
+    2001
+  ],
+  "eval_years": [
+    2002,
+    2002
+  ],
+  "seed": 42,
+  "epochs": 10,
+  "checkpoint": "runs/ablation/current_uniphy_formal/baseline/seed_42/ckpt_final.pt",
+  "params": 3436296,
+  "direct_200": {
+    "rmse": {
+      "6": 0.050134,
+      "12": 0.053226,
+      "18": 0.055828,
+      "24": 0.057383
+    },
+    "acc": {
+      "6": 0.546961,
+      "12": 0.470011,
+      "18": 0.39739,
+      "24": 0.352423
+    },
+    "crps": {
+      "6": 0.027376,
+      "12": 0.030006,
+      "18": 0.032421,
+      "24": 0.033661
+    }
+  },
+  "recursive_200": {
+    "rmse": {
+      "6": 0.050134,
+      "12": 0.053226,
+      "18": 0.055828,
+      "24": 0.057383,
+      "48": 0.062562,
+      "72": 0.224851,
+      "120": 0.363739
+    },
+    "acc": {
+      "6": 0.546961,
+      "12": 0.470011,
+      "18": 0.39739,
+      "24": 0.352423,
+      "48": 0.246168,
+      "72": 0.007699,
+      "120": 0.01342
+    },
+    "crps": {
+      "6": 0.027376,
+      "12": 0.030006,
+      "18": 0.032421,
+      "24": 0.033661,
+      "48": 0.038427,
+      "72": 0.148272,
+      "120": 0.264718
+    }
+  },
+  "finding": "Direct and recursive fixed interval evaluation are numerically identical for 6, 12, 18, and 24 h. The current deterministic baseline is stable at short horizons but degrades sharply at 72 and 120 h, so additional stability oriented model design is required before final claims.",
+  "next_step": "Investigate long horizon stability with theoretically motivated recurrent stabilization and validate by matched numerical experiments."
+}
