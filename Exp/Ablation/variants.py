@@ -61,6 +61,7 @@ def _build_swin_model(model_cfg: dict, device=None) -> SwinTransModel:
         patch_size=tuple(cfg["patch_size"]),
         img_height=int(cfg["img_height"]),
         img_width=int(cfg["img_width"]),
+        mlp_ratio=7,
     )
     if device is not None:
         model = model.to(device)
