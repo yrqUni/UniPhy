@@ -70,8 +70,8 @@ def train_step(
     x_target = data[:, 1:]
     dt_input = dt_data[:, 1:]
 
+    is_l1_only = variant == "E1_l1_only"
     is_deterministic = variant in (
-        "E1_l1_only",
         "C1_deterministic",
         "G1_swin_transformer",
         "G2_convlstm",
@@ -98,7 +98,7 @@ def train_step(
     else:
         crps_loss = compute_weighted_crps(ensemble_stack, x_target, lat_weights)
         ensemble_std = ensemble_stack.std(dim=0).mean()
-        loss = l1_loss + crps_loss
+        loss = l1_loss if is_l1_only else l1_loss + crps_loss
 
     basis_free_variants = (
         "B1_complex_latent",
