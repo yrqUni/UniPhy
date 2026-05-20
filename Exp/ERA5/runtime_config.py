@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from Model.UniPhy.ModelUniPhy import UniPhyModel
+from Model.UniPhy.UniPhyOps import complex_dtype_for
 
 SURFACE_VARS = ["TCWV", "U10", "V10", "T2", "MSLP", "SP"]
 PRESSURE_BASE_VARS = ["VV", "U", "V", "RH", "T", "Z"]
@@ -44,6 +45,8 @@ MODEL_ARG_NAMES = {
     "img_height",
     "img_width",
     "dt_ref",
+    "init_noise_scale",
+    "latent_dynamics",
 }
 DEFAULT_MODEL_CFG = {
     "in_channels": 30,
@@ -55,7 +58,9 @@ DEFAULT_MODEL_CFG = {
     "img_height": 721,
     "img_width": 1440,
     "dt_ref": 6.0,
-    "ensemble_size": 1,
+    "init_noise_scale": 0.0001,
+    "ensemble_size": 4,
+    "latent_dynamics": "real",
 }
 DEFAULT_TRAIN_YEAR_RANGE = [2000, 2008]
 DEFAULT_TEST_YEAR_RANGE = [2009, 2009]
@@ -221,10 +226,22 @@ def get_unwrapped_model(model):
     return model.module if hasattr(model, "module") else model
 
 
-
 def compute_basis_residual(model):
-    device = next(get_unwrapped_model(model).parameters()).device
-    return torch.tensor(0.0, device=device)
+    target = get_unwrapped_model(model)
+    device = next(target.parameters()).device
+    basis_residual = torch.tensor(0.0, device=device)
+    count = 0
+    for block in target.blocks:
+        if not hasattr(block.prop, "basis"):
+            continue
+        basis_dtype = complex_dtype_for(next(block.parameters()).dtype)
+        basis_w, basis_w_inv = block.prop.basis.get_matrix(basis_dtype)
+        eye = torch.eye(basis_w.shape[0], device=device, dtype=basis_w.dtype)
+        basis_residual = basis_residual + (
+            (basis_w @ basis_w_inv - eye).abs().pow(2).mean()
+        )
+        count += 1
+    return basis_residual / max(count, 1)
 
 
 def weighted_channel_mean(values, lat_weights):
