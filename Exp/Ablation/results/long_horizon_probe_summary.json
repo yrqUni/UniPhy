@@ -25,7 +25,8 @@
     "direct_recursive_short_leads_match": true,
     "contractive_relaxation_status": "not_selected",
     "long_horizon_objective_status": "not_selected",
-    "current_reference": "default_10ep"
+    "current_reference": "default_10ep",
+    "latent_consistency_status": "not_selected"
   },
   "results": {
     "default_10ep": {
@@ -114,6 +115,38 @@
         "72": 0.661632,
         "120": 0.59116
       }
+    },
+    "latent_consistency_0p005_240step": {
+      "rmse": {
+        "6": 0.104266,
+        "12": 0.108829,
+        "18": 0.112402,
+        "24": 0.117018,
+        "48": 0.136264,
+        "72": 1.40188,
+        "120": 0.827109
+      },
+      "acc": {
+        "6": 0.078936,
+        "12": 0.062306,
+        "18": 0.056074,
+        "24": 0.050394,
+        "48": 0.039115,
+        "72": 0.030752,
+        "120": 0.020479
+      },
+      "crps": {
+        "6": 0.07097,
+        "12": 0.07489,
+        "18": 0.076758,
+        "24": 0.080878,
+        "48": 0.097843,
+        "72": 1.109608,
+        "120": 0.659158
+      }
     }
+  },
+  "notes": {
+    "latent_consistency": "weight 0.05 became unstable during training; weight 0.005 remained trainable in a short probe but degraded recursive evaluation."
   }
 }
