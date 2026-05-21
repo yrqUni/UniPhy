@@ -29,6 +29,7 @@ def parse_args():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--data-input-dir", required=True)
     p.add_argument("--climatology-dir", required=True)
+    p.add_argument("--climatology-cache", default=None)
     p.add_argument("--climatology-year-range", default="2000,2001")
     p.add_argument("--eval-year-range", default="2002,2002")
     p.add_argument("--lead-times", default="6,12,18,24")
@@ -114,36 +115,54 @@ def evaluate(args):
         pin_memory=device.type == "cuda",
     )
     clim_years = _parse_year_range(args.climatology_year_range)
-    clim_dataset, _ = _build_dataset(
-        args.climatology_dir,
-        clim_years,
-        model_cfg,
-        cond_steps,
-        int(args.step_hours),
-        max_lead,
-    )
-    clim_loader = DataLoader(
-        clim_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
     channels = int(model_cfg.get("out_channels", 30))
     height = int(model_cfg.get("img_height", DEFAULT_MODEL_CFG["img_height"]))
     width = int(model_cfg.get("img_width", DEFAULT_MODEL_CFG["img_width"]))
-    clim_sum = torch.zeros(len(lead_times), channels, height, width)
-    clim_n = 0
     lead_indices = [lead // int(args.step_hours) - 1 for lead in lead_times]
     t0 = time.time()
-    for data, _ in clim_loader:
-        if args.max_samples and clim_n >= args.max_samples:
-            break
-        target_steps = data[:, cond_steps:].float()
-        clim_sum += target_steps[:, lead_indices].sum(dim=0).cpu()
-        clim_n += data.shape[0]
-        if clim_n % max(1, args.log_every) == 0:
-            print(f"climatology samples={clim_n} elapsed={time.time() - t0:.1f}s", flush=True)
-    climatology = (clim_sum / max(clim_n, 1)).to(device)
+    clim_cache = Path(args.climatology_cache) if args.climatology_cache else None
+    if clim_cache and clim_cache.exists():
+        climatology = torch.load(clim_cache, map_location="cpu", weights_only=False)["climatology"].to(device)
+    else:
+        clim_dataset, _ = _build_dataset(
+            args.climatology_dir,
+            clim_years,
+            model_cfg,
+            cond_steps,
+            int(args.step_hours),
+            max_lead,
+        )
+        clim_loader = DataLoader(
+            clim_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+        clim_sum = torch.zeros(len(lead_times), channels, height, width)
+        clim_n = 0
+        for data, _ in clim_loader:
+            if args.max_samples and clim_n >= args.max_samples:
+                break
+            target_steps = data[:, cond_steps:].float()
+            clim_sum += target_steps[:, lead_indices].sum(dim=0).cpu()
+            clim_n += data.shape[0]
+            if clim_n % max(1, args.log_every) == 0:
+                print(f"climatology samples={clim_n} elapsed={time.time() - t0:.1f}s", flush=True)
+        climatology = clim_sum / max(clim_n, 1)
+        if clim_cache:
+            clim_cache.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "climatology": climatology.cpu(),
+                    "lead_times": lead_times,
+                    "year_range": clim_years,
+                    "step_hours": int(args.step_hours),
+                    "condition_steps": cond_steps,
+                    "num_samples": clim_n,
+                },
+                clim_cache,
+            )
+        climatology = climatology.to(device)
     lat_w = build_lat_weights(height, device).squeeze(2)
     mse_sum = torch.zeros(len(lead_times), channels, dtype=torch.float64, device=device)
     overall_mse = torch.zeros(len(lead_times), dtype=torch.float64, device=device)
