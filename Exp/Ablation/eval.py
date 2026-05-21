@@ -33,6 +33,7 @@ def parse_args():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--data-input-dir", required=True)
     p.add_argument("--climatology-dir", default=None)
+    p.add_argument("--climatology-cache", default=None)
     p.add_argument(
         "--climatology-year-range",
         default=None,
@@ -162,24 +163,44 @@ def evaluate(args):
 
     clim_yr_str = args.climatology_year_range or args.eval_year_range
     clim_yr = _parse_year_range(clim_yr_str) if clim_yr_str else eval_yr
-    clim_dataset, _ = build_eval_dataset(
-        clim_dir, clim_yr, model_cfg, cond_steps, lead_times
-    )
-    clim_loader = DataLoader(
-        clim_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
-    clim_sum = torch.zeros(len(lead_times), n_ch, H, W, dtype=torch.float32)
-    clim_n = 0
-    for data, _ in clim_loader:
-        if args.max_samples and clim_n >= args.max_samples:
-            break
-        tgt = data[:, cond_steps:].float()
-        clim_sum += tgt.sum(dim=0).cpu()
-        clim_n += data.shape[0]
-    climatology = (clim_sum / max(clim_n, 1)).to(device)
+    clim_cache = Path(args.climatology_cache) if args.climatology_cache else None
+    if clim_cache and clim_cache.exists():
+        clim_obj = torch.load(clim_cache, map_location="cpu", weights_only=False)
+        climatology = clim_obj["climatology"].to(device)
+    else:
+        clim_dataset, _ = build_eval_dataset(
+            clim_dir, clim_yr, model_cfg, cond_steps, lead_times
+        )
+        clim_loader = DataLoader(
+            clim_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+        clim_sum = torch.zeros(len(lead_times), n_ch, H, W, dtype=torch.float32)
+        clim_n = 0
+        for data, _ in clim_loader:
+            if args.max_samples and clim_n >= args.max_samples:
+                break
+            tgt = data[:, cond_steps:].float()
+            clim_sum += tgt.sum(dim=0).cpu()
+            clim_n += data.shape[0]
+        climatology = clim_sum / max(clim_n, 1)
+        if clim_cache:
+            clim_cache.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "climatology": climatology.cpu(),
+                    "lead_times": lead_times,
+                    "year_range": clim_yr,
+                    "condition_steps": cond_steps,
+                    "channels": n_ch,
+                    "height": H,
+                    "width": W,
+                },
+                clim_cache,
+            )
+        climatology = climatology.to(device)
 
     lat_w = build_lat_weights(H, device).squeeze(2)
 
