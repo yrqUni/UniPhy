@@ -170,7 +170,6 @@ def evaluate(args):
                 "G1_swin_transformer",
                 "G2_convlstm",
                 "C1_deterministic",
-                "E1_l1_only",
             )
             n_members = 1 if deterministic else max(1, int(args.ensemble_size))
             for _ in range(n_members):

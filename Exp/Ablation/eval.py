@@ -150,7 +150,6 @@ def evaluate(args):
     )
     if args.variant in (
         "C1_deterministic",
-        "E1_l1_only",
         "G1_swin_transformer",
         "G2_convlstm",
     ):
@@ -196,7 +195,6 @@ def evaluate(args):
 
     is_det = args.variant in (
         "C1_deterministic",
-        "E1_l1_only",
         "G1_swin_transformer",
         "G2_convlstm",
     )
